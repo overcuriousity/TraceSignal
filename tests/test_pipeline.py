@@ -1,0 +1,191 @@
+"""Tests for the ingestion pipeline."""
+
+from pathlib import Path
+
+import pytest
+
+from tracevector.ingestion.pipeline import IngestionPipeline
+from tracevector.models.embeddings import EmbeddingConfig, EmbeddingModel
+from tracevector.models.event import Event
+
+
+class FakeClickHouseStore:
+    """In-memory ClickHouse store for testing."""
+
+    def __init__(self) -> None:
+        self.events: list[Event] = []
+        self.schema_initialized = False
+
+    def init_schema(self) -> None:
+        self.schema_initialized = True
+
+    def insert_events(self, events: list[Event]) -> int:
+        self.events.extend(events)
+        return len(events)
+
+    def count_events(self, case_id: str | None = None, timeline_id: str | None = None) -> int:
+        events = self.events
+        if case_id is not None:
+            events = [e for e in events if e.case_id == case_id]
+        if timeline_id is not None:
+            events = [e for e in events if e.timeline_id == timeline_id]
+        return len(events)
+
+
+class FakeQdrantStore:
+    """In-memory Qdrant store for testing."""
+
+    def __init__(self) -> None:
+        self.collections: dict[str, dict] = {}
+        self.points: dict[str, list] = {}
+
+    def init_collection(
+        self,
+        case_id: str,
+        embedding_config_hash: str,
+        vector_size: int,
+        distance: str | None = None,
+    ) -> None:
+        name = self._name(case_id, embedding_config_hash)
+        if name in self.collections:
+            existing_size = self.collections[name]["vector_size"]
+            if existing_size != vector_size:
+                raise ValueError(
+                    f"Collection {name!r} exists with vector size {existing_size}, "
+                    f"but requested size is {vector_size}."
+                )
+            return
+        self.collections[name] = {"vector_size": vector_size, "distance": distance}
+        self.points[name] = []
+
+    def upsert_vectors(
+        self,
+        case_id: str,
+        embedding_config_hash: str,
+        events: list[Event],
+        vectors: list[list[float]],
+    ) -> int:
+        name = self._name(case_id, embedding_config_hash)
+        for event, vector in zip(events, vectors, strict=False):
+            self.points[name].append({"id": event.vector_id, "vector": vector})
+        return len(events)
+
+    def count_vectors(self, case_id: str, embedding_config_hash: str) -> int:
+        return len(self.points[self._name(case_id, embedding_config_hash)])
+
+    @staticmethod
+    def _name(case_id: str, embedding_config_hash: str) -> str:
+        return f"tracevector_{case_id}_{embedding_config_hash}"
+
+
+class FakeEmbeddingModel(EmbeddingModel):
+    """Embedding model that returns deterministic vectors without PyTorch."""
+
+    def __init__(self, vector_dimension: int = 8) -> None:
+        self.model_name = "fake-model"
+        self.device = "cpu"
+        self.batch_size = 64
+        self._vector_dimension = vector_dimension
+        self._normalize = True
+        self._pooling = "mean"
+        self._resolved_config: EmbeddingConfig | None = EmbeddingConfig(
+            model_name=self.model_name,
+            device=self.device,
+            vector_dimension=vector_dimension,
+            normalize=True,
+            pooling="mean",
+        )
+        self._model = None
+
+    def load(self):
+        return self
+
+    def vector_dimension(self) -> int:
+        return self._vector_dimension
+
+    def encode(self, texts: list[str]) -> list[list[float]]:
+        # Deterministic fake vectors: first dimension is text length, rest zeros.
+        return [[float(len(t))] + [0.0] * (self._vector_dimension - 1) for t in texts]
+
+
+@pytest.fixture
+def sample_jsonl(tmp_path: Path) -> Path:
+    path = tmp_path / "events.jsonl"
+    path.write_text(
+        '{"message":"User login","timestamp":"2024-01-01T00:00:00+00:00"}\n'
+        '{"message":"User logout","timestamp":"2024-01-01T00:01:00+00:00"}\n'
+        '{"message":"File accessed","timestamp":"2024-01-01T00:02:00+00:00"}\n'
+    )
+    return path
+
+
+def test_pipeline_ingests_events_and_vectors(sample_jsonl: Path) -> None:
+    embedding_model = FakeEmbeddingModel(vector_dimension=8)
+    clickhouse = FakeClickHouseStore()
+    qdrant = FakeQdrantStore()
+
+    pipeline = IngestionPipeline(
+        case_id="case1",
+        timeline_id="timeline1",
+        embedding_model=embedding_model,
+        clickhouse=clickhouse,
+        qdrant=qdrant,
+        batch_size=2,
+    )
+
+    result = pipeline.run(sample_jsonl)
+
+    assert result.case_id == "case1"
+    assert result.timeline_id == "timeline1"
+    assert result.events_parsed == 3
+    assert result.events_inserted == 3
+    assert result.vectors_inserted == 3
+    assert len(clickhouse.events) == 3
+    assert clickhouse.schema_initialized is True
+    assert len(qdrant.collections) == 1
+
+    # Verify embedding metadata was attached to events.
+    for event in clickhouse.events:
+        assert event.embedding_model == "fake-model"
+        assert event.embedding_config_hash == embedding_model.config_hash()
+
+
+def test_pipeline_batching(sample_jsonl: Path) -> None:
+    embedding_model = FakeEmbeddingModel(vector_dimension=8)
+    clickhouse = FakeClickHouseStore()
+    qdrant = FakeQdrantStore()
+
+    pipeline = IngestionPipeline(
+        case_id="case1",
+        timeline_id="timeline1",
+        embedding_model=embedding_model,
+        clickhouse=clickhouse,
+        qdrant=qdrant,
+        batch_size=2,
+    )
+
+    pipeline.run(sample_jsonl)
+
+    collection_name = qdrant._name("case1", embedding_model.config_hash())
+    assert qdrant.count_vectors("case1", embedding_model.config_hash()) == 3
+    assert len(qdrant.points[collection_name]) == 3
+
+
+def test_pipeline_raises_on_missing_path(tmp_path: Path) -> None:
+    pipeline = IngestionPipeline(
+        case_id="case1",
+        timeline_id="timeline1",
+        embedding_model=FakeEmbeddingModel(),
+        clickhouse=FakeClickHouseStore(),
+        qdrant=FakeQdrantStore(),
+    )
+    with pytest.raises(FileNotFoundError):
+        pipeline.run(tmp_path / "does-not-exist.jsonl")
+
+
+def test_qdrant_config_mismatch_is_rejected() -> None:
+    qdrant = FakeQdrantStore()
+    qdrant.init_collection("case1", "hash1", vector_size=384)
+
+    with pytest.raises(ValueError, match="exists with vector size 384"):
+        qdrant.init_collection("case1", "hash1", vector_size=768)
