@@ -1,250 +1,300 @@
+<!--
+Copyright 2024 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Adapted for TraceVector from Google Timesketch frontend-v3.
+-->
 <template>
-  <v-container fluid>
-    <v-row>
-      <v-col cols="12">
+  <ViewLayout>
+    <template #left>
+      <v-expansion-panels v-model="panel" multiple variant="accordion">
+        <TimelinePanel
+          :case-id="caseId"
+          :timelines="appStore.timelines"
+          :current-timeline-id="timelineId"
+        />
+        <FilterPanel v-model="filters" @apply="applyFilters" />
+        <SavedViews
+          :views="appStore.savedViews"
+          :can-save="appStore.hasActiveFilters"
+          @select="loadView"
+          @save-current="saveCurrentView"
+        />
+        <Anomalies
+          :results="anomalies"
+          :loading="anomaliesLoading"
+          @load="loadAnomalies"
+        />
+      </v-expansion-panels>
+    </template>
+
+    <div>
+      <v-toolbar density="compact" flat color="surface" class="mb-2 rounded">
         <v-btn
           variant="text"
+          size="small"
           :to="`/cases/${caseId}`"
           prepend-icon="mdi-arrow-left"
         >
-          Back to case
+          Case
         </v-btn>
-        <h1 class="text-h4 mt-2">{{ timeline?.name || "Timeline" }}</h1>
-        <p class="text-body-2 text-disabled">
-          {{ timeline?.description }}
-        </p>
-      </v-col>
-    </v-row>
+        <v-toolbar-title class="text-body-1">
+          {{ appStore.currentTimeline?.name || "Timeline" }}
+        </v-toolbar-title>
+        <v-spacer />
+        <UploadFormButton
+          :case-id="caseId"
+          :timeline-id="timelineId"
+          @uploaded="onUploaded"
+        />
+      </v-toolbar>
 
-    <v-row>
-      <v-col cols="12" md="6">
-        <v-card>
-          <v-card-title>Upload Timeline File</v-card-title>
-          <v-card-text>
-            <v-file-input
-              v-model="selectedFile"
-              label="CSV or JSONL file"
-              accept=".csv,.jsonl,.json,.tsv"
-              density="comfortable"
-              show-size
-            />
-            <v-select
-              v-model="uploadParser"
-              :items="['auto', 'timesketch_csv', 'jsonl']"
-              label="Parser"
-              density="comfortable"
-            />
-            <v-btn
-              color="primary"
-              :loading="uploading"
-              :disabled="!selectedFile"
-              @click="upload"
-            >
-              Ingest
-            </v-btn>
-            <v-alert
-              v-if="uploadResult"
-              type="success"
-              class="mt-4"
-              density="compact"
-            >
-              Ingested {{ uploadResult.events_inserted }} events
-              ({{ uploadResult.vectors_inserted }} vectors)
-            </v-alert>
-          </v-card-text>
-        </v-card>
-      </v-col>
-
-      <v-col cols="12" md="6">
-        <v-card>
-          <v-card-title>Filters</v-card-title>
-          <v-card-text>
-            <v-row>
-              <v-col cols="12" sm="6">
-                <v-text-field
-                  v-model="filters.q"
-                  label="Search message"
-                  density="comfortable"
-                  append-inner-icon="mdi-magnify"
-                  @keydown.enter="applyFilters"
-                />
-              </v-col>
-              <v-col cols="12" sm="3">
-                <v-text-field
-                  v-model="filters.source"
-                  label="Source"
-                  density="comfortable"
-                />
-              </v-col>
-              <v-col cols="12" sm="3">
-                <v-text-field
-                  v-model="filters.tag"
-                  label="Tag"
-                  density="comfortable"
-                />
-              </v-col>
-            </v-row>
-            <v-btn color="primary" @click="applyFilters">Apply</v-btn>
-            <v-btn variant="text" class="ml-2" @click="resetFilters">Reset</v-btn>
-          </v-card-text>
-        </v-card>
-      </v-col>
-    </v-row>
-
-    <v-row class="mt-4">
-      <v-col cols="12">
-        <v-card>
-          <v-card-title>
-            Events
-            <span class="text-body-2 text-disabled ml-2">
-              ({{ total }} total)
-            </span>
-          </v-card-title>
-          <v-data-table
-            :headers="headers"
-            :items="events"
-            :items-per-page="limit"
-            :page="page"
-            :loading="loading"
-            hide-default-footer
-            class="elevation-0"
-          >
-            <template #item.timestamp="{ item }">
-              {{ formatTimestamp(item.timestamp) }}
-            </template>
-            <template #item.tags="{ item }">
-              <v-chip
-                v-for="tag in item.tags || []"
-                :key="tag"
-                size="x-small"
-                class="mr-1"
-              >
-                {{ tag }}
-              </v-chip>
-            </template>
-            <template #item.attributes="{ item }">
-              <span class="text-caption">{{ formatAttributes(item.attributes) }}</span>
-            </template>
-          </v-data-table>
-          <v-pagination
-            v-if="totalPages > 1"
-            v-model="page"
-            :length="totalPages"
-            class="pa-4"
-            @update:model-value="loadEvents"
+      <v-card class="mb-3">
+        <v-card-text>
+          <SearchInput
+            v-model="filters.q"
+            @search="applyFilters"
+            @clear="clearQuery"
           />
-        </v-card>
-      </v-col>
-    </v-row>
-  </v-container>
+          <FilterChips
+            :filters="appStore.activeFilters"
+            class="mt-2"
+            @remove="removeFilter"
+            @clear="resetFilters"
+          />
+        </v-card-text>
+      </v-card>
+
+      <v-card>
+        <EventTable
+          :events="appStore.events"
+          :total="appStore.eventTotal"
+          :page="appStore.currentPage"
+          :limit="appStore.eventLimit"
+          :total-pages="appStore.totalPages"
+          :loading="appStore.loading"
+          :selected-ids="appStore.selectedEventIds"
+          @update:page="onPageChange"
+          @update:limit="onLimitChange"
+          @update:selected-ids="onSelectionChange"
+          @filter-source="setSourceFilter"
+          @filter-tag="setTagFilter"
+          @tag-selected="tagSelected"
+          @export="exportEvents"
+        />
+      </v-card>
+    </div>
+  </ViewLayout>
+
+  <v-dialog v-model="tagDialog" width="400">
+    <v-card>
+      <v-card-title>Tag selected events</v-card-title>
+      <v-card-text>
+        <v-text-field
+          v-model="newTag"
+          label="Tag"
+          density="comfortable"
+          hide-details
+        />
+      </v-card-text>
+      <v-card-actions>
+        <v-spacer />
+        <v-btn variant="text" @click="tagDialog = false">Cancel</v-btn>
+        <v-btn color="primary" :disabled="!newTag" @click="applyTag">Tag</v-btn>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
+
+  <v-dialog v-model="saveViewDialog" width="400">
+    <v-card>
+      <v-card-title>Save view</v-card-title>
+      <v-card-text>
+        <v-text-field
+          v-model="viewName"
+          label="Name"
+          density="comfortable"
+          hide-details
+        />
+      </v-card-text>
+      <v-card-actions>
+        <v-spacer />
+        <v-btn variant="text" @click="saveViewDialog = false">Cancel</v-btn>
+        <v-btn color="primary" :disabled="!viewName" @click="confirmSaveView"
+          >Save</v-btn
+        >
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from "vue";
+import { onMounted, reactive, ref, watch } from "vue";
 import { useRoute } from "vue-router";
-import {
-  getTimeline as apiGetTimeline,
-  uploadTimeline as apiUploadTimeline,
-  listEvents,
-} from "../services/api";
-import type { Timeline, EventRecord } from "../services/api";
+import ViewLayout from "@/layouts/View.vue";
+import TimelinePanel from "@/components/LeftPanel/TimelinePanel.vue";
+import FilterPanel from "@/components/LeftPanel/FilterPanel.vue";
+import SavedViews from "@/components/LeftPanel/SavedViews.vue";
+import Anomalies from "@/components/LeftPanel/Anomalies.vue";
+import SearchInput from "@/components/Explore/SearchInput.vue";
+import FilterChips from "@/components/Explore/FilterChips.vue";
+import EventTable from "@/components/Explore/EventTable.vue";
+import UploadFormButton from "@/components/UploadFormButton.vue";
+import { useAppStore } from "@/stores/app";
+import type { FilterState, SavedView, SimilarityResult } from "@/services/api";
+import { getAnomalies, createView } from "@/services/api";
 
 const route = useRoute();
+const appStore = useAppStore();
 const caseId = route.params.caseId as string;
 const timelineId = route.params.timelineId as string;
 
-const timeline = ref<Timeline | null>(null);
-const selectedFile = ref<File[] | null>(null);
-const uploadParser = ref("auto");
-const uploading = ref(false);
-const uploadResult = ref<{
-  events_inserted: number;
-  vectors_inserted: number;
-} | null>(null);
+const panel = ref(["timelines", "filters"]);
+const filters = reactive<FilterState>({});
+const tagDialog = ref(false);
+const newTag = ref("");
+const saveViewDialog = ref(false);
+const viewName = ref("");
+const anomalies = ref<SimilarityResult[]>([]);
+const anomaliesLoading = ref(false);
 
-const events = ref<EventRecord[]>([]);
-const total = ref(0);
-const loading = ref(false);
-const page = ref(1);
-const limit = ref(50);
-const filters = reactive({ q: "", source: "", tag: "" });
-
-const headers = [
-  { title: "Time", key: "timestamp", width: "180px" },
-  { title: "Source", key: "source", width: "120px" },
-  { title: "Message", key: "message" },
-  { title: "Tags", key: "tags", width: "150px" },
-  { title: "Attributes", key: "attributes", width: "200px" },
-];
-
-const totalPages = computed(() => Math.ceil(total.value / limit.value) || 1);
-
-async function loadTimeline() {
-  const response = await apiGetTimeline(caseId, timelineId);
-  timeline.value = response.timeline;
-}
-
-async function upload() {
-  const fileArray = selectedFile.value;
-  if (!fileArray || fileArray.length === 0) return;
-  uploading.value = true;
-  const result = await apiUploadTimeline(
-    caseId,
-    timelineId,
-    fileArray[0],
-    uploadParser.value === "auto" ? undefined : uploadParser.value
-  );
-  uploadResult.value = result;
-  selectedFile.value = null;
-  uploading.value = false;
-  await loadTimeline();
-  await loadEvents();
-}
-
-async function loadEvents() {
-  loading.value = true;
-  const offset = (page.value - 1) * limit.value;
-  const result = await listEvents(caseId, timelineId, {
-    q: filters.q || undefined,
-    source: filters.source || undefined,
-    tag: filters.tag || undefined,
-    limit: limit.value,
-    offset,
-  });
-  events.value = result.events;
-  total.value = result.total;
-  loading.value = false;
+async function loadAll() {
+  await appStore.loadTimeline(caseId, timelineId);
+  await appStore.loadSavedViews(caseId);
+  await appStore.loadEvents(caseId, timelineId, filters);
 }
 
 function applyFilters() {
-  page.value = 1;
-  loadEvents();
+  appStore.setPage(1);
+  appStore.loadEvents(caseId, timelineId, filters);
+}
+
+function onPageChange(page: number) {
+  appStore.setPage(page);
+  appStore.loadEvents(caseId, timelineId, filters);
+}
+
+function onLimitChange(limit: number) {
+  appStore.setLimit(limit);
+  appStore.loadEvents(caseId, timelineId, filters);
+}
+
+function onSelectionChange(ids: Set<string>) {
+  appStore.selectedEventIds = ids;
+}
+
+function onUploaded() {
+  appStore.loadTimeline(caseId, timelineId);
+  appStore.loadEvents(caseId, timelineId, filters);
+}
+
+function clearQuery() {
+  filters.q = "";
+  applyFilters();
+}
+
+function setSourceFilter(source: string) {
+  filters.source = source;
+  applyFilters();
+}
+
+function setTagFilter(tag: string) {
+  filters.tag = tag;
+  applyFilters();
+}
+
+function removeFilter(key: "q" | "source" | "tag" | "timerange") {
+  if (key === "timerange") {
+    filters.start = undefined;
+    filters.end = undefined;
+  } else {
+    filters[key] = undefined;
+  }
+  applyFilters();
 }
 
 function resetFilters() {
   filters.q = "";
   filters.source = "";
   filters.tag = "";
-  page.value = 1;
-  loadEvents();
+  filters.start = "";
+  filters.end = "";
+  applyFilters();
 }
 
-function formatTimestamp(value: string | null): string {
-  if (!value) return "—";
-  return new Date(value).toLocaleString();
+function loadView(view: SavedView) {
+  filters.q = view.query;
+  Object.assign(filters, view.filter);
+  applyFilters();
 }
 
-function formatAttributes(attrs: Record<string, string> | null): string {
-  if (!attrs) return "";
-  return Object.entries(attrs)
-    .map(([k, v]) => `${k}: ${v}`)
-    .join(", ");
+function saveCurrentView() {
+  viewName.value = "";
+  saveViewDialog.value = true;
 }
 
-watch(page, loadEvents);
+async function confirmSaveView() {
+  if (!viewName.value) return;
+  try {
+    await createView(caseId, viewName.value, filters.q || "", { ...filters });
+    await appStore.loadSavedViews(caseId);
+    window.dispatchEvent(
+      new CustomEvent("app-success", { detail: "View saved" }),
+    );
+  } finally {
+    saveViewDialog.value = false;
+  }
+}
 
-onMounted(async () => {
-  await loadTimeline();
-  await loadEvents();
+function tagSelected() {
+  newTag.value = "";
+  tagDialog.value = true;
+}
+
+async function applyTag() {
+  // TODO: wire to annotation endpoint once backend supports tagging.
+  window.dispatchEvent(
+    new CustomEvent("app-success", {
+      detail: `Tagged ${appStore.selectedEventIds.size} events (stub)`,
+    }),
+  );
+  tagDialog.value = false;
+}
+
+async function exportEvents() {
+  // TODO: wire to export endpoint once backend supports it.
+  window.dispatchEvent(
+    new CustomEvent("app-success", { detail: "Export started (stub)" }),
+  );
+}
+
+async function loadAnomalies() {
+  anomaliesLoading.value = true;
+  try {
+    anomalies.value = await getAnomalies(caseId, timelineId);
+  } finally {
+    anomaliesLoading.value = false;
+  }
+}
+
+watch(
+  () => route.params.timelineId,
+  () => {
+    loadAll();
+  },
+);
+
+onMounted(() => {
+  loadAll();
 });
 </script>

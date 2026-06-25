@@ -1,8 +1,8 @@
 import { createRouter, createWebHistory } from "vue-router";
-import HomeView from "../views/HomeView.vue";
-import CaseListView from "../views/CaseListView.vue";
-import CaseDetailView from "../views/CaseDetailView.vue";
-import TimelineDetailView from "../views/TimelineDetailView.vue";
+import HomeView from "@/views/HomeView.vue";
+import CaseListView from "@/views/CaseListView.vue";
+import CaseDetailView from "@/views/CaseDetailView.vue";
+import TimelineDetailView from "@/views/TimelineDetailView.vue";
 
 const router = createRouter({
   history: createWebHistory(),
