@@ -1,6 +1,6 @@
 # TraceVector Implementation Progress
 
-Last updated: 2026-06-24
+Last updated: 2026-06-25
 
 This document tracks implementation progress against the MVP defined in
 [`CONCEPT.md`](./CONCEPT.md) and the tech-stack decisions in
@@ -16,8 +16,8 @@ This document tracks implementation progress against the MVP defined in
 |---|---------|--------|-------|
 | 1 | **Ingestion (CLI-first)** | ✅ Done | Streaming CSV/JSONL parsers, `tv ingest` CLI, plus web-based drag-and-drop upload. |
 | 2 | **Storage & Vector Backend** | ✅ Done | ClickHouse `events` table with token-bloom full-text index; Qdrant collections with embedding-config-hash isolation and vector-size config-match checks. |
-| 3 | **Web UI (ELK-like investigation interface)** | 🟡 Core done | Case/timeline management, file upload, event table, full-text search, source/tag filters, and pagination. Missing: saved views, annotations/tags on events, CSV/JSONL export. |
-| 4 | **Anomaly & Similarity Panel** | ❌ Not started | Outlier detection, rare-cluster highlighting, and semantic similarity search are not yet implemented. |
+| 3 | **Web UI (ELK-like investigation interface)** | 🟡 Core done | Replaced the minimal scaffold with a Timesketch-v3-inspired shell: AppBar, navigation, Pinia store, Home/Case/Sketch views, and an Explore-style investigation view. Supports search chips, source/tag filters, time-range filters, selectable event table, saved-views UI, and export stubs. Backend endpoints for saved views, annotations, and export are still pending. |
+| 4 | **Anomaly & Similarity Panel** | 🟡 UI stubbed | Frontend anomaly panel and similarity search UI added; backend endpoints (`/anomalies`, `/similar`) still need Qdrant nearest-neighbor implementation. |
 | 5 | **Deployment & Operation** | 🟡 Partial | Reference `docker-compose.yml`, `uv` workflow, environment-based config. Missing: authentication, GPU index selection, strict offline-mode guard for model downloads. |
 
 ## Completed architectural decisions

@@ -16,20 +16,7 @@ limitations under the License.
 Adapted for TraceVector from Google Timesketch frontend-v3.
 -->
 <template>
-  <v-app>
-    <AppBar />
-    <v-main>
-      <router-view />
-    </v-main>
-    <Notifications />
-  </v-app>
+  <v-container fluid class="pa-6">
+    <slot />
+  </v-container>
 </template>
-
-<script setup lang="ts">
-import AppBar from "@/layouts/AppBar.vue";
-import Notifications from "@/components/Notifications.vue";
-</script>
-
-<style lang="scss">
-@use "@/styles/global.scss" as *;
-</style>

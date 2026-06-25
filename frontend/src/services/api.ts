@@ -1,8 +1,42 @@
-import axios from "axios";
+/*
+ * Copyright 2024 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Adapted for TraceVector from Google Timesketch frontend-v3.
+ */
+
+import axios, { AxiosError } from "axios";
 
 const api = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL || "/",
+  headers: {
+    "Content-Type": "application/json",
+  },
 });
+
+api.interceptors.response.use(
+  (response) => response,
+  (error: AxiosError<{ message?: string; detail?: string }>) => {
+    const message =
+      error.response?.data?.message ||
+      error.response?.data?.detail ||
+      error.message ||
+      "Unknown API error";
+    window.dispatchEvent(new CustomEvent("api-error", { detail: message }));
+    return Promise.reject(error);
+  },
+);
 
 export interface Case {
   id: string;
@@ -47,12 +81,56 @@ export interface EventPage {
   events: EventRecord[];
 }
 
+export interface FilterState {
+  q?: string;
+  source?: string;
+  tag?: string;
+  start?: string;
+  end?: string;
+}
+
+export interface SavedView {
+  id: string;
+  case_id: string;
+  name: string;
+  query: string;
+  filter: FilterState;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface Annotation {
+  id: string;
+  event_id: string;
+  annotation_type: "comment" | "tag";
+  content: string;
+  created_at: string;
+  created_by?: string;
+}
+
+export interface UploadResult {
+  timeline_id: string;
+  events_parsed: number;
+  events_inserted: number;
+  vectors_inserted: number;
+  parser: string;
+}
+
+export interface SimilarityResult {
+  event_id: string;
+  score: number;
+  event: EventRecord;
+}
+
 export async function listCases(): Promise<Case[]> {
   const response = await api.get("/api/cases/");
   return response.data.cases;
 }
 
-export async function createCase(name: string, description?: string): Promise<Case> {
+export async function createCase(
+  name: string,
+  description?: string,
+): Promise<Case> {
   const response = await api.post("/api/cases/", { name, description });
   return response.data.case;
 }
@@ -60,6 +138,15 @@ export async function createCase(name: string, description?: string): Promise<Ca
 export async function getCase(caseId: string): Promise<{ case: Case }> {
   const response = await api.get(`/api/cases/${caseId}`);
   return response.data;
+}
+
+export async function updateCase(
+  caseId: string,
+  name: string,
+  description?: string,
+): Promise<Case> {
+  const response = await api.put(`/api/cases/${caseId}`, { name, description });
+  return response.data.case;
 }
 
 export async function listTimelines(caseId: string): Promise<Timeline[]> {
@@ -71,7 +158,7 @@ export async function createTimeline(
   caseId: string,
   name: string,
   description?: string,
-  parser?: string
+  parser?: string,
 ): Promise<Timeline> {
   const response = await api.post(`/api/cases/${caseId}/timelines`, {
     name,
@@ -83,24 +170,39 @@ export async function createTimeline(
 
 export async function getTimeline(
   caseId: string,
-  timelineId: string
+  timelineId: string,
 ): Promise<{ timeline: Timeline }> {
-  const response = await api.get(`/api/cases/${caseId}/timelines/${timelineId}`);
+  const response = await api.get(
+    `/api/cases/${caseId}/timelines/${timelineId}`,
+  );
   return response.data;
+}
+
+export async function updateTimeline(
+  caseId: string,
+  timelineId: string,
+  updates: Partial<Pick<Timeline, "name" | "description" | "parser">>,
+): Promise<Timeline> {
+  const response = await api.put(
+    `/api/cases/${caseId}/timelines/${timelineId}`,
+    updates,
+  );
+  return response.data.timeline;
+}
+
+export async function deleteTimeline(
+  caseId: string,
+  timelineId: string,
+): Promise<void> {
+  await api.delete(`/api/cases/${caseId}/timelines/${timelineId}`);
 }
 
 export async function uploadTimeline(
   caseId: string,
   timelineId: string,
   file: File,
-  parser?: string
-): Promise<{
-  timeline_id: string;
-  events_parsed: number;
-  events_inserted: number;
-  vectors_inserted: number;
-  parser: string;
-}> {
+  parser?: string,
+): Promise<UploadResult> {
   const formData = new FormData();
   formData.append("file", file);
   if (parser) {
@@ -109,7 +211,7 @@ export async function uploadTimeline(
   const response = await api.post(
     `/api/cases/${caseId}/timelines/${timelineId}/upload`,
     formData,
-    { headers: { "Content-Type": "multipart/form-data" } }
+    { headers: { "Content-Type": "multipart/form-data" } },
   );
   return response.data;
 }
@@ -117,16 +219,123 @@ export async function uploadTimeline(
 export async function listEvents(
   caseId: string,
   timelineId: string,
-  params: {
-    q?: string;
-    source?: string;
-    tag?: string;
-    limit?: number;
-    offset?: number;
-  }
+  params: FilterState & { limit?: number; offset?: number },
 ): Promise<EventPage> {
-  const response = await api.get(`/api/cases/${caseId}/timelines/${timelineId}/events`, {
-    params,
-  });
+  const response = await api.get(
+    `/api/cases/${caseId}/timelines/${timelineId}/events`,
+    { params },
+  );
   return response.data;
 }
+
+// Saved views (stub endpoints – backend support pending).
+export async function listViews(caseId: string): Promise<SavedView[]> {
+  try {
+    const response = await api.get(`/api/cases/${caseId}/views`);
+    return response.data.views;
+  } catch {
+    return [];
+  }
+}
+
+export async function createView(
+  caseId: string,
+  name: string,
+  query: string,
+  filter: FilterState,
+): Promise<SavedView> {
+  const response = await api.post(`/api/cases/${caseId}/views`, {
+    name,
+    query,
+    filter,
+  });
+  return response.data.view;
+}
+
+export async function deleteView(
+  caseId: string,
+  viewId: string,
+): Promise<void> {
+  await api.delete(`/api/cases/${caseId}/views/${viewId}`);
+}
+
+// Event annotations (stub endpoints – backend support pending).
+export async function listAnnotations(
+  caseId: string,
+  timelineId: string,
+  eventId: string,
+): Promise<Annotation[]> {
+  try {
+    const response = await api.get(
+      `/api/cases/${caseId}/timelines/${timelineId}/events/${eventId}/annotations`,
+    );
+    return response.data.annotations;
+  } catch {
+    return [];
+  }
+}
+
+export async function addAnnotation(
+  caseId: string,
+  timelineId: string,
+  eventId: string,
+  annotationType: "comment" | "tag",
+  content: string,
+): Promise<Annotation> {
+  const response = await api.post(
+    `/api/cases/${caseId}/timelines/${timelineId}/events/${eventId}/annotations`,
+    { annotation_type: annotationType, content },
+  );
+  return response.data.annotation;
+}
+
+// Export (stub endpoint – backend support pending).
+export async function exportEvents(
+  caseId: string,
+  timelineId: string,
+  format: "csv" | "jsonl",
+  filter: FilterState,
+): Promise<Blob> {
+  const response = await api.post(
+    `/api/cases/${caseId}/timelines/${timelineId}/export`,
+    { format, filter },
+    { responseType: "blob" },
+  );
+  return response.data;
+}
+
+// Similarity / anomaly search (stub endpoint – backend support pending).
+export async function searchSimilar(
+  caseId: string,
+  timelineId: string,
+  eventId: string,
+  limit = 10,
+): Promise<SimilarityResult[]> {
+  try {
+    const response = await api.get(
+      `/api/cases/${caseId}/timelines/${timelineId}/events/${eventId}/similar`,
+      { params: { limit } },
+    );
+    return response.data.results;
+  } catch {
+    return [];
+  }
+}
+
+export async function getAnomalies(
+  caseId: string,
+  timelineId: string,
+  limit = 50,
+): Promise<SimilarityResult[]> {
+  try {
+    const response = await api.get(
+      `/api/cases/${caseId}/timelines/${timelineId}/anomalies`,
+      { params: { limit } },
+    );
+    return response.data.results;
+  } catch {
+    return [];
+  }
+}
+
+export default api;
