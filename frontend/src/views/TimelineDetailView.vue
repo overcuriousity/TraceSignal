@@ -139,7 +139,7 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref, watch } from "vue";
+import { onMounted, ref, watch } from "vue";
 import { useRoute } from "vue-router";
 import ViewLayout from "@/layouts/View.vue";
 import TimelinePanel from "@/components/LeftPanel/TimelinePanel.vue";
@@ -160,7 +160,7 @@ const caseId = route.params.caseId as string;
 const timelineId = route.params.timelineId as string;
 
 const panel = ref(["timelines", "filters"]);
-const filters = reactive<FilterState>({});
+const filters = ref<FilterState>({});
 const tagDialog = ref(false);
 const newTag = ref("");
 const saveViewDialog = ref(false);
@@ -171,22 +171,22 @@ const anomaliesLoading = ref(false);
 async function loadAll() {
   await appStore.loadTimeline(caseId, timelineId);
   await appStore.loadSavedViews(caseId);
-  await appStore.loadEvents(caseId, timelineId, filters);
+  await appStore.loadEvents(caseId, timelineId, filters.value);
 }
 
 function applyFilters() {
   appStore.setPage(1);
-  appStore.loadEvents(caseId, timelineId, filters);
+  appStore.loadEvents(caseId, timelineId, filters.value);
 }
 
 function onPageChange(page: number) {
   appStore.setPage(page);
-  appStore.loadEvents(caseId, timelineId, filters);
+  appStore.loadEvents(caseId, timelineId, filters.value);
 }
 
 function onLimitChange(limit: number) {
   appStore.setLimit(limit);
-  appStore.loadEvents(caseId, timelineId, filters);
+  appStore.loadEvents(caseId, timelineId, filters.value);
 }
 
 function onSelectionChange(ids: Set<string>) {
@@ -195,46 +195,41 @@ function onSelectionChange(ids: Set<string>) {
 
 function onUploaded() {
   appStore.loadTimeline(caseId, timelineId);
-  appStore.loadEvents(caseId, timelineId, filters);
+  appStore.loadEvents(caseId, timelineId, filters.value);
 }
 
 function clearQuery() {
-  filters.q = "";
+  filters.value.q = "";
   applyFilters();
 }
 
 function setSourceFilter(source: string) {
-  filters.source = source;
+  filters.value.source = source;
   applyFilters();
 }
 
 function setTagFilter(tag: string) {
-  filters.tag = tag;
+  filters.value.tag = tag;
   applyFilters();
 }
 
 function removeFilter(key: "q" | "source" | "tag" | "timerange") {
   if (key === "timerange") {
-    filters.start = undefined;
-    filters.end = undefined;
+    filters.value.start = undefined;
+    filters.value.end = undefined;
   } else {
-    filters[key] = undefined;
+    filters.value[key] = undefined;
   }
   applyFilters();
 }
 
 function resetFilters() {
-  filters.q = "";
-  filters.source = "";
-  filters.tag = "";
-  filters.start = "";
-  filters.end = "";
+  filters.value = { q: "", source: "", tag: "", start: "", end: "" };
   applyFilters();
 }
 
 function loadView(view: SavedView) {
-  filters.q = view.query;
-  Object.assign(filters, view.filter);
+  filters.value = { q: view.query, ...view.filter };
   applyFilters();
 }
 
@@ -246,7 +241,9 @@ function saveCurrentView() {
 async function confirmSaveView() {
   if (!viewName.value) return;
   try {
-    await createView(caseId, viewName.value, filters.q || "", { ...filters });
+    await createView(caseId, viewName.value, filters.value.q || "", {
+      ...filters.value,
+    });
     await appStore.loadSavedViews(caseId);
     window.dispatchEvent(
       new CustomEvent("app-success", { detail: "View saved" }),

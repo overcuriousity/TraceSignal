@@ -19,6 +19,37 @@ from typing import Any
 from tracevector.models.event import Event, ParserConfig, content_hash
 
 
+class _RecordTrackingIterator:
+    """Track the start index and raw lines of each CSV record.
+
+    ``csv.DictReader`` consumes one or more physical lines per logical record
+    (e.g. for quoted fields containing newlines). This wrapper records which
+    lines belong to each record so the caller can reconstruct the exact source
+    bytes and byte offset.
+    """
+
+    def __init__(self, lines: list[str]) -> None:
+        self.lines = lines
+        self.index = 0
+        self.record_start_index = 0
+
+    def __iter__(self) -> "_RecordTrackingIterator":
+        return self
+
+    def __next__(self) -> str:
+        if self.index >= len(self.lines):
+            raise StopIteration
+        line = self.lines[self.index]
+        self.index += 1
+        return line
+
+    def finish_record(self) -> tuple[int, int]:
+        """Return the line indices of the record just completed."""
+        start = self.record_start_index
+        self.record_start_index = self.index
+        return start, self.index
+
+
 def _normalise_tag_field(value: str) -> list[str]:
     """Split a Timesketch tag field into individual tags.
 
@@ -122,6 +153,10 @@ class TimesketchCsvParser(Parser):
                 dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
             except csv.Error:
                 dialect = csv.excel
+            # Timesketch CSV exports use "" to escape quotes inside quoted
+            # fields (e.g. log messages containing quotes). Force this even
+            # when the sniffer guesses differently.
+            dialect.doublequote = True
 
             # Read header line manually so we know the exact byte boundary.
             header_line = fh.readline()
@@ -130,28 +165,38 @@ class TimesketchCsvParser(Parser):
             header_reader = csv.reader([header_line], dialect=dialect)
             headers = next(header_reader, None) or []
             headers = [h.strip() if h else h for h in headers]
+            header_bytes = len(header_line.encode("utf-8"))
 
-            # Track byte offset manually because csv.reader disables fh.tell().
-            byte_offset = len(header_line.encode("utf-8"))
-            line_number = 1
-            for raw_line in fh:
-                line_number += 1
-                current_offset = byte_offset
-                byte_offset += len(raw_line.encode("utf-8"))
+            # Read all physical lines up front. csv.DictReader will correctly
+            # group them into logical records (including quoted multi-line
+            # fields), and we can compute byte offsets from the line list.
+            lines = list(fh)
+            line_byte_offsets = [0]
+            for line in lines:
+                line_byte_offsets.append(
+                    line_byte_offsets[-1] + len(line.encode("utf-8"))
+                )
+
+            wrapper = _RecordTrackingIterator(lines)
+            row_reader = csv.DictReader(
+                wrapper,
+                fieldnames=headers,
+                dialect=dialect,
+            )
+            for row in row_reader:
+                start_idx, end_idx = wrapper.finish_record()
+                raw_line = "".join(lines[start_idx:end_idx])
                 if not raw_line.strip():
                     continue
-
-                row_reader = csv.DictReader(
-                    [raw_line.rstrip("\r\n")],
-                    fieldnames=headers,
-                    dialect=dialect,
+                byte_offset = header_bytes + line_byte_offsets[start_idx]
+                line_number = 2 + start_idx  # header is line 1, first data row line 2
+                yield self._event_from_row(
+                    source_file,
+                    byte_offset,
+                    line_number,
+                    raw_line,
+                    row,
                 )
-                try:
-                    row = next(row_reader)
-                except StopIteration:
-                    continue
-
-                yield self._event_from_row(source_file, current_offset, line_number, raw_line, row)
 
     def _event_from_row(
         self,

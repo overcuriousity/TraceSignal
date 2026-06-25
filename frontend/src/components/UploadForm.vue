@@ -63,7 +63,7 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
       <v-btn
         color="primary"
         :loading="uploading"
-        :disabled="!selectedFile || selectedFile.length === 0"
+        :disabled="!firstFile()"
         @click="upload"
       >
         Ingest
@@ -88,20 +88,27 @@ const emit = defineEmits<{
 }>();
 
 const parserOptions = ["auto", "timesketch_csv", "jsonl"];
-const selectedFile = ref<File[] | null>(null);
+const selectedFile = ref<File | File[] | null>(null);
 const parser = ref("auto");
 const uploading = ref(false);
 const result = ref<UploadResult | null>(null);
 
+function firstFile(): File | null {
+  const value = selectedFile.value;
+  if (!value) return null;
+  if (Array.isArray(value)) return value[0] || null;
+  return value;
+}
+
 async function upload() {
-  const files = selectedFile.value;
-  if (!files || files.length === 0) return;
+  const file = firstFile();
+  if (!file) return;
   uploading.value = true;
   try {
     const res = await uploadTimeline(
       props.caseId,
       props.timelineId,
-      files[0],
+      file,
       parser.value === "auto" ? undefined : parser.value,
     );
     result.value = res;
