@@ -51,6 +51,15 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
         <v-btn
           size="small"
           variant="text"
+          prepend-icon="mdi-comment-plus"
+          :disabled="selectedCount === 0"
+          @click="emit('comment-selected')"
+        >
+          Comment
+        </v-btn>
+        <v-btn
+          size="small"
+          variant="text"
           prepend-icon="mdi-export"
           :disabled="events.length === 0"
           @click="emit('export')"
@@ -75,6 +84,34 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
       >
         {{ tag }}
       </v-chip>
+      <!-- User tag annotations — distinct style with account-tag icon -->
+      <template v-if="annotationsByEvent[item.event_id]">
+        <v-chip
+          v-for="ann in annotationsByEvent[item.event_id].filter(
+            (a) => a.annotation_type === 'tag',
+          )"
+          :key="ann.id"
+          size="x-small"
+          class="mr-1"
+          color="secondary"
+          prepend-icon="mdi-account-tag"
+        >
+          {{ ann.content }}
+        </v-chip>
+        <!-- Comment indicator badge -->
+        <v-icon
+          v-if="
+            annotationsByEvent[item.event_id].some(
+              (a) => a.annotation_type === 'comment',
+            )
+          "
+          size="small"
+          color="secondary"
+          title="Has comments"
+        >
+          mdi-comment-text
+        </v-icon>
+      </template>
     </template>
 
     <template #item.source="{ item }">
@@ -102,8 +139,22 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
       <td :colspan="columns.length" class="pa-4 bg-surface-light">
         <EventDetail
           :event="item"
+          :annotations="annotationsByEvent[item.event_id] ?? []"
           @filter-field="emit('filter-field', $event)"
           @exclude-field="emit('exclude-field', $event)"
+          @add-annotation="
+            emit('add-annotation', {
+              eventId: item.event_id,
+              type: $event.type,
+              content: $event.content,
+            })
+          "
+          @delete-annotation="
+            emit('delete-annotation', {
+              eventId: item.event_id,
+              annotationId: $event,
+            })
+          "
         />
       </td>
     </template>
@@ -139,7 +190,7 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import EventDetail from "@/components/Explore/EventDetail.vue";
-import type { EventRecord } from "@/services/api";
+import type { Annotation, EventRecord } from "@/services/api";
 import dayjs from "dayjs";
 
 const props = defineProps<{
@@ -150,6 +201,7 @@ const props = defineProps<{
   totalPages: number;
   loading: boolean;
   selectedIds: Set<string>;
+  annotationsByEvent: Record<string, Annotation[]>;
 }>();
 
 const emit = defineEmits<{
@@ -160,7 +212,16 @@ const emit = defineEmits<{
   (e: "exclude-field", payload: { key: string; value: string }): void;
   (e: "filter-tag", tag: string): void;
   (e: "tag-selected"): void;
+  (e: "comment-selected"): void;
   (e: "export"): void;
+  (
+    e: "add-annotation",
+    payload: { eventId: string; type: "comment" | "tag"; content: string },
+  ): void;
+  (
+    e: "delete-annotation",
+    payload: { eventId: string; annotationId: string },
+  ): void;
 }>();
 
 const localLimit = ref(props.limit);

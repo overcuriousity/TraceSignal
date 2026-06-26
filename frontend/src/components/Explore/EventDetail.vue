@@ -108,21 +108,108 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
         </v-table>
       </v-col>
     </v-row>
+
+    <!-- Annotations section -->
+    <v-row>
+      <v-col cols="12">
+        <p class="text-caption text-disabled mb-1">Annotations</p>
+        <v-table v-if="annotations.length > 0" density="compact" class="mb-2">
+          <tbody>
+            <tr v-for="ann in annotations" :key="ann.id">
+              <td style="width: 32px">
+                <v-icon
+                  size="small"
+                  :color="ann.annotation_type === 'tag' ? 'secondary' : 'default'"
+                >
+                  {{
+                    ann.annotation_type === "tag"
+                      ? "mdi-account-tag"
+                      : "mdi-comment-text"
+                  }}
+                </v-icon>
+              </td>
+              <td class="text-body-2">{{ ann.content }}</td>
+              <td class="text-right" style="width: 48px">
+                <v-btn
+                  icon="mdi-close"
+                  variant="text"
+                  density="compact"
+                  size="small"
+                  color="error"
+                  title="Delete annotation"
+                  @click="emit('delete-annotation', ann.id)"
+                />
+              </td>
+            </tr>
+          </tbody>
+        </v-table>
+        <p v-else class="text-caption text-disabled mb-2">No annotations yet.</p>
+        <div class="d-flex gap-2">
+          <v-text-field
+            v-model="newAnnotationContent"
+            density="compact"
+            hide-details
+            placeholder="Add tag or comment…"
+            style="max-width: 300px"
+            @keydown.enter.prevent="addTag"
+          />
+          <v-btn
+            size="small"
+            variant="tonal"
+            color="secondary"
+            prepend-icon="mdi-account-tag"
+            :disabled="!newAnnotationContent.trim()"
+            @click="addTag"
+          >
+            Tag
+          </v-btn>
+          <v-btn
+            size="small"
+            variant="tonal"
+            prepend-icon="mdi-comment-plus"
+            :disabled="!newAnnotationContent.trim()"
+            @click="addComment"
+          >
+            Comment
+          </v-btn>
+        </div>
+      </v-col>
+    </v-row>
   </div>
 </template>
 
 <script setup lang="ts">
-import type { EventRecord } from "@/services/api";
+import { ref } from "vue";
+import type { Annotation, EventRecord } from "@/services/api";
 import FieldRow from "@/components/Explore/FieldRow.vue";
 
 defineProps<{
   event: EventRecord;
+  annotations: Annotation[];
 }>();
 
 const emit = defineEmits<{
   (e: "filter-field", payload: { key: string; value: string }): void;
   (e: "exclude-field", payload: { key: string; value: string }): void;
+  (e: "add-annotation", payload: { type: "comment" | "tag"; content: string }): void;
+  (e: "delete-annotation", annotationId: string): void;
 }>();
+
+const newAnnotationContent = ref("");
+
+function addTag() {
+  const content = newAnnotationContent.value.trim();
+  if (!content) return;
+  emit("add-annotation", { type: "tag", content });
+  newAnnotationContent.value = "";
+}
+
+function addComment() {
+  const content = newAnnotationContent.value.trim();
+  if (!content) return;
+  emit("add-annotation", { type: "comment", content });
+  newAnnotationContent.value = "";
+}
 
 async function copyValue(value: string) {
   try {

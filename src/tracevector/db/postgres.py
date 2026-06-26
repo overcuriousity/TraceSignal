@@ -6,7 +6,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import DateTime, JSON, String, func
+from sqlalchemy import JSON, DateTime, String, func
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -121,6 +121,36 @@ class View(Base):
             "filter": self.view_filter or {},
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class Annotation(Base):
+    """A tag or comment annotation attached to a single event."""
+
+    __tablename__ = "annotations"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    timeline_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    event_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    annotation_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    content: Mapped[str] = mapped_column(String(4096), nullable=False)
+    created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary matching the Annotation frontend interface."""
+        return {
+            "id": self.id,
+            "event_id": self.event_id,
+            "annotation_type": self.annotation_type,
+            "content": self.content,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "created_by": self.created_by,
         }
 
 
@@ -302,7 +332,7 @@ class PostgresStore:
 
         Returns True if a row was removed, False if it did not exist.
         """
-        from sqlalchemy import delete, select
+        from sqlalchemy import select
 
         async with self.session_factory() as session:
             result = await session.execute(
@@ -323,7 +353,7 @@ class PostgresStore:
 
         Returns True if the case existed and was removed, False otherwise.
         """
-        from sqlalchemy import delete, select
+        from sqlalchemy import delete
 
         async with self.session_factory() as session:
             case = await session.get(Case, case_id)
@@ -331,6 +361,92 @@ class PostgresStore:
                 return False
             await session.execute(delete(Timeline).where(Timeline.case_id == case_id))
             await session.delete(case)
+            await session.commit()
+            return True
+
+
+    async def list_annotations(
+        self, case_id: str, timeline_id: str, event_id: str
+    ) -> list[Annotation]:
+        """Return annotations for a single event, oldest first."""
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Annotation)
+                .where(
+                    Annotation.case_id == case_id,
+                    Annotation.timeline_id == timeline_id,
+                    Annotation.event_id == event_id,
+                )
+                .order_by(Annotation.created_at.asc())
+            )
+            return list(result.scalars().all())
+
+    async def list_timeline_annotations(
+        self, case_id: str, timeline_id: str
+    ) -> list[Annotation]:
+        """Return all annotations for a timeline (used for bulk table chips)."""
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Annotation)
+                .where(
+                    Annotation.case_id == case_id,
+                    Annotation.timeline_id == timeline_id,
+                )
+                .order_by(Annotation.created_at.asc())
+            )
+            return list(result.scalars().all())
+
+    async def create_annotation(
+        self,
+        case_id: str,
+        timeline_id: str,
+        event_id: str,
+        annotation_id: str,
+        annotation_type: str,
+        content: str,
+        created_by: str | None = None,
+    ) -> Annotation:
+        """Persist a new annotation and return it."""
+        annotation = Annotation(
+            id=annotation_id,
+            case_id=case_id,
+            timeline_id=timeline_id,
+            event_id=event_id,
+            annotation_type=annotation_type,
+            content=content,
+            created_by=created_by,
+        )
+        async with self.session_factory() as session:
+            session.add(annotation)
+            await session.commit()
+            await session.refresh(annotation)
+            return annotation
+
+    async def delete_annotation(
+        self, case_id: str, event_id: str, annotation_id: str
+    ) -> bool:
+        """Delete an annotation row.
+
+        Returns True if the row existed and was removed.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Annotation).where(
+                    Annotation.case_id == case_id,
+                    Annotation.event_id == event_id,
+                    Annotation.id == annotation_id,
+                )
+            )
+            annotation = result.scalar_one_or_none()
+            if annotation is None:
+                return False
+            await session.delete(annotation)
             await session.commit()
             return True
 
