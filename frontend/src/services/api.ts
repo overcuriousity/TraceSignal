@@ -305,7 +305,7 @@ export async function deleteView(
   await api.delete(`/api/cases/${caseId}/views/${viewId}`);
 }
 
-// Event annotations (stub endpoints – backend support pending).
+// Event annotations.
 export async function listAnnotations(
   caseId: string,
   timelineId: string,
@@ -314,6 +314,20 @@ export async function listAnnotations(
   try {
     const response = await api.get(
       `/api/cases/${caseId}/timelines/${timelineId}/events/${eventId}/annotations`,
+    );
+    return response.data.annotations;
+  } catch {
+    return [];
+  }
+}
+
+export async function listTimelineAnnotations(
+  caseId: string,
+  timelineId: string,
+): Promise<Annotation[]> {
+  try {
+    const response = await api.get(
+      `/api/cases/${caseId}/timelines/${timelineId}/annotations`,
     );
     return response.data.annotations;
   } catch {
@@ -333,6 +347,17 @@ export async function addAnnotation(
     { annotation_type: annotationType, content },
   );
   return response.data.annotation;
+}
+
+export async function deleteAnnotation(
+  caseId: string,
+  timelineId: string,
+  eventId: string,
+  annotationId: string,
+): Promise<void> {
+  await api.delete(
+    `/api/cases/${caseId}/timelines/${timelineId}/events/${eventId}/annotations/${annotationId}`,
+  );
 }
 
 // Export (stub endpoint – backend support pending).

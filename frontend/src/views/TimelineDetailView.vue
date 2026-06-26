@@ -119,6 +119,7 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
           :total-pages="appStore.totalPages"
           :loading="appStore.loading"
           :selected-ids="appStore.selectedEventIds"
+          :annotations-by-event="appStore.annotationsByEvent"
           @update:page="onPageChange"
           @update:limit="onLimitChange"
           @update:selected-ids="onSelectionChange"
@@ -126,7 +127,10 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
           @exclude-field="addFieldExclusion"
           @filter-tag="setTagFilter"
           @tag-selected="tagSelected"
+          @comment-selected="commentSelected"
           @export="exportEvents"
+          @add-annotation="onAddAnnotation"
+          @delete-annotation="onDeleteAnnotation"
         />
       </v-card>
     </div>
@@ -147,6 +151,28 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
         <v-spacer />
         <v-btn variant="text" @click="tagDialog = false">Cancel</v-btn>
         <v-btn color="primary" :disabled="!newTag" @click="applyTag">Tag</v-btn>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
+
+  <v-dialog v-model="commentDialog" width="400">
+    <v-card>
+      <v-card-title>Comment on selected events</v-card-title>
+      <v-card-text>
+        <v-textarea
+          v-model="newComment"
+          label="Comment"
+          density="comfortable"
+          hide-details
+          rows="3"
+        />
+      </v-card-text>
+      <v-card-actions>
+        <v-spacer />
+        <v-btn variant="text" @click="commentDialog = false">Cancel</v-btn>
+        <v-btn color="primary" :disabled="!newComment" @click="applyComment"
+          >Comment</v-btn
+        >
       </v-card-actions>
     </v-card>
   </v-dialog>
@@ -198,6 +224,8 @@ const panel = ref(["timelines", "filters"]);
 const filters = ref<FilterState>({});
 const tagDialog = ref(false);
 const newTag = ref("");
+const commentDialog = ref(false);
+const newComment = ref("");
 const saveViewDialog = ref(false);
 const viewName = ref("");
 const anomalies = ref<SimilarityResult[]>([]);
@@ -209,16 +237,19 @@ async function loadAll() {
   await appStore.loadTimeline(caseId, timelineId);
   await appStore.loadSavedViews(caseId);
   await appStore.loadEvents(caseId, timelineId, filters.value);
+  await appStore.loadTimelineAnnotations(caseId, timelineId);
 }
 
 function applyFilters() {
   appStore.setPage(1);
   appStore.loadEvents(caseId, timelineId, filters.value);
+  appStore.loadTimelineAnnotations(caseId, timelineId);
 }
 
 function onPageChange(page: number) {
   appStore.setPage(page);
   appStore.loadEvents(caseId, timelineId, filters.value);
+  appStore.loadTimelineAnnotations(caseId, timelineId);
 }
 
 function onLimitChange(limit: number) {
@@ -331,14 +362,73 @@ function tagSelected() {
   tagDialog.value = true;
 }
 
+function commentSelected() {
+  newComment.value = "";
+  commentDialog.value = true;
+}
+
 async function applyTag() {
-  // TODO: wire to annotation endpoint once backend supports tagging.
+  if (!newTag.value) return;
+  const eventIds = [...appStore.selectedEventIds];
+  await Promise.allSettled(
+    eventIds.map((eventId) =>
+      appStore.addAnnotation(caseId, timelineId, eventId, "tag", newTag.value),
+    ),
+  );
   window.dispatchEvent(
     new CustomEvent("app-success", {
-      detail: `Tagged ${appStore.selectedEventIds.size} events (stub)`,
+      detail: `Tagged ${eventIds.length} event${eventIds.length !== 1 ? "s" : ""}`,
     }),
   );
   tagDialog.value = false;
+}
+
+async function applyComment() {
+  if (!newComment.value) return;
+  const eventIds = [...appStore.selectedEventIds];
+  await Promise.allSettled(
+    eventIds.map((eventId) =>
+      appStore.addAnnotation(
+        caseId,
+        timelineId,
+        eventId,
+        "comment",
+        newComment.value,
+      ),
+    ),
+  );
+  window.dispatchEvent(
+    new CustomEvent("app-success", {
+      detail: `Commented on ${eventIds.length} event${eventIds.length !== 1 ? "s" : ""}`,
+    }),
+  );
+  commentDialog.value = false;
+}
+
+async function onAddAnnotation(payload: {
+  eventId: string;
+  type: "comment" | "tag";
+  content: string;
+}) {
+  await appStore.addAnnotation(
+    caseId,
+    timelineId,
+    payload.eventId,
+    payload.type,
+    payload.content,
+  );
+}
+
+async function onDeleteAnnotation(payload: {
+  eventId: string;
+  annotationId: string;
+}) {
+  await appStore.removeAnnotation(
+    caseId,
+    timelineId,
+    payload.eventId,
+    payload.annotationId,
+  );
 }
 
 async function exportEvents() {

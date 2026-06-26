@@ -7,6 +7,7 @@ normalisation settings are never mixed.
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 from qdrant_client import QdrantClient
@@ -160,7 +161,7 @@ class QdrantStore:
         only the affected points.  Collections that do not exist are skipped.
         """
         for name in self.case_collections(case_id):
-            try:
+            with contextlib.suppress(Exception):
                 self.client.delete(
                     collection_name=name,
                     points_selector=Filter(
@@ -172,16 +173,12 @@ class QdrantStore:
                         ]
                     ),
                 )
-            except Exception:  # noqa: BLE001
-                pass
 
     def delete_case_collections(self, case_id: str) -> None:
         """Delete all Qdrant collections that belong to ``case_id``."""
         for name in self.case_collections(case_id):
-            try:
+            with contextlib.suppress(Exception):
                 self.client.delete_collection(name)
-            except Exception:  # noqa: BLE001
-                pass
 
     def health(self) -> dict[str, Any]:
         """Return a simple health status for the Qdrant connection."""

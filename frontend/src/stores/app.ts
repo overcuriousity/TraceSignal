@@ -19,6 +19,7 @@
 import { defineStore } from "pinia";
 import { ref, computed } from "vue";
 import type {
+  Annotation,
   Case,
   Timeline,
   EventRecord,
@@ -33,6 +34,9 @@ import {
   getTimeline,
   listEvents,
   listViews,
+  listTimelineAnnotations,
+  addAnnotation as apiAddAnnotation,
+  deleteAnnotation as apiDeleteAnnotation,
   deleteTimeline as apiDeleteTimeline,
   deleteCase as apiDeleteCase,
   deleteView as apiDeleteView,
@@ -53,6 +57,7 @@ export const useAppStore = defineStore("app", () => {
   const selectedEventIds = ref<Set<string>>(new Set());
   const savedViews = ref<SavedView[]>([]);
   const activeFilters = ref<FilterState>({});
+  const annotationsByEvent = ref<Record<string, Annotation[]>>({});
 
   // Getters
   const currentCaseName = computed(() => currentCase.value?.name || "");
@@ -188,6 +193,56 @@ export const useAppStore = defineStore("app", () => {
     }
   }
 
+  async function loadTimelineAnnotations(caseId: string, timelineId: string) {
+    try {
+      const list = await listTimelineAnnotations(caseId, timelineId);
+      const map: Record<string, Annotation[]> = {};
+      for (const ann of list) {
+        if (!map[ann.event_id]) map[ann.event_id] = [];
+        map[ann.event_id].push(ann);
+      }
+      annotationsByEvent.value = map;
+    } catch {
+      annotationsByEvent.value = {};
+    }
+  }
+
+  async function addAnnotation(
+    caseId: string,
+    timelineId: string,
+    eventId: string,
+    annotationType: "comment" | "tag",
+    content: string,
+  ) {
+    const annotation = await apiAddAnnotation(
+      caseId,
+      timelineId,
+      eventId,
+      annotationType,
+      content,
+    );
+    const existing = annotationsByEvent.value[eventId] ?? [];
+    annotationsByEvent.value = {
+      ...annotationsByEvent.value,
+      [eventId]: [...existing, annotation],
+    };
+    return annotation;
+  }
+
+  async function removeAnnotation(
+    caseId: string,
+    timelineId: string,
+    eventId: string,
+    annotationId: string,
+  ) {
+    await apiDeleteAnnotation(caseId, timelineId, eventId, annotationId);
+    const existing = annotationsByEvent.value[eventId] ?? [];
+    annotationsByEvent.value = {
+      ...annotationsByEvent.value,
+      [eventId]: existing.filter((a) => a.id !== annotationId),
+    };
+  }
+
   function setPage(page: number) {
     eventOffset.value = (page - 1) * eventLimit.value;
   }
@@ -235,6 +290,7 @@ export const useAppStore = defineStore("app", () => {
     selectedEventIds,
     savedViews,
     activeFilters,
+    annotationsByEvent,
     currentCaseName,
     currentTimelineName,
     hasActiveFilters,
@@ -247,6 +303,9 @@ export const useAppStore = defineStore("app", () => {
     loadTimeline,
     loadEvents,
     loadSavedViews,
+    loadTimelineAnnotations,
+    addAnnotation,
+    removeAnnotation,
     deleteTimeline,
     deleteCase,
     deleteView,

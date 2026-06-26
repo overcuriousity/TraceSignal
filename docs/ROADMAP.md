@@ -101,7 +101,7 @@ Turn the current stub panel into a working feature:
 2. ✅ Fix create-timeline refresh bug (quick win).
 3. ✅ Add case/timeline delete endpoints and UI.
 4. ✅ Persisted saved views + backend endpoints.
-5. Tag/comment annotations + backend endpoints.
+5. ✅ Tag/comment annotations + backend endpoints.
 6. Export CSV/JSONL + backend endpoint.
 7. Time visualization histogram.
 8. Anomaly/similarity panel wired to Qdrant.

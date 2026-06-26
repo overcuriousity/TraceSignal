@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 from tracevector.core.config import get_settings
 from tracevector.core.jobs import JobStore, get_job_store
 from tracevector.db.clickhouse import ClickHouseStore
-from tracevector.db.postgres import PostgresStore, View, generate_id
+from tracevector.db.postgres import PostgresStore, generate_id
 from tracevector.db.qdrant import QdrantStore
 from tracevector.ingestion.parser import detect_format
 from tracevector.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
@@ -41,6 +41,13 @@ class ViewCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     query: str = Field(default="")
     filter: dict[str, Any] = Field(default_factory=dict)
+
+
+class AnnotationCreate(BaseModel):
+    """Payload to create an event annotation."""
+
+    annotation_type: str = Field(..., pattern="^(comment|tag)$")
+    content: str = Field(..., min_length=1, max_length=4096)
 
 
 router = APIRouter(prefix="/api/cases", tags=["cases"])
@@ -260,6 +267,72 @@ async def delete_view(case_id: str, view_id: str) -> dict[str, Any]:
     if not deleted:
         raise HTTPException(status_code=404, detail="View not found")
     return {"deleted": True, "view_id": view_id}
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/annotations")
+async def list_timeline_annotations(case_id: str, timeline_id: str) -> dict[str, Any]:
+    """List all annotations for a timeline (used for bulk event-table chips)."""
+    store = get_store()
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+    annotations = await store.list_timeline_annotations(case_id, timeline_id)
+    return {"annotations": [a.to_dict() for a in annotations]}
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/events/{event_id}/annotations")
+async def list_event_annotations(
+    case_id: str, timeline_id: str, event_id: str
+) -> dict[str, Any]:
+    """List annotations for a single event."""
+    store = get_store()
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+    annotations = await store.list_annotations(case_id, timeline_id, event_id)
+    return {"annotations": [a.to_dict() for a in annotations]}
+
+
+@router.post("/{case_id}/timelines/{timeline_id}/events/{event_id}/annotations")
+async def create_event_annotation(
+    case_id: str,
+    timeline_id: str,
+    event_id: str,
+    payload: AnnotationCreate,
+) -> dict[str, Any]:
+    """Add a tag or comment annotation to an event."""
+    store = get_store()
+    await store.init_schema()
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+    annotation_id = generate_id(f"{event_id}_{payload.annotation_type}")
+    annotation = await store.create_annotation(
+        case_id=case_id,
+        timeline_id=timeline_id,
+        event_id=event_id,
+        annotation_id=annotation_id,
+        annotation_type=payload.annotation_type,
+        content=payload.content,
+    )
+    return {"annotation": annotation.to_dict()}
+
+
+@router.delete(
+    "/{case_id}/timelines/{timeline_id}/events/{event_id}/annotations/{annotation_id}"
+)
+async def delete_event_annotation(
+    case_id: str,
+    timeline_id: str,
+    event_id: str,
+    annotation_id: str,
+) -> dict[str, Any]:
+    """Delete an annotation."""
+    store = get_store()
+    deleted = await store.delete_annotation(case_id, event_id, annotation_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Annotation not found")
+    return {"deleted": True, "annotation_id": annotation_id}
 
 
 def _run_embedding_job(
