@@ -1,16 +1,11 @@
 """FastAPI application factory and API routers."""
 
-from pathlib import Path
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 
 from tracevector import __version__
 from tracevector.api.routers import cases, events, jobs
-
-FRONTEND_DIST = Path(__file__).resolve().parents[3] / "frontend" / "dist"
 
 
 def create_app() -> FastAPI:
@@ -25,7 +20,7 @@ def create_app() -> FastAPI:
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:5173", "http://localhost:8080"],
+        allow_origins=["*"],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -38,26 +33,5 @@ def create_app() -> FastAPI:
     app.include_router(cases.router)
     app.include_router(events.router)
     app.include_router(jobs.router)
-
-    if FRONTEND_DIST.is_dir():
-        app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
-
-        @app.get("/{full_path:path}")
-        async def serve_frontend(full_path: str) -> FileResponse:
-            file_path = FRONTEND_DIST / full_path
-            if file_path.is_file():
-                return FileResponse(file_path)
-            return FileResponse(FRONTEND_DIST / "index.html")
-    else:
-
-        @app.get("/", response_class=JSONResponse)
-        async def no_frontend_built() -> dict:
-            return {
-                "message": "TraceVector API is running, but the frontend has not been built.",
-                "frontend_dist": str(FRONTEND_DIST),
-                "hint": "Run 'cd frontend && npm install && npm run build', then restart tv-web.",
-                "api_docs": "/api/docs",
-                "health": "/api/health",
-            }
 
     return app

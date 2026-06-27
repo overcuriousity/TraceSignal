@@ -100,7 +100,7 @@ async def list_events(
 
 
 class ExportFilter(BaseModel):
-    """Filter parameters mirroring the frontend FilterState."""
+    """Filter parameters for event export."""
 
     q: str | None = None
     source: str | None = None

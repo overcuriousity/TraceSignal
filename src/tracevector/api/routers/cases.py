@@ -156,9 +156,7 @@ async def upload_timeline(
         tmp_path = Path(tmp.name)
 
     try:
-        # The frontend may send the literal string "undefined" when no parser
-        # is selected, or "auto" when the user leaves the default, so treat
-        # those as unspecified and fall back to detection.
+        # Treat sentinel strings as unspecified and fall back to auto-detection.
         fmt = parser if parser and parser.lower() not in {"undefined", "null", "auto", ""} else None
         fmt = fmt or detect_format(tmp_path)
         pipeline = IngestionPipeline(
