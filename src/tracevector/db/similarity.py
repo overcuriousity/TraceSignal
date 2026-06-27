@@ -94,7 +94,7 @@ def _cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
 def _payload_to_event(payload: dict[str, Any]) -> dict[str, Any]:
     """Convert a Qdrant point payload into a minimal EventRecord-compatible dict."""
     # The pipeline stores timestamps as datetime objects in some versions;
-    # convert to ISO string so the frontend can deserialise uniformly.
+    # Convert to ISO string for consistent serialisation.
     ts = payload.get("timestamp")
     if ts is not None and not isinstance(ts, str):
         try:

@@ -13,7 +13,7 @@
 | **Language & packaging** | Python | 3.13, managed with `uv` (3.14 support planned as deps mature) |
 | **Web backend** | FastAPI + Uvicorn | Async API server; same stack as ScalarForensic web UI |
 | **CLI ingestion** | Typer + Python stdlib | `tv ingest ...` command, streaming parser |
-| **Frontend** | Vue.js 3 + Vite + Vuetify | Same framework family as Timesketch; modern build tooling |
+| **Frontend** | TBD — redesign in progress | Served separately; API-first backend |
 | **Metadata store** | PostgreSQL | Cases, timelines, users, views, annotations |
 | **Event store** | ClickHouse | Columnar log store for 80 GiB+ filtering and aggregation |
 | **Vector store** | Qdrant | Embeddings + neighbor search; local disk mode supported |
@@ -32,11 +32,9 @@
   - **AMD ROCm 6.4** is the primary GPU target (mirrors ScalarForensic).
   - **NVIDIA CUDA 12.8** is also supported.
 
-### 3.2 Frontend — Vue.js 3 + Vuetify
-- Timesketch demonstrates this stack works well for forensic timeline UIs.
-- Vue 3 + Vite is lighter and faster to build than the older Vue 2/Webpack setup still present in parts of Timesketch.
-- Vuetify provides the data table, date/time pickers, filters, and dark mode that an ELK-like interface needs.
-- Design philosophy stays close to ScalarForensic: fewer screens, no feature bloat, fast time-to-value.
+### 3.2 Frontend — TBD
+
+The frontend is being redesigned from scratch. The backend exposes a complete REST API (`/api/docs`) and the new UI will consume it. Tech stack decision pending.
 
 ### 3.3 Metadata Store — PostgreSQL
 - External service, provided by the operator.
@@ -67,7 +65,7 @@ TraceVector itself is **only the Python application**. The databases are externa
 ```
 ┌─────────────────────────────────────────┐
 │         TraceVector application         │
-│  (FastAPI + Vue frontend + CLI tools)   │
+│     (FastAPI + CLI tools + frontend)    │
 │             runs via `uv`               │
 └─────────────────────────────────────────┘
          │              │              │
@@ -123,8 +121,8 @@ For a lone analyst on one machine, Qdrant can run in **local mode** through the 
 1. Exact default embedding model and vector dimension.
 2. ClickHouse table schema and materialized views for common filters.
 3. Authentication backend: local users vs. OIDC.
-4. Whether to serve the Vue frontend from Uvicorn directly or via an Nginx sidecar.
+4. Frontend tech stack and whether to serve it from Uvicorn directly or via an Nginx sidecar.
 
 ## 9. Next Step
 
-Approve this tech stack and move to implementation: start with the project skeleton (uv, FastAPI, Vue, Docker Compose) and the ingestion CLI prototype.
+Approve this tech stack and move to implementation: start with the project skeleton (uv, FastAPI, Docker Compose) and the ingestion CLI prototype. Frontend tech stack to be decided separately.

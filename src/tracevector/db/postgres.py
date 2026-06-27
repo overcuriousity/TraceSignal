@@ -112,7 +112,7 @@ class View(Base):
     )
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a serializable dictionary matching the SavedView frontend interface."""
+        """Return a serializable dictionary for the SavedView API response."""
         return {
             "id": self.id,
             "case_id": self.case_id,
@@ -154,7 +154,7 @@ class Annotation(Base):
     )
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a serializable dictionary matching the Annotation frontend interface."""
+        """Return a serializable dictionary for the Annotation API response."""
         return {
             "id": self.id,
             "event_id": self.event_id,
