@@ -208,3 +208,133 @@ def test_combined_query_builds_single_where_clause(
     assert "attributes[{p6:String}] != {p7:String}" in count_query
     assert count_params is not None
     assert set(count_params.keys()) == {f"p{i}" for i in range(8)}
+
+
+# ── iter_events tests ──────────────────────────────────────────────────────────
+
+
+class _BatchedFakeClient:
+    """FakeClickHouseClient that returns pages of rows to simulate iter_events paging.
+
+    The first *full_batch_count* non-count queries return *batch_size* rows each;
+    the next query returns *remainder* rows, then all further queries return empty.
+    """
+
+    def __init__(
+        self,
+        columns: list[str],
+        batch_size: int,
+        full_batch_count: int = 1,
+        remainder: int = 0,
+    ) -> None:
+        self.columns = columns
+        self.batch_size = batch_size
+        self.full_batch_count = full_batch_count
+        self.remainder = remainder
+        self._select_call = 0
+        self.queries: list[tuple[str, dict[str, Any] | None]] = []
+
+    def _make_rows(self, n: int) -> list[list[Any]]:
+        return [[f"evt-{self._select_call}-{i}"] + ["x"] * (len(self.columns) - 1) for i in range(n)]
+
+    def query(
+        self,
+        query: str,
+        parameters: dict[str, Any] | None = None,
+        **_kwargs: Any,
+    ) -> FakeQueryResult:
+        self.queries.append((query, parameters))
+        if query.strip().startswith("SELECT count()"):
+            return FakeQueryResult(result_rows=[[0]])
+        call = self._select_call
+        self._select_call += 1
+        if call < self.full_batch_count:
+            rows = self._make_rows(self.batch_size)
+        elif call == self.full_batch_count:
+            rows = self._make_rows(self.remainder)
+        else:
+            rows = []
+        return FakeQueryResult(result_rows=rows, column_names=self.columns)
+
+
+_EVENT_COLUMNS = [
+    "event_id", "case_id", "timeline_id", "source_file", "byte_offset",
+    "line_number", "content_hash", "parser_name", "parser_version", "ingest_time",
+    "message", "timestamp", "timestamp_desc", "source", "source_long",
+    "display_name", "tags", "attributes", "embedding_model", "embedding_config_hash",
+    "vector_id",
+]
+
+
+def _batched_service(batch_size: int, full_batches: int = 1, remainder: int = 0) -> EventQueryService:
+    client = _BatchedFakeClient(
+        columns=_EVENT_COLUMNS,
+        batch_size=batch_size,
+        full_batch_count=full_batches,
+        remainder=remainder,
+    )
+    store = FakeClickHouseStore()
+    store.client = client  # type: ignore[assignment]
+    return EventQueryService(store=store)
+
+
+def test_iter_events_yields_all_rows_single_batch() -> None:
+    svc = _batched_service(batch_size=3, full_batches=0, remainder=2)
+    rows = list(svc.iter_events(EventQuery(case_id="c1"), batch_size=3))
+    assert len(rows) == 2
+
+
+def test_iter_events_paginates_multiple_full_batches() -> None:
+    """Two full batches of 5 + a remainder of 3 = 13 total rows."""
+    svc = _batched_service(batch_size=5, full_batches=2, remainder=3)
+    rows = list(svc.iter_events(EventQuery(case_id="c1"), batch_size=5))
+    assert len(rows) == 13
+
+
+def test_iter_events_exact_multiple_terminates() -> None:
+    """Batch size exactly divides total; client returns empty on third call."""
+    svc = _batched_service(batch_size=4, full_batches=2, remainder=0)
+    rows = list(svc.iter_events(EventQuery(case_id="c1"), batch_size=4))
+    assert len(rows) == 8
+
+
+def test_iter_events_yields_dicts_with_expected_keys() -> None:
+    svc = _batched_service(batch_size=10, full_batches=0, remainder=1)
+    rows = list(svc.iter_events(EventQuery(case_id="c1"), batch_size=10))
+    assert len(rows) == 1
+    assert "event_id" in rows[0]
+    assert "message" in rows[0]
+
+
+def test_iter_events_where_clause_is_parameterized() -> None:
+    """Filter values must never appear as raw SQL — injection is impossible."""
+    injection = "'; DROP TABLE events; --"
+    svc = _batched_service(batch_size=5, full_batches=0, remainder=0)
+    list(svc.iter_events(EventQuery(case_id=injection), batch_size=5))
+    select_queries = [
+        q for q, _ in svc.store.client.queries  # type: ignore[union-attr]
+        if not q.strip().startswith("SELECT count()")
+    ]
+    assert select_queries, "Expected at least one SELECT query"
+    for sql in select_queries:
+        assert injection not in sql
+        assert "DROP TABLE" not in sql
+
+
+def test_iter_events_applies_filters_in_where_clause() -> None:
+    svc = _batched_service(batch_size=5, full_batches=0, remainder=0)
+    list(svc.iter_events(
+        EventQuery(case_id="c1", source="auth", tag="malware"),
+        batch_size=5,
+    ))
+    select_queries = [
+        (q, p) for q, p in svc.store.client.queries  # type: ignore[union-attr]
+        if not q.strip().startswith("SELECT count()")
+    ]
+    assert select_queries
+    sql, params = select_queries[0]
+    assert "source = {p1:String}" in sql
+    assert "has(tags, {p2:String})" in sql
+    assert params is not None
+    assert params.get("p1") == "auth"
+    assert params.get("p2") == "malware"

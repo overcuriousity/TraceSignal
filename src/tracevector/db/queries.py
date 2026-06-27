@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -58,6 +59,32 @@ def _format_clickhouse_datetime(value: datetime) -> str:
     return value.strftime("%Y-%m-%d %H:%M:%S")
 
 
+# Columns selected in every event query (shared between paginated query and export).
+_EVENT_SELECT_COLUMNS = """
+    event_id,
+    case_id,
+    timeline_id,
+    source_file,
+    byte_offset,
+    line_number,
+    content_hash,
+    parser_name,
+    parser_version,
+    ingest_time,
+    message,
+    timestamp,
+    timestamp_desc,
+    source,
+    source_long,
+    display_name,
+    tags,
+    attributes,
+    embedding_model,
+    embedding_config_hash,
+    vector_id
+"""
+
+
 class _ParameterizedQueryBuilder:
     """Build a ClickHouse WHERE clause using named parameters."""
 
@@ -110,10 +137,13 @@ class EventQueryService:
     def __init__(self, store: ClickHouseStore | None = None) -> None:
         self.store = store or ClickHouseStore()
 
-    def query(self, query: EventQuery) -> EventPage:
-        """Execute an :py:class:`EventQuery` and return a paginated result."""
-        self.store.init_schema()
+    def _build_where(self, query: EventQuery) -> tuple[str, dict[str, Any]]:
+        """Build the parameterized WHERE clause for *query*.
 
+        Returns the clause string and the bound parameters dict.
+        Both are consumed by :py:meth:`query` (paginated) and
+        :py:meth:`iter_events` (streaming export).
+        """
         builder = _ParameterizedQueryBuilder()
         builder.add_param("case_id = :name", query.case_id)
 
@@ -149,46 +179,31 @@ class EventQueryService:
         for key, value in (query.field_exclusions or {}).items():
             builder.add_field_exclusion(key, value)
 
-        where = builder.where_clause()
+        return builder.where_clause(), builder.parameters
+
+    def query(self, query: EventQuery) -> EventPage:
+        """Execute an :py:class:`EventQuery` and return a paginated result."""
+        self.store.init_schema()
+
+        where, parameters = self._build_where(query)
         database = self.store.database
 
         count_result = self.store.client.query(
             f"SELECT count() FROM {database}.events WHERE {where}",
-            parameters=builder.parameters,
+            parameters=parameters,
         )
         total = count_result.result_rows[0][0] if count_result.result_rows else 0
 
         event_result = self.store.client.query(
             f"""
-            SELECT
-                event_id,
-                case_id,
-                timeline_id,
-                source_file,
-                byte_offset,
-                line_number,
-                content_hash,
-                parser_name,
-                parser_version,
-                ingest_time,
-                message,
-                timestamp,
-                timestamp_desc,
-                source,
-                source_long,
-                display_name,
-                tags,
-                attributes,
-                embedding_model,
-                embedding_config_hash,
-                vector_id
+            SELECT {_EVENT_SELECT_COLUMNS}
             FROM {database}.events
             WHERE {where}
             ORDER BY timestamp DESC, event_id
             LIMIT {query.limit}
             OFFSET {query.offset}
             """,
-            parameters=builder.parameters,
+            parameters=parameters,
         )
 
         columns = event_result.column_names
@@ -200,3 +215,38 @@ class EventQueryService:
             limit=query.limit,
             events=events,
         )
+
+    def iter_events(
+        self, query: EventQuery, batch_size: int = 1000
+    ) -> Iterator[dict[str, Any]]:
+        """Yield every event matching *query*, paging through ClickHouse in batches.
+
+        This is used for streaming export where the full result set should not
+        be materialised in memory.  The ``limit`` and ``offset`` fields of
+        *query* are ignored — all matching rows are yielded.
+        """
+        self.store.init_schema()
+
+        where, parameters = self._build_where(query)
+        database = self.store.database
+        offset = 0
+
+        while True:
+            result = self.store.client.query(
+                f"""
+                SELECT {_EVENT_SELECT_COLUMNS}
+                FROM {database}.events
+                WHERE {where}
+                ORDER BY timestamp DESC, event_id
+                LIMIT {batch_size}
+                OFFSET {offset}
+                """,
+                parameters=parameters,
+            )
+            columns = result.column_names
+            rows = result.result_rows
+            for row in rows:
+                yield dict(zip(columns, row, strict=False))
+            if len(rows) < batch_size:
+                break
+            offset += batch_size
