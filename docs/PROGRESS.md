@@ -8,7 +8,7 @@ This document tracks implementation progress against the MVP defined in
 
 ## Overall completion
 
-**Estimated MVP completion: 80 %**
+**Estimated MVP completion: 87 %**
 
 ## MVP feature checklist
 
@@ -16,7 +16,7 @@ This document tracks implementation progress against the MVP defined in
 |---|---------|--------|-------|
 | 1 | **Ingestion (CLI-first)** | ✅ Done | Streaming CSV/JSONL parsers, `tv ingest` CLI, plus web-based drag-and-drop upload. |
 | 2 | **Storage & Vector Backend** | ✅ Done | ClickHouse `events` table with token-bloom full-text index; Qdrant collections with embedding-config-hash isolation and vector-size config-match checks. |
-| 3 | **Web UI (ELK-like investigation interface)** | 🟡 Core done | Timesketch-v3-inspired shell with search chips, source/tag filters, time-range, field-level include/exclude filters, selectable event table (✅ column picker), single-row click-to-expand detail (✅), persisted saved views (✅), case/timeline delete (✅), tag/comment annotations (✅). Export endpoint still pending. |
+| 3 | **Web UI (ELK-like investigation interface)** | 🟡 Core done | Timesketch-v3-inspired shell with search chips, source/tag filters, time-range, field-level include/exclude filters, selectable event table (✅ column picker), single-row click-to-expand detail (✅), persisted saved views (✅), case/timeline delete (✅), tag/comment annotations (✅), CSV/JSONL export (✅). |
 | 4 | **Anomaly & Similarity Panel** | 🟡 UI stubbed | Frontend anomaly panel and similarity search UI added; backend endpoints (`/anomalies`, `/similar`) still need Qdrant nearest-neighbor implementation. |
 | 5 | **Deployment & Operation** | 🟡 Partial | Reference `docker-compose.yml` with fully-qualified image names (podman-compatible), `uv` workflow, environment-based config. Missing: authentication, GPU index selection, strict offline-mode guard for model downloads. |
 
@@ -37,7 +37,7 @@ This document tracks implementation progress against the MVP defined in
 2. ✅ **Saved views** — `View` model in PostgreSQL; GET/POST/DELETE `/api/cases/{id}/views` endpoints; delete affordance in SavedViews panel.
 3. ✅ **Event table UX** — `item-value="event_id"` fixes single-row expand; click anywhere on a row to expand/collapse its detail (skips chips/buttons); persistent chevron icon; column visibility picker (`mdi-view-column-outline`) for Time, Source, Message, Tags, Description, Display name.
 4. ✅ **Podman compatibility** — `docker-compose.yml` updated to use fully-qualified `docker.io/…` image names; tested with podman-compose.
-5. **Export** — download filtered or full event sets as CSV/JSONL.
+5. ✅ **Export** — `POST /api/cases/{id}/timelines/{id}/export`; streams CSV or JSONL respecting active filters; browser download triggered from the Export dropdown in the event table toolbar.
 6. **Anomaly panel** — use Qdrant nearest-neighbor search to surface outliers and enable semantic similarity search.
 7. **Authentication** — basic user auth for team access.
 8. **Offline-mode enforcement** — prevent HuggingFace network calls when `allow_online=false`.

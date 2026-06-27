@@ -213,7 +213,13 @@ import EventTable from "@/components/Explore/EventTable.vue";
 import UploadFormButton from "@/components/UploadFormButton.vue";
 import { useAppStore } from "@/stores/app";
 import type { FilterState, SavedView, SimilarityResult } from "@/services/api";
-import { getAnomalies, createView, startEmbedding, getJob } from "@/services/api";
+import {
+  getAnomalies,
+  createView,
+  startEmbedding,
+  getJob,
+  exportEvents as exportEventsApi,
+} from "@/services/api";
 
 const route = useRoute();
 const appStore = useAppStore();
@@ -431,10 +437,24 @@ async function onDeleteAnnotation(payload: {
   );
 }
 
-async function exportEvents() {
-  // TODO: wire to export endpoint once backend supports it.
+async function exportEvents(format: "csv" | "jsonl") {
+  const blob = await exportEventsApi(
+    caseId,
+    timelineId,
+    format,
+    appStore.activeFilters,
+  );
+  // Trigger a browser file download from the received Blob.
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `${caseId}-${timelineId}-events.${format}`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  URL.revokeObjectURL(url);
   window.dispatchEvent(
-    new CustomEvent("app-success", { detail: "Export started (stub)" }),
+    new CustomEvent("app-success", { detail: `Exported events as ${format.toUpperCase()}` }),
   );
 }
 

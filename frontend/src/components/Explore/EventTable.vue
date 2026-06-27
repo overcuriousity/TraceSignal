@@ -59,15 +59,32 @@ Adapted for TraceVector from Google Timesketch frontend-v3.
         >
           Comment
         </v-btn>
-        <v-btn
-          size="small"
-          variant="text"
-          prepend-icon="mdi-export"
-          :disabled="events.length === 0"
-          @click="emit('export')"
-        >
-          Export
-        </v-btn>
+        <v-menu location="bottom end">
+          <template #activator="{ props: exportMenuProps }">
+            <v-btn
+              size="small"
+              variant="text"
+              prepend-icon="mdi-export"
+              append-icon="mdi-chevron-down"
+              :disabled="events.length === 0"
+              v-bind="exportMenuProps"
+            >
+              Export
+            </v-btn>
+          </template>
+          <v-list density="compact">
+            <v-list-item
+              prepend-icon="mdi-file-delimited-outline"
+              title="Export CSV"
+              @click="emit('export', 'csv')"
+            />
+            <v-list-item
+              prepend-icon="mdi-code-json"
+              title="Export JSONL"
+              @click="emit('export', 'jsonl')"
+            />
+          </v-list>
+        </v-menu>
 
         <!-- Column picker -->
         <v-menu :close-on-content-click="false" location="bottom end">
@@ -256,7 +273,7 @@ const emit = defineEmits<{
   (e: "filter-tag", tag: string): void;
   (e: "tag-selected"): void;
   (e: "comment-selected"): void;
-  (e: "export"): void;
+  (e: "export", format: "csv" | "jsonl"): void;
   (
     e: "add-annotation",
     payload: { eventId: string; type: "comment" | "tag"; content: string },

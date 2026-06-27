@@ -39,10 +39,12 @@ forensic timeline explorer:
   - Backend: `View` model in PostgreSQL; GET/POST/DELETE `/api/cases/{id}/views`.
   - Frontend: saved views left panel, apply on click, save current filter set,
     delete affordance.
-- **Export CSV / JSONL**
+- ✅ **Export CSV / JSONL**
   - Backend: `POST /api/cases/{case_id}/timelines/{timeline_id}/export`
-    accepting `format` and the current `FilterState`.
-  - Frontend: "Export" button in the event table toolbar (stub wired, endpoint pending).
+    accepting `format` and the current `FilterState`; streams all matching events
+    in batches so memory use is bounded on large timelines.
+  - Frontend: "Export" dropdown in the event table toolbar; format picker (CSV / JSONL);
+    blob download triggered in the browser with the active filter applied.
 
 ### 2. Real column filtering ✅
 
@@ -101,7 +103,7 @@ Turn the current stub panel into a working feature:
 4. ✅ Persisted saved views + backend endpoints.
 5. ✅ Tag/comment annotations + backend endpoints.
 6. ✅ Event table UX — single-row expand on click, persistent chevron, column picker.
-7. Export CSV/JSONL + backend endpoint.
+7. ✅ Export CSV/JSONL + backend endpoint.
 8. Time visualization histogram.
 9. Anomaly/similarity panel wired to Qdrant.
 
