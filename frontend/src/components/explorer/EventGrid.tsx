@@ -32,6 +32,7 @@ interface Props {
   expandedId: string | null;
   onExpand: (event: Event | null) => void;
   onLoadMore: () => void;
+  isFetching: boolean;
   visibleColumns: string[];
 }
 
@@ -77,6 +78,7 @@ export function EventGrid({
   expandedId,
   onExpand,
   onLoadMore,
+  isFetching,
   visibleColumns,
 }: Props) {
   const parentRef = useRef<HTMLDivElement>(null);
@@ -225,15 +227,15 @@ export function EventGrid({
   const virtualItems = rowVirtualizer.getVirtualItems();
   const totalHeight = rowVirtualizer.getTotalSize();
 
-  // Load more when near bottom
+  // Load more when near bottom — guard with isFetching to avoid skipping pages
   const handleScroll = useCallback(() => {
     const el = parentRef.current;
-    if (!el) return;
+    if (!el || isFetching) return;
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 200;
     if (nearBottom && events.length < total) {
       onLoadMore();
     }
-  }, [events.length, total, onLoadMore]);
+  }, [isFetching, events.length, total, onLoadMore]);
 
   return (
     <div className="flex flex-1 min-w-0 flex-col h-full">

@@ -19,6 +19,7 @@ class EventQuery:
     q: str | None = None
     source: str | None = None
     tag: str | None = None
+    exclude_tag: str | None = None
     start: datetime | None = None
     end: datetime | None = None
     field_filters: dict[str, str] = field(default_factory=dict)
@@ -132,6 +133,10 @@ class _ParameterizedQueryBuilder:
         column = self._column_expr(key)
         self.add_param(f"{column} != :name", value)
 
+    def add_tag_exclusion(self, value: str) -> None:
+        """Exclude events that have *value* in their tags array."""
+        self.add_param("NOT has(tags, :name)", value)
+
     def _column_expr(self, key: str) -> str:
         normalized = key.strip().lower()
         if normalized in _TOP_LEVEL_FILTER_COLUMNS:
@@ -174,6 +179,9 @@ class EventQueryService:
 
         if query.tag:
             builder.add_param("has(tags, :name)", query.tag)
+
+        if query.exclude_tag:
+            builder.add_tag_exclusion(query.exclude_tag)
 
         if query.start is not None:
             builder.add_param(

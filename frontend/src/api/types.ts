@@ -141,6 +141,7 @@ export interface EventFilters {
   q?: string;
   source?: string;
   tag?: string;
+  excludeTag?: string;
   start?: string;
   end?: string;
   /** key=value field equality filters */

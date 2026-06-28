@@ -62,6 +62,7 @@ async def list_events(
     q: str | None = Query(default=None, description="Full-text search in message"),
     source: str | None = Query(default=None),
     tag: str | None = Query(default=None),
+    exclude_tag: str | None = Query(default=None),
     start: datetime | None = Query(default=None),  # noqa: B008
     end: datetime | None = Query(default=None),  # noqa: B008
     filters: str | None = Query(
@@ -93,6 +94,7 @@ async def list_events(
             q=q,
             source=source,
             tag=tag,
+            exclude_tag=exclude_tag,
             start=start,
             end=end,
             field_filters=_parse_json_object(filters),
@@ -138,6 +140,7 @@ async def get_histogram(
     q: str | None = Query(default=None),
     source: str | None = Query(default=None),
     tag: str | None = Query(default=None),
+    exclude_tag: str | None = Query(default=None),
     start: datetime | None = Query(default=None),  # noqa: B008
     end: datetime | None = Query(default=None),  # noqa: B008
     filters: str | None = Query(default=None),
@@ -164,6 +167,7 @@ async def get_histogram(
             q=q,
             source=source,
             tag=tag,
+            exclude_tag=exclude_tag,
             start=start,
             end=end,
             field_filters=_parse_json_object(filters),

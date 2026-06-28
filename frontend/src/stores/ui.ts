@@ -6,9 +6,9 @@ import { create } from "zustand";
 import { persist } from "zustand/middleware";
 
 interface UiState {
-  /** Columns visible in the event grid, in order. */
-  visibleColumns: string[];
-  setVisibleColumns: (cols: string[]) => void;
+  /** Per-timeline column selections, keyed by "caseId/timelineId". */
+  visibleColumnsByTimeline: Record<string, string[]>;
+  setVisibleColumns: (key: string, cols: string[]) => void;
 
   /** Whether the analysis panel is open. */
   analysisPanelOpen: boolean;
@@ -38,8 +38,11 @@ export const DEFAULT_COLUMNS = [
 export const useUiStore = create<UiState>()(
   persist(
     (set) => ({
-      visibleColumns: DEFAULT_COLUMNS,
-      setVisibleColumns: (cols) => set({ visibleColumns: cols }),
+      visibleColumnsByTimeline: {},
+      setVisibleColumns: (key, cols) =>
+        set((s) => ({
+          visibleColumnsByTimeline: { ...s.visibleColumnsByTimeline, [key]: cols },
+        })),
 
       analysisPanelOpen: false,
       setAnalysisPanelOpen: (open) => set({ analysisPanelOpen: open }),
