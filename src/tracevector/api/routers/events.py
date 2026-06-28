@@ -17,6 +17,15 @@ from tracevector.db.postgres import PostgresStore, generate_id
 from tracevector.db.queries import EventQuery, EventQueryService
 from tracevector.db.similarity import SimilarityService
 
+_query_service: EventQueryService | None = None
+
+
+def _get_query_service() -> EventQueryService:
+    global _query_service  # noqa: PLW0603
+    if _query_service is None:
+        _query_service = EventQueryService()
+    return _query_service
+
 router = APIRouter(prefix="/api/cases", tags=["events"])
 
 _store: PostgresStore | None = None
@@ -65,14 +74,18 @@ async def list_events(
     ),
     limit: int = Query(default=50, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
+    order: str = Query(default="desc", description="Sort order: asc or desc"),
 ) -> dict[str, Any]:
     """List events for a timeline with optional filters."""
+    if order not in ("asc", "desc"):
+        order = "desc"
+
     store = get_store()
     timeline = await store.get_timeline(case_id, timeline_id)
     if timeline is None:
         raise HTTPException(status_code=404, detail="Timeline not found")
 
-    service = EventQueryService()
+    service = _get_query_service()
     page = service.query(
         EventQuery(
             case_id=case_id,
@@ -86,6 +99,7 @@ async def list_events(
             field_exclusions=_parse_json_object(exclusions),
             limit=limit,
             offset=offset,
+            order=order,  # type: ignore[arg-type]
         )
     )
     return {
@@ -94,6 +108,69 @@ async def list_events(
         "limit": page.limit,
         "events": page.events,
     }
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/fields")
+async def list_fields(
+    case_id: str,
+    timeline_id: str,
+) -> dict[str, Any]:
+    """Return the displayable field names for a timeline.
+
+    ``top_level`` contains the fixed columns common to every event.
+    ``attributes`` contains the dynamic keys aggregated from the ``attributes``
+    Map across a sample of up to 50 000 events.  Useful for building a column
+    picker in the UI.
+    """
+    store = get_store()
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    service = _get_query_service()
+    return service.list_fields(case_id, timeline_id)
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/histogram")
+async def get_histogram(
+    case_id: str,
+    timeline_id: str,
+    q: str | None = Query(default=None),
+    source: str | None = Query(default=None),
+    tag: str | None = Query(default=None),
+    start: datetime | None = Query(default=None),  # noqa: B008
+    end: datetime | None = Query(default=None),  # noqa: B008
+    filters: str | None = Query(default=None),
+    exclusions: str | None = Query(default=None),
+    buckets: int = Query(default=60, ge=10, le=200),
+) -> dict[str, Any]:
+    """Return a bucketed event-count histogram for a timeline.
+
+    Honors the same filter params as the events list endpoint so the histogram
+    always reflects the currently-filtered view.  ``buckets`` controls the
+    target number of time buckets (10–200, default 60); the actual interval is
+    ``max(1, duration / buckets)`` seconds.
+    """
+    store = get_store()
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    service = _get_query_service()
+    return service.histogram(
+        EventQuery(
+            case_id=case_id,
+            timeline_id=timeline_id,
+            q=q,
+            source=source,
+            tag=tag,
+            start=start,
+            end=end,
+            field_filters=_parse_json_object(filters),
+            field_exclusions=_parse_json_object(exclusions),
+        ),
+        buckets=buckets,
+    )
 
 
 # ── Export models ─────────────────────────────────────────────────────────────
