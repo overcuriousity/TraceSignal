@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Literal
 
 from tracevector.db.clickhouse import ClickHouseStore
 
@@ -25,6 +25,7 @@ class EventQuery:
     field_exclusions: dict[str, str] = field(default_factory=dict)
     limit: int = 50
     offset: int = 0
+    order: Literal["asc", "desc"] = "desc"
 
 
 @dataclass
@@ -52,6 +53,19 @@ _TOP_LEVEL_FILTER_COLUMNS = frozenset(
         "source_file",
     }
 )
+
+# Top-level columns surfaced as choosable display columns in the UI.
+# Separate from _TOP_LEVEL_FILTER_COLUMNS (which is for filter routing).
+TOP_LEVEL_DISPLAY_COLUMNS = [
+    "timestamp",
+    "source",
+    "source_long",
+    "display_name",
+    "message",
+    "timestamp_desc",
+    "tags",
+    "_annotations",
+]
 
 
 def _format_clickhouse_datetime(value: datetime) -> str:
@@ -194,12 +208,13 @@ class EventQueryService:
         )
         total = count_result.result_rows[0][0] if count_result.result_rows else 0
 
+        sort_dir = query.order.upper()
         event_result = self.store.client.query(
             f"""
             SELECT {_EVENT_SELECT_COLUMNS}
             FROM {database}.events
             WHERE {where}
-            ORDER BY timestamp DESC, event_id
+            ORDER BY timestamp {sort_dir}, event_id
             LIMIT {query.limit}
             OFFSET {query.offset}
             """,
@@ -229,6 +244,7 @@ class EventQueryService:
 
         where, parameters = self._build_where(query)
         database = self.store.database
+        sort_dir = query.order.upper()
         offset = 0
 
         while True:
@@ -237,7 +253,7 @@ class EventQueryService:
                 SELECT {_EVENT_SELECT_COLUMNS}
                 FROM {database}.events
                 WHERE {where}
-                ORDER BY timestamp DESC, event_id
+                ORDER BY timestamp {sort_dir}, event_id
                 LIMIT {batch_size}
                 OFFSET {offset}
                 """,
@@ -250,3 +266,96 @@ class EventQueryService:
             if len(rows) < batch_size:
                 break
             offset += batch_size
+
+    def list_fields(self, case_id: str, timeline_id: str) -> dict[str, list[str]]:
+        """Return the top-level display columns and dynamic attribute keys for a timeline.
+
+        Attribute keys are aggregated across a sample of up to 50 000 events so the
+        call stays fast even on large timelines.
+        """
+        self.store.init_schema()
+        database = self.store.database
+
+        result = self.store.client.query(
+            f"""
+            SELECT groupUniqArrayArray(mapKeys(attributes)) AS keys
+            FROM (
+                SELECT attributes
+                FROM {database}.events
+                WHERE case_id = {{p0:String}} AND timeline_id = {{p1:String}}
+                LIMIT 50000
+            )
+            """,
+            parameters={"p0": case_id, "p1": timeline_id},
+        )
+        raw_keys: list[str] = result.result_rows[0][0] if result.result_rows else []
+        return {
+            "top_level": TOP_LEVEL_DISPLAY_COLUMNS,
+            "attributes": sorted(raw_keys),
+        }
+
+    def histogram(
+        self, query: EventQuery, buckets: int = 60
+    ) -> dict[str, Any]:
+        """Return a bucketed event-count histogram honoring all query filters.
+
+        If the query has no explicit time range the min/max timestamps are
+        derived from the filtered event set first.  Returns an empty bucket
+        list when there are no matching events.
+        """
+        self.store.init_schema()
+        where, parameters = self._build_where(query)
+        database = self.store.database
+
+        # Resolve time range.
+        if query.start is not None and query.end is not None:
+            min_ts: datetime | None = query.start
+            max_ts: datetime | None = query.end
+        else:
+            range_result = self.store.client.query(
+                f"SELECT min(timestamp), max(timestamp) FROM {database}.events WHERE {where}",
+                parameters=parameters,
+            )
+            row = range_result.result_rows[0] if range_result.result_rows else (None, None)
+            min_ts, max_ts = row[0], row[1]
+
+        if min_ts is None or max_ts is None:
+            return {"interval_seconds": 0, "min": None, "max": None, "buckets": []}
+
+        # Ensure timezone-aware for arithmetic.
+        if hasattr(min_ts, "tzinfo") and min_ts.tzinfo is None:
+            min_ts = min_ts.replace(tzinfo=timezone.utc)
+        if hasattr(max_ts, "tzinfo") and max_ts.tzinfo is None:
+            max_ts = max_ts.replace(tzinfo=timezone.utc)
+
+        duration = (max_ts - min_ts).total_seconds()
+        interval = max(1, int(duration / buckets))
+
+        bucket_result = self.store.client.query(
+            f"""
+            SELECT toStartOfInterval(timestamp, INTERVAL {interval} second) AS bucket,
+                   count() AS c
+            FROM {database}.events
+            WHERE {where}
+            GROUP BY bucket
+            ORDER BY bucket
+            """,
+            parameters=parameters,
+        )
+        def _to_utc_iso(dt: Any) -> str:
+            if hasattr(dt, "isoformat"):
+                if hasattr(dt, "tzinfo") and dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.isoformat()
+            return str(dt)
+
+        bucket_list = [
+            {"start": _to_utc_iso(row[0]), "count": row[1]}
+            for row in bucket_result.result_rows
+        ]
+        return {
+            "interval_seconds": interval,
+            "min": min_ts.isoformat(),
+            "max": max_ts.isoformat(),
+            "buckets": bucket_list,
+        }
