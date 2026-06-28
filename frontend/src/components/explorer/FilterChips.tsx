@@ -1,0 +1,99 @@
+import { X } from "lucide-react";
+import type { EventFilters } from "@/api/types";
+
+interface Props {
+  filters: EventFilters;
+  onRemove: (key: keyof EventFilters | string, fieldKey?: string) => void;
+}
+
+interface Chip {
+  label: string;
+  value: string;
+  onRemove: () => void;
+  variant?: "include" | "exclude" | "neutral";
+}
+
+export function FilterChips({ filters, onRemove }: Props) {
+  const chips: Chip[] = [];
+
+  if (filters.q)
+    chips.push({
+      label: "search",
+      value: filters.q,
+      onRemove: () => onRemove("q"),
+      variant: "neutral",
+    });
+  if (filters.source)
+    chips.push({
+      label: "source",
+      value: filters.source,
+      onRemove: () => onRemove("source"),
+      variant: "include",
+    });
+  if (filters.tag)
+    chips.push({
+      label: "tag",
+      value: filters.tag,
+      onRemove: () => onRemove("tag"),
+      variant: "include",
+    });
+  if (filters.start)
+    chips.push({
+      label: "from",
+      value: filters.start.replace("T", " ").replace(/\.\d+Z$/, "Z"),
+      onRemove: () => onRemove("start"),
+      variant: "neutral",
+    });
+  if (filters.end)
+    chips.push({
+      label: "to",
+      value: filters.end.replace("T", " ").replace(/\.\d+Z$/, "Z"),
+      onRemove: () => onRemove("end"),
+      variant: "neutral",
+    });
+
+  for (const [k, v] of Object.entries(filters.filters ?? {})) {
+    chips.push({
+      label: k,
+      value: v,
+      onRemove: () => onRemove("filters", k),
+      variant: "include",
+    });
+  }
+  for (const [k, v] of Object.entries(filters.exclusions ?? {})) {
+    chips.push({
+      label: `!${k}`,
+      value: v,
+      onRemove: () => onRemove("exclusions", k),
+      variant: "exclude",
+    });
+  }
+
+  if (chips.length === 0) return null;
+
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {chips.map((chip, i) => (
+        <span
+          key={i}
+          className={`inline-flex items-center gap-1 rounded px-2 py-0.5 text-xs font-mono leading-none border ${
+            chip.variant === "include"
+              ? "bg-[var(--color-info-dim)] text-[var(--color-info)] border-[var(--color-info)] border-opacity-30"
+              : chip.variant === "exclude"
+                ? "bg-[var(--color-danger-dim)] text-[var(--color-danger)] border-[var(--color-danger)] border-opacity-30"
+                : "bg-[var(--color-bg-active)] text-[var(--color-fg-secondary)] border-[var(--color-border)]"
+          }`}
+        >
+          <span className="opacity-60">{chip.label}=</span>
+          <span className="max-w-[160px] truncate">{chip.value}</span>
+          <button
+            onClick={chip.onRemove}
+            className="ml-0.5 rounded-full p-0.5 opacity-60 hover:opacity-100 transition-base"
+          >
+            <X size={10} />
+          </button>
+        </span>
+      ))}
+    </div>
+  );
+}

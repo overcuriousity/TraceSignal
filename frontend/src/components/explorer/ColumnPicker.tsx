@@ -70,8 +70,10 @@ function ColumnRow({
 
 export function ColumnPicker({ caseId, timelineId }: Props) {
   const [search, setSearch] = useState("");
-  const visibleColumns = useUiStore((s) => s.visibleColumns);
-  const setVisibleColumns = useUiStore((s) => s.setVisibleColumns);
+  const tlKey = `${caseId}/${timelineId}`;
+  const visibleColumns = useUiStore((s) => s.visibleColumnsByTimeline[tlKey] ?? DEFAULT_COLUMNS);
+  const setVisibleColumnsStore = useUiStore((s) => s.setVisibleColumns);
+  const setVisibleColumns = (cols: string[]) => setVisibleColumnsStore(tlKey, cols);
 
   const { data: fields, isLoading } = useQuery({
     queryKey: ["fields", caseId, timelineId],

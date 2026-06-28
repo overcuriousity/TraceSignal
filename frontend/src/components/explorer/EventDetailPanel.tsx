@@ -1,0 +1,313 @@
+import { useState } from "react";
+import { X, Copy, Search, Filter, FilterX } from "lucide-react";
+import { Badge } from "@/components/ui/Badge";
+import { Button } from "@/components/ui/Button";
+import { fmtTimestampFull, fmtRelative } from "@/lib/time";
+import { truncateHash } from "@/lib/format";
+import { Tooltip } from "@/components/ui/Tooltip";
+import type { Event } from "@/api/types";
+
+interface Props {
+  event: Event;
+  annotations: Annotation[];
+  onClose: () => void;
+  onFindSimilar: (event: Event) => void;
+  /** Called when the user clicks filter-in or filter-out on a field row. */
+  onAddFilter: (fieldKey: string, value: string, include: boolean) => void;
+}
+
+function CopyButton({ value }: { value: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      onClick={async (e) => {
+        e.stopPropagation();
+        await navigator.clipboard.writeText(value);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      }}
+      className="shrink-0 rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-fg-primary)] transition-base"
+      title="Copy value"
+    >
+      <Copy size={11} className={copied ? "text-[var(--color-success)]" : ""} />
+    </button>
+  );
+}
+
+/**
+ * A single attribute row with filter-in / filter-out / copy actions.
+ *
+ * filterKey: the field name sent to the backend filters/exclusions param.
+ *   Pass null for rows that are display-only (provenance, timestamps).
+ */
+function FieldRow({
+  label,
+  value,
+  mono = false,
+  filterKey,
+  onAddFilter,
+}: {
+  label: string;
+  value: string | null | undefined;
+  mono?: boolean;
+  filterKey?: string | null;
+  onAddFilter?: (fieldKey: string, value: string, include: boolean) => void;
+}) {
+  if (!value) return null;
+  const canFilter = !!filterKey && !!onAddFilter;
+
+  return (
+    <div className="group flex items-start gap-1.5 py-1.5 border-b border-[var(--color-border-subtle)] hover:bg-[var(--color-bg-hover)] -mx-2 px-2 rounded-sm transition-base">
+      <span className="w-32 shrink-0 text-xs text-[var(--color-fg-muted)] pt-0.5 select-none">
+        {label}
+      </span>
+      <span
+        className={`flex-1 min-w-0 break-all text-xs text-[var(--color-fg-primary)] ${mono ? "font-mono" : ""}`}
+      >
+        {value}
+      </span>
+
+      {/* Action buttons — visible on row hover */}
+      <div className="flex items-center gap-0.5 shrink-0 opacity-0 group-hover:opacity-100 transition-base">
+        {canFilter && (
+          <>
+            <Tooltip content={`Filter IN: ${label} = ${value}`} side="top">
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onAddFilter!(filterKey!, value, true);
+                }}
+                className="rounded p-0.5 text-[var(--color-info)] hover:bg-[var(--color-info-dim)] transition-base"
+              >
+                <Filter size={11} />
+              </button>
+            </Tooltip>
+            <Tooltip content={`Filter OUT: ${label} ≠ ${value}`} side="top">
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onAddFilter!(filterKey!, value, false);
+                }}
+                className="rounded p-0.5 text-[var(--color-danger)] hover:bg-[var(--color-danger-dim)] transition-base"
+              >
+                <FilterX size={11} />
+              </button>
+            </Tooltip>
+          </>
+        )}
+        <CopyButton value={value} />
+      </div>
+    </div>
+  );
+}
+
+export function EventDetailPanel({
+  event,
+  annotations,
+  onClose,
+  onFindSimilar,
+  onAddFilter,
+}: Props) {
+  const userAnnotations = annotations.filter((a) => a.origin === "user");
+  const systemAnnotations = annotations.filter((a) => a.origin === "system");
+
+  return (
+    <div className="flex h-full flex-col border-l border-[var(--color-border)] bg-[var(--color-bg-surface)] w-96 shrink-0">
+      {/* Header */}
+      <div className="flex items-center gap-2 border-b border-[var(--color-border)] px-4 py-3">
+        <h3 className="flex-1 text-sm font-semibold text-[var(--color-fg-primary)]">
+          Event Detail
+        </h3>
+        <Tooltip content="Find similar events (vector search)">
+          <Button variant="ghost" size="icon" onClick={() => onFindSimilar(event)}>
+            <Search size={14} />
+          </Button>
+        </Tooltip>
+        <Button variant="ghost" size="icon" onClick={onClose}>
+          <X size={14} />
+        </Button>
+      </div>
+
+      <div className="flex-1 overflow-y-auto px-4 py-3">
+        {/* Message — filterable on click */}
+        <div className="mb-3 rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3">
+          <div className="flex items-center justify-between mb-1">
+            <p className="text-xs text-[var(--color-fg-muted)]">Message</p>
+            {event.message && (
+              <div className="flex items-center gap-0.5">
+                <Tooltip content="Filter IN: message contains this text">
+                  <button
+                    onClick={() => onAddFilter("q", event.message, true)}
+                    className="rounded p-0.5 text-[var(--color-info)] hover:bg-[var(--color-info-dim)] transition-base"
+                  >
+                    <Filter size={11} />
+                  </button>
+                </Tooltip>
+                <CopyButton value={event.message} />
+              </div>
+            )}
+          </div>
+          <p className="text-sm text-[var(--color-fg-primary)] break-words leading-relaxed">
+            {event.message || "—"}
+          </p>
+        </div>
+
+        {/* Timestamps */}
+        <div className="mb-3">
+          <p className="mb-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-muted)]">
+            Timestamps
+          </p>
+          <FieldRow
+            label="timestamp"
+            value={fmtTimestampFull(event.timestamp)}
+            mono
+            filterKey={null}
+          />
+          <FieldRow
+            label="timestamp_desc"
+            value={event.timestamp_desc}
+            filterKey="timestamp_desc"
+            onAddFilter={onAddFilter}
+          />
+          <FieldRow
+            label="ingest_time"
+            value={fmtRelative(event.ingest_time)}
+            filterKey={null}
+          />
+        </div>
+
+        {/* Source */}
+        <div className="mb-3">
+          <p className="mb-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-muted)]">
+            Source
+          </p>
+          <FieldRow
+            label="source"
+            value={event.source}
+            mono
+            filterKey="source"
+            onAddFilter={onAddFilter}
+          />
+          <FieldRow
+            label="source_long"
+            value={event.source_long}
+            mono
+            filterKey="source_long"
+            onAddFilter={onAddFilter}
+          />
+          <FieldRow
+            label="display_name"
+            value={event.display_name}
+            filterKey="display_name"
+            onAddFilter={onAddFilter}
+          />
+        </div>
+
+        {/* Parser tags */}
+        {event.tags.length > 0 && (
+          <div className="mb-3">
+            <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-muted)]">
+              Parser Tags
+            </p>
+            <div className="flex flex-wrap gap-1">
+              {event.tags.map((t, i) => (
+                <button
+                  key={i}
+                  className="group/tag flex items-center gap-1"
+                  onClick={() => onAddFilter("tag", t, true)}
+                  title={`Filter IN: tag = ${t}`}
+                >
+                  <Badge variant="default" className="hover:border-[var(--color-info)] transition-base">
+                    {t}
+                  </Badge>
+                </button>
+              ))}
+            </div>
+            <p className="mt-1 text-[10px] text-[var(--color-fg-muted)]">
+              Click a tag to filter
+            </p>
+          </div>
+        )}
+
+        {/* Attributes — every row has filter-in / filter-out */}
+        {Object.keys(event.attributes).length > 0 && (
+          <div className="mb-3">
+            <p className="mb-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-muted)]">
+              Attributes
+              <span className="ml-2 normal-case font-normal text-[var(--color-fg-muted)] opacity-60">
+                hover to filter
+              </span>
+            </p>
+            {Object.entries(event.attributes).map(([k, v]) => (
+              <FieldRow
+                key={k}
+                label={k}
+                value={v}
+                mono
+                filterKey={k}
+                onAddFilter={onAddFilter}
+              />
+            ))}
+          </div>
+        )}
+
+        {/* Annotations */}
+        <div className="mb-3">
+          <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-muted)]">
+            Annotations
+          </p>
+          {userAnnotations.length === 0 && (
+            <p className="text-xs text-[var(--color-fg-muted)]">None</p>
+          )}
+          {userAnnotations.map((a) => (
+            <div
+              key={a.id}
+              className="mb-1 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-2.5 py-1.5 text-xs"
+            >
+              <span className="font-medium text-[var(--color-fg-secondary)] capitalize">
+                {a.annotation_type}:
+              </span>{" "}
+              <span className="text-[var(--color-fg-primary)]">{a.content}</span>
+            </div>
+          ))}
+          {systemAnnotations.map((a) => (
+            <div
+              key={a.id}
+              className="mb-1 rounded border border-[var(--color-outlier)] border-opacity-30 bg-[var(--color-outlier-dim)] px-2.5 py-1.5 text-xs"
+            >
+              <span className="font-medium text-[var(--color-outlier)]">
+                ⚠ {a.annotation_type}:
+              </span>{" "}
+              <span className="text-[var(--color-fg-primary)]">{a.content}</span>
+            </div>
+          ))}
+        </div>
+
+        {/* Provenance — display-only, no filter buttons */}
+        <div className="mb-3">
+          <p className="mb-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-muted)]">
+            Provenance
+          </p>
+          <FieldRow label="event_id" value={event.event_id} mono filterKey={null} />
+          <FieldRow
+            label="content_hash"
+            value={truncateHash(event.content_hash, 24)}
+            mono
+            filterKey={null}
+          />
+          <FieldRow label="parser" value={event.parser_name} mono filterKey={null} />
+          <FieldRow label="source_file" value={event.source_file} mono filterKey={null} />
+          <FieldRow
+            label="byte_offset"
+            value={String(event.byte_offset)}
+            mono
+            filterKey={null}
+          />
+          {event.embedding_model && (
+            <FieldRow label="embed_model" value={event.embedding_model} mono filterKey={null} />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

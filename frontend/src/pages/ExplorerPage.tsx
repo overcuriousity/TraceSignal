@@ -27,7 +27,7 @@ import { annotationsApi } from "@/api/annotations";
 import { viewsApi } from "@/api/views";
 import { timelinesApi } from "@/api/timelines";
 import { useJobsStore } from "@/stores/jobs";
-import { useUiStore } from "@/stores/ui";
+import { useUiStore, DEFAULT_COLUMNS } from "@/stores/ui";
 import { paramsToFilters, filtersToParams } from "@/lib/queryParams";
 
 import { FilterRail } from "@/components/explorer/FilterRail";
@@ -101,10 +101,18 @@ export function ExplorerPage() {
       if (fieldKey === "q") {
         // Full-text search: always "include" (no exclusion concept for free text)
         f.q = value;
-      } else if (fieldKey === "source" && include) {
-        f.source = value;
-      } else if (fieldKey === "tag" && include) {
-        f.tag = value;
+      } else if (fieldKey === "source") {
+        if (include) {
+          f.source = value;
+        } else {
+          f.exclusions = { ...(f.exclusions ?? {}), source: value };
+        }
+      } else if (fieldKey === "tag") {
+        if (include) {
+          f.tag = value;
+        } else {
+          f.excludeTag = value;
+        }
       } else if (include) {
         f.filters = { ...(f.filters ?? {}), [fieldKey]: value };
       } else {
@@ -117,13 +125,16 @@ export function ExplorerPage() {
   );
 
   // ── Panel visibility state ────────────────────────────────────────────
-  const [filterRailOpen, setFilterRailOpen] = useState(true);
+  const filterRailOpen = useUiStore((s) => s.filterRailOpen);
+  const setFilterRailOpen = useUiStore((s) => s.setFilterRailOpen);
+  const analysisPanelOpen = useUiStore((s) => s.analysisPanelOpen);
+  const setAnalysisPanelOpen = useUiStore((s) => s.setAnalysisPanelOpen);
   const [expandedEvent, setExpandedEvent] = useState<Event | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [analysisPanelOpen, setAnalysisPanelOpen] = useState(false);
   const [similarAnchor, setSimilarAnchor] = useState<Event | null>(null);
   const [saveViewOpen, setSaveViewOpen] = useState(false);
-  const visibleColumns = useUiStore((s) => s.visibleColumns);
+  const tlKey = `${caseId}/${timelineId}`;
+  const visibleColumns = useUiStore((s) => s.visibleColumnsByTimeline[tlKey] ?? DEFAULT_COLUMNS);
   const histogramOpen = useUiStore((s) => s.histogramOpen);
   const setHistogramOpen = useUiStore((s) => s.setHistogramOpen);
   const sortDir = useUiStore((s) => s.sortDir);
@@ -142,6 +153,7 @@ export function ExplorerPage() {
     data: eventsPage,
     isLoading: eventsLoading,
     isFetching,
+    isError: eventsError,
     refetch,
   } = useQuery({
     queryKey: ["events", caseId, timelineId, filters, offset, sortDir],
@@ -195,13 +207,13 @@ export function ExplorerPage() {
   }, []);
 
   const handleLoadMore = useCallback(() => {
-    if (events.length < total) setOffset((o) => o + PAGE_SIZE);
-  }, [events.length, total]);
+    if (!isFetching && events.length < total) setOffset((o) => o + PAGE_SIZE);
+  }, [isFetching, events.length, total]);
 
   const handleEmbed = useCallback(async () => {
     if (!caseId || !timelineId || !timeline) return;
     const result = await timelinesApi.embed(caseId, timelineId);
-    addJob(result.job_id, `Embedding "${timeline.name}"`);
+    addJob(result.job_id, `Embedding "${timeline.name}"`, `${caseId}/${timelineId}`);
   }, [caseId, timelineId, timeline, addJob]);
 
   const handleFindSimilar = useCallback((event: Event) => {
@@ -328,6 +340,10 @@ export function ExplorerPage() {
             <div className="flex flex-1 items-center justify-center">
               <Spinner size={24} />
             </div>
+          ) : eventsError ? (
+            <div className="flex flex-1 items-center justify-center">
+              <p className="text-sm text-[var(--color-danger)]">Failed to load events</p>
+            </div>
           ) : (
             <div className="flex flex-1 min-w-0 flex-col overflow-hidden">
               <div className="flex flex-1 min-h-0 overflow-hidden">
@@ -342,6 +358,7 @@ export function ExplorerPage() {
                   expandedId={expandedEvent?.event_id ?? null}
                   onExpand={setExpandedEvent}
                   onLoadMore={handleLoadMore}
+                  isFetching={isFetching}
                   visibleColumns={visibleColumns}
                 />
 
@@ -349,8 +366,7 @@ export function ExplorerPage() {
                 {expandedEvent && (
                   <EventDetailPanel
                     event={expandedEvent}
-                    caseId={caseId!}
-                    timelineId={timelineId!}
+                    annotations={annotationMap.get(expandedEvent.event_id) ?? []}
                     onClose={() => setExpandedEvent(null)}
                     onFindSimilar={handleFindSimilar}
                     onAddFilter={handleAddFilter}
