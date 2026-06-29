@@ -133,16 +133,30 @@ export function FilterRail({ filters, onChange, views, onApplyView, onSaveView, 
           </div>
         </div>
 
-        {/* Source */}
+        {/* Artifact */}
         <div>
           <label className="mb-1.5 block text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
-            Source
+            Artifact
           </label>
           <Input
-            placeholder="source name…"
-            value={filters.source ?? ""}
+            placeholder="artifact name…"
+            value={filters.artifact ?? ""}
             onChange={(e) =>
-              onChange({ ...filters, source: e.target.value || undefined })
+              onChange({ ...filters, artifact: e.target.value || undefined })
+            }
+          />
+        </div>
+
+        {/* Source ID */}
+        <div>
+          <label className="mb-1.5 block text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
+            Source ID
+          </label>
+          <Input
+            placeholder="filter by source id…"
+            value={filters.sourceId ?? ""}
+            onChange={(e) =>
+              onChange({ ...filters, sourceId: e.target.value || undefined })
             }
           />
         </div>

@@ -28,7 +28,7 @@ class IngestionResult:
     """Result of an event-ingestion run."""
 
     case_id: str
-    timeline_id: str
+    source_id: str
     files: list[Path] = field(default_factory=list)
     events_parsed: int = 0
     events_inserted: int = 0
@@ -39,7 +39,7 @@ class IngestionResult:
         file_list = ", ".join(str(p) for p in self.files) or "none"
         return (
             f"Ingested {self.events_inserted} events "
-            f"into case '{self.case_id}' / timeline '{self.timeline_id}' "
+            f"into case '{self.case_id}' / source '{self.source_id}' "
             f"from {file_list}"
         )
 
@@ -49,7 +49,7 @@ class EmbeddingResult:
     """Result of an embedding run."""
 
     case_id: str
-    timeline_id: str
+    source_ids: list[str]
     events_processed: int = 0
     vectors_inserted: int = 0
     errors: list[str] = field(default_factory=list)
@@ -59,7 +59,7 @@ class EmbeddingResult:
         return (
             f"Embedded {self.events_processed} events "
             f"({self.vectors_inserted} vectors) "
-            f"into case '{self.case_id}' / timeline '{self.timeline_id}'"
+            f"into case '{self.case_id}' / sources {self.source_ids}"
         )
 
 
@@ -73,14 +73,14 @@ class IngestionPipeline:
     def __init__(
         self,
         case_id: str,
-        timeline_id: str,
+        source_id: str,
         clickhouse: ClickHouseStore | None = None,
         batch_size: int | None = None,
         file_hash: str | None = None,
         source_name: str | None = None,
     ) -> None:
         self.case_id = case_id
-        self.timeline_id = timeline_id
+        self.source_id = source_id
         self.clickhouse = clickhouse or ClickHouseStore()
         self.batch_size = batch_size or get_settings().embedding_batch_size
         self.file_hash = file_hash
@@ -101,7 +101,7 @@ class IngestionPipeline:
         files = self._resolve_files(path)
         result = IngestionResult(
             case_id=self.case_id,
-            timeline_id=self.timeline_id,
+            source_id=self.source_id,
             files=files,
         )
 
@@ -115,10 +115,15 @@ class IngestionPipeline:
             # directory ingestion compute a per-file hash.
             file_hash = self.file_hash if single_file else hash_file(file_path)
             source_name = self.source_name if single_file else file_path.name
+            if not file_hash:
+                raise ValueError(
+                    f"Could not compute file hash for {file_path}; "
+                    "ingestion requires a file-level hash for forensic integrity."
+                )
             parser = get_parser(
                 fmt,
                 self.case_id,
-                self.timeline_id,
+                self.source_id,
                 file_hash=file_hash,
                 source_name=source_name or file_path.name,
             )
@@ -170,18 +175,18 @@ class EmbeddingPipeline:
     """Background embedding pipeline: read events from ClickHouse, embed,
     and write vectors to Qdrant.
 
-    ``field_config`` is the analyst-defined per-source field selection
-    (shape: ``{"version": 1, "sources": {"<source>": ["message", "attr:k"]}}``)
+    ``field_config`` is the analyst-defined per-artifact field selection
+    (shape: ``{"version": 1, "artifacts": {"<artifact>": ["message", "attr:k"]}}``)
     produced by the embedding wizard.  When ``None``, the legacy all-fields
-    behaviour applies and all sources are embedded.  When supplied, only sources
-    listed in ``field_config["sources"]`` are embedded, and only the selected
-    fields are used to build the embedding text.
+    behaviour applies and all artifacts are embedded.  When supplied, only
+    artifacts listed in ``field_config["artifacts"]`` are embedded, and only
+    the selected fields are used to build the embedding text.
     """
 
     def __init__(
         self,
         case_id: str,
-        timeline_id: str,
+        source_ids: list[str],
         embedding_model: EmbeddingModel | None = None,
         clickhouse: ClickHouseStore | None = None,
         qdrant: QdrantStore | None = None,
@@ -190,7 +195,7 @@ class EmbeddingPipeline:
         field_config: dict[str, Any] | None = None,
     ) -> None:
         self.case_id = case_id
-        self.timeline_id = timeline_id
+        self.source_ids = source_ids
         self.embedding_model = embedding_model or EmbeddingModel()
         self.clickhouse = clickhouse or ClickHouseStore()
         self.qdrant = qdrant or QdrantStore()
@@ -199,10 +204,10 @@ class EmbeddingPipeline:
         self.field_config = field_config  # None → legacy all-fields
 
     def run(self) -> EmbeddingResult:
-        """Generate embeddings for all events of the configured timeline."""
+        """Generate embeddings for all events of the configured sources."""
         result = EmbeddingResult(
             case_id=self.case_id,
-            timeline_id=self.timeline_id,
+            source_ids=self.source_ids,
         )
 
         self.clickhouse.init_schema()
@@ -232,9 +237,12 @@ class EmbeddingPipeline:
             vector_size=base_config.vector_dimension or self.embedding_model.vector_dimension(),
         )
 
-        total = self.clickhouse.count_events(
-            case_id=self.case_id,
-            timeline_id=self.timeline_id,
+        total = sum(
+            self.clickhouse.count_events(
+                case_id=self.case_id,
+                source_id=source_id,
+            )
+            for source_id in self.source_ids
         )
 
         if total == 0:
@@ -244,39 +252,46 @@ class EmbeddingPipeline:
 
         first_exception: BaseException | None = None
         processed = 0
-        offset = 0
-        while processed < total:
-            try:
-                batch = self.clickhouse.list_events(
-                    case_id=self.case_id,
-                    timeline_id=self.timeline_id,
-                    limit=self.batch_size,
-                    offset=offset,
-                )
-            except Exception as exc:  # noqa: BLE001
-                error = f"Failed to read events at offset {offset}: {exc}\n{traceback.format_exc()}"
-                result.errors.append(error)
-                if first_exception is None:
-                    first_exception = exc
-                break
+        for source_id in self.source_ids:
+            offset = 0
+            while True:
+                try:
+                    batch = self.clickhouse.list_events(
+                        case_id=self.case_id,
+                        source_id=source_id,
+                        limit=self.batch_size,
+                        offset=offset,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    error = (
+                        f"Failed to read events for source {source_id} "
+                        f"at offset {offset}: {exc}\n{traceback.format_exc()}"
+                    )
+                    result.errors.append(error)
+                    if first_exception is None:
+                        first_exception = exc
+                    break
 
-            if not batch:
-                break
+                if not batch:
+                    break
 
-            try:
-                vectors_inserted = self._embed_batch(batch, config)
-                result.events_processed += len(batch)
-                result.vectors_inserted += vectors_inserted
-            except Exception as exc:  # noqa: BLE001
-                error = f"Failed to embed batch at offset {offset}: {exc}\n{traceback.format_exc()}"
-                result.errors.append(error)
-                if first_exception is None:
-                    first_exception = exc
-                break
+                try:
+                    vectors_inserted = self._embed_batch(batch, config)
+                    result.events_processed += len(batch)
+                    result.vectors_inserted += vectors_inserted
+                except Exception as exc:  # noqa: BLE001
+                    error = (
+                        f"Failed to embed batch for source {source_id} "
+                        f"at offset {offset}: {exc}\n{traceback.format_exc()}"
+                    )
+                    result.errors.append(error)
+                    if first_exception is None:
+                        first_exception = exc
+                    break
 
-            processed += len(batch)
-            offset += len(batch)
-            self._report_progress(total=total, processed=processed)
+                processed += len(batch)
+                offset += len(batch)
+                self._report_progress(total=total, processed=processed)
 
         if result.errors:
             message = "Embedding failed:\n" + "\n".join(result.errors)
@@ -291,22 +306,22 @@ class EmbeddingPipeline:
     ) -> int:
         """Embed one batch and persist vectors to Qdrant.
 
-        When ``self.field_config`` is set, rows whose ``source`` is not listed
+        When ``self.field_config`` is set, rows whose ``artifact`` is not listed
         in the config are silently skipped (not embedded).  This allows the
-        analyst to exclude noisy sources entirely.
+        analyst to exclude noisy artifacts entirely.
         """
-        source_fields: dict[str, list[str]] | None = None
+        artifact_fields: dict[str, list[str]] | None = None
         if self.field_config is not None:
-            source_fields = self.field_config.get("sources", {})
+            artifact_fields = self.field_config.get("artifacts", {})
 
-        # Filter out rows for unconfigured sources when a field config is set.
-        if source_fields is not None:
-            batch = [row for row in batch if (row.get("source") or "") in source_fields]
+        # Filter out rows for unconfigured artifacts when a field config is set.
+        if artifact_fields is not None:
+            batch = [row for row in batch if (row.get("artifact") or "") in artifact_fields]
 
         if not batch:
             return 0
 
-        texts = [_text_for_embedding(row, source_fields) for row in batch]
+        texts = [_text_for_embedding(row, artifact_fields) for row in batch]
         vectors = self.embedding_model.encode(texts)
 
         config_hash = config.config_hash()
@@ -336,25 +351,25 @@ class EmbeddingPipeline:
 
 def _text_for_embedding(
     row: dict[str, Any],
-    source_fields: dict[str, list[str]] | None = None,
+    artifact_fields: dict[str, list[str]] | None = None,
 ) -> str:
     """Build a single text representation for embedding from a stored event row.
 
-    ``source_fields`` maps each source name to the list of field tokens chosen
+    ``artifact_fields`` maps each artifact name to the list of field tokens chosen
     by the analyst in the embedding wizard.  Field tokens are either plain
     top-level column names (``"message"``, ``"display_name"``, …) or
     ``"attr:<key>"`` for entries in the ``attributes`` map.
 
-    When ``source_fields`` is ``None`` (legacy / no config), the original
+    When ``artifact_fields`` is ``None`` (legacy / no config), the original
     all-fields behaviour is preserved: every non-empty field is included.
     """
     parts: list[str] = []
     attributes = row.get("attributes") or {}
     message = row.get("message")
 
-    if source_fields is not None:
-        source = row.get("source") or ""
-        selected = source_fields.get(source, [])
+    if artifact_fields is not None:
+        artifact = row.get("artifact") or ""
+        selected = artifact_fields.get(artifact, [])
         for token in selected:
             if token.startswith("attr:"):
                 key = token[5:]
@@ -385,12 +400,12 @@ def _text_for_embedding(
         timestamp_desc = row.get("timestamp_desc")
         if timestamp_desc:
             parts.append(f"time_desc={timestamp_desc}")
-        source = row.get("source")
-        if source:
-            parts.append(f"source={source}")
-        source_long = row.get("source_long")
-        if source_long:
-            parts.append(f"source_long={source_long}")
+        artifact = row.get("artifact")
+        if artifact:
+            parts.append(f"artifact={artifact}")
+        artifact_long = row.get("artifact_long")
+        if artifact_long:
+            parts.append(f"artifact_long={artifact_long}")
         display_name = row.get("display_name")
         if display_name:
             parts.append(f"display_name={display_name}")
@@ -412,18 +427,19 @@ def _qdrant_payload(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "event_id": str(row.get("event_id")),
         "case_id": row.get("case_id"),
-        "timeline_id": row.get("timeline_id"),
+        "source_id": row.get("source_id"),
         "source_file": str(row.get("source_file", "")),
         "byte_offset": row.get("byte_offset"),
         "line_number": row.get("line_number"),
         "content_hash": row.get("content_hash"),
+        "file_hash": row.get("file_hash"),
         "parser_name": row.get("parser_name"),
         "parser_version": row.get("parser_version"),
         "message": row.get("message"),
         "timestamp": row.get("timestamp"),
         "timestamp_desc": row.get("timestamp_desc"),
-        "source": row.get("source"),
-        "source_long": row.get("source_long"),
+        "artifact": row.get("artifact"),
+        "artifact_long": row.get("artifact_long"),
         "display_name": row.get("display_name"),
         "tags": row.get("tags"),
         "embedding_model": row.get("embedding_model"),

@@ -57,18 +57,18 @@ interface AnnotationCellProps {
   eventId: string;
   anns: Annotation[];
   caseId: string;
-  timelineId: string;
+  sourceId: string;
 }
 
 function TagPopover({
   eventId,
   anns,
   caseId,
-  timelineId,
+  sourceId,
 }: AnnotationCellProps) {
   const [open, setOpen] = useState(false);
   const [value, setValue] = useState("");
-  const { add, remove } = useAnnotationMutations(caseId, timelineId);
+  const { add, remove } = useAnnotationMutations(caseId, sourceId);
   const userTags = anns.filter((a) => a.annotation_type === "tag" && a.origin === "user");
 
   function submit() {
@@ -154,11 +154,11 @@ function CommentPopover({
   eventId,
   anns,
   caseId,
-  timelineId,
+  sourceId,
 }: AnnotationCellProps) {
   const [open, setOpen] = useState(false);
   const [value, setValue] = useState("");
-  const { add, remove } = useAnnotationMutations(caseId, timelineId);
+  const { add, remove } = useAnnotationMutations(caseId, sourceId);
   const userComments = anns.filter((a) => a.annotation_type === "comment" && a.origin === "user");
 
   function submit() {
@@ -242,8 +242,8 @@ function CommentPopover({
 }
 
 /** Mark-normal toggle button: adds/removes a "normal" user annotation. */
-function NormalToggle({ eventId, anns, caseId, timelineId }: AnnotationCellProps) {
-  const { add, remove } = useAnnotationMutations(caseId, timelineId);
+function NormalToggle({ eventId, anns, caseId, sourceId }: AnnotationCellProps) {
+  const { add, remove } = useAnnotationMutations(caseId, sourceId);
   const normalAnn = anns.find((a) => a.annotation_type === "normal" && a.origin === "user");
   const isNormal = !!normalAnn;
 
@@ -347,7 +347,7 @@ export function EventGrid({
             eventId={row.original.event_id}
             anns={annotations.get(row.original.event_id) ?? []}
             caseId={caseId}
-            timelineId={timelineId}
+            sourceId={row.original.source_id}
           />
         ),
       },
@@ -373,13 +373,46 @@ export function EventGrid({
           </span>
         ),
       },
-      source: {
-        id: "source",
-        header: "Source",
+      artifact: {
+        id: "artifact",
+        header: "Artifact",
         size: 140,
+        cell: ({ row }) => {
+          const value = row.original.artifact || row.original.source_file || null;
+          return (
+            <span className="font-mono text-xs truncate text-[var(--color-info)]">
+              {value ?? "—"}
+            </span>
+          );
+        },
+      },
+      artifact_long: {
+        id: "artifact_long",
+        header: "Artifact Long",
+        size: 180,
         cell: ({ row }) => (
           <span className="font-mono text-xs truncate text-[var(--color-info)]">
-            {row.original.source ?? "—"}
+            {row.original.artifact_long ?? "—"}
+          </span>
+        ),
+      },
+      source_id: {
+        id: "source_id",
+        header: "Source ID",
+        size: 160,
+        cell: ({ row }) => (
+          <span className="font-mono text-xs truncate text-[var(--color-fg-secondary)]">
+            {row.original.source_id}
+          </span>
+        ),
+      },
+      timestamp_desc: {
+        id: "timestamp_desc",
+        header: "Time Desc",
+        size: 140,
+        cell: ({ row }) => (
+          <span className="text-xs truncate text-[var(--color-fg-secondary)]">
+            {row.original.timestamp_desc ?? "—"}
           </span>
         ),
       },
@@ -445,9 +478,11 @@ export function EventGrid({
       },
     };
 
-    for (const colId of visibleColumns) {
-      // Retired column IDs that have been superseded
+    for (let colId of visibleColumns) {
+      // Retired column IDs that have been superseded by the model refactor.
       if (colId === "tags" || colId === "_annotations") continue;
+      if (colId === "source") colId = "artifact";
+      if (colId === "source_long") colId = "artifact_long";
       const def = colDefs[colId];
       if (def) {
         cols.push(def);

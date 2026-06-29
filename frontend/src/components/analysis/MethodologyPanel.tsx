@@ -3,7 +3,7 @@
  *
  * Shows a human-readable, reproducible record of:
  *   - Which embedding model was used
- *   - Exactly which fields of which sources were embedded
+ *   - Exactly which fields of which artifacts were embedded
  *   - The embedding config hash that pins this configuration
  *   - The active anomaly algorithm and its key parameters
  *
@@ -12,18 +12,18 @@
 import { useQuery } from "@tanstack/react-query";
 import { similarityApi } from "@/api/similarity";
 import { Info, Hash, Cpu, AlertTriangle, ShieldCheck } from "lucide-react";
-import type { Timeline } from "@/api/types";
+import type { Source } from "@/api/types";
 
 interface Props {
   caseId: string;
   timelineId: string;
-  timeline: Timeline;
+  source: Source | null;
 }
 
 const TOP_LEVEL_LABELS: Record<string, string> = {
   message: "Message",
   timestamp_desc: "Timestamp description",
-  source_long: "Source (long)",
+  artifact_long: "Artifact (long)",
   display_name: "Display name",
   tags: "Parser tags",
 };
@@ -33,16 +33,16 @@ function tokenLabel(token: string): string {
   return TOP_LEVEL_LABELS[token] ?? token;
 }
 
-export function MethodologyPanel({ caseId, timelineId, timeline }: Props) {
+export function MethodologyPanel({ caseId, timelineId, source }: Props) {
   const { data: anomalyData } = useQuery({
     queryKey: ["anomalies", caseId, timelineId],
     queryFn: () => similarityApi.listAnomalies(caseId, timelineId, 1, 100),
     staleTime: 60_000,
-    enabled: (timeline.vector_count ?? 0) > 0,
+    enabled: (source?.vector_count ?? 0) > 0,
   });
 
-  const cfg = timeline.embedding_config;
-  const hasVectors = (timeline.vector_count ?? 0) > 0;
+  const cfg = source?.embedding_config;
+  const hasVectors = (source?.vector_count ?? 0) > 0;
   const method = anomalyData?.method ?? "centroid-distance";
   const baselineSize = anomalyData?.baseline_size ?? 0;
   const sampleSize = anomalyData?.sample_size ?? 0;
@@ -60,7 +60,7 @@ export function MethodologyPanel({ caseId, timelineId, timeline }: Props) {
           <div className="flex items-start gap-2">
             <span className="text-[var(--color-fg-muted)] w-24 shrink-0">Model</span>
             <span className="font-mono text-[var(--color-fg-primary)] break-all">
-              {timeline.embedding_model ?? "all-MiniLM-L6-v2 (default)"}
+              {source?.embedding_model ?? "all-MiniLM-L6-v2 (default)"}
             </span>
           </div>
 
@@ -85,13 +85,13 @@ export function MethodologyPanel({ caseId, timelineId, timeline }: Props) {
         {/* Field selection */}
         {cfg ? (
           <div className="space-y-2">
-            {Object.entries(cfg.sources).map(([source, fields]) => (
+            {Object.entries(cfg.artifacts).map(([artifact, fields]) => (
               <div
-                key={source}
+                key={artifact}
                 className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] px-3 py-2.5 space-y-1.5"
               >
                 <p className="font-semibold font-mono text-[var(--color-fg-primary)]">
-                  {source || "(unknown source)"}
+                  {artifact || "(unknown artifact)"}
                 </p>
                 <div className="flex flex-wrap gap-1">
                   {(fields as string[]).map((f) => (
@@ -112,8 +112,8 @@ export function MethodologyPanel({ caseId, timelineId, timeline }: Props) {
         ) : hasVectors ? (
           <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] px-3 py-2.5">
             <p className="text-[var(--color-fg-muted)]">
-              Legacy embedding — all fields from all sources were included.
-              Re-embed with the wizard to configure per-source field selection.
+              Legacy embedding — all fields from all artifacts were included.
+              Re-embed with the wizard to configure per-artifact field selection.
             </p>
           </div>
         ) : null}

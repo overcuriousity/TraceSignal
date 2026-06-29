@@ -26,6 +26,7 @@ def _get_query_service() -> EventQueryService:
         _query_service = EventQueryService()
     return _query_service
 
+
 router = APIRouter(prefix="/api/cases", tags=["events"])
 
 _store: PostgresStore | None = None
@@ -55,12 +56,23 @@ def _parse_json_object(value: str | None) -> dict[str, str]:
     return {str(k): str(v) for k, v in parsed.items()}
 
 
+async def _resolve_timeline_source_ids(case_id: str, timeline_id: str) -> list[str]:
+    """Return the source IDs attached to a timeline."""
+    store = get_store()
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+    sources = await store.list_timeline_sources(case_id, timeline_id)
+    return [s.id for s in sources]
+
+
 @router.get("/{case_id}/timelines/{timeline_id}/events")
 async def list_events(
     case_id: str,
     timeline_id: str,
     q: str | None = Query(default=None, description="Full-text search in message"),
-    source: str | None = Query(default=None),
+    artifact: str | None = Query(default=None),
+    source_id: str | None = Query(default=None),
     tag: str | None = Query(default=None),
     exclude_tag: str | None = Query(default=None),
     start: datetime | None = Query(default=None),  # noqa: B008
@@ -81,18 +93,16 @@ async def list_events(
     if order not in ("asc", "desc"):
         order = "desc"
 
-    store = get_store()
-    timeline = await store.get_timeline(case_id, timeline_id)
-    if timeline is None:
-        raise HTTPException(status_code=404, detail="Timeline not found")
+    source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
 
     service = _get_query_service()
     page = service.query(
         EventQuery(
             case_id=case_id,
-            timeline_id=timeline_id,
+            source_ids=source_ids,
             q=q,
-            source=source,
+            artifact=artifact,
+            source_id=source_id,
             tag=tag,
             exclude_tag=exclude_tag,
             start=start,
@@ -124,13 +134,9 @@ async def list_fields(
     Map across a sample of up to 50 000 events.  Useful for building a column
     picker in the UI.
     """
-    store = get_store()
-    timeline = await store.get_timeline(case_id, timeline_id)
-    if timeline is None:
-        raise HTTPException(status_code=404, detail="Timeline not found")
-
+    source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
     service = _get_query_service()
-    return service.list_fields(case_id, timeline_id)
+    return service.list_fields(case_id, source_ids)
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/embedding-fields")
@@ -138,20 +144,16 @@ async def list_embedding_fields(
     case_id: str,
     timeline_id: str,
 ) -> dict[str, Any]:
-    """Return per-source field information for the embedding wizard.
+    """Return per-artifact field information for the embedding wizard.
 
-    For each distinct ``source`` in the timeline, returns the event count,
-    the embeddable top-level fields, available attribute keys, and a
-    recommended preselection.  Used by the frontend embedding wizard to
-    let analysts choose which fields of which sources to embed.
+    For each distinct ``artifact`` across the timeline's sources, returns the
+    event count, the embeddable top-level fields, available attribute keys, and
+    a recommended preselection.  Used by the frontend embedding wizard to let
+    analysts choose which fields of which artifacts to embed.
     """
-    store = get_store()
-    timeline = await store.get_timeline(case_id, timeline_id)
-    if timeline is None:
-        raise HTTPException(status_code=404, detail="Timeline not found")
-
+    source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
     service = _get_query_service()
-    return service.list_fields_by_source(case_id, timeline_id)
+    return service.list_fields_by_artifact(case_id, source_ids)
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/histogram")
@@ -159,7 +161,8 @@ async def get_histogram(
     case_id: str,
     timeline_id: str,
     q: str | None = Query(default=None),
-    source: str | None = Query(default=None),
+    artifact: str | None = Query(default=None),
+    source_id: str | None = Query(default=None),
     tag: str | None = Query(default=None),
     exclude_tag: str | None = Query(default=None),
     start: datetime | None = Query(default=None),  # noqa: B008
@@ -175,18 +178,15 @@ async def get_histogram(
     target number of time buckets (10–200, default 60); the actual interval is
     ``max(1, duration / buckets)`` seconds.
     """
-    store = get_store()
-    timeline = await store.get_timeline(case_id, timeline_id)
-    if timeline is None:
-        raise HTTPException(status_code=404, detail="Timeline not found")
-
+    source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
     service = _get_query_service()
     return service.histogram(
         EventQuery(
             case_id=case_id,
-            timeline_id=timeline_id,
+            source_ids=source_ids,
             q=q,
-            source=source,
+            artifact=artifact,
+            source_id=source_id,
             tag=tag,
             exclude_tag=exclude_tag,
             start=start,
@@ -205,7 +205,8 @@ class ExportFilter(BaseModel):
     """Filter parameters for event export."""
 
     q: str | None = None
-    source: str | None = None
+    artifact: str | None = None
+    source_id: str | None = None
     tag: str | None = None
     exclude_tag: str | None = None
     start: datetime | None = None
@@ -229,12 +230,15 @@ _CSV_COLUMNS = [
     "event_id",
     "timestamp",
     "timestamp_desc",
-    "source",
-    "source_long",
+    "source_id",
+    "artifact",
+    "artifact_long",
     "display_name",
     "message",
     "tags",
     "attributes",
+    "content_hash",
+    "file_hash",
 ]
 
 
@@ -284,16 +288,14 @@ async def export_events(
     body: ExportRequest,
 ) -> StreamingResponse:
     """Stream all events matching the given filters as CSV or JSONL."""
-    store = get_store()
-    timeline = await store.get_timeline(case_id, timeline_id)
-    if timeline is None:
-        raise HTTPException(status_code=404, detail="Timeline not found")
+    source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
 
     eq = EventQuery(
         case_id=case_id,
-        timeline_id=timeline_id,
+        source_ids=source_ids,
         q=body.filter.q,
-        source=body.filter.source,
+        artifact=body.filter.artifact,
+        source_id=body.filter.source_id,
         tag=body.filter.tag,
         exclude_tag=body.filter.exclude_tag,
         start=body.filter.start,
@@ -340,17 +342,13 @@ async def find_similar_events(
 ) -> dict[str, Any]:
     """Return events semantically similar to ``event_id`` using vector search.
 
-    Requires embeddings to have been generated for the timeline.  Returns
-    ``status="not_embedded"`` when no vectors exist, ``status="vector_not_found"``
-    when the specific event has no vector.
+    Requires embeddings to have been generated for the timeline's sources.
+    Returns ``status="not_embedded"`` when no vectors exist,
+    ``status="vector_not_found"`` when the specific event has no vector.
     """
-    store = get_store()
-    timeline = await store.get_timeline(case_id, timeline_id)
-    if timeline is None:
-        raise HTTPException(status_code=404, detail="Timeline not found")
-
+    source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
     svc = _get_similarity_service()
-    result = svc.find_similar(case_id, timeline_id, event_id, limit=limit)
+    result = svc.find_similar(case_id, source_ids, event_id, limit=limit)
     return {
         "status": result.status,
         "results": [
@@ -374,18 +372,13 @@ async def list_anomalies(
     Requires embeddings to have been generated first.
     """
     store = get_store()
-    timeline = await store.get_timeline(case_id, timeline_id)
-    if timeline is None:
-        raise HTTPException(status_code=404, detail="Timeline not found")
-
+    source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
     svc = _get_similarity_service()
-    # Resolve normal IDs here (in async context) before calling sync find_anomalies.
     normal_ids = await store.list_event_ids_by_annotation_type(
-        case_id, timeline_id, "normal"
+        case_id, source_ids, "normal"
     )
     result = svc.find_anomalies(
-        case_id, timeline_id, limit=limit, sample_size=sample_size,
-        normal_ids=normal_ids,
+        case_id, source_ids, limit=limit, sample_size=sample_size, normal_ids=normal_ids
     )
     return {
         "status": result.status,
@@ -420,9 +413,9 @@ async def tag_anomalies(
 ) -> dict[str, Any]:
     """Re-compute outliers and persist them as system annotations.
 
-    Clears any existing system outlier annotations for the timeline first,
-    so repeated calls replace rather than accumulate results.  Each outlier
-    receives:
+    Clears any existing system outlier annotations for the timeline's sources
+    first, so repeated calls replace rather than accumulate results.  Each
+    outlier receives:
     - ``annotation_type="outlier"`` / ``origin="system"``
     - A human-readable ``content`` summarising the score.
     - A structured ``details`` JSON with the raw math for the Analysis panel.
@@ -430,16 +423,13 @@ async def tag_anomalies(
     Returns the same result shape as ``GET /anomalies`` plus a ``tagged`` count.
     """
     store = get_store()
-    timeline = await store.get_timeline(case_id, timeline_id)
-    if timeline is None:
-        raise HTTPException(status_code=404, detail="Timeline not found")
-
+    source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
     svc = _get_similarity_service()
     normal_ids = await store.list_event_ids_by_annotation_type(
-        case_id, timeline_id, "normal"
+        case_id, source_ids, "normal"
     )
     result = svc.find_anomalies(
-        case_id, timeline_id, limit=body.limit, sample_size=body.sample_size,
+        case_id, source_ids, limit=body.limit, sample_size=body.sample_size,
         normal_ids=normal_ids,
     )
 
@@ -454,8 +444,8 @@ async def tag_anomalies(
             "results": [],
         }
 
-    # Clear prior system outlier annotations for this timeline.
-    await store.delete_system_annotations(case_id, timeline_id, "outlier")
+    # Clear prior system outlier annotations for this timeline's sources.
+    await store.delete_system_annotations(case_id, source_ids, "outlier")
 
     # Write one system annotation per outlier.
     rows = []
@@ -469,14 +459,14 @@ async def tag_anomalies(
             )
         else:
             content = (
-                f"Outlier — cosine distance {d['distance']:.4f} from timeline centroid "
+                f"Outlier — cosine distance {d['distance']:.4f} from source centroid "
                 f"(rank {d['rank']}/{d['of']}, sample {d.get('sample_size', '?')})"
             )
         rows.append(
             {
                 "annotation_id": generate_id(f"{r.event_id}_outlier"),
                 "case_id": case_id,
-                "timeline_id": timeline_id,
+                "source_id": r.event.get("source_id", ""),
                 "event_id": r.event_id,
                 "annotation_type": "outlier",
                 "content": content,

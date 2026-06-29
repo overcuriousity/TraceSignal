@@ -17,7 +17,7 @@ describe("filtersToParams / paramsToFilters round-trip", () => {
   it("round-trips simple scalar filters", () => {
     const f: EventFilters = {
       q: "powershell",
-      source: "WinEvtx",
+      artifact: "WinEvtx",
       tag: "suspicious",
       start: "2024-01-01T00:00:00.000Z",
       end: "2024-01-31T23:59:59.000Z",
@@ -25,7 +25,7 @@ describe("filtersToParams / paramsToFilters round-trip", () => {
     const p = filtersToParams(f);
     const out = paramsToFilters(p);
     expect(out.q).toBe("powershell");
-    expect(out.source).toBe("WinEvtx");
+    expect(out.artifact).toBe("WinEvtx");
     expect(out.tag).toBe("suspicious");
     expect(out.start).toBe("2024-01-01T00:00:00.000Z");
     expect(out.end).toBe("2024-01-31T23:59:59.000Z");
@@ -45,7 +45,7 @@ describe("filtersToParams / paramsToFilters round-trip", () => {
   it("omits undefined fields from params", () => {
     const f: EventFilters = { q: "test" };
     const p = filtersToParams(f);
-    expect(p.has("source")).toBe(false);
+    expect(p.has("artifact")).toBe(false);
     expect(p.has("tag")).toBe(false);
     expect(p.has("filters")).toBe(false);
   });

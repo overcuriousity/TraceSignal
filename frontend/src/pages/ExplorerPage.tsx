@@ -84,10 +84,10 @@ export function ExplorerPage() {
    * Handler wired to the detail panel's filter-in/filter-out buttons.
    *
    * Special cases:
-   *   - filterKey "q"      → sets the top-level full-text search param
-   *   - filterKey "source" → sets the dedicated source param (include only)
-   *   - filterKey "tag"    → sets the dedicated tag param (include only)
-   *   - everything else    → goes into filters{} or exclusions{}
+   *   - filterKey "q"       → sets the top-level full-text search param
+   *   - filterKey "artifact" → sets the dedicated artifact param (include only)
+   *   - filterKey "tag"     → sets the dedicated tag param (include only)
+   *   - everything else     → goes into filters{} or exclusions{}
    */
   const handleAddFilter = useCallback(
     (fieldKey: string, value: string, include: boolean) => {
@@ -96,11 +96,11 @@ export function ExplorerPage() {
       if (fieldKey === "q") {
         // Full-text search: always "include" (no exclusion concept for free text)
         f.q = value;
-      } else if (fieldKey === "source") {
+      } else if (fieldKey === "artifact") {
         if (include) {
-          f.source = value;
+          f.artifact = value;
         } else {
-          f.exclusions = { ...(f.exclusions ?? {}), source: value };
+          f.exclusions = { ...(f.exclusions ?? {}), artifact: value };
         }
       } else if (fieldKey === "tag") {
         if (include) {
@@ -145,6 +145,12 @@ export function ExplorerPage() {
   const { data: timeline } = useQuery({
     queryKey: ["timeline", caseId, timelineId],
     queryFn: () => timelinesApi.get(caseId!, timelineId!),
+    enabled: !!(caseId && timelineId),
+  });
+
+  const { data: timelineSources } = useQuery({
+    queryKey: ["timeline-sources", caseId, timelineId],
+    queryFn: () => timelinesApi.listSources(caseId!, timelineId!),
     enabled: !!(caseId && timelineId),
   });
 
@@ -200,7 +206,8 @@ export function ExplorerPage() {
 
   const events = useMemo(() => eventsData?.pages.flatMap((p) => p.events) ?? [], [eventsData]);
   const total = eventsData?.pages[0]?.total ?? 0;
-  const hasVectors = (timeline?.vector_count ?? 0) > 0;
+  const hasVectors =
+    (timelineSources?.some((s) => s.vector_count > 0) ?? false);
 
   // ── Handlers ───────────────────────────────────────────────────────────
   const handleToggleSelect = useCallback((id: string) => {
@@ -361,7 +368,7 @@ const handleFindSimilar = useCallback((event: Event) => {
                     event={expandedEvent}
                     annotations={annotationMap.get(expandedEvent.event_id) ?? []}
                     caseId={caseId!}
-                    timelineId={timelineId!}
+                    sourceId={expandedEvent.source_id}
                     onClose={() => setExpandedEvent(null)}
                     onFindSimilar={handleFindSimilar}
                     onAddFilter={handleAddFilter}
@@ -388,9 +395,8 @@ const handleFindSimilar = useCallback((event: Event) => {
 
               {/* Bulk action bar */}
               <BulkActionBar
-                selectedIds={[...selectedIds]}
+                selectedEvents={events.filter((e) => selectedIds.has(e.event_id))}
                 caseId={caseId!}
-                timelineId={timelineId!}
                 onClear={() => setSelectedIds(new Set())}
               />
             </div>
