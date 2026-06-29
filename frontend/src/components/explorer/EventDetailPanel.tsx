@@ -338,15 +338,15 @@ export function EventDetailPanel({
         </div>
 
         {/* Parser tags */}
-        {event.tags.length > 0 && (
+        {(event.tags ?? []).length > 0 && (
           <div className="mb-3">
             <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
               Parser Tags
             </p>
             <div className="flex flex-wrap gap-1">
-              {event.tags.map((t, i) => (
+              {(event.tags ?? []).map((t) => (
                 <button
-                  key={i}
+                  key={t}
                   className="group/tag flex items-center gap-1"
                   onClick={() => onAddFilter("tag", t, true)}
                   title={`Filter IN: tag = ${t}`}
@@ -364,7 +364,7 @@ export function EventDetailPanel({
         )}
 
         {/* Attributes — every row has filter-in / filter-out */}
-        {Object.keys(event.attributes).length > 0 && (
+        {Object.keys(event.attributes ?? {}).length > 0 && (
           <div className="mb-3">
             <p className="mb-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
               Attributes
@@ -372,7 +372,7 @@ export function EventDetailPanel({
                 hover to filter
               </span>
             </p>
-            {Object.entries(event.attributes).map(([k, v]) => (
+            {Object.entries(event.attributes ?? {}).map(([k, v]) => (
               <FieldRow
                 key={k}
                 label={k}

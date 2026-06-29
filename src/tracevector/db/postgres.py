@@ -426,13 +426,17 @@ class PostgresStore:
         embedding_config: dict,
     ) -> None:
         """Persist the analyst's per-source field selection on the timeline."""
-        timeline = await self.get_timeline(case_id, timeline_id)
-        if timeline is None:
-            return
-        timeline.embedding_config = embedding_config
-        timeline.updated_at = datetime.now(UTC)
         async with self.session_factory() as session:
-            session.add(timeline)
+            result = await session.execute(
+                update(Timeline)
+                .where(Timeline.case_id == case_id, Timeline.id == timeline_id)
+                .values(
+                    embedding_config=embedding_config,
+                    updated_at=datetime.now(UTC),
+                )
+            )
+            if result.rowcount == 0:
+                return
             await session.commit()
 
     async def list_event_ids_by_annotation_type(
@@ -450,12 +454,14 @@ class PostgresStore:
 
         async with self.session_factory() as session:
             result = await session.execute(
-                select(Annotation.event_id).where(
+                select(Annotation.event_id)
+                .where(
                     Annotation.case_id == case_id,
                     Annotation.timeline_id == timeline_id,
                     Annotation.annotation_type == annotation_type,
                     Annotation.origin == origin,
                 )
+                .distinct()
             )
             return [row[0] for row in result.all()]
 

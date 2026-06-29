@@ -9,7 +9,7 @@
  * All filter state lives in the URL so investigation links are shareable.
  * Filter-in / Filter-out from the detail panel adds directly to the URL.
  */
-import { useState, useCallback, useMemo } from "react";
+import { useState, useCallback, useMemo, useEffect } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
 import { useQuery, useInfiniteQuery } from "@tanstack/react-query";
 import {
@@ -135,6 +135,12 @@ export function ExplorerPage() {
   const sortDir = useUiStore((s) => s.sortDir);
   const setSortDir = useUiStore((s) => s.setSortDir);
 
+  // Clear selection when filters or sort direction change so stale IDs are
+  // never bulk-annotated against a different result set.
+  useEffect(() => {
+    setSelectedIds(new Set());
+  }, [filters, sortDir]);
+
   // ── Data queries ───────────────────────────────────────────────────────
   const { data: timeline } = useQuery({
     queryKey: ["timeline", caseId, timelineId],
@@ -152,18 +158,17 @@ export function ExplorerPage() {
     hasNextPage,
   } = useInfiniteQuery({
     queryKey: ["events", caseId, timelineId, filters, sortDir],
-    queryFn: ({ pageParam }) =>
-      eventsApi.list(caseId!, timelineId!, {
-        ...filters,
-        limit: PAGE_SIZE,
-        offset: pageParam,
-        order: sortDir,
-      }),
+    queryFn: ({ pageParam, signal }) =>
+      eventsApi.list(
+        caseId!,
+        timelineId!,
+        { ...filters, limit: PAGE_SIZE, offset: pageParam, order: sortDir },
+        signal,
+      ),
     initialPageParam: 0,
-    getNextPageParam: (_lastPage, allPages) => {
+    getNextPageParam: (lastPage, allPages) => {
       const loaded = allPages.reduce((sum, p) => sum + p.events.length, 0);
-      const total = allPages[0]?.total ?? 0;
-      return loaded < total ? loaded : undefined;
+      return loaded < lastPage.total ? loaded : undefined;
     },
     enabled: !!(caseId && timelineId),
     placeholderData: (prev) => prev,

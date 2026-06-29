@@ -10,8 +10,6 @@ from tracevector.api.main import create_app
 _FRONTEND_DIR = Path(__file__).resolve().parents[3] / "frontend"
 _FRONTEND_DIST = _FRONTEND_DIR / "dist"
 
-app = create_app()
-
 
 def _build_frontend() -> None:
     if _FRONTEND_DIST.is_dir():
@@ -21,8 +19,11 @@ def _build_frontend() -> None:
     subprocess.run(["npm", "run", "build"], cwd=_FRONTEND_DIR, check=True)
 
 
+_build_frontend()
+app = create_app()
+
+
 def start() -> None:
-    _build_frontend()
     uvicorn.run(
         "tracevector.web.app:app",
         host="0.0.0.0",

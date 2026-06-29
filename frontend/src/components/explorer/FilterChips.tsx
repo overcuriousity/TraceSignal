@@ -73,9 +73,9 @@ export function FilterChips({ filters, onRemove }: Props) {
 
   return (
     <div className="flex flex-wrap gap-1.5">
-      {chips.map((chip, i) => (
+      {chips.map((chip) => (
         <span
-          key={i}
+          key={`${chip.label}:${chip.value}`}
           className={`inline-flex items-center gap-1 rounded px-2 py-0.5 text-xs font-mono leading-none border ${
             chip.variant === "include"
               ? "bg-[var(--color-info-dim)] text-[var(--color-info)] border-[var(--color-info)]/30"

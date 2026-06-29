@@ -411,8 +411,8 @@ export function EventGrid({
               </span>
               {hasTags && (
                 <div className="flex flex-wrap gap-0.5">
-                  {parserTags.slice(0, 5).map((t, i) => (
-                    <Badge key={i} variant="muted" className="text-[11px] py-0 leading-tight">
+                  {parserTags.slice(0, 5).map((t) => (
+                    <Badge key={t} variant="muted" className="text-[11px] py-0 leading-tight">
                       {t}
                     </Badge>
                   ))}
@@ -433,10 +433,10 @@ export function EventGrid({
         header: "Parser Tags",
         size: 120,
         cell: ({ row }) =>
-          row.original.tags.length > 0 ? (
+          (row.original.tags ?? []).length > 0 ? (
             <span className="flex flex-wrap gap-0.5">
-              {row.original.tags.slice(0, 3).map((t, i) => (
-                <Badge key={i} variant="muted">
+              {row.original.tags.slice(0, 3).map((t) => (
+                <Badge key={t} variant="muted">
                   {t}
                 </Badge>
               ))}

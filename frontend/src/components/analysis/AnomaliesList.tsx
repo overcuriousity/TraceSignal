@@ -135,7 +135,7 @@ export function AnomaliesList({ caseId, timelineId, onSelectEvent }: Props) {
               </span>
             </div>
             <p className="text-xs text-[var(--color-fg-secondary)] leading-relaxed">
-              {truncate(r.event.message, 160)}
+              {truncate(r.event.message ?? "", 160)}
             </p>
           </button>
         ))}

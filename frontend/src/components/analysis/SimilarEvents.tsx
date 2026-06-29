@@ -44,7 +44,7 @@ export function SimilarEvents({
       <div className="rounded border border-[var(--color-accent)]/30 bg-[var(--color-accent-dim)] px-3 py-2 text-xs">
         <p className="text-[var(--color-fg-muted)] mb-0.5">Anchor</p>
         <p className="text-[var(--color-fg-primary)]">
-          {truncate(anchorEvent.message, 120)}
+          {truncate(anchorEvent.message ?? "", 120)}
         </p>
       </div>
 
@@ -79,7 +79,7 @@ export function SimilarEvents({
             </span>
           </div>
           <p className="text-xs text-[var(--color-fg-secondary)]">
-            {truncate(r.event.message, 140)}
+            {truncate(r.event.message ?? "", 140)}
           </p>
         </button>
       ))}

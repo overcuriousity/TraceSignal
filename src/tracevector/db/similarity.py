@@ -277,6 +277,27 @@ class SimilarityService:
         Uses Qdrant's Recommendation API with the normal events as negatives.
         Normal events are excluded from the returned results.
         """
+        # Filter normal_ids to only those that exist in the Qdrant collection.
+        # IDs come from Postgres annotations which may predate embedding.
+        existing_points = self.qdrant.client.retrieve(
+            collection_name=collection,
+            ids=normal_ids,
+            with_vectors=False,
+            with_payload=False,
+        )
+        existing_ids = [str(p.id) for p in existing_points]
+        if not existing_ids:
+            return AnomalyResult(
+                status="ok",
+                results=[],
+                sample_size=0,
+                embedding_config_hash=config_hash,
+                baseline_size=0,
+                method="normal-baseline",
+            )
+        normal_ids = existing_ids
+        normal_id_set = set(existing_ids)
+
         # Request extra results so we can drop normal events from the list.
         fetch_limit = limit + len(normal_ids)
         hits = self.qdrant.recommend_anomalies(
@@ -344,7 +365,7 @@ class SimilarityService:
                 "method": "normal-baseline",
                 "distance": round(distance, 6),
                 "rank": rank,
-                "of": limit,
+                "of": len(hits),
                 "baseline_size": len(normal_ids),
                 "embedding_config_hash": config_hash,
             }

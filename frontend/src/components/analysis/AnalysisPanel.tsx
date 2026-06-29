@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { X, AlertTriangle, Search, BookOpen } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { AnomaliesList } from "./AnomaliesList";
@@ -33,8 +33,10 @@ export function AnalysisPanel({
 }: Props) {
   const [tab, setTab] = useState<Tab>(similarAnchor ? "similar" : "anomalies");
 
-  // Auto-switch to similar when anchor is set
-  if (similarAnchor && tab !== "similar") setTab("similar");
+  // Auto-switch to the similar tab when the anchor event is set.
+  useEffect(() => {
+    if (similarAnchor) setTab("similar");
+  }, [similarAnchor]);
 
   return (
     <div className="flex h-full w-80 shrink-0 flex-col border-l border-[var(--color-border)] bg-[var(--color-bg-surface)]">

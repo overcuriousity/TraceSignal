@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Tag, MessageSquare, ShieldCheck, X } from "lucide-react";
+import { Tag, MessageSquare, ShieldCheck, X, AlertCircle } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Spinner } from "@/components/ui/Spinner";
@@ -15,37 +15,50 @@ interface Props {
 export function BulkActionBar({ selectedIds, caseId, timelineId, onClear }: Props) {
   const [mode, setMode] = useState<"tag" | "comment" | null>(null);
   const [value, setValue] = useState("");
+  const [error, setError] = useState<string | null>(null);
   const { add } = useAnnotationMutations(caseId, timelineId);
 
   function applyToAll() {
     if (!mode || !value.trim()) return;
+    setError(null);
     const type = mode === "tag" ? "tag" : "comment";
-    // Fire all creates in parallel; the shared hook invalidates on success.
     Promise.all(
       selectedIds.map((eventId) =>
         add.mutateAsync({ eventId, type, content: value.trim() }),
       ),
-    ).finally(() => {
+    ).then(() => {
       onClear();
       setMode(null);
       setValue("");
+    }).catch((err: Error) => {
+      setError(err.message);
     });
   }
 
   function markAllNormal() {
+    setError(null);
     Promise.all(
       selectedIds.map((eventId) =>
         add.mutateAsync({ eventId, type: "normal", content: "normal operation" }),
       ),
-    ).finally(() => {
+    ).then(() => {
       onClear();
+    }).catch((err: Error) => {
+      setError(err.message);
     });
   }
 
   if (selectedIds.length === 0) return null;
 
   return (
-    <div className="flex items-center gap-3 border-t border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-4 py-2.5">
+    <div className="flex flex-col border-t border-[var(--color-border)] bg-[var(--color-bg-elevated)]">
+      {error && (
+        <div className="flex items-center gap-1.5 px-4 py-1.5 text-xs text-[var(--color-danger)] bg-[var(--color-danger-dim)]">
+          <AlertCircle size={12} />
+          {error}
+        </div>
+      )}
+      <div className="flex items-center gap-3 px-4 py-2.5">
       <span className="text-xs font-medium text-[var(--color-fg-secondary)]">
         {selectedIds.length} selected
       </span>
@@ -106,6 +119,7 @@ export function BulkActionBar({ selectedIds, caseId, timelineId, onClear }: Prop
           </Button>
         </>
       )}
+      </div>
     </div>
   );
 }
