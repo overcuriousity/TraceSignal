@@ -255,7 +255,7 @@ export function ExplorerPage() {
             <Button
               variant="ghost"
               size="icon"
-              onClick={() => setFilterRailOpen((o) => !o)}
+              onClick={() => setFilterRailOpen(!filterRailOpen)}
               className={hasActiveFilters && !filterRailOpen ? "text-[var(--color-accent)]" : ""}
             >
               {filterRailOpen ? <PanelLeftClose size={15} /> : <PanelLeftOpen size={15} />}
@@ -315,7 +315,7 @@ export function ExplorerPage() {
               <Button
                 variant={analysisPanelOpen ? "accent" : "outline"}
                 size="sm"
-                onClick={() => setAnalysisPanelOpen((o) => !o)}
+                onClick={() => setAnalysisPanelOpen(!analysisPanelOpen)}
               >
                 <FlaskConical size={13} />
                 Analysis

@@ -1,14 +1,28 @@
 """Entry point for the TraceVector web server."""
 
+import subprocess
+from pathlib import Path
+
 import uvicorn
 
 from tracevector.api.main import create_app
 
+_FRONTEND_DIR = Path(__file__).resolve().parents[3] / "frontend"
+_FRONTEND_DIST = _FRONTEND_DIR / "dist"
+
 app = create_app()
 
 
+def _build_frontend() -> None:
+    if _FRONTEND_DIST.is_dir():
+        return
+    print("frontend/dist not found — installing dependencies and building frontend...")
+    subprocess.run(["npm", "install"], cwd=_FRONTEND_DIR, check=True)
+    subprocess.run(["npm", "run", "build"], cwd=_FRONTEND_DIR, check=True)
+
+
 def start() -> None:
-    """Start the Uvicorn server."""
+    _build_frontend()
     uvicorn.run(
         "tracevector.web.app:app",
         host="0.0.0.0",
