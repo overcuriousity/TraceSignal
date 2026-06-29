@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/Button";
 import { fmtTimestampFull, fmtRelative } from "@/lib/time";
 import { truncateHash } from "@/lib/format";
 import { Tooltip } from "@/components/ui/Tooltip";
-import type { Event } from "@/api/types";
+import type { Event, Annotation } from "@/api/types";
 
 interface Props {
   event: Event;
