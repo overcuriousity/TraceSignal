@@ -23,24 +23,9 @@ uv sync
 uv run tv-web
 ```
 
-The web UI is available at `http://localhost:8080` (OpenAPI docs at `/api/docs`).
+The API is available at `http://localhost:8080` (OpenAPI docs at `/api/docs`).
 
-`tv-web` builds the frontend automatically on first run if `frontend/dist` is missing. This requires Node.js/npm to be installed. If you prefer to build it manually:
-
-```bash
-cd frontend
-npm install
-npm run build
-cd ..
-```
-
-For development, start the Vue frontend separately:
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
+The frontend is being redesigned — tech stack TBD.
 
 ## Documentation
 
