@@ -24,8 +24,8 @@ export function ToastItem({
 }: ToastItemProps) {
   const variantClass = {
     default: "border-[var(--color-border-strong)]",
-    success: "border-[var(--color-success)] border-opacity-40",
-    danger: "border-[var(--color-danger)] border-opacity-40",
+    success: "border-[var(--color-success)]/40",
+    danger: "border-[var(--color-danger)]/40",
   }[variant];
 
   return (

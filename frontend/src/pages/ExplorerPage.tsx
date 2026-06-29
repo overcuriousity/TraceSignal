@@ -11,15 +11,13 @@
  */
 import { useState, useCallback, useMemo } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useInfiniteQuery } from "@tanstack/react-query";
 import {
   FlaskConical,
   RefreshCw,
   PanelLeftClose,
   PanelLeftOpen,
   BarChart2,
-  ArrowDownAZ,
-  ArrowUpAZ,
 } from "lucide-react";
 
 import { eventsApi } from "@/api/events";
@@ -58,11 +56,9 @@ export function ExplorerPage() {
 
   // ── Filter state (URL-driven) ──────────────────────────────────────────
   const filters = useMemo(() => paramsToFilters(searchParams), [searchParams]);
-  const [offset, setOffset] = useState(0);
 
   const setFilters = useCallback(
     (f: EventFilters) => {
-      setOffset(0);
       setSearchParams(filtersToParams(f));
     },
     [setSearchParams],
@@ -150,20 +146,28 @@ export function ExplorerPage() {
   });
 
   const {
-    data: eventsPage,
+    data: eventsData,
     isLoading: eventsLoading,
     isFetching,
     isError: eventsError,
     refetch,
-  } = useQuery({
-    queryKey: ["events", caseId, timelineId, filters, offset, sortDir],
-    queryFn: () =>
+    fetchNextPage,
+    hasNextPage,
+  } = useInfiniteQuery({
+    queryKey: ["events", caseId, timelineId, filters, sortDir],
+    queryFn: ({ pageParam }) =>
       eventsApi.list(caseId!, timelineId!, {
         ...filters,
         limit: PAGE_SIZE,
-        offset,
+        offset: pageParam,
         order: sortDir,
       }),
+    initialPageParam: 0,
+    getNextPageParam: (_lastPage, allPages) => {
+      const loaded = allPages.reduce((sum, p) => sum + p.events.length, 0);
+      const total = allPages[0]?.total ?? 0;
+      return loaded < total ? loaded : undefined;
+    },
     enabled: !!(caseId && timelineId),
     placeholderData: (prev) => prev,
   });
@@ -192,8 +196,8 @@ export function ExplorerPage() {
     return m;
   }, [annotations]);
 
-  const events = eventsPage?.events ?? [];
-  const total = eventsPage?.total ?? 0;
+  const events = useMemo(() => eventsData?.pages.flatMap((p) => p.events) ?? [], [eventsData]);
+  const total = eventsData?.pages[0]?.total ?? 0;
   const hasVectors = (timeline?.vector_count ?? 0) > 0;
 
   // ── Handlers ───────────────────────────────────────────────────────────
@@ -207,8 +211,8 @@ export function ExplorerPage() {
   }, []);
 
   const handleLoadMore = useCallback(() => {
-    if (!isFetching && events.length < total) setOffset((o) => o + PAGE_SIZE);
-  }, [isFetching, events.length, total]);
+    if (!isFetching && hasNextPage) fetchNextPage();
+  }, [isFetching, hasNextPage, fetchNextPage]);
 
   const handleEmbed = useCallback(async () => {
     if (!caseId || !timelineId || !timeline) return;
@@ -276,16 +280,6 @@ export function ExplorerPage() {
           <div className="flex items-center gap-1.5 shrink-0 ml-auto">
             <TriageMeter annotations={annotations ?? []} totalEvents={total} />
 
-            <Tooltip content={sortDir === "desc" ? "Newest first (click for oldest first)" : "Oldest first (click for newest first)"}>
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={() => setSortDir(sortDir === "desc" ? "asc" : "desc")}
-              >
-                {sortDir === "desc" ? <ArrowDownAZ size={14} /> : <ArrowUpAZ size={14} />}
-              </Button>
-            </Tooltip>
-
             <Tooltip content={histogramOpen ? "Hide histogram" : "Show histogram"}>
               <Button
                 variant={histogramOpen ? "accent" : "ghost"}
@@ -336,7 +330,7 @@ export function ExplorerPage() {
 
         {/* Main area */}
         <div className="flex flex-1 min-h-0 overflow-hidden">
-          {eventsLoading && !eventsPage ? (
+          {eventsLoading && !eventsData ? (
             <div className="flex flex-1 items-center justify-center">
               <Spinner size={24} />
             </div>
@@ -351,7 +345,6 @@ export function ExplorerPage() {
                 <EventGrid
                   events={events}
                   total={total}
-                  offset={offset}
                   annotations={annotationMap}
                   selectedIds={selectedIds}
                   caseId={caseId!}
@@ -362,6 +355,8 @@ export function ExplorerPage() {
                   onLoadMore={handleLoadMore}
                   isFetching={isFetching}
                   visibleColumns={visibleColumns}
+                  sortDir={sortDir}
+                  onSortToggle={() => setSortDir(sortDir === "desc" ? "asc" : "desc")}
                 />
 
                 {/* Detail panel */}

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { X, Copy, Search, Filter, FilterX, Tag, MessageSquare, Trash2, Plus, Clock } from "lucide-react";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
@@ -8,6 +8,7 @@ import { fmtTimestampFull, fmtRelative } from "@/lib/time";
 import { truncateHash } from "@/lib/format";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { useAnnotationMutations } from "@/hooks/useAnnotationMutations";
+import { useUiStore } from "@/stores/ui";
 import type { Event, Annotation } from "@/api/types";
 
 interface Props {
@@ -63,7 +64,7 @@ function FieldRow({
 
   return (
     <div className="group flex items-start gap-1.5 py-1.5 border-b border-[var(--color-border-subtle)] hover:bg-[var(--color-bg-hover)] -mx-2 px-2 rounded-sm transition-base">
-      <span className="w-32 shrink-0 text-xs text-[var(--color-fg-muted)] pt-0.5 select-none">
+      <span className="w-32 shrink-0 text-xs text-[var(--color-fg-secondary)] pt-0.5 select-none">
         {label}
       </span>
       <span
@@ -159,6 +160,33 @@ export function EventDetailPanel({
   const [addMode, setAddMode] = useState<"tag" | "comment" | null>(null);
   const { add, remove } = useAnnotationMutations(caseId, timelineId);
 
+  // ── Resize drag ────────────────────────────────────────────────────────
+  const { detailPanelWidth, setDetailPanelWidth } = useUiStore();
+  const dragState = useRef<{ startX: number; startWidth: number } | null>(null);
+
+  const onDragStart = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    dragState.current = { startX: e.clientX, startWidth: detailPanelWidth };
+  }, [detailPanelWidth]);
+
+  useEffect(() => {
+    function onMouseMove(e: MouseEvent) {
+      if (!dragState.current) return;
+      const delta = dragState.current.startX - e.clientX;
+      const newWidth = Math.max(280, Math.min(800, dragState.current.startWidth + delta));
+      setDetailPanelWidth(newWidth);
+    }
+    function onMouseUp() {
+      dragState.current = null;
+    }
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+    };
+  }, [setDetailPanelWidth]);
+
   const userAnnotations = annotations.filter((a) => a.origin === "user");
   const systemAnnotations = annotations.filter((a) => a.origin === "system");
 
@@ -171,7 +199,16 @@ export function EventDetailPanel({
   }
 
   return (
-    <div className="flex h-full flex-col border-l border-[var(--color-border)] bg-[var(--color-bg-surface)] w-96 shrink-0">
+    <div
+      className="relative flex h-full flex-col border-l border-[var(--color-border)] bg-[var(--color-bg-surface)] shrink-0"
+      style={{ width: detailPanelWidth }}
+    >
+      {/* Drag handle — left edge */}
+      <div
+        onMouseDown={onDragStart}
+        className="absolute left-0 top-0 h-full w-1 cursor-col-resize opacity-0 hover:opacity-100 hover:bg-[var(--color-accent)] transition-opacity z-10"
+        style={{ marginLeft: -2 }}
+      />
       {/* Header */}
       <div className="flex items-center gap-2 border-b border-[var(--color-border)] px-4 py-3">
         <h3 className="flex-1 text-sm font-semibold text-[var(--color-fg-primary)]">
@@ -191,7 +228,7 @@ export function EventDetailPanel({
         {/* Message — filterable on click */}
         <div className="mb-3 rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3">
           <div className="flex items-center justify-between mb-1">
-            <p className="text-xs text-[var(--color-fg-muted)]">Message</p>
+            <p className="text-xs text-[var(--color-fg-secondary)]">Message</p>
             {event.message && (
               <div className="flex items-center gap-0.5">
                 <Tooltip content="Filter IN: message contains this text">
@@ -213,7 +250,7 @@ export function EventDetailPanel({
 
         {/* Timestamps */}
         <div className="mb-3">
-          <p className="mb-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-muted)]">
+          <p className="mb-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
             Timestamps
           </p>
           <FieldRow
@@ -237,7 +274,7 @@ export function EventDetailPanel({
 
         {/* Source */}
         <div className="mb-3">
-          <p className="mb-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-muted)]">
+          <p className="mb-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
             Source
           </p>
           <FieldRow
@@ -265,7 +302,7 @@ export function EventDetailPanel({
         {/* Parser tags */}
         {event.tags.length > 0 && (
           <div className="mb-3">
-            <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-muted)]">
+            <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
               Parser Tags
             </p>
             <div className="flex flex-wrap gap-1">
@@ -282,7 +319,7 @@ export function EventDetailPanel({
                 </button>
               ))}
             </div>
-            <p className="mt-1 text-[10px] text-[var(--color-fg-muted)]">
+            <p className="mt-1 text-[11px] text-[var(--color-fg-muted)]">
               Click a tag to filter
             </p>
           </div>
@@ -291,9 +328,9 @@ export function EventDetailPanel({
         {/* Attributes — every row has filter-in / filter-out */}
         {Object.keys(event.attributes).length > 0 && (
           <div className="mb-3">
-            <p className="mb-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-muted)]">
+            <p className="mb-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
               Attributes
-              <span className="ml-2 normal-case font-normal text-[var(--color-fg-muted)] opacity-60">
+              <span className="ml-2 normal-case font-normal text-[var(--color-fg-muted)] text-[11px] opacity-60">
                 hover to filter
               </span>
             </p>
@@ -312,7 +349,7 @@ export function EventDetailPanel({
 
         {/* Annotations — editable */}
         <div className="mb-3">
-          <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-muted)]">
+          <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
             Annotations
           </p>
 
@@ -345,7 +382,7 @@ export function EventDetailPanel({
                 </Tooltip>
               </div>
               <Tooltip content={fmtTimestampFull(a.created_at)} side="bottom">
-                <p className="mt-1 flex items-center gap-1 text-[9px] text-[var(--color-fg-muted)]">
+                <p className="mt-1 flex items-center gap-1 text-[11px] text-[var(--color-fg-muted)]">
                   <Clock size={8} />
                   {a.created_by ?? "anonymous"} · {fmtRelative(a.created_at)}
                 </p>
@@ -357,7 +394,7 @@ export function EventDetailPanel({
           {systemAnnotations.map((a) => (
             <div
               key={a.id}
-              className="mb-1 rounded border border-[var(--color-outlier)] border-opacity-30 bg-[var(--color-outlier-dim)] px-2.5 py-1.5 text-xs"
+              className="mb-1 rounded border border-[var(--color-outlier)]/30 bg-[var(--color-outlier-dim)] px-2.5 py-1.5 text-xs"
             >
               <span className="font-medium text-[var(--color-outlier)]">
                 ⚠ {a.annotation_type}:
@@ -400,7 +437,7 @@ export function EventDetailPanel({
 
         {/* Provenance — display-only, no filter buttons */}
         <div className="mb-3">
-          <p className="mb-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-muted)]">
+          <p className="mb-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
             Provenance
           </p>
           <FieldRow label="event_id" value={event.event_id} mono filterKey={null} />

@@ -45,7 +45,7 @@ export function DeleteCaseDialog({ case_, onClose }: Props) {
         description="This will cascade-delete all timelines, events, vectors, and annotations. This cannot be undone."
       >
         <div className="space-y-4">
-          <p className="rounded border border-[var(--color-danger)] border-opacity-30 bg-[var(--color-danger-dim)] px-3 py-2 text-xs text-[var(--color-danger)]">
+          <p className="rounded border border-[var(--color-danger)]/30 bg-[var(--color-danger-dim)] px-3 py-2 text-xs text-[var(--color-danger)]">
             All data for this case will be permanently deleted from ClickHouse, Qdrant, and
             PostgreSQL.
           </p>

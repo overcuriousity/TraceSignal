@@ -15,7 +15,7 @@ const buttonVariants = cva(
         ghost:
           "text-[var(--color-fg-secondary)] hover:bg-[var(--color-bg-hover)] hover:text-[var(--color-fg-primary)]",
         danger:
-          "bg-[var(--color-danger-dim)] text-[var(--color-danger)] border border-[var(--color-danger)] border-opacity-30 hover:bg-[var(--color-danger)] hover:text-white",
+          "bg-[var(--color-danger-dim)] text-[var(--color-danger)] border border-[var(--color-danger)]/30 hover:bg-[var(--color-danger)] hover:text-white",
         outline:
           "border border-[var(--color-border-strong)] text-[var(--color-fg-secondary)] hover:bg-[var(--color-bg-hover)] hover:text-[var(--color-fg-primary)]",
       },

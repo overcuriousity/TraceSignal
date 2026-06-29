@@ -25,6 +25,10 @@ interface UiState {
   /** Chronological sort direction for the event grid. */
   sortDir: "asc" | "desc";
   setSortDir: (dir: "asc" | "desc") => void;
+
+  /** Width of the event detail panel in pixels. */
+  detailPanelWidth: number;
+  setDetailPanelWidth: (w: number) => void;
 }
 
 export const DEFAULT_COLUMNS = [
@@ -53,6 +57,9 @@ export const useUiStore = create<UiState>()(
 
       sortDir: "desc",
       setSortDir: (dir) => set({ sortDir: dir }),
+
+      detailPanelWidth: 384,
+      setDetailPanelWidth: (w) => set({ detailPanelWidth: w }),
     }),
     { name: "tv-ui" },
   ),
