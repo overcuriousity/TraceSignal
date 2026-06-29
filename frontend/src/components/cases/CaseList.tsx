@@ -21,7 +21,7 @@ export function CaseList() {
 
   if (error) {
     return (
-      <div className="rounded border border-[var(--color-danger)] border-opacity-30 bg-[var(--color-danger-dim)] px-4 py-3 text-sm text-[var(--color-danger)]">
+      <div className="rounded border border-[var(--color-danger)]/30 bg-[var(--color-danger-dim)] px-4 py-3 text-sm text-[var(--color-danger)]">
         Failed to load cases: {(error as Error).message}
       </div>
     );

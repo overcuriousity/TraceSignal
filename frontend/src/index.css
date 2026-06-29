@@ -18,7 +18,7 @@
   /* Foreground */
   --color-fg-primary: #e2e4ec;
   --color-fg-secondary: #8b8fa8;
-  --color-fg-muted: #555975;
+  --color-fg-muted: #7d82a0;
   --color-fg-disabled: #3a3d50;
 
   /* Borders */
@@ -69,7 +69,7 @@
 
 html {
   color-scheme: dark;
-  font-size: 14px;
+  font-size: 15px;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
@@ -93,7 +93,7 @@ body {
 /* ── Monospace class ─────────────────────────────────────────────────────── */
 .mono {
   font-family: var(--font-mono);
-  font-size: 0.85em;
+  font-size: 0.9em;
   letter-spacing: 0;
 }
 

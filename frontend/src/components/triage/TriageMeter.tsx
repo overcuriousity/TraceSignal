@@ -69,7 +69,7 @@ export function TriageMeter({ annotations, totalEvents: _totalEvents }: Props) {
         >
           <div className="hidden sm:flex items-center gap-2 w-28">
             <div className="flex-1">
-              <p className="text-[10px] font-medium uppercase tracking-wide text-[var(--color-fg-muted)] mb-1">
+              <p className="text-[11px] font-medium uppercase tracking-wide text-[var(--color-fg-muted)] mb-1">
                 Outliers
               </p>
               <Progress
@@ -77,7 +77,7 @@ export function TriageMeter({ annotations, totalEvents: _totalEvents }: Props) {
                 indicatorClassName="bg-[var(--color-outlier)]"
               />
             </div>
-            <span className="text-[10px] font-mono text-[var(--color-outlier)]">
+            <span className="text-[11px] font-mono text-[var(--color-outlier)]">
               {outlierPct}%
             </span>
           </div>

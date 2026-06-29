@@ -114,7 +114,7 @@ export function UploadDialog({ caseId, timelineId, timelineName }: Props) {
 
           {/* Result */}
           {data && (
-            <div className="rounded border border-[var(--color-success)] border-opacity-40 bg-[var(--color-success-dim)] px-3 py-2 text-xs text-[var(--color-success)]">
+            <div className="rounded border border-[var(--color-success)]/40 bg-[var(--color-success-dim)] px-3 py-2 text-xs text-[var(--color-success)]">
               Ingested {data.events_inserted.toLocaleString()} events via{" "}
               <span className="font-mono">{data.parser}</span>
               {data.events_parsed !== data.events_inserted &&

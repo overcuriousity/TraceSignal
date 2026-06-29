@@ -81,7 +81,7 @@ export function AnomaliesList({ caseId, timelineId, onSelectEvent }: Props) {
         {data.results.map((r) => (
           <button
             key={r.event_id}
-            className="w-full rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-3 py-2.5 text-left hover:border-[var(--color-outlier)] hover:border-opacity-40 hover:bg-[var(--color-outlier-dim)] transition-base"
+            className="w-full rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-3 py-2.5 text-left hover:border-[var(--color-outlier)]/40 hover:bg-[var(--color-outlier-dim)] transition-base"
             onClick={() => onSelectEvent?.(r.event)}
           >
             <div className="flex items-center gap-2 mb-1">

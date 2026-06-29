@@ -14,11 +14,11 @@ const variantClasses: Record<BadgeVariant, string> = {
   accent:
     "bg-[var(--color-accent-dim)] text-[var(--color-accent)] border border-[var(--color-accent-muted)]",
   success:
-    "bg-[var(--color-success-dim)] text-[var(--color-success)] border border-[var(--color-success)] border-opacity-30",
+    "bg-[var(--color-success-dim)] text-[var(--color-success)] border border-[var(--color-success)]/30",
   danger:
-    "bg-[var(--color-danger-dim)] text-[var(--color-danger)] border border-[var(--color-danger)] border-opacity-30",
+    "bg-[var(--color-danger-dim)] text-[var(--color-danger)] border border-[var(--color-danger)]/30",
   outlier:
-    "bg-[var(--color-outlier-dim)] text-[var(--color-outlier)] border border-[var(--color-outlier)] border-opacity-30",
+    "bg-[var(--color-outlier-dim)] text-[var(--color-outlier)] border border-[var(--color-outlier)]/30",
   muted: "bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)]",
 };
 

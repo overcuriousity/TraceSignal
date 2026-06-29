@@ -52,7 +52,7 @@ function JobRow({ job }: { job: TrackedJob }) {
     <div
       className={cn(
         "flex items-start gap-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-3 py-2 text-xs min-w-[200px] max-w-[260px]",
-        job.status === "failed" && "border-[var(--color-danger)] border-opacity-40",
+        job.status === "failed" && "border-[var(--color-danger)]/40",
       )}
     >
       <div className="mt-0.5">{icon}</div>

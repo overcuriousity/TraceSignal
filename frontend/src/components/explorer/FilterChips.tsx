@@ -78,9 +78,9 @@ export function FilterChips({ filters, onRemove }: Props) {
           key={i}
           className={`inline-flex items-center gap-1 rounded px-2 py-0.5 text-xs font-mono leading-none border ${
             chip.variant === "include"
-              ? "bg-[var(--color-info-dim)] text-[var(--color-info)] border-[var(--color-info)] border-opacity-30"
+              ? "bg-[var(--color-info-dim)] text-[var(--color-info)] border-[var(--color-info)]/30"
               : chip.variant === "exclude"
-                ? "bg-[var(--color-danger-dim)] text-[var(--color-danger)] border-[var(--color-danger)] border-opacity-30"
+                ? "bg-[var(--color-danger-dim)] text-[var(--color-danger)] border-[var(--color-danger)]/30"
                 : "bg-[var(--color-bg-active)] text-[var(--color-fg-secondary)] border-[var(--color-border)]"
           }`}
         >

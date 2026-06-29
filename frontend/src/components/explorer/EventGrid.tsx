@@ -18,7 +18,7 @@ import {
   type ColumnDef,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ChevronRight, AlertTriangle, Tag, MessageSquare, Trash2 } from "lucide-react";
+import { ChevronRight, AlertTriangle, Tag, MessageSquare, Trash2, ArrowUp, ArrowDown } from "lucide-react";
 import type { Event, Annotation } from "@/api/types";
 import { fmtTimestamp, fmtRelative, fmtTimestampFull } from "@/lib/time";
 import { truncate } from "@/lib/format";
@@ -37,7 +37,6 @@ const OVERSCAN = 10;
 interface Props {
   events: Event[];
   total: number;
-  offset: number;
   annotations: Map<string, Annotation[]>; // eventId → annotations
   selectedIds: Set<string>;
   caseId: string;
@@ -48,6 +47,8 @@ interface Props {
   onLoadMore: () => void;
   isFetching: boolean;
   visibleColumns: string[];
+  sortDir: "asc" | "desc";
+  onSortToggle: () => void;
 }
 
 // ── Annotation column ────────────────────────────────────────────────────────
@@ -92,7 +93,7 @@ function TagPopover({
         >
           <Tag size={13} />
           {userTags.length > 0 && (
-            <span className="ml-0.5 text-[10px] font-mono">{userTags.length}</span>
+            <span className="ml-0.5 text-[11px] font-mono">{userTags.length}</span>
           )}
         </PopoverTrigger>
       </Tooltip>
@@ -106,9 +107,9 @@ function TagPopover({
                   className="group/tag flex items-center gap-1.5 rounded bg-[var(--color-accent-dim)] px-2 py-1"
                 >
                   <Tag size={9} className="shrink-0 text-[var(--color-accent)]" />
-                  <span className="flex-1 text-[10px] text-[var(--color-accent)] font-medium">{t.content}</span>
+                  <span className="flex-1 text-[11px] text-[var(--color-accent)] font-medium">{t.content}</span>
                   <Tooltip content={fmtTimestampFull(t.created_at)} side="top">
-                    <span className="text-[9px] text-[var(--color-fg-muted)] whitespace-nowrap">
+                    <span className="text-[11px] text-[var(--color-fg-muted)] whitespace-nowrap">
                       {t.created_by ? `${t.created_by} · ` : ""}{fmtRelative(t.created_at)}
                     </span>
                   </Tooltip>
@@ -182,7 +183,7 @@ function CommentPopover({
         >
           <MessageSquare size={13} />
           {userComments.length > 0 && (
-            <span className="ml-0.5 text-[10px] font-mono">{userComments.length}</span>
+            <span className="ml-0.5 text-[11px] font-mono">{userComments.length}</span>
           )}
         </PopoverTrigger>
       </Tooltip>
@@ -205,7 +206,7 @@ function CommentPopover({
                     </button>
                   </div>
                   <Tooltip content={fmtTimestampFull(c.created_at)} side="bottom">
-                    <p className="mt-1 text-[9px] text-[var(--color-fg-muted)]">
+                    <p className="mt-1 text-[11px] text-[var(--color-fg-muted)]">
                       {c.created_by ?? "anonymous"} · {fmtRelative(c.created_at)}
                     </p>
                   </Tooltip>
@@ -268,7 +269,6 @@ function AnnotationCell(props: AnnotationCellProps) {
 export function EventGrid({
   events,
   total,
-  offset,
   annotations,
   selectedIds,
   caseId,
@@ -279,6 +279,8 @@ export function EventGrid({
   onLoadMore,
   isFetching,
   visibleColumns,
+  sortDir,
+  onSortToggle,
 }: Props) {
   const parentRef = useRef<HTMLDivElement>(null);
 
@@ -318,7 +320,16 @@ export function EventGrid({
     const colDefs: Record<string, ColumnDef<Event>> = {
       timestamp: {
         id: "timestamp",
-        header: "Timestamp",
+        header: () => (
+          <button
+            onClick={onSortToggle}
+            className="flex items-center gap-1 hover:text-[var(--color-fg-primary)] transition-base"
+            title={sortDir === "desc" ? "Newest first — click for oldest first" : "Oldest first — click for newest first"}
+          >
+            Timestamp
+            {sortDir === "desc" ? <ArrowDown size={10} /> : <ArrowUp size={10} />}
+          </button>
+        ),
         size: 170,
         cell: ({ row }) => (
           <span className="font-mono text-xs text-[var(--color-fg-secondary)]">
@@ -365,12 +376,12 @@ export function EventGrid({
               {hasTags && (
                 <div className="flex flex-wrap gap-0.5">
                   {parserTags.slice(0, 5).map((t, i) => (
-                    <Badge key={i} variant="muted" className="text-[9px] py-0 leading-tight">
+                    <Badge key={i} variant="muted" className="text-[11px] py-0 leading-tight">
                       {t}
                     </Badge>
                   ))}
                   {userTags.map((t) => (
-                    <Badge key={t.id} variant="accent" className="text-[9px] py-0 leading-tight">
+                    <Badge key={t.id} variant="accent" className="text-[11px] py-0 leading-tight">
                       {t.content}
                     </Badge>
                   ))}
@@ -436,7 +447,7 @@ export function EventGrid({
     });
 
     return cols;
-  }, [visibleColumns, selectedIds, annotations, expandedId, onToggleSelect, caseId, timelineId]);
+  }, [visibleColumns, selectedIds, annotations, expandedId, onToggleSelect, caseId, timelineId, sortDir, onSortToggle]);
 
   const table = useReactTable({
     data: events,
@@ -473,7 +484,7 @@ export function EventGrid({
           hg.headers.map((h) => (
             <div
               key={h.id}
-              className="px-2.5 py-2 text-[10px] font-semibold uppercase tracking-wider text-[var(--color-fg-muted)] select-none"
+              className="px-2.5 py-2 text-[11px] font-semibold uppercase tracking-wider text-[var(--color-fg-secondary)] select-none"
               style={{
                 width: h.column.id === "message" ? undefined : h.getSize(),
                 flex: h.column.id === "message" ? "1 1 0" : undefined,
@@ -515,18 +526,18 @@ export function EventGrid({
                 className={cn(
                   "flex items-center border-b border-[var(--color-border-subtle)] cursor-pointer transition-base group",
                   isExpanded
-                    ? "bg-[var(--color-bg-active)] border-[var(--color-accent)] border-opacity-40"
+                    ? "bg-[var(--color-bg-active)] border-[var(--color-accent)]/40"
                     : isSelected
                       ? "bg-[var(--color-accent-dim)]"
                       : "hover:bg-[var(--color-bg-hover)]",
                   hasOutlier && !isSelected && !isExpanded &&
-                    "border-l-2 border-l-[var(--color-outlier)] border-l-opacity-50",
+                    "border-l-2 border-l-[var(--color-outlier)]/50",
                 )}
               >
                 {row.getVisibleCells().map((cell) => (
                   <div
                     key={cell.id}
-                    className="px-2 truncate"
+                    className="px-2.5 truncate"
                     style={{
                       width:
                         cell.column.id === "message"
@@ -550,8 +561,8 @@ export function EventGrid({
       {/* Footer */}
       <div className="flex shrink-0 items-center justify-between border-t border-[var(--color-border)] bg-[var(--color-bg-surface)] px-4 py-1.5 text-xs text-[var(--color-fg-muted)]">
         <span>
-          Showing {events.length.toLocaleString()} of {total.toLocaleString()} events
-          {offset > 0 ? ` (offset ${offset.toLocaleString()})` : ""}
+          {events.length.toLocaleString()} of {total.toLocaleString()} events loaded
+          {events.length >= total && total > 0 && " · all loaded"}
         </span>
         {events.length < total && (
           <button
