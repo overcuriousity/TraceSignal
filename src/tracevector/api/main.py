@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from tracevector import __version__
 from tracevector.api.routers import cases, events, jobs
 
-FRONTEND_DIST = Path(__file__).resolve().parents[3] / "frontend" / "dist"
+_FRONTEND_DIST = Path(__file__).resolve().parents[3] / "frontend" / "dist"
 
 
 def create_app() -> FastAPI:
@@ -39,25 +39,19 @@ def create_app() -> FastAPI:
     app.include_router(events.router)
     app.include_router(jobs.router)
 
-    if FRONTEND_DIST.is_dir():
-        app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
+    # Serve the built frontend when frontend/dist exists.
+    # Run `npm run build` inside frontend/ once; tv-web then serves everything.
+    # For development with HMR, run `npm run dev` (port 5173) alongside tv-web instead.
+    if _FRONTEND_DIST.is_dir():
+        assets_dir = _FRONTEND_DIST / "assets"
+        if assets_dir.is_dir():
+            app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
-        @app.get("/{full_path:path}")
+        @app.get("/{full_path:path}", include_in_schema=False)
         async def serve_frontend(full_path: str) -> FileResponse:
-            file_path = FRONTEND_DIST / full_path
-            if file_path.is_file():
-                return FileResponse(file_path)
-            return FileResponse(FRONTEND_DIST / "index.html")
-    else:
-
-        @app.get("/", response_class=JSONResponse)
-        async def no_frontend_built() -> dict:
-            return {
-                "message": "TraceVector API is running, but the frontend has not been built.",
-                "frontend_dist": str(FRONTEND_DIST),
-                "hint": "Run 'cd frontend && npm install && npm run build', then restart tv-web.",
-                "api_docs": "/api/docs",
-                "health": "/api/health",
-            }
+            candidate = _FRONTEND_DIST / full_path
+            if candidate.is_file():
+                return FileResponse(candidate)
+            return FileResponse(_FRONTEND_DIST / "index.html")
 
     return app

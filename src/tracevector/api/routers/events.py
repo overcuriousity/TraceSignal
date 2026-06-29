@@ -17,6 +17,15 @@ from tracevector.db.postgres import PostgresStore, generate_id
 from tracevector.db.queries import EventQuery, EventQueryService
 from tracevector.db.similarity import SimilarityService
 
+_query_service: EventQueryService | None = None
+
+
+def _get_query_service() -> EventQueryService:
+    global _query_service  # noqa: PLW0603
+    if _query_service is None:
+        _query_service = EventQueryService()
+    return _query_service
+
 router = APIRouter(prefix="/api/cases", tags=["events"])
 
 _store: PostgresStore | None = None
@@ -53,6 +62,7 @@ async def list_events(
     q: str | None = Query(default=None, description="Full-text search in message"),
     source: str | None = Query(default=None),
     tag: str | None = Query(default=None),
+    exclude_tag: str | None = Query(default=None),
     start: datetime | None = Query(default=None),  # noqa: B008
     end: datetime | None = Query(default=None),  # noqa: B008
     filters: str | None = Query(
@@ -65,14 +75,18 @@ async def list_events(
     ),
     limit: int = Query(default=50, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
+    order: str = Query(default="desc", description="Sort order: asc or desc"),
 ) -> dict[str, Any]:
     """List events for a timeline with optional filters."""
+    if order not in ("asc", "desc"):
+        order = "desc"
+
     store = get_store()
     timeline = await store.get_timeline(case_id, timeline_id)
     if timeline is None:
         raise HTTPException(status_code=404, detail="Timeline not found")
 
-    service = EventQueryService()
+    service = _get_query_service()
     page = service.query(
         EventQuery(
             case_id=case_id,
@@ -80,12 +94,14 @@ async def list_events(
             q=q,
             source=source,
             tag=tag,
+            exclude_tag=exclude_tag,
             start=start,
             end=end,
             field_filters=_parse_json_object(filters),
             field_exclusions=_parse_json_object(exclusions),
             limit=limit,
             offset=offset,
+            order=order,  # type: ignore[arg-type]
         )
     )
     return {
@@ -96,15 +112,102 @@ async def list_events(
     }
 
 
+@router.get("/{case_id}/timelines/{timeline_id}/fields")
+async def list_fields(
+    case_id: str,
+    timeline_id: str,
+) -> dict[str, Any]:
+    """Return the displayable field names for a timeline.
+
+    ``top_level`` contains the fixed columns common to every event.
+    ``attributes`` contains the dynamic keys aggregated from the ``attributes``
+    Map across a sample of up to 50 000 events.  Useful for building a column
+    picker in the UI.
+    """
+    store = get_store()
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    service = _get_query_service()
+    return service.list_fields(case_id, timeline_id)
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/embedding-fields")
+async def list_embedding_fields(
+    case_id: str,
+    timeline_id: str,
+) -> dict[str, Any]:
+    """Return per-source field information for the embedding wizard.
+
+    For each distinct ``source`` in the timeline, returns the event count,
+    the embeddable top-level fields, available attribute keys, and a
+    recommended preselection.  Used by the frontend embedding wizard to
+    let analysts choose which fields of which sources to embed.
+    """
+    store = get_store()
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    service = _get_query_service()
+    return service.list_fields_by_source(case_id, timeline_id)
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/histogram")
+async def get_histogram(
+    case_id: str,
+    timeline_id: str,
+    q: str | None = Query(default=None),
+    source: str | None = Query(default=None),
+    tag: str | None = Query(default=None),
+    exclude_tag: str | None = Query(default=None),
+    start: datetime | None = Query(default=None),  # noqa: B008
+    end: datetime | None = Query(default=None),  # noqa: B008
+    filters: str | None = Query(default=None),
+    exclusions: str | None = Query(default=None),
+    buckets: int = Query(default=60, ge=10, le=200),
+) -> dict[str, Any]:
+    """Return a bucketed event-count histogram for a timeline.
+
+    Honors the same filter params as the events list endpoint so the histogram
+    always reflects the currently-filtered view.  ``buckets`` controls the
+    target number of time buckets (10–200, default 60); the actual interval is
+    ``max(1, duration / buckets)`` seconds.
+    """
+    store = get_store()
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    service = _get_query_service()
+    return service.histogram(
+        EventQuery(
+            case_id=case_id,
+            timeline_id=timeline_id,
+            q=q,
+            source=source,
+            tag=tag,
+            exclude_tag=exclude_tag,
+            start=start,
+            end=end,
+            field_filters=_parse_json_object(filters),
+            field_exclusions=_parse_json_object(exclusions),
+        ),
+        buckets=buckets,
+    )
+
+
 # ── Export models ─────────────────────────────────────────────────────────────
 
 
 class ExportFilter(BaseModel):
-    """Filter parameters mirroring the frontend FilterState."""
+    """Filter parameters for event export."""
 
     q: str | None = None
     source: str | None = None
     tag: str | None = None
+    exclude_tag: str | None = None
     start: datetime | None = None
     end: datetime | None = None
     # 'fields' / 'exclude' map to field_filters / field_exclusions in EventQuery.
@@ -192,6 +295,7 @@ async def export_events(
         q=body.filter.q,
         source=body.filter.source,
         tag=body.filter.tag,
+        exclude_tag=body.filter.exclude_tag,
         start=body.filter.start,
         end=body.filter.end,
         field_filters=body.filter.fields,
@@ -275,12 +379,19 @@ async def list_anomalies(
         raise HTTPException(status_code=404, detail="Timeline not found")
 
     svc = _get_similarity_service()
+    # Resolve normal IDs here (in async context) before calling sync find_anomalies.
+    normal_ids = await store.list_event_ids_by_annotation_type(
+        case_id, timeline_id, "normal"
+    )
     result = svc.find_anomalies(
-        case_id, timeline_id, limit=limit, sample_size=sample_size
+        case_id, timeline_id, limit=limit, sample_size=sample_size,
+        normal_ids=normal_ids,
     )
     return {
         "status": result.status,
+        "method": result.method,
         "sample_size": result.sample_size,
+        "baseline_size": result.baseline_size,
         "embedding_config_hash": result.embedding_config_hash,
         "results": [
             {
@@ -324,15 +435,21 @@ async def tag_anomalies(
         raise HTTPException(status_code=404, detail="Timeline not found")
 
     svc = _get_similarity_service()
+    normal_ids = await store.list_event_ids_by_annotation_type(
+        case_id, timeline_id, "normal"
+    )
     result = svc.find_anomalies(
-        case_id, timeline_id, limit=body.limit, sample_size=body.sample_size
+        case_id, timeline_id, limit=body.limit, sample_size=body.sample_size,
+        normal_ids=normal_ids,
     )
 
     if result.status != "ok":
         return {
             "status": result.status,
+            "method": result.method,
             "tagged": 0,
             "sample_size": result.sample_size,
+            "baseline_size": result.baseline_size,
             "embedding_config_hash": result.embedding_config_hash,
             "results": [],
         }
@@ -344,10 +461,17 @@ async def tag_anomalies(
     rows = []
     for r in result.results:
         d = r.details
-        content = (
-            f"Outlier — cosine distance {d['distance']:.4f} from timeline centroid "
-            f"(rank {d['rank']}/{d['of']}, sample {d['sample_size']})"
-        )
+        method = d.get("method", "centroid-distance")
+        if method == "normal-baseline":
+            content = (
+                f"Outlier — distance {d['distance']:.4f} from analyst-defined normal baseline "
+                f"({d['baseline_size']} normal events, rank {d['rank']}/{d['of']})"
+            )
+        else:
+            content = (
+                f"Outlier — cosine distance {d['distance']:.4f} from timeline centroid "
+                f"(rank {d['rank']}/{d['of']}, sample {d.get('sample_size', '?')})"
+            )
         rows.append(
             {
                 "annotation_id": generate_id(f"{r.event_id}_outlier"),
@@ -365,8 +489,10 @@ async def tag_anomalies(
 
     return {
         "status": "ok",
+        "method": result.method,
         "tagged": tagged,
         "sample_size": result.sample_size,
+        "baseline_size": result.baseline_size,
         "embedding_config_hash": result.embedding_config_hash,
         "results": [
             {

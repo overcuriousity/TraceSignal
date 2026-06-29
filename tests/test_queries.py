@@ -32,6 +32,7 @@ class FakeClickHouseClient:
             "byte_offset",
             "line_number",
             "content_hash",
+            "file_hash",
             "parser_name",
             "parser_version",
             "ingest_time",
@@ -338,3 +339,170 @@ def test_iter_events_applies_filters_in_where_clause() -> None:
     assert params is not None
     assert params.get("p1") == "auth"
     assert params.get("p2") == "malware"
+
+
+# ── order (sort direction) tests ───────────────────────────────────────────────
+
+
+def _find_order_query(service: EventQueryService) -> str:
+    """Return the first query that contains ORDER BY (the data query, not count)."""
+    for query, _ in service.store.client.queries:
+        if "ORDER BY" in query:
+            return query
+    raise AssertionError("No ORDER BY query found")
+
+
+def test_query_default_order_is_desc(service: EventQueryService) -> None:
+    service.query(EventQuery(case_id="case-1"))
+    query = _find_order_query(service)
+    assert "ORDER BY timestamp DESC" in query
+
+
+def test_query_order_asc(service: EventQueryService) -> None:
+    service.query(EventQuery(case_id="case-1", order="asc"))
+    query = _find_order_query(service)
+    assert "ORDER BY timestamp ASC" in query
+
+
+def test_iter_events_order_asc() -> None:
+    svc = _batched_service(batch_size=5, full_batches=0, remainder=3)
+    list(svc.iter_events(EventQuery(case_id="c1", order="asc"), batch_size=5))
+    select_queries = [
+        q for q, _ in svc.store.client.queries  # type: ignore[union-attr]
+        if not q.strip().startswith("SELECT count()")
+    ]
+    assert select_queries
+    assert "ORDER BY timestamp ASC" in select_queries[0]
+
+
+# ── list_fields tests ──────────────────────────────────────────────────────────
+
+
+class _FieldsFakeClient:
+    """Returns a canned groupUniqArrayArray result for list_fields queries."""
+
+    def __init__(self, keys: list[str]) -> None:
+        self._keys = keys
+        self.queries: list[tuple[str, dict[str, Any] | None]] = []
+
+    def query(
+        self,
+        query: str,
+        parameters: dict[str, Any] | None = None,
+        **_kwargs: Any,
+    ) -> FakeQueryResult:
+        self.queries.append((query, parameters))
+        return FakeQueryResult(result_rows=[[self._keys]], column_names=["keys"])
+
+
+def _fields_service(keys: list[str]) -> EventQueryService:
+    store = FakeClickHouseStore()
+    store.client = _FieldsFakeClient(keys)  # type: ignore[assignment]
+    return EventQueryService(store=store)
+
+
+def test_list_fields_returns_sorted_attribute_keys() -> None:
+    svc = _fields_service(["zebra", "alpha", "middle"])
+    result = svc.list_fields("c1", "tl1")
+    assert result["attributes"] == ["alpha", "middle", "zebra"]
+
+
+def test_list_fields_returns_top_level_columns() -> None:
+    from tracevector.db.queries import TOP_LEVEL_DISPLAY_COLUMNS
+    svc = _fields_service([])
+    result = svc.list_fields("c1", "tl1")
+    assert result["top_level"] == TOP_LEVEL_DISPLAY_COLUMNS
+
+
+def test_list_fields_empty_dataset() -> None:
+    svc = _fields_service([])
+    result = svc.list_fields("c1", "tl1")
+    assert result["attributes"] == []
+
+
+# ── histogram tests ────────────────────────────────────────────────────────────
+
+from datetime import UTC, timedelta  # noqa: E402 (already imported at top, repeated for clarity)
+
+
+class _HistogramFakeClient:
+    """Returns canned range + bucket results for histogram queries."""
+
+    def __init__(self, min_ts: datetime, max_ts: datetime, bucket_rows: list[Any]) -> None:
+        self._min = min_ts
+        self._max = max_ts
+        self._buckets = bucket_rows
+        self._call = 0
+        self.queries: list[tuple[str, dict[str, Any] | None]] = []
+
+    def query(
+        self,
+        query: str,
+        parameters: dict[str, Any] | None = None,
+        **_kwargs: Any,
+    ) -> FakeQueryResult:
+        self.queries.append((query, parameters))
+        stripped = query.strip()
+        if "min(timestamp)" in stripped:
+            return FakeQueryResult(result_rows=[[self._min, self._max]], column_names=["min", "max"])
+        if "toStartOfInterval" in stripped:
+            return FakeQueryResult(result_rows=self._buckets, column_names=["bucket", "c"])
+        # count() fallback
+        return FakeQueryResult(result_rows=[[len(self._buckets)]])
+
+
+def _histogram_service(
+    min_ts: datetime, max_ts: datetime, bucket_rows: list[Any]
+) -> EventQueryService:
+    store = FakeClickHouseStore()
+    store.client = _HistogramFakeClient(min_ts, max_ts, bucket_rows)  # type: ignore[assignment]
+    return EventQueryService(store=store)
+
+
+def test_histogram_returns_bucket_count() -> None:
+    min_ts = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+    max_ts = datetime(2024, 1, 2, 0, 0, 0, tzinfo=UTC)
+    # 3 fake buckets with datetime objects as bucket start
+    bucket_rows = [
+        [min_ts, 10],
+        [min_ts + timedelta(hours=8), 20],
+        [min_ts + timedelta(hours=16), 5],
+    ]
+    svc = _histogram_service(min_ts, max_ts, bucket_rows)
+    result = svc.histogram(EventQuery(case_id="c1", timeline_id="tl1"), buckets=60)
+    assert result["interval_seconds"] > 0
+    assert len(result["buckets"]) == 3
+    assert result["buckets"][1]["count"] == 20
+
+
+def test_histogram_respects_explicit_time_range() -> None:
+    """When start/end are provided, no range-query should be issued."""
+    min_ts = datetime(2024, 3, 1, tzinfo=UTC)
+    max_ts = datetime(2024, 3, 2, tzinfo=UTC)
+    svc = _histogram_service(min_ts, max_ts, [[min_ts, 7]])
+    eq = EventQuery(case_id="c1", timeline_id="tl1", start=min_ts, end=max_ts)
+    result = svc.histogram(eq, buckets=60)
+    # No min/max range query should have been issued
+    range_queries = [q for q, _ in svc.store.client.queries if "min(timestamp)" in q]  # type: ignore[union-attr]
+    assert range_queries == []
+    assert result["buckets"][0]["count"] == 7
+
+
+def test_histogram_empty_dataset_returns_empty_buckets() -> None:
+    """Client returns None timestamps → empty bucket list."""
+    store = FakeClickHouseStore()
+
+    class _EmptyClient:
+        queries: list = []
+
+        def query(self, query: str, parameters: Any = None, **_: Any) -> FakeQueryResult:
+            self.queries.append(query)
+            if "min(timestamp)" in query:
+                return FakeQueryResult(result_rows=[[None, None]])
+            return FakeQueryResult(result_rows=[], column_names=["bucket", "c"])
+
+    store.client = _EmptyClient()  # type: ignore[assignment]
+    svc = EventQueryService(store=store)
+    result = svc.histogram(EventQuery(case_id="c1", timeline_id="tl1"))
+    assert result["buckets"] == []
+    assert result["min"] is None
