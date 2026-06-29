@@ -6,9 +6,20 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, Index, String, func, update
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    delete,
+    func,
+    select,
+    update,
+)
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload
 
 from tracevector.core.config import get_settings
 
@@ -48,23 +59,35 @@ class Case(Base):
         }
 
 
-class Timeline(Base):
-    """A timeline (data source) inside a case."""
+class Source(Base):
+    """One ingested file in a case.
 
-    __tablename__ = "timelines"
+    The Source is the atomic unit of forensic provenance and immutability.
+    Events and vectors are scoped by ``source_id`` so a Source can be reused
+    across multiple Timelines without duplicating data.
+    """
+
+    __tablename__ = "sources"
+    __table_args__ = (
+        Index("ix_sources_case_id_file_hash", "case_id", "file_hash", unique=True),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(String(4096), nullable=True)
+    filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    file_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(default=0)
     parser: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    embedding_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    # Per-source field selection chosen by the analyst in the embedding wizard.
-    # Shape: {"version": 1, "sources": {"<source>": ["message", "attr:key", ...]}}
-    # None when embeddings were run with the legacy all-fields behaviour.
-    embedding_config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    parser_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     event_count: Mapped[int] = mapped_column(default=0)
     vector_count: Mapped[int] = mapped_column(default=0)
+    embedding_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Per-source field selection chosen by the analyst in the embedding wizard.
+    # Shape: {"version": 1, "sources": {"<artifact>": ["message", "attr:key", ...]}}
+    embedding_config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
@@ -77,6 +100,10 @@ class Timeline(Base):
         server_default=func.now(),
     )
 
+    timelines: Mapped[list[Timeline]] = relationship(
+        "Timeline", secondary="timeline_sources", back_populates="sources"
+    )
+
     def to_dict(self) -> dict[str, Any]:
         """Return a serializable dictionary."""
         return {
@@ -84,14 +111,76 @@ class Timeline(Base):
             "case_id": self.case_id,
             "name": self.name,
             "description": self.description,
+            "filename": self.filename,
+            "file_hash": self.file_hash,
+            "size_bytes": self.size_bytes,
             "parser": self.parser,
-            "embedding_model": self.embedding_model,
-            "embedding_config": self.embedding_config,
+            "parser_version": self.parser_version,
             "event_count": self.event_count,
             "vector_count": self.vector_count,
+            "embedding_model": self.embedding_model,
+            "embedding_config": self.embedding_config,
+            "created_by": self.created_by,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+class Timeline(Base):
+    """A named grouping of Sources within a case.
+
+    The default Timeline (``is_default=True``) automatically contains every
+    Source uploaded to the case. Custom Timelines are analyst-defined subsets.
+    """
+
+    __tablename__ = "timelines"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(String(4096), nullable=True)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    sources: Mapped[list[Source]] = relationship(
+        "Source", secondary="timeline_sources", back_populates="timelines"
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary."""
+        return {
+            "id": self.id,
+            "case_id": self.case_id,
+            "name": self.name,
+            "description": self.description,
+            "is_default": self.is_default,
+            "source_ids": [s.id for s in self.sources],
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class TimelineSource(Base):
+    """Many-to-many join between Timelines and Sources."""
+
+    __tablename__ = "timeline_sources"
+
+    timeline_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("timelines.id", ondelete="CASCADE"), primary_key=True
+    )
+    source_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("sources.id", ondelete="CASCADE"), primary_key=True
+    )
 
 
 class View(Base):
@@ -129,51 +218,6 @@ class View(Base):
         }
 
 
-class TimelineUpload(Base):
-    """A source file that has been uploaded and ingested for a timeline.
-
-    The composite unique index on (case_id, timeline_id, file_hash) guarantees
-    that the same file cannot be ingested twice for the same timeline.
-    """
-
-    __tablename__ = "timeline_uploads"
-    __table_args__ = (
-        Index(
-            "ix_timeline_uploads_case_timeline_hash",
-            "case_id",
-            "timeline_id",
-            "file_hash",
-            unique=True,
-        ),
-    )
-
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    timeline_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    file_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    parser: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    event_count: Mapped[int] = mapped_column(default=0)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(UTC),
-        server_default=func.now(),
-    )
-
-    def to_dict(self) -> dict[str, Any]:
-        """Return a serializable dictionary."""
-        return {
-            "id": self.id,
-            "case_id": self.case_id,
-            "timeline_id": self.timeline_id,
-            "file_hash": self.file_hash,
-            "filename": self.filename,
-            "parser": self.parser,
-            "event_count": self.event_count,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-        }
-
-
 class Annotation(Base):
     """A tag or comment annotation attached to a single event.
 
@@ -182,13 +226,16 @@ class Annotation(Base):
     written by the outlier-detection pipeline and carry structured math in the
     ``details`` JSON column; they are presented differently in the UI and cannot
     be deleted through the normal annotation delete endpoint.
+
+    Annotations are scoped by ``source_id`` because events are stored once per
+    Source and may appear in multiple Timelines.
     """
 
     __tablename__ = "annotations"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    timeline_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     event_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     annotation_type: Mapped[str] = mapped_column(String(16), nullable=False)
     content: Mapped[str] = mapped_column(String(4096), nullable=False)
@@ -210,6 +257,7 @@ class Annotation(Base):
         return {
             "id": self.id,
             "event_id": self.event_id,
+            "source_id": self.source_id,
             "annotation_type": self.annotation_type,
             "content": self.content,
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -232,33 +280,9 @@ class PostgresStore:
         )
 
     async def init_schema(self) -> None:
-        """Create metadata tables if they do not exist.
-
-        On PostgreSQL, also runs idempotent ``ALTER TABLE`` statements so that
-        existing development databases gain the ``origin`` and ``details``
-        columns added to ``Annotation`` without requiring Alembic migrations.
-        These statements are skipped on SQLite (used in tests) because SQLite
-        does not support ``IF NOT EXISTS`` column guards or the ``JSONB`` type.
-        """
-        from sqlalchemy import text
-
+        """Create metadata tables if they do not exist."""
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-            # Guard: only needed on PostgreSQL; create_all already handles new DBs.
-            dialect = conn.dialect.name
-            if dialect == "postgresql":
-                await conn.execute(
-                    text(
-                        "ALTER TABLE annotations "
-                        "ADD COLUMN IF NOT EXISTS origin VARCHAR(16) NOT NULL DEFAULT 'user'"
-                    )
-                )
-                await conn.execute(
-                    text("ALTER TABLE annotations ADD COLUMN IF NOT EXISTS details JSONB")
-                )
-                await conn.execute(
-                    text("ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedding_config JSONB")
-                )
 
     async def get_case(self, case_id: str) -> Case | None:
         """Return a case by ID, or None if not found."""
@@ -266,10 +290,18 @@ class PostgresStore:
             return await session.get(Case, case_id)
 
     async def create_case(self, case_id: str, name: str, description: str | None = None) -> Case:
-        """Create a new case."""
+        """Create a new case and its default timeline."""
         case = Case(id=case_id, name=name, description=description)
+        default_timeline = Timeline(
+            id=generate_id("all-sources"),
+            case_id=case_id,
+            name="All sources",
+            description="Default timeline containing every source in this case.",
+            is_default=True,
+        )
         async with self.session_factory() as session:
             session.add(case)
+            session.add(default_timeline)
             await session.commit()
             await session.refresh(case)
             return case
@@ -282,15 +314,195 @@ class PostgresStore:
             result = await session.execute(select(Case).order_by(Case.created_at.desc()))
             return list(result.scalars().all())
 
-    async def get_timeline(self, case_id: str, timeline_id: str) -> Timeline | None:
-        """Return a timeline by case and timeline IDs."""
+    # ------------------------------------------------------------------
+    # Sources
+    # ------------------------------------------------------------------
+
+    async def get_source(self, case_id: str, source_id: str) -> Source | None:
+        """Return a source by case and source IDs."""
         from sqlalchemy import select
 
         async with self.session_factory() as session:
             result = await session.execute(
-                select(Timeline).where(
+                select(Source).where(
+                    Source.case_id == case_id,
+                    Source.id == source_id,
+                )
+            )
+            return result.scalar_one_or_none()
+
+    async def get_source_by_hash(self, case_id: str, file_hash: str) -> Source | None:
+        """Return an existing source row for the same file hash, if any."""
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Source).where(
+                    Source.case_id == case_id,
+                    Source.file_hash == file_hash,
+                )
+            )
+            return result.scalar_one_or_none()
+
+    async def list_sources(self, case_id: str) -> list[Source]:
+        """Return all sources for a case ordered by creation time."""
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Source)
+                .where(Source.case_id == case_id)
+                .order_by(Source.created_at.desc())
+            )
+            return list(result.scalars().all())
+
+    async def create_source(
+        self,
+        case_id: str,
+        source_id: str,
+        name: str,
+        file_hash: str,
+        size_bytes: int,
+        filename: str | None = None,
+        parser: str | None = None,
+        parser_version: str | None = None,
+        event_count: int = 0,
+        created_by: str | None = None,
+    ) -> Source:
+        """Create a new source record within a case."""
+        source = Source(
+            id=source_id,
+            case_id=case_id,
+            name=name,
+            filename=filename,
+            file_hash=file_hash,
+            size_bytes=size_bytes,
+            parser=parser,
+            parser_version=parser_version,
+            event_count=event_count,
+            created_by=created_by,
+        )
+        async with self.session_factory() as session:
+            session.add(source)
+            await session.commit()
+            await session.refresh(source)
+            return source
+
+    async def update_source_counts(
+        self,
+        case_id: str,
+        source_id: str,
+        event_count: int | None = None,
+        vector_count: int | None = None,
+    ) -> None:
+        """Update stored event/vector counts for a source.
+
+        ``event_count`` is treated as a delta and added atomically to the
+        stored value. ``vector_count`` is set to the supplied absolute value.
+        Pass ``None`` for a count that should not be changed.
+        """
+        values: dict = {"updated_at": datetime.now(UTC)}
+        if vector_count is not None:
+            values["vector_count"] = vector_count
+        async with self.session_factory() as session:
+            if event_count is not None:
+                await session.execute(
+                    update(Source)
+                    .where(Source.id == source_id, Source.case_id == case_id)
+                    .values(
+                        event_count=Source.event_count + event_count,
+                        **dict(values),
+                    )
+                )
+            elif values:
+                await session.execute(
+                    update(Source)
+                    .where(Source.id == source_id, Source.case_id == case_id)
+                    .values(**values)
+                )
+            await session.commit()
+
+    async def update_source_embedding_config(
+        self,
+        case_id: str,
+        source_id: str,
+        embedding_model: str | None = None,
+        embedding_config: dict | None = None,
+    ) -> None:
+        """Persist the analyst's per-source field selection on the source."""
+        async with self.session_factory() as session:
+            values: dict = {"updated_at": datetime.now(UTC)}
+            if embedding_model is not None:
+                values["embedding_model"] = embedding_model
+            if embedding_config is not None:
+                values["embedding_config"] = embedding_config
+            result = await session.execute(
+                update(Source)
+                .where(Source.case_id == case_id, Source.id == source_id)
+                .values(**values)
+            )
+            if result.rowcount == 0:
+                return
+            await session.commit()
+
+    async def delete_source(self, case_id: str, source_id: str) -> bool:
+        """Delete a source row.
+
+        Returns True if a row was removed, False if it did not exist.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Source).where(
+                    Source.case_id == case_id,
+                    Source.id == source_id,
+                )
+            )
+            source = result.scalar_one_or_none()
+            if source is None:
+                return False
+            await session.delete(source)
+            await session.commit()
+            return True
+
+    # ------------------------------------------------------------------
+    # Timelines
+    # ------------------------------------------------------------------
+
+    async def get_timeline(self, case_id: str, timeline_id: str) -> Timeline | None:
+        """Return a timeline by case and timeline IDs.
+
+        Sources are eagerly loaded so that ``to_dict()`` can build ``source_ids``
+        without triggering an async lazy load outside of a session.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline)
+                .options(selectinload(Timeline.sources))
+                .where(
                     Timeline.case_id == case_id,
                     Timeline.id == timeline_id,
+                )
+            )
+            return result.scalar_one_or_none()
+
+    async def get_default_timeline(self, case_id: str) -> Timeline | None:
+        """Return the default timeline for a case, if it exists.
+
+        Sources are eagerly loaded so callers can safely read ``source_ids``.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline)
+                .options(selectinload(Timeline.sources))
+                .where(
+                    Timeline.case_id == case_id,
+                    Timeline.is_default.is_(True),
                 )
             )
             return result.scalar_one_or_none()
@@ -301,181 +513,197 @@ class PostgresStore:
         timeline_id: str,
         name: str,
         description: str | None = None,
-        parser: str | None = None,
-        embedding_model: str | None = None,
+        source_ids: list[str] | None = None,
     ) -> Timeline:
-        """Create a new timeline within a case."""
+        """Create a new timeline within a case and optionally attach sources."""
         timeline = Timeline(
             id=timeline_id,
             case_id=case_id,
             name=name,
             description=description,
-            parser=parser,
-            embedding_model=embedding_model,
         )
         async with self.session_factory() as session:
             session.add(timeline)
-            await session.commit()
-            await session.refresh(timeline)
-            return timeline
-
-    async def update_timeline_counts(
-        self,
-        case_id: str,
-        timeline_id: str,
-        event_count: int | None = None,
-        vector_count: int | None = None,
-    ) -> None:
-        """Update stored event/vector counts for a timeline.
-
-        ``event_count`` is treated as a delta and added atomically to the
-        stored value (preventing lost updates under concurrent uploads).
-        ``vector_count`` is set to the supplied absolute value.
-        Pass ``None`` for a count that should not be changed.
-        """
-        values: dict = {"updated_at": datetime.now(UTC)}
-        if vector_count is not None:
-            values["vector_count"] = vector_count
-        async with self.session_factory() as session:
-            if event_count is not None:
-                # Atomic increment avoids the read-then-write race when two
-                # uploads complete concurrently for the same timeline.
-                await session.execute(
-                    update(Timeline)
-                    .where(Timeline.id == timeline_id, Timeline.case_id == case_id)
-                    .values(
-                        event_count=Timeline.event_count + event_count,
-                        **{k: v for k, v in values.items()},
+            if source_ids:
+                sources = await session.execute(
+                    select(Source).where(
+                        Source.case_id == case_id,
+                        Source.id.in_(source_ids),
                     )
                 )
-            elif values:
-                await session.execute(
-                    update(Timeline)
-                    .where(Timeline.id == timeline_id, Timeline.case_id == case_id)
-                    .values(**values)
-                )
+                timeline.sources.extend(sources.scalars().all())
             await session.commit()
+            await session.refresh(timeline)
+            # Eagerly load sources for the returned instance so ``to_dict()`` works
+            # after the session closes.
+            await session.refresh(timeline, attribute_names=["sources"])
+            return timeline
 
-    async def get_timeline_upload_by_hash(
+    async def add_source_to_timeline(
         self,
         case_id: str,
         timeline_id: str,
-        file_hash: str,
-    ) -> TimelineUpload | None:
-        """Return an existing upload row for the same file hash, if any."""
+        source_id: str,
+    ) -> bool:
+        """Add a source to a timeline.
+
+        Returns True if the source was added, False if it was already a member
+        or the timeline/source did not exist.
+        """
         from sqlalchemy import select
 
         async with self.session_factory() as session:
-            result = await session.execute(
-                select(TimelineUpload).where(
-                    TimelineUpload.case_id == case_id,
-                    TimelineUpload.timeline_id == timeline_id,
-                    TimelineUpload.file_hash == file_hash,
+            timeline = await session.execute(
+                select(Timeline.id).where(
+                    Timeline.case_id == case_id,
+                    Timeline.id == timeline_id,
                 )
             )
-            return result.scalar_one_or_none()
+            if timeline.scalar_one_or_none() is None:
+                return False
 
-    async def create_timeline_upload(
-        self,
-        case_id: str,
-        timeline_id: str,
-        upload_id: str,
-        file_hash: str,
-        filename: str | None,
-        event_count: int,
-        parser: str | None = None,
-    ) -> TimelineUpload:
-        """Record an uploaded source file for a timeline."""
-        upload = TimelineUpload(
-            id=upload_id,
-            case_id=case_id,
-            timeline_id=timeline_id,
-            file_hash=file_hash,
-            filename=filename,
-            parser=parser,
-            event_count=event_count,
-        )
-        async with self.session_factory() as session:
-            session.add(upload)
-            await session.commit()
-            await session.refresh(upload)
-            return upload
-
-    async def delete_timeline_uploads_for_timeline(
-        self,
-        case_id: str,
-        timeline_id: str,
-    ) -> int:
-        """Remove all upload records for a timeline. Returns deleted row count."""
-        from sqlalchemy import delete
-
-        async with self.session_factory() as session:
-            result = await session.execute(
-                delete(TimelineUpload).where(
-                    TimelineUpload.case_id == case_id,
-                    TimelineUpload.timeline_id == timeline_id,
+            source = await session.execute(
+                select(Source.id).where(
+                    Source.case_id == case_id,
+                    Source.id == source_id,
                 )
             )
-            await session.commit()
-            return result.rowcount
+            if source.scalar_one_or_none() is None:
+                return False
 
-    async def update_timeline_embedding_config(
-        self,
-        case_id: str,
-        timeline_id: str,
-        embedding_config: dict,
-    ) -> None:
-        """Persist the analyst's per-source field selection on the timeline."""
-        async with self.session_factory() as session:
-            result = await session.execute(
+            existing = await session.execute(
+                select(TimelineSource).where(
+                    TimelineSource.timeline_id == timeline_id,
+                    TimelineSource.source_id == source_id,
+                )
+            )
+            if existing.scalar_one_or_none() is not None:
+                return False
+
+            session.add(TimelineSource(timeline_id=timeline_id, source_id=source_id))
+            await session.execute(
                 update(Timeline)
-                .where(Timeline.case_id == case_id, Timeline.id == timeline_id)
-                .values(
-                    embedding_config=embedding_config,
-                    updated_at=datetime.now(UTC),
+                .where(Timeline.id == timeline_id)
+                .values(updated_at=datetime.now(UTC))
+            )
+            await session.commit()
+            return True
+
+    async def remove_source_from_timeline(
+        self,
+        case_id: str,
+        timeline_id: str,
+        source_id: str,
+    ) -> bool:
+        """Remove a source from a timeline.
+
+        Returns True if the source was removed, False otherwise.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            timeline = await session.execute(
+                select(Timeline.id).where(
+                    Timeline.case_id == case_id,
+                    Timeline.id == timeline_id,
+                )
+            )
+            if timeline.scalar_one_or_none() is None:
+                return False
+
+            result = await session.execute(
+                delete(TimelineSource).where(
+                    TimelineSource.timeline_id == timeline_id,
+                    TimelineSource.source_id == source_id,
                 )
             )
             if result.rowcount == 0:
-                return
+                return False
+
+            await session.execute(
+                update(Timeline)
+                .where(Timeline.id == timeline_id)
+                .values(updated_at=datetime.now(UTC))
+            )
             await session.commit()
+            return True
 
-    async def list_event_ids_by_annotation_type(
-        self,
-        case_id: str,
-        timeline_id: str,
-        annotation_type: str,
-        origin: str = "user",
-    ) -> list[str]:
-        """Return the event_ids that have at least one annotation of the given type.
-
-        Used by the anomaly service to retrieve the analyst-defined normal set.
-        """
+    async def list_timeline_sources(self, case_id: str, timeline_id: str) -> list[Source]:
+        """Return all sources attached to a timeline."""
         from sqlalchemy import select
 
         async with self.session_factory() as session:
             result = await session.execute(
-                select(Annotation.event_id)
+                select(Source)
+                .join(TimelineSource)
+                .join(Timeline)
                 .where(
-                    Annotation.case_id == case_id,
-                    Annotation.timeline_id == timeline_id,
-                    Annotation.annotation_type == annotation_type,
-                    Annotation.origin == origin,
+                    Timeline.case_id == case_id,
+                    Timeline.id == timeline_id,
                 )
-                .distinct()
+                .order_by(Source.created_at.desc())
             )
-            return [row[0] for row in result.all()]
+            return list(result.scalars().all())
 
     async def list_timelines(self, case_id: str) -> list[Timeline]:
-        """Return all timelines for a case ordered by creation time."""
+        """Return all timelines for a case ordered by creation time.
+
+        Sources are eagerly loaded so that ``to_dict()`` can build ``source_ids``
+        without triggering an async lazy load outside of a session.
+        """
         from sqlalchemy import select
 
         async with self.session_factory() as session:
             result = await session.execute(
                 select(Timeline)
+                .options(selectinload(Timeline.sources))
                 .where(Timeline.case_id == case_id)
                 .order_by(Timeline.created_at.desc())
             )
             return list(result.scalars().all())
+
+    async def delete_timeline(self, case_id: str, timeline_id: str) -> bool:
+        """Delete a timeline row.
+
+        The default timeline cannot be deleted. Returns True if a row was
+        removed, False if it did not exist or was the default timeline.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline).where(
+                    Timeline.case_id == case_id,
+                    Timeline.id == timeline_id,
+                )
+            )
+            timeline = result.scalar_one_or_none()
+            if timeline is None or timeline.is_default:
+                return False
+            await session.delete(timeline)
+            await session.commit()
+            return True
+
+    async def delete_case(self, case_id: str) -> bool:
+        """Delete a case and all its timelines and sources in one transaction.
+
+        Returns True if the case existed and was removed, False otherwise.
+        """
+        from sqlalchemy import delete
+
+        async with self.session_factory() as session:
+            case = await session.get(Case, case_id)
+            if case is None:
+                return False
+            await session.execute(delete(Timeline).where(Timeline.case_id == case_id))
+            await session.execute(delete(Source).where(Source.case_id == case_id))
+            await session.delete(case)
+            await session.commit()
+            return True
+
+    # ------------------------------------------------------------------
+    # Views
+    # ------------------------------------------------------------------
 
     async def list_views(self, case_id: str) -> list[View]:
         """Return all saved views for a case ordered by creation time (newest first)."""
@@ -537,45 +765,15 @@ class PostgresStore:
             await session.commit()
             return True
 
-    async def delete_timeline(self, case_id: str, timeline_id: str) -> bool:
-        """Delete a timeline row.
-
-        Returns True if a row was removed, False if it did not exist.
-        """
-        from sqlalchemy import select
-
-        async with self.session_factory() as session:
-            result = await session.execute(
-                select(Timeline).where(
-                    Timeline.case_id == case_id,
-                    Timeline.id == timeline_id,
-                )
-            )
-            timeline = result.scalar_one_or_none()
-            if timeline is None:
-                return False
-            await session.delete(timeline)
-            await session.commit()
-            return True
-
-    async def delete_case(self, case_id: str) -> bool:
-        """Delete a case and all its timeline rows in one transaction.
-
-        Returns True if the case existed and was removed, False otherwise.
-        """
-        from sqlalchemy import delete
-
-        async with self.session_factory() as session:
-            case = await session.get(Case, case_id)
-            if case is None:
-                return False
-            await session.execute(delete(Timeline).where(Timeline.case_id == case_id))
-            await session.delete(case)
-            await session.commit()
-            return True
+    # ------------------------------------------------------------------
+    # Annotations
+    # ------------------------------------------------------------------
 
     async def list_annotations(
-        self, case_id: str, timeline_id: str, event_id: str
+        self,
+        case_id: str,
+        source_id: str,
+        event_id: str,
     ) -> list[Annotation]:
         """Return annotations for a single event, oldest first."""
         from sqlalchemy import select
@@ -585,15 +783,19 @@ class PostgresStore:
                 select(Annotation)
                 .where(
                     Annotation.case_id == case_id,
-                    Annotation.timeline_id == timeline_id,
+                    Annotation.source_id == source_id,
                     Annotation.event_id == event_id,
                 )
                 .order_by(Annotation.created_at.asc())
             )
             return list(result.scalars().all())
 
-    async def list_timeline_annotations(self, case_id: str, timeline_id: str) -> list[Annotation]:
-        """Return all annotations for a timeline (used for bulk table chips)."""
+    async def list_source_annotations(
+        self,
+        case_id: str,
+        source_ids: list[str],
+    ) -> list[Annotation]:
+        """Return all annotations for one or more sources (used for event-table chips)."""
         from sqlalchemy import select
 
         async with self.session_factory() as session:
@@ -601,7 +803,7 @@ class PostgresStore:
                 select(Annotation)
                 .where(
                     Annotation.case_id == case_id,
-                    Annotation.timeline_id == timeline_id,
+                    Annotation.source_id.in_(source_ids),
                 )
                 .order_by(Annotation.created_at.asc())
             )
@@ -610,7 +812,7 @@ class PostgresStore:
     async def create_annotation(
         self,
         case_id: str,
-        timeline_id: str,
+        source_id: str,
         event_id: str,
         annotation_id: str,
         annotation_type: str,
@@ -623,7 +825,7 @@ class PostgresStore:
         annotation = Annotation(
             id=annotation_id,
             case_id=case_id,
-            timeline_id=timeline_id,
+            source_id=source_id,
             event_id=event_id,
             annotation_type=annotation_type,
             content=content,
@@ -649,7 +851,7 @@ class PostgresStore:
             Annotation(
                 id=row["annotation_id"],
                 case_id=row["case_id"],
-                timeline_id=row["timeline_id"],
+                source_id=row["source_id"],
                 event_id=row["event_id"],
                 annotation_type=row["annotation_type"],
                 content=row["content"],
@@ -665,9 +867,12 @@ class PostgresStore:
         return len(annotations)
 
     async def delete_system_annotations(
-        self, case_id: str, timeline_id: str, annotation_type: str
+        self,
+        case_id: str,
+        source_ids: list[str],
+        annotation_type: str,
     ) -> int:
-        """Delete all system-origin annotations of a given type for a timeline.
+        """Delete all system-origin annotations of a given type for sources.
 
         Used before re-writing outlier tags so that a fresh "Tag outliers" run
         does not accumulate duplicate machine annotations.  Returns the count of
@@ -679,7 +884,7 @@ class PostgresStore:
             result = await session.execute(
                 delete(Annotation).where(
                     Annotation.case_id == case_id,
-                    Annotation.timeline_id == timeline_id,
+                    Annotation.source_id.in_(source_ids),
                     Annotation.annotation_type == annotation_type,
                     Annotation.origin == "system",
                 )
@@ -687,7 +892,12 @@ class PostgresStore:
             await session.commit()
             return result.rowcount
 
-    async def delete_annotation(self, case_id: str, event_id: str, annotation_id: str) -> bool:
+    async def delete_annotation(
+        self,
+        case_id: str,
+        event_id: str,
+        annotation_id: str,
+    ) -> bool:
         """Delete a user-origin annotation row.
 
         System annotations (``origin="system"``) are managed by the analysis
@@ -712,6 +922,32 @@ class PostgresStore:
             await session.delete(annotation)
             await session.commit()
             return True
+
+    async def list_event_ids_by_annotation_type(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        annotation_type: str,
+        origin: str = "user",
+    ) -> list[str]:
+        """Return the event_ids that have at least one annotation of the given type.
+
+        Used by the anomaly service to retrieve the analyst-defined normal set.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Annotation.event_id)
+                .where(
+                    Annotation.case_id == case_id,
+                    Annotation.source_id.in_(source_ids),
+                    Annotation.annotation_type == annotation_type,
+                    Annotation.origin == origin,
+                )
+                .distinct()
+            )
+            return [row[0] for row in result.all()]
 
 
 def generate_id(base: str) -> str:

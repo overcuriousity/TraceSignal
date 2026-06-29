@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+import warnings
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -94,10 +95,10 @@ class Event:
     """A single forensic event produced by a parser.
 
     Attributes:
-        event_id: Deterministic UUIDv5 derived from case, timeline, file hash,
+        event_id: Deterministic UUIDv5 derived from case, source, file hash,
             byte offset, and content hash.
         case_id: Investigation case identifier.
-        timeline_id: Timeline identifier within the case.
+        source_id: Source identifier (one ingested file) within the case.
         source_file: Original source file identifier (filename or path) for
             display and provenance. Not used in event identity calculation.
         byte_offset: Byte offset in the source file where the raw record starts.
@@ -110,8 +111,8 @@ class Event:
         message: Human-readable event message.
         timestamp: Optional event timestamp (ISO 8601 string).
         timestamp_desc: Description of what ``timestamp`` represents.
-        source: Short source name.
-        source_long: Long source name.
+        artifact: Short artifact name (renamed from ``source``).
+        artifact_long: Long artifact name (renamed from ``source_long``).
         display_name: Display name of the source artifact.
         tags: List of tags attached by the parser.
         attributes: Additional format-specific fields.
@@ -121,7 +122,7 @@ class Event:
     """
 
     case_id: str
-    timeline_id: str
+    source_id: str
     source_file: Path
     byte_offset: int
     content_hash: str
@@ -134,8 +135,8 @@ class Event:
     ingest_time: datetime = field(default_factory=lambda: datetime.now(UTC))
     timestamp: str | None = None
     timestamp_desc: str | None = None
-    source: str | None = None
-    source_long: str | None = None
+    artifact: str | None = None
+    artifact_long: str | None = None
     display_name: str | None = None
     tags: list[str] = field(default_factory=list)
     attributes: dict[str, Any] = field(default_factory=dict)
@@ -154,15 +155,15 @@ class Event:
         Identity is based on the file-level hash when available, not the
         transient path where the file happened to be stored during ingestion.
         This makes re-uploads of the same source file produce identical event
-        IDs. When no file hash is supplied (e.g. CLI one-off ingestion) the
-        resolved source path is used as a fallback.
+        IDs. A missing file hash is a forensic error; callers should ensure a
+        real hash is supplied.
         """
         namespace = uuid.uuid5(uuid.NAMESPACE_URL, f"tracevector:{self.case_id}")
         source_identity = (
             self.file_hash if self.file_hash else self.source_file.resolve().as_posix()
         )
         digest_input = (
-            f"{self.timeline_id}\n"
+            f"{self.source_id}\n"
             f"{source_identity}\n"
             f"{self.byte_offset}\n"
             f"{self.content_hash}\n"
@@ -177,14 +178,14 @@ class Event:
 
     def text_for_embedding(
         self,
-        source_fields: dict[str, list[str]] | None = None,
+        artifact_fields: dict[str, list[str]] | None = None,
     ) -> str:
         """Build a single text representation for embedding.
 
         Delegates to the canonical implementation in
         ``tracevector.ingestion.pipeline._text_for_embedding`` using a transient
-        dict row derived from this event.  Passing ``source_fields`` applies the
-        same analyst-defined per-source field selection used by the pipeline;
+        dict row derived from this event.  Passing ``artifact_fields`` applies the
+        same analyst-defined per-artifact field selection used by the pipeline;
         omitting it falls back to the legacy all-fields behaviour.
 
         Falls back to ``self.raw_line`` when the result would otherwise be empty.
@@ -195,13 +196,13 @@ class Event:
             "message": self.message,
             "timestamp": self.timestamp,
             "timestamp_desc": self.timestamp_desc,
-            "source": self.source,
-            "source_long": self.source_long,
+            "artifact": self.artifact,
+            "artifact_long": self.artifact_long,
             "display_name": self.display_name,
             "tags": self.tags,
             "attributes": self.attributes,
         }
-        result = _text_for_embedding(row, source_fields)
+        result = _text_for_embedding(row, artifact_fields)
         return result if result else self.raw_line
 
     def to_clickhouse_row(self) -> dict[str, Any]:
@@ -210,7 +211,7 @@ class Event:
         return {
             "event_id": str(self.event_id),
             "case_id": self.case_id,
-            "timeline_id": self.timeline_id,
+            "source_id": self.source_id,
             "source_file": str(self.source_file),
             "byte_offset": self.byte_offset,
             "line_number": self.line_number if self.line_number is not None else 0,
@@ -222,8 +223,8 @@ class Event:
             "message": self.message,
             "timestamp": parsed_ts if parsed_ts is not None else None,
             "timestamp_desc": self.timestamp_desc or "",
-            "source": self.source or "",
-            "source_long": self.source_long or "",
+            "artifact": self.artifact or "",
+            "artifact_long": self.artifact_long or "",
             "display_name": self.display_name or "",
             "tags": self.tags,
             "attributes": {str(k): str(v) for k, v in self.attributes.items()},
@@ -237,7 +238,7 @@ class Event:
         return {
             "event_id": str(self.event_id),
             "case_id": self.case_id,
-            "timeline_id": self.timeline_id,
+            "source_id": self.source_id,
             "source_file": str(self.source_file),
             "byte_offset": self.byte_offset,
             "line_number": self.line_number,
@@ -248,8 +249,8 @@ class Event:
             "message": self.message,
             "timestamp": self.timestamp,
             "timestamp_desc": self.timestamp_desc,
-            "source": self.source,
-            "source_long": self.source_long,
+            "artifact": self.artifact,
+            "artifact_long": self.artifact_long,
             "display_name": self.display_name,
             "tags": self.tags,
             "embedding_model": self.embedding_model,
@@ -271,11 +272,21 @@ def _parse_timestamp(value: str | int | float | datetime | None) -> datetime | N
     Accepts ISO-8601 strings, common ``YYYY-MM-DD HH:MM:SS`` forms, and
     Unix epoch integers/strings in seconds, milliseconds, or microseconds.
     Returns ``None`` when the value cannot be parsed.
+
+    Naive datetimes and unqualified string timestamps are assumed to be UTC
+    with a warning, per the model refinement requirements.
     """
     if value is None:
         return None
     if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=UTC)
+        if value.tzinfo is None:
+            warnings.warn(
+                f"Naive timestamp {value!r} assumed UTC; "
+                "configure per-source timezone when available.",
+                stacklevel=2,
+            )
+            return value.replace(tzinfo=UTC)
+        return value
     if isinstance(value, (int, float)):
         return datetime.fromtimestamp(value, tz=UTC)
 
@@ -286,14 +297,27 @@ def _parse_timestamp(value: str | int | float | datetime | None) -> datetime | N
     # ISO-8601 (python's fromisoformat does not accept trailing Z before 3.11).
     try:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+        if dt.tzinfo is None:
+            warnings.warn(
+                f"Naive timestamp {s!r} assumed UTC; "
+                "configure per-source timezone when available.",
+                stacklevel=2,
+            )
+            return dt.replace(tzinfo=UTC)
+        return dt
     except ValueError:
         pass
 
     # Common absolute datetime formats.
     for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
         try:
-            return datetime.strptime(s, fmt).replace(tzinfo=UTC)
+            dt = datetime.strptime(s, fmt)
+            warnings.warn(
+                f"Unqualified timestamp {s!r} assumed UTC; "
+                "configure per-source timezone when available.",
+                stacklevel=2,
+            )
+            return dt.replace(tzinfo=UTC)
         except ValueError:
             pass
 

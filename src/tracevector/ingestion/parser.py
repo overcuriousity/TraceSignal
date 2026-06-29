@@ -73,13 +73,13 @@ class Parser(ABC):
     def __init__(
         self,
         case_id: str,
-        timeline_id: str,
+        source_id: str,
         config: ParserConfig,
         file_hash: str | None = None,
         source_name: str | None = None,
     ) -> None:
         self.case_id = case_id
-        self.timeline_id = timeline_id
+        self.source_id = source_id
         self.config = config
         self.file_hash = file_hash
         self.source_name = source_name
@@ -98,32 +98,37 @@ class Parser(ABC):
         message: str,
         timestamp: str | None = None,
         timestamp_desc: str | None = None,
-        source: str | None = None,
-        source_long: str | None = None,
+        artifact: str | None = None,
+        artifact_long: str | None = None,
         display_name: str | None = None,
         tags: list[str] | None = None,
         attributes: dict[str, Any] | None = None,
     ) -> Event:
         """Build an :py:class:`Event` with forensic metadata populated."""
+        if not self.file_hash:
+            raise ValueError(
+                "A real file hash is required for forensic integrity. "
+                "Rejecting ingestion without a file-level hash."
+            )
         # Fall back to the read path when no explicit source name is supplied
         # (e.g. CLI one-off ingestion).
         provenance_file = Path(self.source_name) if self.source_name else source_file
         return Event(
             case_id=self.case_id,
-            timeline_id=self.timeline_id,
+            source_id=self.source_id,
             source_file=provenance_file,
             byte_offset=byte_offset,
             line_number=line_number,
             content_hash=content_hash(raw_line),
-            file_hash=self.file_hash or content_hash(raw_line),
+            file_hash=self.file_hash,
             parser_name=self.config.name,
             parser_version=self.config.version,
             raw_line=raw_line,
             message=message,
             timestamp=timestamp,
             timestamp_desc=timestamp_desc,
-            source=source,
-            source_long=source_long,
+            artifact=artifact,
+            artifact_long=artifact_long,
             display_name=display_name,
             tags=tags or [],
             attributes=attributes or {},
@@ -148,8 +153,8 @@ class TimesketchCsvParser(Parser):
         "timestamp_desc": "timestamp_desc",
         "timestamp": "timestamp",
         "message": "message",
-        "source": "source",
-        "source_long": "source_long",
+        "source": "artifact",
+        "source_long": "artifact_long",
         "parser": "parser",
         "display_name": "display_name",
         "tag": "tags",
@@ -245,8 +250,8 @@ class TimesketchCsvParser(Parser):
             message=message,
             timestamp=mapped.get("timestamp"),
             timestamp_desc=mapped.get("timestamp_desc"),
-            source=mapped.get("source"),
-            source_long=mapped.get("source_long"),
+            artifact=mapped.get("artifact"),
+            artifact_long=mapped.get("artifact_long"),
             display_name=mapped.get("display_name"),
             tags=tags,
             attributes=attributes,
@@ -266,8 +271,8 @@ class JsonlParser(Parser):
         "timestamp_desc": "timestamp_desc",
         "message": "message",
         "msg": "message",
-        "source": "source",
-        "source_long": "source_long",
+        "source": "artifact",
+        "source_long": "artifact_long",
         "parser": "parser",
         "display_name": "display_name",
         "tag": "tags",
@@ -332,8 +337,8 @@ class JsonlParser(Parser):
             message=message,
             timestamp=mapped.get("timestamp"),
             timestamp_desc=mapped.get("timestamp_desc"),
-            source=mapped.get("source"),
-            source_long=mapped.get("source_long"),
+            artifact=mapped.get("artifact"),
+            artifact_long=mapped.get("artifact_long"),
             display_name=mapped.get("display_name"),
             tags=tags,
             attributes=attributes,
@@ -343,7 +348,7 @@ class JsonlParser(Parser):
 def get_parser(
     format_name: str,
     case_id: str,
-    timeline_id: str,
+    source_id: str,
     options: dict[str, Any] | None = None,
     file_hash: str | None = None,
     source_name: str | None = None,
@@ -357,10 +362,10 @@ def get_parser(
     Args:
         format_name: Parser format identifier.
         case_id: Investigation case identifier.
-        timeline_id: Timeline identifier within the case.
+        source_id: Source identifier within the case.
         options: Optional parser-specific options.
-        file_hash: Optional SHA-256 hex digest of the whole source file. When
-            supplied it drives deterministic event identity.
+        file_hash: SHA-256 hex digest of the whole source file. Required for
+            forensic integrity; ingestion is rejected when not supplied.
         source_name: Optional provenance name (e.g. original filename) to store
             as ``source_file`` instead of the transient read path.
     """
@@ -372,11 +377,11 @@ def get_parser(
     name = format_name.lower()
     if name in {"timesketch_csv", "csv"}:
         return TimesketchCsvParser(
-            case_id, timeline_id, config, file_hash=file_hash, source_name=source_name
+            case_id, source_id, config, file_hash=file_hash, source_name=source_name
         )
     if name in {"jsonl", "json"}:
         return JsonlParser(
-            case_id, timeline_id, config, file_hash=file_hash, source_name=source_name
+            case_id, source_id, config, file_hash=file_hash, source_name=source_name
         )
     raise ValueError(f"Unsupported parser format: {format_name}")
 

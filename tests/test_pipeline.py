@@ -24,25 +24,27 @@ class FakeClickHouseStore:
         self.events.extend(events)
         return len(events)
 
-    def count_events(self, case_id: str | None = None, timeline_id: str | None = None) -> int:
+    def count_events(
+        self, case_id: str | None = None, source_id: str | None = None
+    ) -> int:
         events = self.events
         if case_id is not None:
             events = [e for e in events if e.case_id == case_id]
-        if timeline_id is not None:
-            events = [e for e in events if e.timeline_id == timeline_id]
+        if source_id is not None:
+            events = [e for e in events if e.source_id == source_id]
         return len(events)
 
     def list_events(
         self,
         case_id: str,
-        timeline_id: str,
+        source_id: str,
         limit: int,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
         events = [
             e.as_dict()
             for e in self.events
-            if e.case_id == case_id and e.timeline_id == timeline_id
+            if e.case_id == case_id and e.source_id == source_id
         ]
         return events[offset : offset + limit]
 
@@ -148,15 +150,17 @@ def test_pipeline_ingests_events_without_vectors(sample_jsonl: Path) -> None:
 
     pipeline = IngestionPipeline(
         case_id="case1",
-        timeline_id="timeline1",
+        source_id="source1",
         clickhouse=clickhouse,
         batch_size=2,
+        source_name="events.jsonl",
+        file_hash="abc",
     )
 
     result = pipeline.run(sample_jsonl)
 
     assert result.case_id == "case1"
-    assert result.timeline_id == "timeline1"
+    assert result.source_id == "source1"
     assert result.events_parsed == 3
     assert result.events_inserted == 3
     assert len(clickhouse.events) == 3
@@ -170,15 +174,17 @@ def test_embedding_pipeline_generates_vectors(sample_jsonl: Path) -> None:
 
     ingest = IngestionPipeline(
         case_id="case1",
-        timeline_id="timeline1",
+        source_id="source1",
         clickhouse=clickhouse,
         batch_size=2,
+        source_name="events.jsonl",
+        file_hash="abc",
     )
     ingest.run(sample_jsonl)
 
     embed = EmbeddingPipeline(
         case_id="case1",
-        timeline_id="timeline1",
+        source_ids=["source1"],
         embedding_model=embedding_model,
         clickhouse=clickhouse,
         qdrant=qdrant,
@@ -196,8 +202,10 @@ def test_embedding_pipeline_generates_vectors(sample_jsonl: Path) -> None:
 def test_pipeline_raises_on_missing_path(tmp_path: Path) -> None:
     pipeline = IngestionPipeline(
         case_id="case1",
-        timeline_id="timeline1",
+        source_id="source1",
         clickhouse=FakeClickHouseStore(),
+        source_name="missing.jsonl",
+        file_hash="abc",
     )
     with pytest.raises(FileNotFoundError):
         pipeline.run(tmp_path / "does-not-exist.jsonl")
@@ -212,7 +220,7 @@ def test_pipeline_deduplicates_identical_file_hash(sample_jsonl: Path) -> None:
 
     pipeline = IngestionPipeline(
         case_id="case1",
-        timeline_id="timeline1",
+        source_id="source1",
         clickhouse=clickhouse,
         batch_size=2,
         file_hash="abc123",

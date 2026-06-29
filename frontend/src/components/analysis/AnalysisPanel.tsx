@@ -1,10 +1,12 @@
 import { useState, useEffect } from "react";
 import { X, AlertTriangle, Search, BookOpen } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/Button";
 import { AnomaliesList } from "./AnomaliesList";
 import { SimilarEvents } from "./SimilarEvents";
 import { EmbeddingStatusBanner } from "./EmbeddingStatusBanner";
 import { MethodologyPanel } from "./MethodologyPanel";
+import { sourcesApi } from "@/api/sources";
 import { cn } from "@/lib/cn";
 import type { Event, Timeline } from "@/api/types";
 
@@ -24,7 +26,7 @@ interface Props {
 export function AnalysisPanel({
   caseId,
   timelineId,
-  timeline,
+  timeline: _timeline,
   hasVectors,
   similarAnchor,
   onClose,
@@ -37,6 +39,13 @@ export function AnalysisPanel({
   useEffect(() => {
     if (similarAnchor) setTab("similar");
   }, [similarAnchor]);
+
+  const { data: sources } = useQuery({
+    queryKey: ["timeline-sources", caseId, timelineId],
+    queryFn: () => sourcesApi.list(caseId),
+    enabled: true,
+  });
+  const firstSource = sources?.[0] ?? null;
 
   return (
     <div className="flex h-full w-80 shrink-0 flex-col border-l border-[var(--color-border)] bg-[var(--color-bg-surface)]">
@@ -76,7 +85,7 @@ export function AnalysisPanel({
       <div className="flex-1 overflow-y-auto p-4">
         {!hasVectors && (
           <div className="mb-4">
-            <EmbeddingStatusBanner status="not_embedded" timeline={timeline} />
+            <EmbeddingStatusBanner status="not_embedded" source={firstSource} />
           </div>
         )}
 
@@ -106,7 +115,7 @@ export function AnalysisPanel({
           <MethodologyPanel
             caseId={caseId}
             timelineId={timelineId}
-            timeline={timeline}
+            source={firstSource}
           />
         )}
       </div>

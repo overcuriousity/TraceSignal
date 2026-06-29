@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     embedding_device: str = "cpu"
     embedding_batch_size: int = 64
 
+    # Source file retention
+    source_retention_path: str = "data/sources"
+
 
 @lru_cache
 def get_settings() -> Settings:

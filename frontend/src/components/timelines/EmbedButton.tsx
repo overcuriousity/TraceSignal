@@ -1,31 +1,30 @@
 import { useMutation } from "@tanstack/react-query";
 import { Cpu } from "lucide-react";
-import { timelinesApi } from "@/api/timelines";
+import { sourcesApi } from "@/api/sources";
 import { useJobsStore } from "@/stores/jobs";
 import { Button } from "@/components/ui/Button";
 import { Tooltip } from "@/components/ui/Tooltip";
+import type { Source } from "@/api/types";
 
 interface Props {
   caseId: string;
-  timelineId: string;
-  timelineName: string;
-  vectorCount: number;
+  source: Source;
 }
 
-export function EmbedButton({ caseId, timelineId, timelineName, vectorCount }: Props) {
+export function EmbedButton({ caseId, source }: Props) {
   const addJob = useJobsStore((s) => s.addJob);
 
   const { mutate, isPending } = useMutation({
-    mutationFn: () => timelinesApi.embed(caseId, timelineId),
+    mutationFn: () => sourcesApi.embed(caseId, source.id),
     onSuccess: (result) => {
-      addJob(result.job_id, `Embedding "${timelineName}"`);
+      addJob(result.job_id, `Embedding "${source.name}"`);
     },
   });
 
-  const label = vectorCount > 0 ? "Re-embed" : "Embed";
+  const label = source.vector_count > 0 ? "Re-embed" : "Embed";
   const tip =
-    vectorCount > 0
-      ? `${vectorCount.toLocaleString()} vectors — click to re-run embedding`
+    source.vector_count > 0
+      ? `${source.vector_count.toLocaleString()} vectors — click to re-run embedding`
       : "Generate vector embeddings for similarity search & anomaly detection";
 
   return (

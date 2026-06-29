@@ -15,7 +15,7 @@ interface Props {
   event: Event;
   annotations: Annotation[];
   caseId: string;
-  timelineId: string;
+  sourceId: string;
   onClose: () => void;
   onFindSimilar: (event: Event) => void;
   /** Called when the user clicks filter-in or filter-out on a field row. */
@@ -190,13 +190,13 @@ export function EventDetailPanel({
   event,
   annotations,
   caseId,
-  timelineId,
+  sourceId,
   onClose,
   onFindSimilar,
   onAddFilter,
 }: Props) {
   const [addMode, setAddMode] = useState<"tag" | "comment" | null>(null);
-  const { add, remove } = useAnnotationMutations(caseId, timelineId);
+  const { add, remove } = useAnnotationMutations(caseId, sourceId);
 
   // ── Resize drag ────────────────────────────────────────────────────────
   const { detailPanelWidth, setDetailPanelWidth } = useUiStore();
@@ -310,23 +310,23 @@ export function EventDetailPanel({
           />
         </div>
 
-        {/* Source */}
+        {/* Artifact */}
         <div className="mb-3">
           <p className="mb-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-            Source
+            Artifact
           </p>
           <FieldRow
-            label="source"
-            value={event.source}
+            label="artifact"
+            value={event.artifact || event.source_file || null}
             mono
-            filterKey="source"
+            filterKey="artifact"
             onAddFilter={onAddFilter}
           />
           <FieldRow
-            label="source_long"
-            value={event.source_long}
+            label="artifact_long"
+            value={event.artifact_long}
             mono
-            filterKey="source_long"
+            filterKey="artifact_long"
             onAddFilter={onAddFilter}
           />
           <FieldRow
@@ -485,9 +485,16 @@ export function EventDetailPanel({
             Provenance
           </p>
           <FieldRow label="event_id" value={event.event_id} mono filterKey={null} />
+          <FieldRow label="source_id" value={event.source_id} mono filterKey={null} />
           <FieldRow
             label="content_hash"
             value={truncateHash(event.content_hash, 24)}
+            mono
+            filterKey={null}
+          />
+          <FieldRow
+            label="file_hash"
+            value={truncateHash(event.file_hash, 24)}
             mono
             filterKey={null}
           />

@@ -23,11 +23,18 @@ export function FilterChips({ filters, onRemove }: Props) {
       onRemove: () => onRemove("q"),
       variant: "neutral",
     });
-  if (filters.source)
+  if (filters.artifact)
     chips.push({
-      label: "source",
-      value: filters.source,
-      onRemove: () => onRemove("source"),
+      label: "artifact",
+      value: filters.artifact,
+      onRemove: () => onRemove("artifact"),
+      variant: "include",
+    });
+  if (filters.sourceId)
+    chips.push({
+      label: "sourceId",
+      value: filters.sourceId,
+      onRemove: () => onRemove("sourceId"),
       variant: "include",
     });
   if (filters.tag)

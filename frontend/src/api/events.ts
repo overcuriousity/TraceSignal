@@ -11,7 +11,8 @@ export const eventsApi = {
     const params: Record<string, string | number | boolean | undefined | null> =
       {
         q: filters.q,
-        source: filters.source,
+        artifact: filters.artifact,
+        source_id: filters.sourceId,
         tag: filters.tag,
         exclude_tag: filters.excludeTag,
         start: filters.start,
@@ -52,7 +53,8 @@ export const eventsApi = {
   ): Promise<HistogramResponse> => {
     const params: Record<string, string | number | undefined | null> = {
       q: filters.q,
-      source: filters.source,
+      artifact: filters.artifact,
+      source_id: filters.sourceId,
       tag: filters.tag,
       exclude_tag: filters.excludeTag,
       start: filters.start,

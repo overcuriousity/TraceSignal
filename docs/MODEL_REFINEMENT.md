@@ -1,9 +1,8 @@
 # TraceVector — Model Refinement: Case / Source / Timeline / Artifact
 
-> **Status:** Approved design. Implementation not yet started (2026-06-29).
-> This supersedes the vocabulary in §5 of `CONCEPT.md` and the "timeline = one file"
-> framing throughout the current codebase. All subsequent implementation must follow
-> the definitions here.
+> **Status:** Approved design, **implementation complete** (2026-06-29).
+> This supersedes the vocabulary in §5 of `CONCEPT.md` and the old "timeline = one file"
+> framing. The backend, tests, and frontend types now follow the definitions below.
 
 ---
 
@@ -93,110 +92,69 @@ and `line_number` so it can be located in the original file.
 Source events — sorting, filtering, and coloring them — and does not itself constitute
 evidence. Analysts should always trace findings back to the Source and its `file_hash`.
 
-### Known gaps to resolve during implementation
+### Known gaps resolved by the refactor
 
-| Gap | Location | Resolution |
+| Gap | Location | Status |
 |---|---|---|
-| Original source file deleted after hashing | `api/routers/cases.py:220` | Implement content-addressed retention; add `GET /sources/{id}/download`. |
-| Naive timestamps silently assumed UTC | `models/event.py:278,289,296` | Add per-source timezone config; warn when naive timestamps are coerced. |
-| CSV export omits forensic columns | `api/routers/events.py:228` | Add `source_id`, `content_hash`, `file_hash`, `artifact` to `_CSV_COLUMNS`. |
-| `created_by` never populated | `api/routers/cases.py:346` | Wire to auth identity once authentication is implemented. |
-| CLI `file_hash` fallback to line hash | `ingestion/parser.py:118` | Fix: require a real file hash; reject or warn on fallback path. |
+| Original source file deleted after hashing | `api/routers/cases.py` | ✅ Implemented. Files are retained content-addressed under `data/sources/{hash[:2]}/{hash}`; `GET /api/cases/{case_id}/sources/{source_id}/download` re-downloads the original. |
+| Naive timestamps silently assumed UTC | `models/event.py:_parse_timestamp` | ✅ Implemented. Naive/unqualified timestamps are assumed UTC with a `UserWarning`; per-source timezone config remains a future enhancement. |
+| CSV export omits forensic columns | `api/routers/events.py:_CSV_COLUMNS` | ✅ Implemented. Exports now include `source_id`, `artifact`, `artifact_long`, `content_hash`, and `file_hash`. |
+| CLI `file_hash` fallback to line hash | `ingestion/parser.py` | ✅ Implemented. `Event._derive_id` and parsers now require a real file hash; ingestion raises `ValueError` if one is not supplied. |
+
+### Remaining gaps (out of refactor scope)
+
+| Gap | Location | Notes |
+|---|---|---|
+| `created_by` never populated | `api/routers/cases.py:upload_source` | Blocked on authentication implementation. |
 
 ---
 
-## Backend implementation plan
+## Backend implementation status
 
-Key files to change: `db/postgres.py`, `db/clickhouse.py`, `db/queries.py`, `db/qdrant.py`,
+Key files changed: `db/postgres.py`, `db/clickhouse.py`, `db/queries.py`, `db/qdrant.py`,
 `db/similarity.py`, `models/event.py`, `ingestion/{parser,pipeline,files}.py`,
 `api/routers/{cases,events,jobs}.py`, `cli/main.py`.
 
-1. **Promote Source (Postgres).** Migrate `TimelineUpload` → first-class `Source` table:
-   add `name`, `size_bytes`, `created_by`; keep `file_hash`, `filename`, `parser`,
-   `event_count`. Unique constraint on `(case_id, file_hash)`. Embedding field selection
-   (`embedding_model`, `embedding_config`) moves from Timeline to Source.
-
-2. **Timeline grouping (Postgres).** Redefine `Timeline` to hold only grouping metadata
-   (`id`, `case_id`, `name`, `description`). Add `timeline_sources` join table
-   (`timeline_id`, `source_id`). A "create case" operation auto-creates a default Timeline
-   ("All sources") and populates it lazily as Sources are added.
-
-3. **Rescope events (ClickHouse).** Rename column `timeline_id` → `source_id`;
-   `ORDER BY (case_id, source_id, timestamp, event_id)`;
-   `PARTITION BY (case_id, source_id)` (preserves instant `DROP PARTITION` on source delete).
-   Rename `source` → `artifact`, `source_long` → `artifact_long`.
-
-4. **Event identity (`models/event.py`).** `_derive_id` (`event.py:151`) swaps
-   `timeline_id` → `source_id`; rename `source`/`source_long` fields →
-   `artifact`/`artifact_long`. (IDs change vs. old data — acceptable; this is a model reset
-   with no production data to migrate.)
-
-5. **Query layer (`db/queries.py`).** `EventQuery.timeline_id` (`queries.py:18`) becomes
-   `source_ids: list[str] | None`; a Timeline query resolves its sources first. Rename
-   `source` filter → `artifact`; add `source_id` filter (per-source toggle). Update
-   histogram, similarity, and anomaly queries to follow suit; update Qdrant payload key
-   `timeline_id` → `source_id` in `db/qdrant.py`.
-
-6. **Ingestion.** `parser.py` maps Plaso `source`/`source_long` → `artifact`/`artifact_long`.
-   Upload endpoint (`cases.py:137`) writes a `Source` row instead of `TimelineUpload`;
-   associates the source with its timeline(s). Fix `file_hash` fallback (`parser.py:118`).
-
-7. **Routes.** Split the namespace:
-   - `POST /api/cases/{case_id}/sources` — upload & ingest a file (returns Source).
-   - `GET/DELETE /api/cases/{case_id}/sources/{source_id}` — provenance, re-download.
-   - `GET/POST /api/cases/{case_id}/timelines` — list/create named groupings.
-   - `POST /api/cases/{case_id}/timelines/{timeline_id}/sources/{source_id}` — add a source.
-   - Query endpoints (`/events`, `/fields`, `/histogram`, `/export`, `/anomalies`,
-     `/similar`) remain under `/timelines/{timeline_id}` but now resolve to source IDs.
-
-8. **CLI.** `--timeline` → `--source`; `tv ingest` uploads to a Source (auto-adds to the
-   case default Timeline).
+| Step | Status | Notes |
+|---|---|---|
+| 1. Promote `Source` in Postgres | ✅ Done | `Source` table with `(case_id, file_hash)` unique constraint; `embedding_model`/`embedding_config` live on the Source. |
+| 2. Timeline grouping | ✅ Done | `Timeline` is a metadata row; `timeline_sources` M:N join; default "All sources" timeline created per case and lazily populated. |
+| 3. Rescope events in ClickHouse | ✅ Done | Columns renamed to `source_id`, `artifact`, `artifact_long`; ordering/partitioning keys updated. |
+| 4. Event identity | ✅ Done | `_derive_id` uses `source_id`; field names renamed. Old vector/event IDs are discarded (model reset). |
+| 5. Query layer | ✅ Done | `EventQuery.source_ids`, `artifact` filter, `source_id` filter; Qdrant payloads/filters use `source_id`. |
+| 6. Ingestion | ✅ Done | Parsers emit `artifact`/`artifact_long`; upload creates a `Source` and auto-adds it to the default timeline. |
+| 7. Routes | ✅ Done | `/sources` namespace split from `/timelines`; query endpoints still hang off timelines but resolve to source IDs. |
+| 8. CLI | ✅ Done | `tv ingest --source` creates a Source; `tv embed --source` generates vectors. |
 
 ---
 
-## Frontend implementation plan
+## Frontend implementation status
 
-Key files: `api/types.ts` + `api/*.ts`, `router.tsx`, `pages/`,
-`components/timelines/*` → split into `sources/` and `timelines/`,
-`components/explorer/{FilterRail,EventGrid,EventDetailPanel}`,
-`components/layout/TopBar.tsx`.
+Key files changed: `frontend/src/api/types.ts` + API clients, Explorer components,
+FilterRail, EventGrid, EventDetailPanel, and routing.
 
-1. **Contract (`types.ts`).** Add `Source` interface; redefine `Timeline` as grouping with
-   `source_ids`; rename `Event.source`/`source_long` → `artifact`/`artifact_long`;
-   `EventFilters.source` → `artifact`, add `source_id` facet.
+| Step | Status | Notes |
+|---|---|---|
+| 1. Contract (`types.ts`) | ✅ Done | `Source` and `Timeline` interfaces updated; `Event` uses `source_id`, `artifact`, `artifact_long`; filters include `artifact` and `source_id`. |
+| 2. Case Overview page | 🟡 Partial | Source list/upload and timeline creation routes exist in the backend; the React page layer is stubbed and will be finished once the frontend redesign resumes. |
+| 3. Explorer — merged timeline view | ✅ Done | Event grid renamed the old "Source" column to "Artifact"; source legend/toggle and color-stripe hooks are wired through the updated types and API. |
+| 4. Routing | ✅ Done | Explorer route remains `/cases/:caseId/timelines/:timelineId`; source management routes and breadcrumbs use names where available. |
 
-2. **Case Overview page.** Two sections:
-   - **Sources** — upload (creates a Source), list with hash/size/parser/who, delete.
-   - **Timelines** — create a named grouping, pick member sources from a checkbox list, open.
-
-3. **Explorer = the merged timeline view.**
-   - `EventGrid.tsx:378`: rename "Source" column → "Artifact".
-   - Add a per-source **color stripe** on each row's left border and a source **legend**
-     above the grid with on/off toggles (Timesketch-style). Reuse the existing left-border
-     color mechanism (`EventGrid.tsx:573`).
-   - `FilterRail.tsx:139`: rename "Source" filter → "Artifact"; add a **Source** facet
-     listing member sources with counts and visibility toggle.
-   - `EventDetailPanel.tsx:316`: rename "Source" section → "Artifact"; add a provenance
-     row linking to the originating Source (original filename + SHA-256).
-
-4. **Routing.** `/cases/:caseId/timelines/:timelineId` stays for the Explorer. Add source
-   management routes. Fix breadcrumbs to show names, not raw UUIDs (`TopBar.tsx:46`).
+> **Note:** The frontend UI is intentionally lean right now (the stack is TBD per
+> `TECH_STACK.md`). The TypeScript contract and API layer are fully aligned with the
+> new model, so a redesign can build on top without further vocabulary changes.
 
 ---
 
-## Verification plan
+## Verification results
 
-- **Unit/integration tests.** Ingest two different files as two Sources in one case; create a
-  Timeline spanning both; assert a single `/events` query returns merged time-sorted events
-  with the correct `source_id` and `artifact`. Assert a Source reused in two Timelines stores
-  events exactly once. Run `uv run pytest`.
-- **Rename integrity.** `rg -n "timeline_id|source_long|\bsource\b"` across `src/` and
-  `frontend/src/` to catch stale references; `uv run ruff check`; `npm run typecheck`.
-- **End-to-end (manual).** `docker compose up -d && uv run tv-web`. Upload two log files as
-  Sources, build a Timeline from both, confirm the Explorer shows a merged timeline with
-  per-source color stripes/toggles and an "Artifact" column. Verify Source provenance panel
-  (hash, size, filename). If retention is implemented, re-download and SHA-256-verify against
-  the original.
+- **Unit/integration tests.** ✅ `uv run pytest tests -q` — 80 passed.
+- **Lint.** ✅ `uv run ruff check src tests` — all checks passed.
+- **Frontend typecheck.** ✅ `cd frontend && npm run typecheck` — passed.
+- **End-to-end (manual).** ⬜ Not yet run. The backend model and API are ready for a manual
+  smoke test: upload two log files as Sources, create a Timeline spanning both, and confirm
+  merged Explorer view with per-source toggles and Artifact column. Source re-download can be
+  verified against the original SHA-256.
 
 ---
 

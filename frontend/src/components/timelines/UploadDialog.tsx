@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Upload, FileText } from "lucide-react";
-import { timelinesApi } from "@/api/timelines";
+import { sourcesApi } from "@/api/sources";
 import { Dialog, DialogContent, DialogTrigger, DialogClose } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -9,11 +9,9 @@ import { fmtBytes } from "@/lib/format";
 
 interface Props {
   caseId: string;
-  timelineId: string;
-  timelineName: string;
 }
 
-export function UploadDialog({ caseId, timelineId, timelineName }: Props) {
+export function UploadDialog({ caseId }: Props) {
   const [open, setOpen] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const [parser, setParser] = useState("");
@@ -23,9 +21,14 @@ export function UploadDialog({ caseId, timelineId, timelineName }: Props) {
 
   const { mutate, isPending, error, data } = useMutation({
     mutationFn: () =>
-      timelinesApi.upload(caseId, timelineId, file!, parser || undefined),
+      sourcesApi.upload(
+        caseId,
+        file!,
+        file?.name,
+        parser || undefined,
+      ),
     onSuccess: (result) => {
-      qc.invalidateQueries({ queryKey: ["timeline", caseId, timelineId] });
+      qc.invalidateQueries({ queryKey: ["sources", caseId] });
       qc.invalidateQueries({ queryKey: ["timelines", caseId] });
       console.info("Upload result", result);
       // Auto-close on successful new uploads after a short delay so the user
@@ -60,8 +63,8 @@ export function UploadDialog({ caseId, timelineId, timelineName }: Props) {
         </Button>
       </DialogTrigger>
       <DialogContent
-        title={`Upload to "${timelineName}"`}
-        description="Supported formats: Timesketch CSV, JSONL. Parser auto-detected if omitted."
+        title="Upload source file"
+        description="Uploading creates a new Source and adds it to the default timeline. Supported formats: Timesketch CSV, JSONL. Parser auto-detected if omitted."
       >
         <div className="space-y-4">
           {/* Drop zone */}

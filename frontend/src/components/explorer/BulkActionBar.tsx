@@ -3,52 +3,72 @@ import { Tag, MessageSquare, ShieldCheck, X, AlertCircle } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Spinner } from "@/components/ui/Spinner";
-import { useAnnotationMutations } from "@/hooks/useAnnotationMutations";
+import { annotationsApi } from "@/api/annotations";
+import type { Event } from "@/api/types";
 
 interface Props {
-  selectedIds: string[];
+  selectedEvents: Event[];
   caseId: string;
-  timelineId: string;
   onClear: () => void;
 }
 
-export function BulkActionBar({ selectedIds, caseId, timelineId, onClear }: Props) {
+export function BulkActionBar({ selectedEvents, caseId, onClear }: Props) {
   const [mode, setMode] = useState<"tag" | "comment" | null>(null);
   const [value, setValue] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const { add } = useAnnotationMutations(caseId, timelineId);
+  const [isPending, setIsPending] = useState(false);
 
-  function applyToAll() {
+  async function applyToAll() {
     if (!mode || !value.trim()) return;
     setError(null);
+    setIsPending(true);
     const type = mode === "tag" ? "tag" : "comment";
-    Promise.all(
-      selectedIds.map((eventId) =>
-        add.mutateAsync({ eventId, type, content: value.trim() }),
-      ),
-    ).then(() => {
+    try {
+      await Promise.all(
+        selectedEvents.map((event) =>
+          annotationsApi.create(
+            caseId,
+            event.source_id,
+            event.event_id,
+            type,
+            value.trim(),
+          ),
+        ),
+      );
       onClear();
       setMode(null);
       setValue("");
-    }).catch((err: Error) => {
-      setError(err.message);
-    });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsPending(false);
+    }
   }
 
-  function markAllNormal() {
+  async function markAllNormal() {
     setError(null);
-    Promise.all(
-      selectedIds.map((eventId) =>
-        add.mutateAsync({ eventId, type: "normal", content: "normal operation" }),
-      ),
-    ).then(() => {
+    setIsPending(true);
+    try {
+      await Promise.all(
+        selectedEvents.map((event) =>
+          annotationsApi.create(
+            caseId,
+            event.source_id,
+            event.event_id,
+            "normal",
+            "normal operation",
+          ),
+        ),
+      );
       onClear();
-    }).catch((err: Error) => {
-      setError(err.message);
-    });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsPending(false);
+    }
   }
 
-  if (selectedIds.length === 0) return null;
+  if (selectedEvents.length === 0) return null;
 
   return (
     <div className="flex flex-col border-t border-[var(--color-border)] bg-[var(--color-bg-elevated)]">
@@ -60,7 +80,7 @@ export function BulkActionBar({ selectedIds, caseId, timelineId, onClear }: Prop
       )}
       <div className="flex items-center gap-3 px-4 py-2.5">
       <span className="text-xs font-medium text-[var(--color-fg-secondary)]">
-        {selectedIds.length} selected
+        {selectedEvents.length} selected
       </span>
 
       {mode === null ? (
@@ -74,10 +94,10 @@ export function BulkActionBar({ selectedIds, caseId, timelineId, onClear }: Prop
           <Button
             variant="outline"
             size="sm"
-            disabled={add.isPending}
+            disabled={isPending}
             onClick={markAllNormal}
           >
-            {add.isPending ? <Spinner size={13} /> : <ShieldCheck size={13} />}
+            {isPending ? <Spinner size={13} /> : <ShieldCheck size={13} />}
             Mark Normal
           </Button>
           <Button
@@ -106,10 +126,10 @@ export function BulkActionBar({ selectedIds, caseId, timelineId, onClear }: Prop
           <Button
             variant="accent"
             size="sm"
-            disabled={!value.trim() || add.isPending}
+            disabled={!value.trim() || isPending}
             onClick={applyToAll}
           >
-            {add.isPending ? <Spinner size={13} /> : "Apply"}
+            {isPending ? <Spinner size={13} /> : "Apply"}
           </Button>
           <Button variant="ghost" size="sm" onClick={() => setMode(null)}>
             Cancel

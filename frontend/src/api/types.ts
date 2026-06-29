@@ -9,12 +9,32 @@ export interface Case {
 }
 
 /**
- * Per-source field selection stored on a timeline after the embedding wizard.
- * Shape: { version: 1, sources: { "<source>": ["message", "attr:user_agent"] } }
+ * Per-artifact field selection stored on a source after the embedding wizard.
+ * Shape: { version: 1, artifacts: { "<artifact>": ["message", "attr:user_agent"] } }
  */
 export interface EmbeddingFieldConfig {
   version: 1;
-  sources: Record<string, string[]>;
+  artifacts: Record<string, string[]>;
+}
+
+export interface Source {
+  id: string;
+  case_id: string;
+  name: string;
+  description: string | null;
+  filename: string | null;
+  file_hash: string;
+  size_bytes: number;
+  parser: string | null;
+  parser_version: string | null;
+  event_count: number;
+  vector_count: number;
+  embedding_model: string | null;
+  /** Analyst-defined per-artifact field selection, null when not yet configured. */
+  embedding_config: EmbeddingFieldConfig | null;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface Timeline {
@@ -22,12 +42,8 @@ export interface Timeline {
   case_id: string;
   name: string;
   description: string | null;
-  parser: string | null;
-  embedding_model: string | null;
-  /** Analyst-defined per-source field selection, null when not yet configured. */
-  embedding_config: EmbeddingFieldConfig | null;
-  event_count: number;
-  vector_count: number;
+  is_default: boolean;
+  source_ids: string[];
   created_at: string;
   updated_at: string;
 }
@@ -35,19 +51,20 @@ export interface Timeline {
 export interface Event {
   event_id: string;
   case_id: string;
-  timeline_id: string;
+  source_id: string;
   source_file: string;
   byte_offset: number;
   line_number: number | null;
   content_hash: string;
+  file_hash: string;
   parser_name: string;
   parser_version: string;
   ingest_time: string;
   message: string;
   timestamp: string | null;
   timestamp_desc: string | null;
-  source: string | null;
-  source_long: string | null;
+  artifact: string | null;
+  artifact_long: string | null;
   display_name: string | null;
   /** Parser-derived tags (ClickHouse). Different from annotation tags. */
   tags: string[];
@@ -79,7 +96,7 @@ export type AnnotationOrigin = "user" | "system";
 export interface Annotation {
   id: string;
   case_id: string;
-  timeline_id: string;
+  source_id: string;
   event_id: string;
   annotation_type: AnnotationType;
   content: string;
@@ -143,24 +160,24 @@ export interface TagAnomaliesResponse extends AnomaliesResponse {
   tagged: number;
 }
 
-/** Per-source field info returned by /embedding-fields */
-export interface EmbeddingSourceInfo {
-  source: string;
+/** Per-artifact field info returned by /embedding-fields */
+export interface EmbeddingArtifactInfo {
+  artifact: string;
   count: number;
   /** Fixed top-level fields available for embedding */
   top_level: string[];
-  /** Dynamic attribute keys found for this source */
+  /** Dynamic attribute keys found for this artifact */
   attributes: string[];
   /** Recommended preselection (tokens like "message", "attr:user_agent") */
   recommended: string[];
 }
 
 export interface EmbeddingFieldsResponse {
-  sources: EmbeddingSourceInfo[];
+  artifacts: EmbeddingArtifactInfo[];
 }
 
 export interface UploadResult {
-  timeline_id: string;
+  source_id: string;
   events_parsed: number;
   events_inserted: number;
   parser: string;
@@ -175,7 +192,8 @@ export interface HealthResponse {
 /** Filter params for the events query */
 export interface EventFilters {
   q?: string;
-  source?: string;
+  artifact?: string;
+  sourceId?: string;
   tag?: string;
   excludeTag?: string;
   start?: string;
@@ -215,7 +233,8 @@ export interface ExportRequest {
   format: "csv" | "jsonl";
   filter: {
     q?: string;
-    source?: string;
+    artifact?: string;
+    source_id?: string;
     tag?: string;
     exclude_tag?: string;
     start?: string;

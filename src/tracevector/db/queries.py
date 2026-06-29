@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from tracevector.db.clickhouse import ClickHouseStore
@@ -15,9 +15,10 @@ class EventQuery:
     """Query parameters for the event viewer."""
 
     case_id: str
-    timeline_id: str | None = None
+    source_ids: list[str] | None = None
     q: str | None = None
-    source: str | None = None
+    artifact: str | None = None
+    source_id: str | None = None
     tag: str | None = None
     exclude_tag: str | None = None
     start: datetime | None = None
@@ -46,12 +47,15 @@ _TOP_LEVEL_FILTER_COLUMNS = frozenset(
         "message",
         "timestamp",
         "timestamp_desc",
-        "source",
-        "source_long",
+        "artifact",
+        "artifact_long",
         "display_name",
         "parser_name",
         "parser_version",
         "source_file",
+        "source_id",
+        "content_hash",
+        "file_hash",
     }
 )
 
@@ -59,8 +63,9 @@ _TOP_LEVEL_FILTER_COLUMNS = frozenset(
 # Separate from _TOP_LEVEL_FILTER_COLUMNS (which is for filter routing).
 TOP_LEVEL_DISPLAY_COLUMNS = [
     "timestamp",
-    "source",
-    "source_long",
+    "source_id",
+    "artifact",
+    "artifact_long",
     "display_name",
     "message",
     "timestamp_desc",
@@ -78,19 +83,20 @@ def _format_clickhouse_datetime(value: datetime) -> str:
 _EVENT_SELECT_COLUMNS = """
     event_id,
     case_id,
-    timeline_id,
+    source_id,
     source_file,
     byte_offset,
     line_number,
     content_hash,
+    file_hash,
     parser_name,
     parser_version,
     ingest_time,
     message,
     timestamp,
     timestamp_desc,
-    source,
-    source_long,
+    artifact,
+    artifact_long,
     display_name,
     tags,
     attributes,
@@ -122,6 +128,14 @@ class _ParameterizedQueryBuilder:
         name = self._param_name()
         self.conditions.append(sql_fragment.replace(":name", f"{{{name}:String}}"))
         self.parameters[name] = value
+
+    def add_in_list(self, column: str, values: list[str]) -> None:
+        """Add an ``IN (...)`` condition for a list of string values."""
+        names = [self._param_name() for _ in values]
+        in_clause = ", ".join(f"{{{name}:String}}" for name in names)
+        self.conditions.append(f"{column} IN ({in_clause})")
+        for name, value in zip(names, values, strict=False):
+            self.parameters[name] = value
 
     def add_field_filter(self, key: str, value: str) -> None:
         """Add an equality filter on a top-level column or attribute."""
@@ -166,16 +180,19 @@ class EventQueryService:
         builder = _ParameterizedQueryBuilder()
         builder.add_param("case_id = :name", query.case_id)
 
-        if query.timeline_id is not None:
-            builder.add_param("timeline_id = :name", query.timeline_id)
+        if query.source_ids is not None:
+            builder.add_in_list("source_id", query.source_ids)
+
+        if query.source_id is not None:
+            builder.add_param("source_id = :name", query.source_id)
 
         if query.q:
             # ClickHouse tokenbf_v1 index supports hasToken and multiSearchAny.
             # We use ILIKE for substring search as a simple baseline.
             builder.add_param("message ILIKE :name", f"%{query.q}%")
 
-        if query.source:
-            builder.add_param("source = :name", query.source)
+        if query.artifact:
+            builder.add_param("artifact = :name", query.artifact)
 
         if query.tag:
             builder.add_param("has(tags, :name)", query.tag)
@@ -275,14 +292,24 @@ class EventQueryService:
                 break
             offset += batch_size
 
-    def list_fields(self, case_id: str, timeline_id: str) -> dict[str, list[str]]:
-        """Return the top-level display columns and dynamic attribute keys for a timeline.
+    def list_fields(
+        self, case_id: str, source_ids: list[str]
+    ) -> dict[str, list[str]]:
+        """Return the displayable field names for a timeline.
 
-        Attribute keys are aggregated across a sample of up to 50 000 events so the
-        call stays fast even on large timelines.
+        ``top_level`` contains the fixed columns common to every event.
+        ``attributes`` contains the dynamic keys aggregated from the ``attributes``
+        Map across a sample of up to 50 000 events.  Useful for building a column
+        picker in the UI.
         """
         self.store.init_schema()
         database = self.store.database
+
+        params: dict[str, str] = {"p0": case_id}
+        source_params = [f"s{i}" for i in range(len(source_ids))]
+        source_in = ", ".join(f"{{{name}:String}}" for name in source_params)
+        for name, value in zip(source_params, source_ids, strict=False):
+            params[name] = value
 
         result = self.store.client.query(
             f"""
@@ -290,11 +317,11 @@ class EventQueryService:
             FROM (
                 SELECT attributes
                 FROM {database}.events
-                WHERE case_id = {{p0:String}} AND timeline_id = {{p1:String}}
+                WHERE case_id = {{p0:String}} AND source_id IN ({source_in})
                 LIMIT 50000
             )
             """,
-            parameters={"p0": case_id, "p1": timeline_id},
+            parameters=params,
         )
         raw_keys: list[str] = result.result_rows[0][0] if result.result_rows else []
         return {
@@ -302,28 +329,34 @@ class EventQueryService:
             "attributes": sorted(raw_keys),
         }
 
-    def list_fields_by_source(
-        self, case_id: str, timeline_id: str
+    def list_fields_by_artifact(
+        self, case_id: str, source_ids: list[str]
     ) -> dict[str, list[dict[str, Any]]]:
-        """Return per-source field information for the embedding wizard.
+        """Return per-artifact field information for the embedding wizard.
 
-        For each distinct ``source`` value in the timeline, returns the event
-        count, the available top-level embedding fields, and the dynamic
-        attribute keys found in that source's events.  A ``recommended`` list
-        preselects ``message`` (always) plus ``display_name`` and ``source_long``
-        where present, and all attribute keys (they are source-specific by
-        definition).  The analyst trims in the wizard.
+        For each distinct ``artifact`` value across the timeline's sources,
+        returns the event count, the available top-level embedding fields, and
+        the dynamic attribute keys found in that artifact's events.  A
+        ``recommended`` list preselects ``message`` (always) plus
+        ``display_name`` and ``artifact_long`` where present, and all attribute
+        keys.  The analyst trims in the wizard.
 
-        Results are based on a sample of up to 50 000 events per source.
+        Results are based on a sample of up to 50 000 events per artifact.
         """
         self.store.init_schema()
         database = self.store.database
+
+        params: dict[str, str] = {"p0": case_id}
+        source_params = [f"s{i}" for i in range(len(source_ids))]
+        source_in = ", ".join(f"{{{name}:String}}" for name in source_params)
+        for name, value in zip(source_params, source_ids, strict=False):
+            params[name] = value
 
         # Top-level fields that are meaningful for embedding (not IDs/provenance).
         EMBEDDABLE_TOP_LEVEL = [
             "message",
             "timestamp_desc",
-            "source_long",
+            "artifact_long",
             "display_name",
             "tags",
         ]
@@ -331,37 +364,37 @@ class EventQueryService:
         result = self.store.client.query(
             f"""
             SELECT
-                source,
+                artifact,
                 count() AS n,
                 groupUniqArrayArray(mapKeys(attributes)) AS attr_keys
             FROM (
-                SELECT source, attributes
+                SELECT artifact, attributes
                 FROM {database}.events
-                WHERE case_id = {{p0:String}} AND timeline_id = {{p1:String}}
+                WHERE case_id = {{p0:String}} AND source_id IN ({source_in})
                 LIMIT 50000
             )
-            GROUP BY source
+            GROUP BY artifact
             ORDER BY n DESC
             """,
-            parameters={"p0": case_id, "p1": timeline_id},
+            parameters=params,
         )
 
-        sources = []
+        artifacts = []
         for row in result.result_rows:
-            source_name = row[0] or ""
+            artifact_name = row[0] or ""
             count = row[1]
             attr_keys = sorted(row[2]) if row[2] else []
 
             # Recommended = always message, plus optional top-level, plus all attrs.
             recommended: list[str] = ["message"]
-            for f in ("display_name", "source_long", "timestamp_desc", "tags"):
+            for f in ("display_name", "artifact_long", "timestamp_desc", "tags"):
                 if f not in recommended:
                     recommended.append(f)
             recommended.extend(f"attr:{k}" for k in attr_keys)
 
-            sources.append(
+            artifacts.append(
                 {
-                    "source": source_name,
+                    "artifact": artifact_name,
                     "count": count,
                     "top_level": EMBEDDABLE_TOP_LEVEL,
                     "attributes": attr_keys,
@@ -369,7 +402,7 @@ class EventQueryService:
                 }
             )
 
-        return {"sources": sources}
+        return {"artifacts": artifacts}
 
     def histogram(
         self, query: EventQuery, buckets: int = 60
@@ -401,9 +434,9 @@ class EventQueryService:
 
         # Ensure timezone-aware for arithmetic.
         if hasattr(min_ts, "tzinfo") and min_ts.tzinfo is None:
-            min_ts = min_ts.replace(tzinfo=timezone.utc)
+            min_ts = min_ts.replace(tzinfo=UTC)
         if hasattr(max_ts, "tzinfo") and max_ts.tzinfo is None:
-            max_ts = max_ts.replace(tzinfo=timezone.utc)
+            max_ts = max_ts.replace(tzinfo=UTC)
 
         duration = (max_ts - min_ts).total_seconds()
         interval = max(1, int(duration / buckets))
@@ -419,10 +452,11 @@ class EventQueryService:
             """,
             parameters=parameters,
         )
+
         def _to_utc_iso(dt: Any) -> str:
             if hasattr(dt, "isoformat"):
                 if hasattr(dt, "tzinfo") and dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
+                    dt = dt.replace(tzinfo=UTC)
                 return dt.isoformat()
             return str(dt)
 

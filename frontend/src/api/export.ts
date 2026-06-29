@@ -11,7 +11,8 @@ export async function downloadExport(
     format,
     filter: {
       q: filters.q,
-      source: filters.source,
+      artifact: filters.artifact,
+      source_id: filters.sourceId,
       tag: filters.tag,
       exclude_tag: filters.excludeTag,
       start: filters.start,
