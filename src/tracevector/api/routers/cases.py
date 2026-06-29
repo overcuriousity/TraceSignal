@@ -155,6 +155,14 @@ async def upload_timeline(
         raise HTTPException(status_code=404, detail="Timeline not found")
 
     file_hash = hash_file(file.file)
+    # hash_file rewinds seekable streams; fail fast if the stream stayed at EOF.
+    try:
+        file.file.seek(0)
+    except (OSError, AttributeError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file stream is not seekable; cannot ingest",
+        ) from exc
     existing_upload = await store.get_timeline_upload_by_hash(
         case_id=case_id,
         timeline_id=timeline_id,

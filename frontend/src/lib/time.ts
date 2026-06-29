@@ -12,13 +12,20 @@ export function fmtTimestamp(value: string | null | undefined): string {
   }
 }
 
-/** Format a timestamp with timezone for the detail panel. */
+/** Format a timestamp with timezone for the detail panel. Always renders in UTC. */
 export function fmtTimestampFull(value: string | null | undefined): string {
   if (!value) return "—";
   try {
     const d = parseISO(value);
     if (!isValid(d)) return value;
-    return format(d, "yyyy-MM-dd HH:mm:ss.SSS 'UTC'");
+    const year = d.getUTCFullYear();
+    const month = String(d.getUTCMonth() + 1).padStart(2, "0");
+    const day = String(d.getUTCDate()).padStart(2, "0");
+    const hours = String(d.getUTCHours()).padStart(2, "0");
+    const minutes = String(d.getUTCMinutes()).padStart(2, "0");
+    const seconds = String(d.getUTCSeconds()).padStart(2, "0");
+    const ms = String(d.getUTCMilliseconds()).padStart(3, "0");
+    return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}.${ms} UTC`;
   } catch {
     return value;
   }

@@ -6,6 +6,7 @@ export const eventsApi = {
     caseId: string,
     timelineId: string,
     filters: EventFilters = {},
+    signal?: AbortSignal,
   ): Promise<EventPage> => {
     const params: Record<string, string | number | boolean | undefined | null> =
       {
@@ -28,6 +29,7 @@ export const eventsApi = {
     return get<EventPage>(
       `/cases/${caseId}/timelines/${timelineId}/events`,
       params,
+      signal,
     );
   },
 
