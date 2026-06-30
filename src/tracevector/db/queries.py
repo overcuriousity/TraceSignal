@@ -12,6 +12,7 @@ from tracevector.db.field_recommend import (
     recommend_fields,
     recommend_fields_across_sources,
     timeline_cohesion_summary,
+    timeline_universal_cohesion,
 )
 
 
@@ -534,9 +535,31 @@ class EventQueryService:
             )
 
         # Aggregate cross-source cohesion summary for the whole timeline.
+        #
+        # Per-artifact cohesion (all_verdicts_for_cohesion) only sees a field
+        # as "shared" when the *same* artifact type appears in ≥2 sources.
+        # For timelines with disjoint artifact sets this always yields zero
+        # shared fields, producing a spurious "weak" verdict.
+        #
+        # Instead we use timeline_universal_cohesion: pool each source's
+        # values across ALL its artifacts for the canonical top-level fields
+        # (message, display_name, tags, timestamp_desc) and compute cohesion
+        # there.  These fields exist in every Timesketch source regardless of
+        # artifact type, so they provide an honest cross-source signal.
         if is_multi_source:
+            # Build source_id -> token -> [values] pooled across all artifacts.
+            pooled_by_source: dict[str, dict[str, list[Any]]] = {}
+            for artifact_name, src_map in samples_by_src.items():
+                for src_id, token_map in src_map.items():
+                    dest = pooled_by_source.setdefault(src_id, {})
+                    for token, vals in token_map.items():
+                        dest.setdefault(token, []).extend(vals)
+            universal_verdicts = timeline_universal_cohesion(
+                pooled_by_source,
+                encode=encode,
+            )
             cohesion_summary = timeline_cohesion_summary(
-                all_verdicts_for_cohesion,
+                universal_verdicts,
                 source_count=len(source_ids),
                 encode_available=encode is not None,
             )

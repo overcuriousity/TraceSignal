@@ -1,5 +1,6 @@
+import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Tag, ShieldCheck, Info } from "lucide-react";
+import { AlertTriangle, Tag, ShieldCheck, Info, Layers } from "lucide-react";
 import { similarityApi } from "@/api/similarity";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
@@ -11,20 +12,25 @@ import type { Event } from "@/api/types";
 interface Props {
   caseId: string;
   timelineId: string;
+  /** Number of sources in the timeline; toggles the per-source centering control. */
+  sourceCount?: number;
   onSelectEvent?: (event: Event) => void;
 }
 
-export function AnomaliesList({ caseId, timelineId, onSelectEvent }: Props) {
+export function AnomaliesList({ caseId, timelineId, sourceCount = 1, onSelectEvent }: Props) {
   const qc = useQueryClient();
+  const [normalizePerSource, setNormalizePerSource] = useState(false);
+
+  const isMultiSource = sourceCount > 1;
 
   const { data, isLoading, error } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId],
-    queryFn: () => similarityApi.listAnomalies(caseId, timelineId, 50, 5000),
+    queryKey: ["anomalies", caseId, timelineId, normalizePerSource],
+    queryFn: () => similarityApi.listAnomalies(caseId, timelineId, 50, 5000, normalizePerSource),
     staleTime: 60_000,
   });
 
   const { mutate: tagAnomalies, isPending: isTagging } = useMutation({
-    mutationFn: () => similarityApi.tagAnomalies(caseId, timelineId, 50, 5000),
+    mutationFn: () => similarityApi.tagAnomalies(caseId, timelineId, 50, 5000, normalizePerSource),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["annotations", caseId, timelineId] });
       qc.invalidateQueries({ queryKey: ["anomalies", caseId, timelineId] });
@@ -54,6 +60,7 @@ export function AnomaliesList({ caseId, timelineId, onSelectEvent }: Props) {
   }
 
   const isBaselineMode = data.method === "normal-baseline";
+  const isPerSourceMode = data.method === "per-source-centroid";
 
   return (
     <div className="space-y-3">
@@ -74,6 +81,21 @@ export function AnomaliesList({ caseId, timelineId, onSelectEvent }: Props) {
             <p className="opacity-70">
               Mark more routine events as Normal in the timeline to refine results.
               Use for triage — proximity to your baseline ≠ confirmed threat.
+            </p>
+          </>
+        ) : isPerSourceMode ? (
+          <>
+            <p className="flex items-center gap-1.5">
+              <Layers size={11} className="text-[var(--color-accent)] shrink-0" />
+              <span>
+                Ranked by deviation from each{" "}
+                <strong className="text-[var(--color-fg-secondary)]">source's own bulk</strong>{" "}
+                ({data.sample_size.toLocaleString()} events sampled).
+              </span>
+            </p>
+            <p className="flex items-center gap-1 opacity-70">
+              <Info size={10} />
+              Source-format differences removed. Outliers reflect behaviour, not log style.
             </p>
           </>
         ) : (
@@ -97,6 +119,23 @@ export function AnomaliesList({ caseId, timelineId, onSelectEvent }: Props) {
           </>
         )}
       </div>
+
+      {/* Per-source centering toggle — only surfaced for multi-source timelines */}
+      {isMultiSource && (
+        <label className="flex cursor-pointer items-center gap-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] px-3 py-2 text-xs text-[var(--color-fg-muted)] hover:border-[var(--color-border-hover)] transition-base">
+          <input
+            type="checkbox"
+            className="accent-[var(--color-accent)]"
+            checked={normalizePerSource}
+            onChange={(e) => setNormalizePerSource(e.target.checked)}
+          />
+          <Layers size={11} className="shrink-0" />
+          <span>
+            <strong className="text-[var(--color-fg-secondary)]">Center per source</strong>
+            {" "}— score events against their own source's bulk to remove format bias
+          </span>
+        </label>
+      )}
 
       {/* Persist all as annotations */}
       <Button

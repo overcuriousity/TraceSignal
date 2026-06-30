@@ -34,10 +34,15 @@ class FakeScoredPoint:
 class _FakeRetrieveResult:
     """Minimal stand-in for qdrant_client retrieve results."""
 
-    def __init__(self, id: str, vector: list[float] | None) -> None:
+    def __init__(
+        self,
+        id: str,
+        vector: list[float] | None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
         self.id = id
         self.vector = vector
-        self.payload: dict[str, Any] = {}
+        self.payload: dict[str, Any] = payload or {}
 
 
 class FakeQdrantStore:
@@ -62,7 +67,8 @@ class FakeQdrantStore:
         for p in points:
             if p.id in id_set:
                 vec = p.vector if with_vectors else None
-                results.append(_FakeRetrieveResult(p.id, vec))
+                payload = p.payload if with_payload else {}
+                results.append(_FakeRetrieveResult(p.id, vec, payload))
         return results
 
     def _add_point(
@@ -479,3 +485,135 @@ def test_find_similar_returns_nearest_first():
     # "close" should rank before "far".
     assert result.results[0].event_id == "close"
     assert result.results[0].score > result.results[1].score
+
+
+# ---------------------------------------------------------------------------
+# Per-source batch-effect correction tests
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_per_source_centroid_mode_surfaces_within_source_outlier():
+    """Per-source centering promotes within-source outliers over cross-source ones.
+
+    Setup:
+    - Source S1: events clustered around +x direction.
+    - Source S2: events clustered around +y direction.
+    - ``cross_outlier``: an S2 event pointing toward -y (far from S1's +x,
+      but also genuinely anomalous within S2). With no centering S2 events
+      generally rank above S1 events because S2 is far from the global centroid
+      (which leans toward +x since S1 contributes more bulk). With centering
+      the planted within-S1 outlier (pointing -x in the S1 cluster's space)
+      should outrank plain cross-source distance.
+    """
+    import numpy as np
+
+    qdrant = FakeQdrantStore()
+    # S1: cluster around +x (4 bulk events)
+    for i in range(4):
+        qdrant._add_point("col1", f"s1_bulk_{i}", _unit([1.0, 0.05 * i, 0.0]), "s1",
+                          f"s1 bulk {i}")
+    # S1: one within-source outlier pointing -x (anomalous within S1)
+    qdrant._add_point("col1", "s1_outlier", _unit([-1.0, 0.0, 0.0]), "s1",
+                      "s1 outlier")
+    # S2: cluster around +y (4 bulk events)
+    for i in range(4):
+        qdrant._add_point("col1", f"s2_bulk_{i}", _unit([0.05 * i, 1.0, 0.0]), "s2",
+                          f"s2 bulk {i}")
+
+    ch = FakeClickHouseStore()
+    svc = SimilarityService(qdrant=qdrant, clickhouse=ch)
+
+    # Without centering: global-centroid mode. The global centroid blends S1 and
+    # S2 bulk; S2 events (far from the S1-dominated centroid) may rank high.
+    result_raw = svc.find_anomalies("case1", ["s1", "s2"], limit=10, sample_size=100,
+                                    normalize_per_source=False)
+    assert result_raw.status == "ok"
+    assert result_raw.method == "centroid-distance"
+
+    # With per-source centering: each event is scored vs its own source centroid.
+    result_centered = svc.find_anomalies("case1", ["s1", "s2"], limit=10,
+                                         sample_size=100, normalize_per_source=True)
+    assert result_centered.status == "ok"
+    assert result_centered.method == "per-source-centroid"
+
+    # The within-S1 outlier (s1_outlier) must rank first in centered mode.
+    centered_ids = [r.event_id for r in result_centered.results]
+    assert "s1_outlier" in centered_ids
+    assert centered_ids[0] == "s1_outlier", (
+        f"Expected s1_outlier first, got {centered_ids[0]}"
+    )
+
+    # Verify normalized_per_source flag is surfaced in details.
+    for r in result_centered.results:
+        assert r.details.get("normalized_per_source") is True
+
+
+def test_normalize_per_source_baseline_mode_unchanged():
+    """Passing normalize_per_source in baseline mode does NOT change ranking.
+
+    Per-source centering is disabled in baseline mode because the analyst's
+    Normal annotations already provide per-source calibration.  Centering
+    normal events (which sit near the source mean) reduces them to near-zero
+    vectors and destroys their discriminative content.  The flag is accepted
+    by the API but the ranking must be identical to the un-flagged case.
+    """
+    qdrant = FakeQdrantStore()
+    # S1 normals clustered around +x; outlier anti-parallel.
+    for i in range(3):
+        qdrant._add_point("col1", f"s1_normal_{i}", _unit([1.0, 0.05 * i, 0.0]),
+                          "s1", f"s1 normal {i}")
+    qdrant._add_point("col1", "s1_outlier", _unit([-1.0, 0.0, 0.0]), "s1", "s1 outlier")
+    # S2 bulk and normal.
+    for i in range(3):
+        qdrant._add_point("col1", f"s2_bulk_{i}", _unit([0.05 * i, 1.0, 0.0]),
+                          "s2", f"s2 bulk {i}")
+    qdrant._add_point("col1", "s2_normal", _unit([0.0, 1.0, 0.0]), "s2", "s2 normal")
+
+    ch = FakeClickHouseStore()
+    svc = SimilarityService(qdrant=qdrant, clickhouse=ch)
+    normal_ids = ["s1_normal_0", "s1_normal_1", "s1_normal_2", "s2_normal"]
+
+    result_raw = svc.find_anomalies(
+        "case1", ["s1", "s2"], limit=10, sample_size=100,
+        normal_ids=normal_ids, normalize_per_source=False,
+    )
+    result_flagged = svc.find_anomalies(
+        "case1", ["s1", "s2"], limit=10, sample_size=100,
+        normal_ids=normal_ids, normalize_per_source=True,
+    )
+
+    # Both must use normal-baseline method.
+    assert result_flagged.method == "normal-baseline"
+    # Normal events excluded.
+    for nid in normal_ids:
+        assert nid not in [r.event_id for r in result_flagged.results]
+    # Rankings identical.
+    assert [r.event_id for r in result_raw.results] == [
+        r.event_id for r in result_flagged.results
+    ]
+    # Flag surfaced as False (centering not applied in baseline mode).
+    for r in result_flagged.results:
+        assert r.details.get("normalized_per_source") is False
+
+
+def test_normalize_per_source_noop_single_source():
+    """Per-source centering is a no-op for single-source timelines.
+
+    The result must be identical to the unnormalized case (no crash, correct
+    ranking) when only one source is present.
+    """
+    qdrant = FakeQdrantStore()
+    for i in range(3):
+        qdrant._add_point("col1", f"normal_{i}", _unit([1.0, 0.0]), "s1", f"normal {i}")
+    qdrant._add_point("col1", "outlier", _unit([-1.0, 0.0]), "s1", "outlier")
+
+    ch = FakeClickHouseStore()
+    svc = SimilarityService(qdrant=qdrant, clickhouse=ch)
+
+    # Single source: flag should be silently ignored (effective_normalize=False).
+    result = svc.find_anomalies("case1", ["s1"], limit=4, sample_size=100,
+                                normalize_per_source=True)
+    assert result.status == "ok"
+    # Single source — falls through to global centroid mode.
+    assert result.method == "centroid-distance"
+    assert result.results[0].event_id == "outlier"
