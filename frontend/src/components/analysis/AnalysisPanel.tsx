@@ -6,16 +6,15 @@ import { AnomaliesList } from "./AnomaliesList";
 import { SimilarEvents } from "./SimilarEvents";
 import { EmbeddingStatusBanner } from "./EmbeddingStatusBanner";
 import { MethodologyPanel } from "./MethodologyPanel";
-import { sourcesApi } from "@/api/sources";
+import { timelinesApi } from "@/api/timelines";
 import { cn } from "@/lib/cn";
-import type { Event, Timeline } from "@/api/types";
+import type { Event } from "@/api/types";
 
 type Tab = "anomalies" | "similar" | "methodology";
 
 interface Props {
   caseId: string;
   timelineId: string;
-  timeline: Timeline;
   hasVectors: boolean;
   similarAnchor: Event | null;
   onClose: () => void;
@@ -26,7 +25,6 @@ interface Props {
 export function AnalysisPanel({
   caseId,
   timelineId,
-  timeline: _timeline,
   hasVectors,
   similarAnchor,
   onClose,
@@ -42,8 +40,7 @@ export function AnalysisPanel({
 
   const { data: sources } = useQuery({
     queryKey: ["timeline-sources", caseId, timelineId],
-    queryFn: () => sourcesApi.list(caseId),
-    enabled: true,
+    queryFn: () => timelinesApi.listSources(caseId, timelineId),
   });
   const firstSource = sources?.[0] ?? null;
 

@@ -13,9 +13,11 @@ export function useAnnotationMutations(caseId: string, sourceId: string) {
   const qc = useQueryClient();
 
   const invalidate = () => {
-    qc.invalidateQueries({ queryKey: ["annotations", caseId, sourceId] });
+    // Invalidate by prefix so all timeline- and source-scoped annotation
+    // queries for this case are refreshed regardless of how consumers key them.
+    qc.invalidateQueries({ queryKey: ["annotations", caseId] });
     // Marking an event Normal changes which anomaly algorithm is active.
-    qc.invalidateQueries({ queryKey: ["anomalies", caseId, sourceId] });
+    qc.invalidateQueries({ queryKey: ["anomalies", caseId] });
   };
 
   const add = useMutation({

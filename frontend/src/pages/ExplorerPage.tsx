@@ -380,7 +380,6 @@ const handleFindSimilar = useCallback((event: Event) => {
                   <AnalysisPanel
                     caseId={caseId!}
                     timelineId={timelineId!}
-                    timeline={timeline}
                     hasVectors={hasVectors}
                     similarAnchor={similarAnchor}
                     onClose={() => {

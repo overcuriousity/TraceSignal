@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { Tag, MessageSquare, ShieldCheck, X, AlertCircle } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -13,10 +14,16 @@ interface Props {
 }
 
 export function BulkActionBar({ selectedEvents, caseId, onClear }: Props) {
+  const qc = useQueryClient();
   const [mode, setMode] = useState<"tag" | "comment" | null>(null);
   const [value, setValue] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [isPending, setIsPending] = useState(false);
+
+  const invalidate = () => {
+    qc.invalidateQueries({ queryKey: ["annotations", caseId] });
+    qc.invalidateQueries({ queryKey: ["anomalies", caseId] });
+  };
 
   async function applyToAll() {
     if (!mode || !value.trim()) return;
@@ -35,6 +42,7 @@ export function BulkActionBar({ selectedEvents, caseId, onClear }: Props) {
           ),
         ),
       );
+      invalidate();
       onClear();
       setMode(null);
       setValue("");
@@ -60,6 +68,7 @@ export function BulkActionBar({ selectedEvents, caseId, onClear }: Props) {
           ),
         ),
       );
+      invalidate();
       onClear();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
