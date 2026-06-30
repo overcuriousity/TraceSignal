@@ -53,6 +53,8 @@ class EmbeddingResult:
     events_processed: int = 0
     vectors_inserted: int = 0
     errors: list[str] = field(default_factory=list)
+    # Full config hash used for the Qdrant collection; set by EmbeddingPipeline.run().
+    config_hash: str = ""
 
     def summary(self) -> str:
         """Return a human-readable summary."""
@@ -231,9 +233,11 @@ class EmbeddingPipeline:
             pooling=base_config.pooling,
             field_config_hash=field_config_hash,
         )
+        config_hash = config.config_hash()
+        result.config_hash = config_hash
         self.qdrant.init_collection(
             case_id=self.case_id,
-            embedding_config_hash=config.config_hash(),
+            embedding_config_hash=config_hash,
             vector_size=base_config.vector_dimension or self.embedding_model.vector_dimension(),
         )
 

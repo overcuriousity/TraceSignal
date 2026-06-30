@@ -215,3 +215,312 @@ def recommend_fields(
         verdicts=verdicts,
         related_groups=related_groups,
     )
+
+
+# ---------------------------------------------------------------------------
+# Cross-source cohesion (timeline-level recommendation)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TimelineFieldVerdict:
+    """Heuristic + cross-source classification of a field for a timeline."""
+
+    token: str
+    recommended: bool
+    # "text" | "shared-cohesive" | "divergent" | "source-specific"
+    # | "numeric" | "hash" | "guid" | "id" | "constant" | "empty"
+    kind: str
+    reason: str
+    # How many of the timeline's sources contain this field.
+    present_in_sources: int
+    # Mean pairwise cosine between per-source value-centroids; None when
+    # fewer than 2 sources have the field or encode is absent.
+    cohesion: float | None
+
+
+@dataclass
+class TimelineFieldRecommendation:
+    """Result of :func:`recommend_fields_across_sources` for one artifact."""
+
+    recommended: list[str]
+    verdicts: list[TimelineFieldVerdict]
+    related_groups: list[list[str]]
+
+
+@dataclass
+class CohesionSummary:
+    """Timeline-level cohesion verdict used by the wizard banner and analysis UI."""
+
+    # "strong" (≥0.7) | "moderate" (≥0.5) | "weak" (<0.5) | "unavailable"
+    level: str
+    # Mean cohesion across all shared fields (None when unavailable).
+    mean_cohesion: float | None
+    # Number of fields present in ≥2 sources and text-rich.
+    shared_field_count: int
+    source_count: int
+    message: str
+
+
+def cross_source_cohesion(
+    values_by_source: dict[str, Sequence[Any]],
+    encode: Callable[[list[str]], list[list[float]]],
+    max_values: int = 40,
+) -> float | None:
+    """Return the mean pairwise cosine between per-source value-centroids.
+
+    ``values_by_source`` maps source_id → list of sampled values for one field.
+    Returns ``None`` when fewer than 2 sources have usable values.
+    """
+    centroids = []
+    for values in values_by_source.values():
+        c = _field_centroid(values, encode, max_values)
+        if c is not None:
+            centroids.append(c)
+    if len(centroids) < 2:
+        return None
+    # Mean pairwise cosine — centroids are already L2-normalised.
+    mat = np.vstack(centroids)  # (n, d)
+    sim_matrix = mat @ mat.T  # (n, n)
+    n = len(centroids)
+    # Pairwise upper-triangle indices only (exclude self-similarity).
+    pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+    if not pairs:
+        return None
+    return float(np.mean([sim_matrix[i, j] for i, j in pairs]))
+
+
+def recommend_fields_across_sources(
+    field_samples_by_source: dict[str, dict[str, Sequence[Any]]],
+    *,
+    source_count: int,
+    always_tokens: Sequence[str] = ("message",),
+    encode: Callable[[list[str]], list[list[float]]] | None = None,
+    sim_threshold: float = 0.6,
+    cohesion_threshold: float = 0.6,
+    max_values_for_embedding: int = 40,
+) -> TimelineFieldRecommendation:
+    """Timeline-level field recommendation with cross-source cohesion scoring.
+
+    ``field_samples_by_source`` maps ``source_id → token → [sampled values]``.
+    ``source_count`` is the total number of sources in the timeline (some may
+    contribute no samples for a given artifact, so this can exceed the number
+    of keys in ``field_samples_by_source``).
+
+    Single-source timelines degrade to the per-source heuristic (no cohesion
+    penalty for source-specific fields).  ``encode`` absence further degrades
+    to heuristic-only (no Stage 2 pairing, no cohesion computation).
+
+    Selection rules for multi-source timelines (source_count >= 2):
+    - ``message`` → always on.
+    - text-rich **and** present in ≥2 sources **and** cohesion ≥ threshold → on,
+      kind ``"shared-cohesive"``.
+    - text-rich **and** present in ≥2 sources **and** cohesion < threshold → off,
+      reason ``"diverges across sources — would track source identity"``.
+    - text-rich **but** present in only 1 source → off (kind ``"source-specific"``).
+    - low-signal (id/hash/guid/numeric/constant/empty) → off regardless.
+    """
+    always = set(always_tokens)
+    is_multi_source = source_count >= 2
+
+    # Pool values from all sources per token.
+    pooled: dict[str, list[Any]] = {}
+    source_values: dict[str, dict[str, list[Any]]] = {}  # token → source_id → values
+    for src_id, token_map in field_samples_by_source.items():
+        for token, values in token_map.items():
+            pooled.setdefault(token, []).extend(values)
+            source_values.setdefault(token, {}).setdefault(src_id, []).extend(values)
+
+    all_tokens = list(pooled.keys())
+
+    verdicts: list[TimelineFieldVerdict] = []
+    for token in all_tokens:
+        values = pooled[token]
+        present = len(source_values.get(token, {}))
+
+        # Cohesion (Stage 2, only when encode is available and ≥2 sources).
+        cohesion: float | None = None
+        if encode is not None and present >= 2:
+            cohesion = cross_source_cohesion(
+                source_values[token], encode, max_values_for_embedding
+            )
+
+        if token in always:
+            verdicts.append(
+                TimelineFieldVerdict(
+                    token=token,
+                    recommended=True,
+                    kind="text",
+                    reason="primary embedding field",
+                    present_in_sources=present,
+                    cohesion=cohesion,
+                )
+            )
+            continue
+
+        # Stage 1: value-heuristic verdict on pooled values.
+        base = classify_field(token, values)
+
+        if not base.recommended:
+            # Low-signal regardless of sharing.
+            verdicts.append(
+                TimelineFieldVerdict(
+                    token=token,
+                    recommended=False,
+                    kind=base.kind,
+                    reason=base.reason,
+                    present_in_sources=present,
+                    cohesion=cohesion,
+                )
+            )
+            continue
+
+        # Text-rich field — apply cross-source rules for multi-source timelines.
+        if is_multi_source:
+            if present < 2:
+                verdicts.append(
+                    TimelineFieldVerdict(
+                        token=token,
+                        recommended=False,
+                        kind="source-specific",
+                        reason="source-specific — skews cross-source comparison",
+                        present_in_sources=present,
+                        cohesion=cohesion,
+                    )
+                )
+            elif cohesion is not None and cohesion < cohesion_threshold:
+                verdicts.append(
+                    TimelineFieldVerdict(
+                        token=token,
+                        recommended=False,
+                        kind="divergent",
+                        reason="diverges across sources — would track source identity",
+                        present_in_sources=present,
+                        cohesion=cohesion,
+                    )
+                )
+            else:
+                # Shared and cohesive (or cohesion unavailable — give benefit of doubt).
+                verdicts.append(
+                    TimelineFieldVerdict(
+                        token=token,
+                        recommended=True,
+                        kind="shared-cohesive",
+                        reason="shared across sources with cohesive content",
+                        present_in_sources=present,
+                        cohesion=cohesion,
+                    )
+                )
+        else:
+            # Single-source: plain text verdict.
+            verdicts.append(
+                TimelineFieldVerdict(
+                    token=token,
+                    recommended=True,
+                    kind=base.kind,
+                    reason=base.reason,
+                    present_in_sources=present,
+                    cohesion=cohesion,
+                )
+            )
+
+    recommended = [v.token for v in verdicts if v.recommended]
+
+    # Stage 2: group related fields using pooled values.
+    related_groups: list[list[str]] = []
+    if encode is not None and len(recommended) >= 2:
+        related_groups = _group_related_fields(
+            {t: pooled[t] for t in recommended},
+            encode=encode,
+            sim_threshold=sim_threshold,
+            max_values=max_values_for_embedding,
+        )
+
+    return TimelineFieldRecommendation(
+        recommended=recommended,
+        verdicts=verdicts,
+        related_groups=related_groups,
+    )
+
+
+def timeline_cohesion_summary(
+    verdicts: list[TimelineFieldVerdict],
+    *,
+    source_count: int,
+    encode_available: bool,
+) -> CohesionSummary:
+    """Aggregate per-field verdicts into a timeline-level cohesion verdict.
+
+    Used by the embedding wizard banner and the analysis UI to explain whether
+    cross-source outlier detection is expected to be meaningful.
+    """
+    if not encode_available:
+        return CohesionSummary(
+            level="unavailable",
+            mean_cohesion=None,
+            shared_field_count=0,
+            source_count=source_count,
+            message=(
+                "Embedding model unavailable — field cohesion could not be computed. "
+                "Recommendations are heuristic-only."
+            ),
+        )
+
+    if source_count < 2:
+        return CohesionSummary(
+            level="unavailable",
+            mean_cohesion=None,
+            shared_field_count=0,
+            source_count=source_count,
+            message="Single-source timeline — cross-source cohesion does not apply.",
+        )
+
+    shared = [
+        v for v in verdicts if v.present_in_sources >= 2 and v.cohesion is not None
+    ]
+    if not shared:
+        return CohesionSummary(
+            level="weak",
+            mean_cohesion=None,
+            shared_field_count=0,
+            source_count=source_count,
+            message=(
+                "No shared fields with computable cohesion. "
+                "Cross-source outliers will likely track source format rather than behaviour."
+            ),
+        )
+
+    mean_c = float(np.mean([v.cohesion for v in shared]))  # type: ignore[arg-type]
+    shared_count = len(shared)
+
+    if mean_c >= 0.7:
+        level = "strong"
+        msg = (
+            f"{shared_count} shared field{'s' if shared_count != 1 else ''} with "
+            f"strong cohesion ({mean_c:.2f}). "
+            "Cross-source outlier detection should be meaningful."
+        )
+    elif mean_c >= 0.5:
+        level = "moderate"
+        msg = (
+            f"{shared_count} shared field{'s' if shared_count != 1 else ''} with "
+            f"moderate cohesion ({mean_c:.2f}). "
+            "Results may reflect some source-format variation — "
+            "consider using the analyst-baseline mode."
+        )
+    else:
+        level = "weak"
+        msg = (
+            f"{shared_count} shared field{'s' if shared_count != 1 else ''} with "
+            f"weak cohesion ({mean_c:.2f}). "
+            "Cross-source outliers will likely track source format rather than behaviour. "
+            "Mark representative 'Normal' events to switch to nearest-normal baseline scoring."
+        )
+
+    return CohesionSummary(
+        level=level,
+        mean_cohesion=mean_c,
+        shared_field_count=shared_count,
+        source_count=source_count,
+        message=msg,
+    )

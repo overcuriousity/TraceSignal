@@ -142,8 +142,9 @@ export function MethodologyPanel({ caseId, timelineId, source }: Props) {
               <div className="flex items-start gap-2">
                 <span className="text-[var(--color-fg-muted)] w-24 shrink-0">Scoring</span>
                 <span className="text-[var(--color-fg-secondary)]">
-                  Qdrant Recommendation API — negative examples only. Events
-                  ranked by cosine distance from the normal set centroid.
+                  Nearest-normal max-similarity. Each candidate is scored by its
+                  cosine similarity to the closest baseline event; the least
+                  similar (highest distance) are ranked as outliers.
                 </span>
               </div>
               <div className="flex items-start gap-2">

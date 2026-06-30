@@ -8,7 +8,11 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from tracevector.db.clickhouse import ClickHouseStore
-from tracevector.db.field_recommend import recommend_fields
+from tracevector.db.field_recommend import (
+    recommend_fields,
+    recommend_fields_across_sources,
+    timeline_cohesion_summary,
+)
 
 
 @dataclass
@@ -145,12 +149,16 @@ class _ParameterizedQueryBuilder:
         self.parameters[name] = value
 
     def add_in_list(self, column: str, values: list[str]) -> None:
-        """Add an ``IN (...)`` condition for a list of string values."""
-        names = [self._param_name() for _ in values]
-        in_clause = ", ".join(f"{{{name}:String}}" for name in names)
-        self.conditions.append(f"{column} IN ({in_clause})")
-        for name, value in zip(names, values, strict=False):
-            self.parameters[name] = value
+        """Add a membership condition for a list of string values.
+
+        Uses ``has({arr:Array(String)}, column)`` rather than
+        ``column IN ({p0}, {p1}, ...)`` because ClickHouse 24.x requires the
+        second argument of ``IN`` to be a constant or table expression — a list
+        of individual parameterized strings does not qualify.
+        """
+        name = self._param_name()
+        self.conditions.append(f"has({{{name}:Array(String)}}, {column})")
+        self.parameters[name] = values
 
     def add_field_filter(self, key: str, value: str) -> None:
         """Add an equality filter on a top-level column or attribute."""
@@ -320,11 +328,7 @@ class EventQueryService:
         self.store.init_schema()
         database = self.store.database
 
-        params: dict[str, str] = {"p0": case_id}
-        source_params = [f"s{i}" for i in range(len(source_ids))]
-        source_in = ", ".join(f"{{{name}:String}}" for name in source_params)
-        for name, value in zip(source_params, source_ids, strict=False):
-            params[name] = value
+        params: dict[str, Any] = {"p0": case_id, "src": source_ids}
 
         result = self.store.client.query(
             f"""
@@ -332,7 +336,7 @@ class EventQueryService:
             FROM (
                 SELECT attributes
                 FROM {database}.events
-                WHERE case_id = {{p0:String}} AND source_id IN ({source_in})
+                WHERE case_id = {{p0:String}} AND has({{src:Array(String)}}, source_id)
                 LIMIT 50000
             )
             """,
@@ -360,32 +364,34 @@ class EventQueryService:
         *,
         encode: Callable[[list[str]], list[list[float]]] | None = None,
         sample_per_artifact: int = 400,
-    ) -> dict[str, list[dict[str, Any]]]:
+    ) -> dict[str, Any]:
         """Return per-artifact field information for the embedding wizard.
 
         For each distinct ``artifact`` across the sources, returns the event
         count, the available top-level embedding fields, the dynamic attribute
         keys, and a *content-aware* recommendation produced by the hybrid
-        heuristic→pairs strategy (see :mod:`tracevector.db.field_recommend`):
+        heuristic→pairs strategy (see :mod:`tracevector.db.field_recommend`).
 
-        - ``recommended`` — tokens whose sampled values look semantically rich.
-        - ``field_analysis`` — per-field verdict (recommended / kind / reason)
-          so the wizard can explain why each field was kept or dropped.
-        - ``related_groups`` — groups of fields whose values embed close together
-          (only populated when an ``encode`` callable is supplied).
+        When multiple sources are passed the recommendation uses
+        :func:`~tracevector.db.field_recommend.recommend_fields_across_sources`
+        which applies cross-source cohesion scoring so that the wizard
+        default-selects only fields that carry **comparable content across all
+        sources** (avoiding the batch-effect where embedding space separates
+        events by source format rather than behaviour).
 
-        ``encode`` is the embedding callable used for stage 2; pass ``None`` for
-        a fast heuristic-only result.  Field values are sampled per artifact
-        (``sample_per_artifact`` rows, randomised).
+        The top-level ``cohesion`` key summarises the timeline's embedding
+        substrate quality: ``"strong"`` / ``"moderate"`` / ``"weak"`` /
+        ``"unavailable"``.
+
+        Per-field verdicts now include ``present_in_sources`` and ``cohesion``
+        when the multi-source path is used.
+
+        ``encode`` is the embedding callable; pass ``None`` for heuristic-only.
         """
         self.store.init_schema()
         database = self.store.database
 
-        params: dict[str, Any] = {"p0": case_id, "per": sample_per_artifact}
-        source_params = [f"s{i}" for i in range(len(source_ids))]
-        source_in = ", ".join(f"{{{name}:String}}" for name in source_params)
-        for name, value in zip(source_params, source_ids, strict=False):
-            params[name] = value
+        params: dict[str, Any] = {"p0": case_id, "src": source_ids, "per": sample_per_artifact}
 
         # 1. Full attribute-key inventory + event count per artifact.
         inv = self.store.client.query(
@@ -397,7 +403,7 @@ class EventQueryService:
             FROM (
                 SELECT artifact, attributes
                 FROM {database}.events
-                WHERE case_id = {{p0:String}} AND source_id IN ({source_in})
+                WHERE case_id = {{p0:String}} AND has({{src:Array(String)}}, source_id)
                 LIMIT 50000
             )
             GROUP BY artifact
@@ -410,18 +416,21 @@ class EventQueryService:
             for row in inv.result_rows
         }
 
-        # 2. Randomised value sample per artifact for content classification.
+        # 2. Randomised value sample per artifact **and source** so that
+        #    cross-source cohesion can be computed per field.
         cols = ["message", "timestamp_desc", "artifact_long", "display_name", "tags"]
         sample = self.store.client.query(
             f"""
-            SELECT artifact, {", ".join(cols)}, attributes
+            SELECT source_id, artifact, {", ".join(cols)}, attributes
             FROM (
-                SELECT artifact, {", ".join(cols)}, attributes,
-                       row_number() OVER (PARTITION BY artifact ORDER BY rand()) AS _rn
+                SELECT source_id, artifact, {", ".join(cols)}, attributes,
+                       row_number() OVER (
+                           PARTITION BY artifact, source_id ORDER BY rand()
+                       ) AS _rn
                 FROM (
-                    SELECT artifact, {", ".join(cols)}, attributes
+                    SELECT source_id, artifact, {", ".join(cols)}, attributes
                     FROM {database}.events
-                    WHERE case_id = {{p0:String}} AND source_id IN ({source_in})
+                    WHERE case_id = {{p0:String}} AND has({{src:Array(String)}}, source_id)
                     LIMIT 200000
                 )
             )
@@ -430,32 +439,87 @@ class EventQueryService:
             parameters=params,
         )
 
-        # artifact -> token -> list of sampled values
-        samples: dict[str, dict[str, list[Any]]] = {}
+        is_multi_source = len(source_ids) > 1
+
+        # artifact -> source_id -> token -> list of sampled values  (multi-source)
+        # artifact -> token -> list of sampled values               (single-source)
+        samples_by_src: dict[str, dict[str, dict[str, list[Any]]]] = {}
+        samples_flat: dict[str, dict[str, list[Any]]] = {}
         for row in sample.result_rows:
-            artifact_name = row[0] or ""
-            bucket = samples.setdefault(artifact_name, {})
-            for i, col in enumerate(cols, start=1):
+            src_id = row[0]
+            artifact_name = row[1] or ""
+            src_bucket = samples_by_src.setdefault(artifact_name, {}).setdefault(src_id, {})
+            flat_bucket = samples_flat.setdefault(artifact_name, {})
+            for i, col in enumerate(cols, start=2):
                 value = row[i]
                 if col == "tags" and isinstance(value, (list, tuple)):
                     value = " ".join(str(t) for t in value)
-                bucket.setdefault(col, []).append(value)
-            attrs = row[len(cols) + 1]
+                src_bucket.setdefault(col, []).append(value)
+                flat_bucket.setdefault(col, []).append(value)
+            attrs = row[len(cols) + 2]
             for key, value in _iter_attr_items(attrs):
-                bucket.setdefault(f"attr:{key}", []).append(value)
+                src_bucket.setdefault(f"attr:{key}", []).append(value)
+                flat_bucket.setdefault(f"attr:{key}", []).append(value)
 
         artifacts = []
-        for artifact_name, (count, attr_keys) in inventory.items():
-            bucket = samples.get(artifact_name, {})
-            # Seed every candidate token so each gets a verdict, even if unsampled.
-            field_samples: dict[str, list[Any]] = {
-                t: bucket.get(t, []) for t in self._EMBEDDABLE_TOP_LEVEL
-            }
-            for key in attr_keys:
-                token = f"attr:{key}"
-                field_samples[token] = bucket.get(token, [])
+        all_verdicts_for_cohesion = []
 
-            rec = recommend_fields(field_samples, encode=encode)
+        for artifact_name, (count, attr_keys) in inventory.items():
+            if is_multi_source:
+                # Build field_samples_by_source: source_id → token → values.
+                # Seed every candidate token for every source so absent fields
+                # still get verdicts with present_in_sources=0.
+                all_tokens = list(self._EMBEDDABLE_TOP_LEVEL) + [
+                    f"attr:{k}" for k in attr_keys
+                ]
+                src_samples: dict[str, dict[str, list[Any]]] = {
+                    src_id: {
+                        token: samples_by_src.get(artifact_name, {})
+                        .get(src_id, {})
+                        .get(token, [])
+                        for token in all_tokens
+                    }
+                    for src_id in source_ids
+                }
+                rec = recommend_fields_across_sources(
+                    src_samples,
+                    source_count=len(source_ids),
+                    encode=encode,
+                )
+                all_verdicts_for_cohesion.extend(rec.verdicts)
+                field_analysis = [
+                    {
+                        "token": v.token,
+                        "recommended": v.recommended,
+                        "kind": v.kind,
+                        "reason": v.reason,
+                        "present_in_sources": v.present_in_sources,
+                        "cohesion": v.cohesion,
+                    }
+                    for v in rec.verdicts
+                ]
+            else:
+                # Single source — use the original per-artifact recommender.
+                flat_bucket = samples_flat.get(artifact_name, {})
+                field_samples: dict[str, list[Any]] = {
+                    t: flat_bucket.get(t, []) for t in self._EMBEDDABLE_TOP_LEVEL
+                }
+                for key in attr_keys:
+                    token = f"attr:{key}"
+                    field_samples[token] = flat_bucket.get(token, [])
+                rec_single = recommend_fields(field_samples, encode=encode)
+                field_analysis = [
+                    {
+                        "token": v.token,
+                        "recommended": v.recommended,
+                        "kind": v.kind,
+                        "reason": v.reason,
+                        "present_in_sources": 1,
+                        "cohesion": None,
+                    }
+                    for v in rec_single.verdicts
+                ]
+                rec = rec_single  # for recommended / related_groups below
 
             artifacts.append(
                 {
@@ -464,20 +528,35 @@ class EventQueryService:
                     "top_level": self._EMBEDDABLE_TOP_LEVEL,
                     "attributes": attr_keys,
                     "recommended": rec.recommended,
-                    "field_analysis": [
-                        {
-                            "token": v.token,
-                            "recommended": v.recommended,
-                            "kind": v.kind,
-                            "reason": v.reason,
-                        }
-                        for v in rec.verdicts
-                    ],
+                    "field_analysis": field_analysis,
                     "related_groups": rec.related_groups,
                 }
             )
 
-        return {"artifacts": artifacts}
+        # Aggregate cross-source cohesion summary for the whole timeline.
+        if is_multi_source:
+            cohesion_summary = timeline_cohesion_summary(
+                all_verdicts_for_cohesion,
+                source_count=len(source_ids),
+                encode_available=encode is not None,
+            )
+        else:
+            cohesion_summary = timeline_cohesion_summary(
+                [],
+                source_count=len(source_ids),
+                encode_available=encode is not None,
+            )
+
+        return {
+            "artifacts": artifacts,
+            "cohesion": {
+                "level": cohesion_summary.level,
+                "mean_cohesion": cohesion_summary.mean_cohesion,
+                "shared_field_count": cohesion_summary.shared_field_count,
+                "source_count": cohesion_summary.source_count,
+                "message": cohesion_summary.message,
+            },
+        }
 
     def histogram(
         self, query: EventQuery, buckets: int = 60

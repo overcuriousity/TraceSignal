@@ -1,16 +1,21 @@
 /**
- * Per-source embedding wizard.
+ * Timeline-level embedding wizard.
  *
- * Loads content-aware field recommendations for the source (hybrid
- * heuristic→pairs analysis on the backend) and lets the analyst pick which
- * fields of which artifacts to embed.  Recommended fields are preselected;
- * low-signal fields (IDs, hashes, numbers, constants) are shown with the reason
- * they were skipped.  Semantically related fields are surfaced as groups.
+ * Analyses all sources in the timeline together and recommends a shared,
+ * cross-source-cohesive field config.  The backend computes:
+ *   1. Per-field text-signal heuristics (are values worth embedding?).
+ *   2. Cross-source cohesion (do the values carry comparable meaning across
+ *      sources?).  Source-specific or divergent fields are off by default to
+ *      avoid the "batch effect" where distance measures source format rather
+ *      than event behaviour.
+ *
+ * A cohesion banner at the top explains the quality of the merged embedding
+ * substrate and warns when cross-source outlier detection may be unreliable.
  */
 import { useMemo, useState } from "react";
-import { useMutation, useQuery } from "@tanstack/react-query";
-import { Cpu, Check, Link2, Info } from "lucide-react";
-import { sourcesApi } from "@/api/sources";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Cpu, Check, Link2, Info, AlertTriangle, ShieldCheck } from "lucide-react";
+import { timelinesApi } from "@/api/timelines";
 import { useJobsStore } from "@/stores/jobs";
 import {
   Dialog,
@@ -21,11 +26,16 @@ import {
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
-import type { EmbeddingArtifactInfo, FieldVerdict, Source } from "@/api/types";
+import type {
+  CohesionSummary,
+  EmbeddingArtifactInfo,
+  FieldVerdict,
+  Timeline,
+} from "@/api/types";
 
 interface Props {
   caseId: string;
-  source: Source;
+  timeline: Timeline;
   /** Called after the embed job is started so parent can update. */
   onJobStarted?: (jobId: string) => void;
 }
@@ -54,147 +64,72 @@ const KIND_HINT: Record<string, string> = {
   id: "identifier",
   constant: "constant",
   empty: "empty",
+  "source-specific": "source-specific",
+  divergent: "divergent",
 };
 
-export function EmbedWizard({ caseId, source, onJobStarted }: Props) {
-  const [open, setOpen] = useState(false);
-  const [selected, setSelected] = useState<Record<string, Set<string>>>({});
-  const addJob = useJobsStore((s) => s.addJob);
-  const label = (source.vector_count ?? 0) > 0 ? "Re-embed" : "Embed";
+// ---------------------------------------------------------------------------
+// Cohesion banner
+// ---------------------------------------------------------------------------
 
-  const { data, isLoading } = useQuery({
-    queryKey: ["embedding-fields", caseId, source.id],
-    queryFn: () => sourcesApi.embeddingFields(caseId, source.id),
-    enabled: open,
-  });
+const COHESION_COLORS: Record<string, string> = {
+  strong: "var(--color-success)",
+  moderate: "var(--color-info)",
+  weak: "var(--color-warning)",
+  unavailable: "var(--color-fg-muted)",
+};
 
-  // Initialise selection once data arrives: stored config if re-embedding,
-  // otherwise the recommended preselection.
-  const initialised = Object.keys(selected).length > 0;
-  if (open && data && !initialised && data.artifacts.length > 0) {
-    const next: Record<string, Set<string>> = {};
-    const stored = source.embedding_config?.artifacts;
-    for (const art of data.artifacts) {
-      next[art.artifact] = new Set(
-        stored?.[art.artifact] ?? art.recommended,
-      );
-    }
-    setSelected(next);
-  }
+const COHESION_LABELS: Record<string, string> = {
+  strong: "Strong",
+  moderate: "Moderate",
+  weak: "Weak",
+  unavailable: "Unavailable",
+};
 
-  const embedMutation = useMutation({
-    mutationFn: () => {
-      const artifacts: Record<string, string[]> = {};
-      for (const [art, tokens] of Object.entries(selected)) {
-        if (tokens.size > 0) artifacts[art] = Array.from(tokens);
-      }
-      return sourcesApi.embed(caseId, source.id, { version: 1, artifacts });
-    },
-    onSuccess: (result) => {
-      addJob(result.job_id, `Embedding "${source.name}"`);
-      onJobStarted?.(result.job_id);
-      handleOpen(false);
-    },
-  });
-
-  function handleOpen(v: boolean) {
-    setOpen(v);
-    if (!v) setSelected({});
-  }
-
-  function toggle(artifact: string, token: string) {
-    setSelected((prev) => {
-      const cur = new Set(prev[artifact] ?? []);
-      if (cur.has(token)) cur.delete(token);
-      else cur.add(token);
-      return { ...prev, [artifact]: cur };
-    });
-  }
-
-  function toggleGroup(artifact: string, group: string[]) {
-    setSelected((prev) => {
-      const cur = new Set(prev[artifact] ?? []);
-      const allOn = group.every((t) => cur.has(t));
-      for (const t of group) {
-        if (allOn) cur.delete(t);
-        else cur.add(t);
-      }
-      return { ...prev, [artifact]: cur };
-    });
-  }
-
-  const totalSelected = useMemo(
-    () => Object.values(selected).reduce((n, s) => n + s.size, 0),
-    [selected],
-  );
+function CohesionBanner({ cohesion }: { cohesion: CohesionSummary }) {
+  const color = COHESION_COLORS[cohesion.level] ?? "var(--color-fg-muted)";
+  const label = COHESION_LABELS[cohesion.level] ?? cohesion.level;
+  const isWeak = cohesion.level === "weak";
 
   return (
-    <Dialog open={open} onOpenChange={handleOpen}>
-      <DialogTrigger asChild>
-        <Button variant="outline" size="sm">
-          <Cpu size={13} /> {label}
-        </Button>
-      </DialogTrigger>
-      <DialogContent
-        title="Embedding wizard"
-        description="Choose which fields of which artifacts to embed. Recommendations are based on each field's content."
-        className="max-w-2xl"
-      >
-        {isLoading || !data ? (
-          <div className="flex justify-center py-12">
-            <Spinner />
-          </div>
-        ) : data.artifacts.length === 0 ? (
-          <p className="py-8 text-center text-xs text-[var(--color-fg-muted)]">
-            No events found for this source.
-          </p>
+    <div
+      className="rounded border p-2.5 space-y-1.5"
+      style={{ borderColor: `${color}33`, background: `${color}0d` }}
+    >
+      <div className="flex items-center gap-2">
+        {isWeak ? (
+          <AlertTriangle size={12} style={{ color }} className="shrink-0" />
+        ) : cohesion.level === "strong" ? (
+          <ShieldCheck size={12} style={{ color }} className="shrink-0" />
         ) : (
-          <div className="space-y-4">
-            <div className="max-h-[55vh] space-y-4 overflow-y-auto pr-1">
-              {data.artifacts.map((art) => (
-                <ArtifactSection
-                  key={art.artifact}
-                  info={art}
-                  selected={selected[art.artifact] ?? new Set()}
-                  onToggle={(t) => toggle(art.artifact, t)}
-                  onToggleGroup={(g) => toggleGroup(art.artifact, g)}
-                />
-              ))}
-            </div>
-
-            <div className="flex items-center justify-between border-t border-[var(--color-border)] pt-3">
-              <span className="text-xs text-[var(--color-fg-muted)]">
-                {totalSelected} field{totalSelected === 1 ? "" : "s"} selected
-                across {data.artifacts.length} artifact
-                {data.artifacts.length === 1 ? "" : "s"}
-              </span>
-              <div className="flex gap-2">
-                <DialogClose asChild>
-                  <Button variant="ghost" size="sm">
-                    Cancel
-                  </Button>
-                </DialogClose>
-                <Button
-                  variant="accent"
-                  size="sm"
-                  disabled={totalSelected === 0 || embedMutation.isPending}
-                  onClick={() => embedMutation.mutate()}
-                >
-                  {embedMutation.isPending ? (
-                    <Spinner size={13} />
-                  ) : (
-                    <Check size={13} />
-                  )}
-                  {label} {source.event_count.toLocaleString()} events
-                </Button>
-              </div>
-            </div>
-          </div>
+          <Info size={12} style={{ color }} className="shrink-0" />
         )}
-      </DialogContent>
-    </Dialog>
+        <span className="text-xs font-semibold" style={{ color }}>
+          Cross-source cohesion:{" "}
+          {label}
+          {cohesion.mean_cohesion != null && (
+            <span className="font-normal ml-1 opacity-80">
+              ({cohesion.mean_cohesion.toFixed(2)})
+            </span>
+          )}
+        </span>
+        {cohesion.shared_field_count > 0 && (
+          <span className="ml-auto text-[10px] text-[var(--color-fg-muted)]">
+            {cohesion.shared_field_count} shared field
+            {cohesion.shared_field_count !== 1 ? "s" : ""}
+          </span>
+        )}
+      </div>
+      <p className="text-[11px] text-[var(--color-fg-secondary)] leading-snug">
+        {cohesion.message}
+      </p>
+    </div>
   );
 }
+
+// ---------------------------------------------------------------------------
+// Artifact section
+// ---------------------------------------------------------------------------
 
 function ArtifactSection({
   info,
@@ -231,6 +166,11 @@ function ArtifactSection({
           const v = verdicts.get(token);
           const on = selected.has(token);
           const skippedKind = v && !v.recommended ? KIND_HINT[v.kind] : null;
+          // Show cohesion score for shared-cohesive fields.
+          const cohesionHint =
+            v?.kind === "shared-cohesive" && v.cohesion != null
+              ? `· ${v.cohesion.toFixed(2)}`
+              : null;
           const chip = (
             <button
               key={token}
@@ -246,6 +186,9 @@ function ArtifactSection({
               {tokenLabel(token)}
               {skippedKind && (
                 <span className="text-[9px] opacity-60">· {skippedKind}</span>
+              )}
+              {cohesionHint && (
+                <span className="text-[9px] opacity-50">{cohesionHint}</span>
               )}
             </button>
           );
@@ -280,5 +223,176 @@ function ArtifactSection({
         </div>
       )}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Wizard
+// ---------------------------------------------------------------------------
+
+export function EmbedWizard({ caseId, timeline, onJobStarted }: Props) {
+  const [open, setOpen] = useState(false);
+  const [selected, setSelected] = useState<Record<string, Set<string>>>({});
+  const addJob = useJobsStore((s) => s.addJob);
+  const qc = useQueryClient();
+
+  const isEmbedded = timeline.is_embedded;
+  const isStale = timeline.is_stale;
+  const label = isEmbedded ? "Re-embed" : "Embed";
+
+  const { data, isLoading } = useQuery({
+    queryKey: ["timeline-embedding-fields", caseId, timeline.id],
+    queryFn: () => timelinesApi.embeddingFields(caseId, timeline.id),
+    enabled: open,
+  });
+
+  // Initialise selection once data arrives: stored timeline config if
+  // re-embedding, otherwise the backend's cross-source recommendation.
+  const initialised = Object.keys(selected).length > 0;
+  if (open && data && !initialised && data.artifacts.length > 0) {
+    const next: Record<string, Set<string>> = {};
+    const stored = timeline.embedding_config?.artifacts;
+    for (const art of data.artifacts) {
+      next[art.artifact] = new Set(
+        stored?.[art.artifact] ?? art.recommended,
+      );
+    }
+    setSelected(next);
+  }
+
+  const embedMutation = useMutation({
+    mutationFn: () => {
+      const artifacts: Record<string, string[]> = {};
+      for (const [art, tokens] of Object.entries(selected)) {
+        if (tokens.size > 0) artifacts[art] = Array.from(tokens);
+      }
+      return timelinesApi.embed(caseId, timeline.id, { version: 1, artifacts });
+    },
+    onSuccess: (result) => {
+      addJob(result.job_id, `Embedding "${timeline.name}"`);
+      onJobStarted?.(result.job_id);
+      // Invalidate timelines so is_embedded / is_stale update.
+      qc.invalidateQueries({ queryKey: ["timelines", caseId] });
+      handleOpen(false);
+    },
+  });
+
+  function handleOpen(v: boolean) {
+    setOpen(v);
+    if (!v) setSelected({});
+  }
+
+  function toggle(artifact: string, token: string) {
+    setSelected((prev) => {
+      const cur = new Set(prev[artifact] ?? []);
+      if (cur.has(token)) cur.delete(token);
+      else cur.add(token);
+      return { ...prev, [artifact]: cur };
+    });
+  }
+
+  function toggleGroup(artifact: string, group: string[]) {
+    setSelected((prev) => {
+      const cur = new Set(prev[artifact] ?? []);
+      const allOn = group.every((t) => cur.has(t));
+      for (const t of group) {
+        if (allOn) cur.delete(t);
+        else cur.add(t);
+      }
+      return { ...prev, [artifact]: cur };
+    });
+  }
+
+  const totalSelected = useMemo(
+    () => Object.values(selected).reduce((n, s) => n + s.size, 0),
+    [selected],
+  );
+
+  const totalEvents = useMemo(
+    () => (data?.artifacts ?? []).reduce((n, a) => n + a.count, 0),
+    [data],
+  );
+
+  return (
+    <Dialog open={open} onOpenChange={handleOpen}>
+      <DialogTrigger asChild>
+        <Button
+          variant={isStale ? "outline" : "outline"}
+          size="sm"
+          className={isStale ? "border-[var(--color-warning)] text-[var(--color-warning)]" : ""}
+        >
+          <Cpu size={13} /> {label}
+          {isStale && (
+            <span className="ml-1 text-[9px] opacity-80">· stale</span>
+          )}
+        </Button>
+      </DialogTrigger>
+      <DialogContent
+        title="Embedding wizard"
+        description={
+          timeline.source_ids.length > 1
+            ? "Choose which fields to embed across all sources in this timeline. Fields are recommended based on shared content and cross-source cohesion."
+            : "Choose which fields of which artifacts to embed. Recommendations are based on each field's content."
+        }
+        className="max-w-2xl"
+      >
+        {isLoading || !data ? (
+          <div className="flex justify-center py-12">
+            <Spinner />
+          </div>
+        ) : data.artifacts.length === 0 ? (
+          <p className="py-8 text-center text-xs text-[var(--color-fg-muted)]">
+            No events found for this timeline.
+          </p>
+        ) : (
+          <div className="space-y-4">
+            {/* Cohesion banner (only for multi-source timelines) */}
+            {timeline.source_ids.length > 1 && data.cohesion && (
+              <CohesionBanner cohesion={data.cohesion} />
+            )}
+
+            <div className="max-h-[50vh] space-y-4 overflow-y-auto pr-1">
+              {data.artifacts.map((art) => (
+                <ArtifactSection
+                  key={art.artifact}
+                  info={art}
+                  selected={selected[art.artifact] ?? new Set()}
+                  onToggle={(t) => toggle(art.artifact, t)}
+                  onToggleGroup={(g) => toggleGroup(art.artifact, g)}
+                />
+              ))}
+            </div>
+
+            <div className="flex items-center justify-between border-t border-[var(--color-border)] pt-3">
+              <span className="text-xs text-[var(--color-fg-muted)]">
+                {totalSelected} field{totalSelected === 1 ? "" : "s"} selected
+                across {data.artifacts.length} artifact
+                {data.artifacts.length === 1 ? "" : "s"}
+              </span>
+              <div className="flex gap-2">
+                <DialogClose asChild>
+                  <Button variant="ghost" size="sm">
+                    Cancel
+                  </Button>
+                </DialogClose>
+                <Button
+                  variant="accent"
+                  size="sm"
+                  disabled={totalSelected === 0 || embedMutation.isPending}
+                  onClick={() => embedMutation.mutate()}
+                >
+                  {embedMutation.isPending ? (
+                    <Spinner size={13} />
+                  ) : (
+                    <Check size={13} />
+                  )}
+                  {label} {totalEvents.toLocaleString()} events
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
   );
 }

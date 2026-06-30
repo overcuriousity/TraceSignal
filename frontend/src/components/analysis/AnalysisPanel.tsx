@@ -38,11 +38,22 @@ export function AnalysisPanel({
     if (similarAnchor) setTab("similar");
   }, [similarAnchor]);
 
+  // Load the timeline to drive stale / not-embedded banners.
+  const { data: timeline } = useQuery({
+    queryKey: ["timeline", caseId, timelineId],
+    queryFn: () => timelinesApi.get(caseId, timelineId),
+    refetchInterval: 30_000,
+  });
+
+  // Derive source list for MethodologyPanel (first source carries embedding config).
   const { data: sources } = useQuery({
     queryKey: ["timeline-sources", caseId, timelineId],
     queryFn: () => timelinesApi.listSources(caseId, timelineId),
   });
   const firstSource = sources?.[0] ?? null;
+
+  // Show the banner when: not embedded at all, OR embedded-but-stale.
+  const showBanner = !hasVectors || (timeline?.is_stale ?? false);
 
   return (
     <div className="flex h-full w-80 shrink-0 flex-col border-l border-[var(--color-border)] bg-[var(--color-bg-surface)]">
@@ -80,9 +91,13 @@ export function AnalysisPanel({
       </div>
 
       <div className="flex-1 overflow-y-auto p-4">
-        {!hasVectors && (
+        {showBanner && (
           <div className="mb-4">
-            <EmbeddingStatusBanner status="not_embedded" source={firstSource} />
+            <EmbeddingStatusBanner
+              status={hasVectors ? "ok" : "not_embedded"}
+              timeline={timeline ?? null}
+              caseId={caseId}
+            />
           </div>
         )}
 

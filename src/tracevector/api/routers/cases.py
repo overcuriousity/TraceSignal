@@ -603,6 +603,10 @@ async def start_embedding(
 ) -> dict[str, Any]:
     """Start a background job to generate embeddings for a source.
 
+    **Legacy endpoint** — the primary embedding workflow is now timeline-level
+    via ``POST /{case_id}/timelines/{timeline_id}/embed``.  This endpoint
+    remains for advanced per-source use and backwards compatibility.
+
     Accepts an optional ``embedding_config`` body produced by the embedding
     wizard.  When supplied it is persisted on the source and used to control
     which fields of which artifacts get embedded.  Omit the body to reuse the
@@ -638,3 +642,125 @@ async def start_embedding(
         field_config,
     )
     return {"job_id": job.id, "status": job.status}
+
+
+def _run_timeline_embedding_job(
+    job_id: str,
+    case_id: str,
+    timeline_id: str,
+    source_ids: list[str],
+    job_store: JobStore,
+    field_config: dict[str, Any] | None = None,
+) -> None:
+    """Embed all sources of a timeline with a shared field config."""
+
+    def progress_callback(total: int, processed: int) -> None:
+        job_store.update(
+            job_id,
+            status="running",
+            progress={"total": total, "processed": processed},
+        )
+
+    try:
+        pipeline = EmbeddingPipeline(
+            case_id=case_id,
+            source_ids=source_ids,
+            batch_size=get_settings().embedding_batch_size,
+            progress_callback=progress_callback,
+            field_config=field_config,
+        )
+        result = pipeline.run()
+
+        store = PostgresStore()
+        embedding_model = get_settings().embedding_model
+        asyncio.run(
+            store.set_timeline_embedding(
+                case_id=case_id,
+                timeline_id=timeline_id,
+                model=embedding_model,
+                config=field_config or {},
+                config_hash=result.config_hash,
+                embedded_source_ids=source_ids,
+            )
+        )
+        # Update vector counts on each source.
+        # EmbeddingPipeline processes all sources in one collection so we set
+        # an approximate per-source count (total / n sources) as a best effort;
+        # the authoritative vector count is queryable from Qdrant directly.
+        per_source = result.vectors_inserted // max(len(source_ids), 1)
+        for sid in source_ids:
+            asyncio.run(
+                store.update_source_counts(
+                    case_id=case_id,
+                    source_id=sid,
+                    vector_count=per_source,
+                )
+            )
+        job_store.update(
+            job_id,
+            status="completed",
+            progress={
+                "total": result.events_processed,
+                "processed": result.events_processed,
+            },
+            result={
+                "vectors_inserted": result.vectors_inserted,
+                "config_hash": result.config_hash,
+                "source_ids": source_ids,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        job_store.update(job_id, status="failed", error=str(exc))
+
+
+@router.post("/{case_id}/timelines/{timeline_id}/embed")
+async def start_timeline_embedding(
+    case_id: str,
+    timeline_id: str,
+    background_tasks: BackgroundTasks,
+    body: EmbedRequest | None = None,
+) -> dict[str, Any]:
+    """Embed all sources in a timeline with a single shared field config.
+
+    This is the primary embedding entry point.  The wizard on the frontend
+    computes a cross-source-cohesive field selection and submits it here.
+
+    On success the timeline is marked as embedded with a snapshot of the
+    current source set.  If sources are later added the timeline becomes
+    *stale* (``is_stale=True`` in ``to_dict()``), prompting a re-embed.
+    """
+    store = get_store()
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    sources = await store.list_timeline_sources(case_id, timeline_id)
+    if not sources:
+        raise HTTPException(
+            status_code=422,
+            detail="Timeline has no sources — add at least one source before embedding.",
+        )
+    source_ids = [s.id for s in sources]
+
+    # Resolve effective field config: request body > timeline's stored config > None.
+    field_config: dict[str, Any] | None = None
+    if body is not None and body.embedding_config is not None:
+        field_config = body.embedding_config
+    elif timeline.embedding_config:
+        field_config = timeline.embedding_config
+
+    job_store = get_job_store()
+    job = job_store.create(
+        kind="embed",
+        progress={"total": 0, "processed": 0},
+    )
+    background_tasks.add_task(
+        _run_timeline_embedding_job,
+        job.id,
+        case_id,
+        timeline_id,
+        source_ids,
+        job_store,
+        field_config,
+    )
+    return {"job_id": job.id, "status": job.status, "source_ids": source_ids}

@@ -44,6 +44,18 @@ export interface Timeline {
   description: string | null;
   is_default: boolean;
   source_ids: string[];
+  /** True when an embedding job has completed for this timeline. */
+  is_embedded: boolean;
+  /**
+   * True when the current source set differs from the set that was
+   * embedded — analysis may be incomplete.
+   */
+  is_stale: boolean;
+  /** The analyst-defined field config used for the most recent embed. */
+  embedding_config: EmbeddingFieldConfig | null;
+  embedding_model: string | null;
+  embedded_source_ids: string[] | null;
+  embedded_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -165,9 +177,31 @@ export interface FieldVerdict {
   /** "message" or "attr:<key>" */
   token: string;
   recommended: boolean;
-  /** "text" | "numeric" | "hash" | "guid" | "id" | "constant" | "empty" */
+  /**
+   * "text" | "shared-cohesive" | "divergent" | "source-specific"
+   * | "numeric" | "hash" | "guid" | "id" | "constant" | "empty"
+   */
   kind: string;
   reason: string;
+  /** How many of the timeline's sources contain this field. */
+  present_in_sources: number;
+  /**
+   * Mean pairwise cosine between per-source value-centroids.
+   * null when fewer than 2 sources have the field or encode is absent.
+   */
+  cohesion: number | null;
+}
+
+/** Timeline-level embedding substrate quality verdict. */
+export interface CohesionSummary {
+  /** "strong" | "moderate" | "weak" | "unavailable" */
+  level: string;
+  /** Mean cohesion across shared fields; null when unavailable. */
+  mean_cohesion: number | null;
+  /** Number of text-rich fields present in ≥2 sources. */
+  shared_field_count: number;
+  source_count: number;
+  message: string;
 }
 
 /** Per-artifact field info returned by /embedding-fields */
@@ -188,6 +222,8 @@ export interface EmbeddingArtifactInfo {
 
 export interface EmbeddingFieldsResponse {
   artifacts: EmbeddingArtifactInfo[];
+  /** Timeline-level cohesion summary. */
+  cohesion: CohesionSummary;
 }
 
 export interface UploadResult {
