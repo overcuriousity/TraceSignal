@@ -16,6 +16,7 @@ from sqlalchemy import (
     delete,
     func,
     select,
+    text,
     update,
 )
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -131,6 +132,12 @@ class Timeline(Base):
 
     The default Timeline (``is_default=True``) automatically contains every
     Source uploaded to the case. Custom Timelines are analyst-defined subsets.
+
+    Embedding state is tracked on the Timeline, not on individual Sources.  A
+    timeline is *embedded* when ``embedding_config`` is set.  It becomes *stale*
+    when its current ``source_ids`` differ from ``embedded_source_ids`` — this
+    is derived at serialisation time so no explicit flag-update is needed when
+    sources are added or removed.
     """
 
     __tablename__ = "timelines"
@@ -152,12 +159,26 @@ class Timeline(Base):
         server_default=func.now(),
     )
 
+    # --- Embedding state (all nullable; None → not yet embedded) -------------
+    embedding_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    embedding_config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    embedding_config_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Snapshot of source_ids at embed time; used to derive staleness.
+    embedded_source_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    embedded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     sources: Mapped[list[Source]] = relationship(
         "Source", secondary="timeline_sources", back_populates="timelines"
     )
 
     def to_dict(self) -> dict[str, Any]:
         """Return a serializable dictionary."""
+        current_ids = sorted(s.id for s in self.sources)
+        embedded_ids = sorted(self.embedded_source_ids or [])
+        is_embedded = self.embedding_config is not None
+        is_stale = is_embedded and current_ids != embedded_ids
         return {
             "id": self.id,
             "case_id": self.case_id,
@@ -165,6 +186,13 @@ class Timeline(Base):
             "description": self.description,
             "is_default": self.is_default,
             "source_ids": [s.id for s in self.sources],
+            "is_embedded": is_embedded,
+            "is_stale": is_stale,
+            "embedding_model": self.embedding_model,
+            "embedding_config": self.embedding_config,
+            "embedding_config_hash": self.embedding_config_hash,
+            "embedded_source_ids": self.embedded_source_ids,
+            "embedded_at": self.embedded_at.isoformat() if self.embedded_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -280,9 +308,24 @@ class PostgresStore:
         )
 
     async def init_schema(self) -> None:
-        """Create metadata tables if they do not exist."""
+        """Create metadata tables if they do not exist.
+
+        Also runs additive ALTER TABLE migrations for columns added after the
+        initial schema creation (Postgres ``IF NOT EXISTS`` prevents errors on
+        re-runs).
+        """
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            # Additive migration: timeline embedding-state columns (added in
+            # the timeline-level embedding refactor).  Safe to run repeatedly.
+            for stmt in (
+                "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedding_model VARCHAR(255)",
+                "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedding_config JSON",
+                "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedding_config_hash VARCHAR(128)",
+                "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedded_source_ids JSON",
+                "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedded_at TIMESTAMPTZ",
+            ):
+                await conn.execute(text(stmt))
 
     async def get_case(self, case_id: str) -> Case | None:
         """Return a case by ID, or None if not found."""
@@ -644,6 +687,36 @@ class PostgresStore:
                 .order_by(Source.created_at.desc())
             )
             return list(result.scalars().all())
+
+    async def set_timeline_embedding(
+        self,
+        case_id: str,
+        timeline_id: str,
+        *,
+        model: str,
+        config: dict,
+        config_hash: str,
+        embedded_source_ids: list[str],
+    ) -> bool:
+        """Persist embedding metadata on a timeline after a successful embed job.
+
+        Returns True if the timeline was found and updated, False otherwise.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                update(Timeline)
+                .where(Timeline.case_id == case_id, Timeline.id == timeline_id)
+                .values(
+                    embedding_model=model,
+                    embedding_config=config,
+                    embedding_config_hash=config_hash,
+                    embedded_source_ids=embedded_source_ids,
+                    embedded_at=datetime.now(UTC),
+                    updated_at=datetime.now(UTC),
+                )
+            )
+            await session.commit()
+            return result.rowcount > 0
 
     async def list_timelines(self, case_id: str) -> list[Timeline]:
         """Return all timelines for a case ordered by creation time.

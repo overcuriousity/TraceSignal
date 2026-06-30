@@ -1,5 +1,5 @@
 import { del, get, post } from "./client";
-import type { Source, Timeline } from "./types";
+import type { EmbeddingFieldsResponse, EmbeddingFieldConfig, Source, Timeline } from "./types";
 
 export const timelinesApi = {
   list: (caseId: string) =>
@@ -40,5 +40,18 @@ export const timelinesApi = {
   removeSource: (caseId: string, timelineId: string, sourceId: string) =>
     del<{ removed: boolean }>(
       `/cases/${caseId}/timelines/${timelineId}/sources/${sourceId}`,
+    ),
+
+  /** Fetch per-artifact field recommendations for the timeline's embedding wizard. */
+  embeddingFields: (caseId: string, timelineId: string) =>
+    get<EmbeddingFieldsResponse>(
+      `/cases/${caseId}/timelines/${timelineId}/embedding-fields`,
+    ),
+
+  /** Start a background job to embed all sources of a timeline. */
+  embed: (caseId: string, timelineId: string, config: EmbeddingFieldConfig) =>
+    post<{ job_id: string; status: string; source_ids: string[] }>(
+      `/cases/${caseId}/timelines/${timelineId}/embed`,
+      { embedding_config: config },
     ),
 };
