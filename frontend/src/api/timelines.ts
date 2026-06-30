@@ -1,5 +1,5 @@
-import { del, get, post, postForm } from "./client";
-import type { EmbeddingFieldConfig, Timeline, UploadResult } from "./types";
+import { del, get, post } from "./client";
+import type { EmbeddingFieldsResponse, EmbeddingFieldConfig, Source, Timeline } from "./types";
 
 export const timelinesApi = {
   list: (caseId: string) =>
@@ -12,37 +12,46 @@ export const timelinesApi = {
       `/cases/${caseId}/timelines/${timelineId}`,
     ).then((r) => r.timeline),
 
-  create: (caseId: string, name: string, description?: string) =>
+  create: (
+    caseId: string,
+    name: string,
+    description?: string,
+    sourceIds?: string[],
+  ) =>
     post<{ timeline: Timeline }>(`/cases/${caseId}/timelines`, {
       name,
       description,
+      source_ids: sourceIds ?? [],
     }).then((r) => r.timeline),
 
   delete: (caseId: string, timelineId: string) =>
     del<{ deleted: boolean }>(`/cases/${caseId}/timelines/${timelineId}`),
 
-  upload: (
-    caseId: string,
-    timelineId: string,
-    file: File,
-    parser?: string,
-  ): Promise<UploadResult> => {
-    const form = new FormData();
-    form.append("file", file);
-    if (parser) form.append("parser", parser);
-    return postForm<UploadResult>(
-      `/cases/${caseId}/timelines/${timelineId}/upload`,
-      form,
-    );
-  },
+  listSources: (caseId: string, timelineId: string) =>
+    get<{ sources: Source[] }>(
+      `/cases/${caseId}/timelines/${timelineId}/sources`,
+    ).then((r) => r.sources),
 
-  embed: (
-    caseId: string,
-    timelineId: string,
-    embeddingConfig?: EmbeddingFieldConfig,
-  ) =>
-    post<{ job_id: string; status: string }>(
+  addSource: (caseId: string, timelineId: string, sourceId: string) =>
+    post<{ added: boolean }>(
+      `/cases/${caseId}/timelines/${timelineId}/sources/${sourceId}`,
+    ),
+
+  removeSource: (caseId: string, timelineId: string, sourceId: string) =>
+    del<{ removed: boolean }>(
+      `/cases/${caseId}/timelines/${timelineId}/sources/${sourceId}`,
+    ),
+
+  /** Fetch per-artifact field recommendations for the timeline's embedding wizard. */
+  embeddingFields: (caseId: string, timelineId: string) =>
+    get<EmbeddingFieldsResponse>(
+      `/cases/${caseId}/timelines/${timelineId}/embedding-fields`,
+    ),
+
+  /** Start a background job to embed all sources of a timeline. */
+  embed: (caseId: string, timelineId: string, config: EmbeddingFieldConfig) =>
+    post<{ job_id: string; status: string; source_ids: string[] }>(
       `/cases/${caseId}/timelines/${timelineId}/embed`,
-      embeddingConfig != null ? { embedding_config: embeddingConfig } : undefined,
+      { embedding_config: config },
     ),
 };

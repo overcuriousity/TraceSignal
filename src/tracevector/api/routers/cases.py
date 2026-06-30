@@ -1,4 +1,4 @@
-"""API routes for cases, timelines, and uploads."""
+"""API routes for cases, sources, timelines, and annotations."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from tracevector.core.config import get_settings
@@ -33,7 +34,7 @@ class TimelineCreate(BaseModel):
 
     name: str = Field(..., min_length=1, max_length=255)
     description: str | None = Field(default=None, max_length=4096)
-    parser: str | None = Field(default=None)
+    source_ids: list[str] = Field(default_factory=list)
 
 
 class ViewCreate(BaseModel):
@@ -51,6 +52,16 @@ class AnnotationCreate(BaseModel):
     content: str = Field(..., min_length=1, max_length=4096)
 
 
+class SourceUploadResponse(BaseModel):
+    """Response shape for a source upload."""
+
+    source_id: str
+    events_parsed: int
+    events_inserted: int
+    parser: str
+    duplicate: bool
+
+
 router = APIRouter(prefix="/api/cases", tags=["cases"])
 
 _store: PostgresStore | None = None
@@ -64,6 +75,24 @@ def get_store() -> PostgresStore:
     return _store
 
 
+def _retention_dir() -> Path:
+    """Return the directory used for content-addressed source file retention."""
+    path = Path(get_settings().source_retention_path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _retention_path(file_hash: str) -> Path:
+    """Return the content-addressed path for a retained source file."""
+    # Shard by the first two hash characters to avoid huge flat directories.
+    return _retention_dir() / file_hash[:2] / file_hash
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Cases
+# ═════════════════════════════════════════════════════════════════════════════
+
+
 @router.get("/")
 async def list_cases() -> dict[str, Any]:
     """List all cases."""
@@ -75,7 +104,7 @@ async def list_cases() -> dict[str, Any]:
 
 @router.post("/")
 async def create_case(payload: CaseCreate) -> dict[str, Any]:
-    """Create a new case."""
+    """Create a new case (and its default timeline)."""
     store = get_store()
     await store.init_schema()
     case_id = generate_id(payload.name)
@@ -95,6 +124,193 @@ async def get_case(case_id: str) -> dict[str, Any]:
     if case is None:
         raise HTTPException(status_code=404, detail="Case not found")
     return {"case": case.to_dict()}
+
+
+@router.delete("/{case_id}")
+async def delete_case(case_id: str) -> dict[str, Any]:
+    """Delete a case and cascade-remove all its sources, timelines, events, and vectors."""
+    store = get_store()
+    case = await store.get_case(case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    qdrant = QdrantStore()
+    ch = ClickHouseStore()
+
+    sources = await store.list_sources(case_id)
+    for source in sources:
+        qdrant.delete_source_points(case_id, source.id)
+        ch.delete_source_events(case_id, source.id)
+    qdrant.delete_case_collections(case_id)
+    await store.delete_case(case_id)
+
+    return {"deleted": True, "case_id": case_id}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Sources
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+@router.get("/{case_id}/sources")
+async def list_sources(case_id: str) -> dict[str, Any]:
+    """List all sources within a case."""
+    store = get_store()
+    sources = await store.list_sources(case_id)
+    return {"sources": [s.to_dict() for s in sources]}
+
+
+@router.get("/{case_id}/sources/{source_id}")
+async def get_source(case_id: str, source_id: str) -> dict[str, Any]:
+    """Get a single source by ID."""
+    store = get_store()
+    source = await store.get_source(case_id, source_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Source not found")
+    return {"source": source.to_dict()}
+
+
+@router.post("/{case_id}/sources")
+async def upload_source(
+    case_id: str,
+    file: UploadFile = File(...),  # noqa: B008
+    parser: str | None = Form(default=None),
+    name: str | None = Form(default=None),
+) -> SourceUploadResponse:
+    """Upload a source file and ingest events into ClickHouse.
+
+    ``name`` is supplied as a form field, but the function may also be called
+    directly from tests with a plain ``str`` or ``None`` value.
+
+    Embeddings are *not* generated here; use the embed endpoint for that.
+    Uploading a file whose SHA-256 hash already exists in this case is
+    idempotent and returns the existing source without creating duplicate
+    events.
+    """
+    if not isinstance(name, (str, type(None))):
+        name = None
+    store = get_store()
+    await store.init_schema()
+    case = await store.get_case(case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    file_hash = hash_file(file.file)
+    try:
+        file.file.seek(0)
+    except (OSError, AttributeError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file stream is not seekable; cannot ingest",
+        ) from exc
+
+    existing_source = await store.get_source_by_hash(case_id, file_hash)
+    if existing_source is not None:
+        return SourceUploadResponse(
+            source_id=existing_source.id,
+            events_parsed=existing_source.event_count,
+            events_inserted=0,
+            parser=parser or existing_source.parser or "auto",
+            duplicate=True,
+        )
+
+    suffix = Path(file.filename or "upload").suffix or ".tmp"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        tmp_path = Path(tmp.name)
+        size_bytes = tmp_path.stat().st_size
+
+    try:
+        fmt = parser if parser and parser.lower() not in {"undefined", "null", "auto", ""} else None
+        fmt = fmt or detect_format(tmp_path)
+        source_id = generate_id(f"{case_id}:{file_hash}")
+        source_name = name or file.filename or tmp_path.name
+
+        # Retain the original file content-addressed by hash.
+        retention_path = _retention_path(file_hash)
+        retention_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(tmp_path, retention_path)
+
+        pipeline = IngestionPipeline(
+            case_id=case_id,
+            source_id=source_id,
+            batch_size=get_settings().embedding_batch_size,
+            file_hash=file_hash,
+            source_name=file.filename or tmp_path.name,
+        )
+        result = pipeline.run(tmp_path, format_name=fmt)
+
+        await store.create_source(
+            case_id=case_id,
+            source_id=source_id,
+            name=source_name,
+            file_hash=file_hash,
+            size_bytes=size_bytes,
+            filename=file.filename,
+            parser=fmt,
+            event_count=result.events_inserted,
+        )
+
+        # Auto-add the new source to the case's default timeline.
+        default_timeline = await store.get_default_timeline(case_id)
+        if default_timeline is not None:
+            await store.add_source_to_timeline(case_id, default_timeline.id, source_id)
+
+        return SourceUploadResponse(
+            source_id=source_id,
+            events_parsed=result.events_parsed,
+            events_inserted=result.events_inserted,
+            parser=fmt,
+            duplicate=False,
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+@router.get("/{case_id}/sources/{source_id}/download")
+async def download_source(case_id: str, source_id: str) -> FileResponse:
+    """Re-download the original source file by its SHA-256 hash."""
+    store = get_store()
+    source = await store.get_source(case_id, source_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    retention_path = _retention_path(source.file_hash)
+    if not retention_path.exists():
+        raise HTTPException(status_code=404, detail="Original source file no longer retained")
+
+    filename = source.filename or f"{source.file_hash}.bin"
+    return FileResponse(
+        path=retention_path,
+        filename=filename,
+        media_type="application/octet-stream",
+    )
+
+
+@router.delete("/{case_id}/sources/{source_id}")
+async def delete_source(case_id: str, source_id: str) -> dict[str, Any]:
+    """Delete a source and cascade-remove its events and vectors.
+
+    The source is removed from all timelines automatically by the foreign-key
+    cascade on ``timeline_sources``.
+    """
+    store = get_store()
+    source = await store.get_source(case_id, source_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    qdrant = QdrantStore()
+    ch = ClickHouseStore()
+    qdrant.delete_source_points(case_id, source_id)
+    ch.delete_source_events(case_id, source_id)
+    await store.delete_source(case_id, source_id)
+
+    return {"deleted": True, "source_id": source_id}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Timelines
+# ═════════════════════════════════════════════════════════════════════════════
 
 
 @router.get("/{case_id}/timelines")
@@ -117,7 +333,7 @@ async def get_timeline(case_id: str, timeline_id: str) -> dict[str, Any]:
 
 @router.post("/{case_id}/timelines")
 async def create_timeline(case_id: str, payload: TimelineCreate) -> dict[str, Any]:
-    """Create a new timeline within a case."""
+    """Create a new timeline (grouping of sources) within a case."""
     store = get_store()
     await store.init_schema()
     case = await store.get_case(case_id)
@@ -129,146 +345,73 @@ async def create_timeline(case_id: str, payload: TimelineCreate) -> dict[str, An
         timeline_id=timeline_id,
         name=payload.name,
         description=payload.description,
-        parser=payload.parser,
+        source_ids=payload.source_ids,
     )
     return {"timeline": timeline.to_dict()}
 
 
-@router.post("/{case_id}/timelines/{timeline_id}/upload")
-async def upload_timeline(
-    case_id: str,
-    timeline_id: str,
-    file: UploadFile = File(...),  # noqa: B008
-    parser: str | None = Form(default=None),
-) -> dict[str, Any]:
-    """Upload a timeline file and ingest events into ClickHouse.
-
-    Embeddings are *not* generated here; use the embed endpoint for that.
-    Uploading a file whose SHA-256 hash has already been ingested for this
-    timeline is idempotent and returns the existing result without creating
-    duplicate events.
-    """
-    store = get_store()
-    await store.init_schema()
-    timeline = await store.get_timeline(case_id, timeline_id)
-    if timeline is None:
-        raise HTTPException(status_code=404, detail="Timeline not found")
-
-    file_hash = hash_file(file.file)
-    # hash_file rewinds seekable streams; fail fast if the stream stayed at EOF.
-    try:
-        file.file.seek(0)
-    except (OSError, AttributeError) as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded file stream is not seekable; cannot ingest",
-        ) from exc
-    existing_upload = await store.get_timeline_upload_by_hash(
-        case_id=case_id,
-        timeline_id=timeline_id,
-        file_hash=file_hash,
-    )
-    if existing_upload is not None:
-        return {
-            "timeline_id": timeline_id,
-            "events_parsed": existing_upload.event_count,
-            "events_inserted": 0,
-            "parser": parser or existing_upload.parser or "auto",
-            "duplicate": True,
-        }
-
-    suffix = Path(file.filename or "upload").suffix or ".tmp"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        shutil.copyfileobj(file.file, tmp)
-        tmp_path = Path(tmp.name)
-
-    try:
-        # Treat sentinel strings as unspecified and fall back to auto-detection.
-        fmt = parser if parser and parser.lower() not in {"undefined", "null", "auto", ""} else None
-        fmt = fmt or detect_format(tmp_path)
-        pipeline = IngestionPipeline(
-            case_id=case_id,
-            timeline_id=timeline_id,
-            batch_size=get_settings().embedding_batch_size,
-            file_hash=file_hash,
-            source_name=file.filename or tmp_path.name,
-        )
-        result = pipeline.run(tmp_path, format_name=fmt)
-        await store.update_timeline_counts(
-            case_id=case_id,
-            timeline_id=timeline_id,
-            event_count=result.events_inserted,
-            vector_count=0,
-        )
-        await store.create_timeline_upload(
-            case_id=case_id,
-            timeline_id=timeline_id,
-            upload_id=generate_id(f"{timeline_id}:{file_hash}"),
-            file_hash=file_hash,
-            filename=file.filename,
-            event_count=result.events_inserted,
-            parser=fmt,
-        )
-        return {
-            "timeline_id": timeline_id,
-            "events_parsed": result.events_parsed,
-            "events_inserted": result.events_inserted,
-            "parser": fmt,
-            "duplicate": False,
-        }
-    finally:
-        tmp_path.unlink(missing_ok=True)
-
-
 @router.delete("/{case_id}/timelines/{timeline_id}")
 async def delete_timeline(case_id: str, timeline_id: str) -> dict[str, Any]:
-    """Delete a timeline and cascade-remove its events and vectors.
+    """Delete a timeline.
 
-    Removes data from all three stores in this order:
-    1. Qdrant vector points filtered by timeline_id (payload filter, per-collection).
-    2. ClickHouse events partition (case_id, timeline_id) via DROP PARTITION.
-    3. PostgreSQL Timeline row.
+    Deleting a timeline does *not* delete its sources, events, or vectors —
+    those remain available in the default timeline and other groupings.
     """
     store = get_store()
-    timeline = await store.get_timeline(case_id, timeline_id)
-    if timeline is None:
+    deleted = await store.delete_timeline(case_id, timeline_id)
+    if not deleted:
         raise HTTPException(status_code=404, detail="Timeline not found")
-
-    qdrant = QdrantStore()
-    ch = ClickHouseStore()
-    qdrant.delete_timeline_points(case_id, timeline_id)
-    ch.delete_timeline_events(case_id, timeline_id)
-    await store.delete_timeline_uploads_for_timeline(case_id, timeline_id)
-    await store.delete_timeline(case_id, timeline_id)
-
     return {"deleted": True, "timeline_id": timeline_id}
 
 
-@router.delete("/{case_id}")
-async def delete_case(case_id: str) -> dict[str, Any]:
-    """Delete a case and cascade-remove all its timelines, events, and vectors.
-
-    Removes data from all three stores in this order:
-    1. Qdrant vector points per timeline, then all case collections.
-    2. ClickHouse events partitions per timeline.
-    3. PostgreSQL Case row (and Timeline rows via delete_case).
-    """
+@router.get("/{case_id}/timelines/{timeline_id}/sources")
+async def list_timeline_sources(case_id: str, timeline_id: str) -> dict[str, Any]:
+    """List the sources attached to a timeline."""
     store = get_store()
-    case = await store.get_case(case_id)
-    if case is None:
-        raise HTTPException(status_code=404, detail="Case not found")
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+    sources = await store.list_timeline_sources(case_id, timeline_id)
+    return {"sources": [s.to_dict() for s in sources]}
 
-    timelines = await store.list_timelines(case_id)
 
-    qdrant = QdrantStore()
-    ch = ClickHouseStore()
-    for tl in timelines:
-        qdrant.delete_timeline_points(case_id, tl.id)
-        ch.delete_timeline_events(case_id, tl.id)
-    qdrant.delete_case_collections(case_id)
-    await store.delete_case(case_id)
+@router.post("/{case_id}/timelines/{timeline_id}/sources/{source_id}")
+async def add_source_to_timeline(
+    case_id: str,
+    timeline_id: str,
+    source_id: str,
+) -> dict[str, Any]:
+    """Add a source to a timeline."""
+    store = get_store()
+    added = await store.add_source_to_timeline(case_id, timeline_id, source_id)
+    if not added:
+        raise HTTPException(
+            status_code=400,
+            detail="Source is already a member of the timeline, or one of the IDs was not found",
+        )
+    return {"added": True, "timeline_id": timeline_id, "source_id": source_id}
 
-    return {"deleted": True, "case_id": case_id}
+
+@router.delete("/{case_id}/timelines/{timeline_id}/sources/{source_id}")
+async def remove_source_from_timeline(
+    case_id: str,
+    timeline_id: str,
+    source_id: str,
+) -> dict[str, Any]:
+    """Remove a source from a timeline."""
+    store = get_store()
+    removed = await store.remove_source_from_timeline(case_id, timeline_id, source_id)
+    if not removed:
+        raise HTTPException(
+            status_code=400,
+            detail="Source is not a member of the timeline, or one of the IDs was not found",
+        )
+    return {"removed": True, "timeline_id": timeline_id, "source_id": source_id}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Views
+# ═════════════════════════════════════════════════════════════════════════════
 
 
 @router.get("/{case_id}/views")
@@ -307,45 +450,72 @@ async def delete_view(case_id: str, view_id: str) -> dict[str, Any]:
     return {"deleted": True, "view_id": view_id}
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Annotations
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/tags")
+async def list_timeline_tags(case_id: str, timeline_id: str) -> dict[str, Any]:
+    """Return the distinct user annotation-tag labels for a timeline's sources.
+
+    Used to power tag autocomplete in the UI.
+    """
+    store = get_store()
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+    sources = await store.list_timeline_sources(case_id, timeline_id)
+    source_ids = [s.id for s in sources]
+    tags = await store.list_distinct_tag_contents(case_id, source_ids)
+    return {"tags": tags}
+
+
 @router.get("/{case_id}/timelines/{timeline_id}/annotations")
 async def list_timeline_annotations(case_id: str, timeline_id: str) -> dict[str, Any]:
-    """List all annotations for a timeline (used for bulk event-table chips)."""
+    """List all annotations for a timeline's sources (used for event-table chips)."""
     store = get_store()
     timeline = await store.get_timeline(case_id, timeline_id)
     if timeline is None:
         raise HTTPException(status_code=404, detail="Timeline not found")
-    annotations = await store.list_timeline_annotations(case_id, timeline_id)
+    sources = await store.list_timeline_sources(case_id, timeline_id)
+    source_ids = [s.id for s in sources]
+    annotations = await store.list_source_annotations(case_id, source_ids)
     return {"annotations": [a.to_dict() for a in annotations]}
 
 
-@router.get("/{case_id}/timelines/{timeline_id}/events/{event_id}/annotations")
-async def list_event_annotations(case_id: str, timeline_id: str, event_id: str) -> dict[str, Any]:
+@router.get("/{case_id}/sources/{source_id}/events/{event_id}/annotations")
+async def list_event_annotations(
+    case_id: str,
+    source_id: str,
+    event_id: str,
+) -> dict[str, Any]:
     """List annotations for a single event."""
     store = get_store()
-    timeline = await store.get_timeline(case_id, timeline_id)
-    if timeline is None:
-        raise HTTPException(status_code=404, detail="Timeline not found")
-    annotations = await store.list_annotations(case_id, timeline_id, event_id)
+    source = await store.get_source(case_id, source_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Source not found")
+    annotations = await store.list_annotations(case_id, source_id, event_id)
     return {"annotations": [a.to_dict() for a in annotations]}
 
 
-@router.post("/{case_id}/timelines/{timeline_id}/events/{event_id}/annotations")
+@router.post("/{case_id}/sources/{source_id}/events/{event_id}/annotations")
 async def create_event_annotation(
     case_id: str,
-    timeline_id: str,
+    source_id: str,
     event_id: str,
     payload: AnnotationCreate,
 ) -> dict[str, Any]:
     """Add a tag or comment annotation to an event."""
     store = get_store()
     await store.init_schema()
-    timeline = await store.get_timeline(case_id, timeline_id)
-    if timeline is None:
-        raise HTTPException(status_code=404, detail="Timeline not found")
+    source = await store.get_source(case_id, source_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Source not found")
     annotation_id = generate_id(f"{event_id}_{payload.annotation_type}")
     annotation = await store.create_annotation(
         case_id=case_id,
-        timeline_id=timeline_id,
+        source_id=source_id,
         event_id=event_id,
         annotation_id=annotation_id,
         annotation_type=payload.annotation_type,
@@ -354,35 +524,43 @@ async def create_event_annotation(
     return {"annotation": annotation.to_dict()}
 
 
-@router.delete("/{case_id}/timelines/{timeline_id}/events/{event_id}/annotations/{annotation_id}")
+@router.delete("/{case_id}/sources/{source_id}/events/{event_id}/annotations/{annotation_id}")
 async def delete_event_annotation(
     case_id: str,
-    timeline_id: str,
+    source_id: str,
     event_id: str,
     annotation_id: str,
 ) -> dict[str, Any]:
     """Delete an annotation."""
     store = get_store()
+    source = await store.get_source(case_id, source_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Source not found")
     deleted = await store.delete_annotation(case_id, event_id, annotation_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Annotation not found")
     return {"deleted": True, "annotation_id": annotation_id}
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Embeddings
+# ═════════════════════════════════════════════════════════════════════════════
+
+
 class EmbedRequest(BaseModel):
     """Optional body for the embed endpoint.
 
-    When ``embedding_config`` is provided it is persisted on the timeline and
-    used to drive per-source field selection.  Omit the body (or send an empty
-    object) to reuse the timeline's stored config, falling back to legacy
+    When ``embedding_config`` is provided it is persisted on the source and
+    used to drive per-artifact field selection.  Omit the body (or send an empty
+    object) to reuse the source's stored config, falling back to legacy
     all-fields behaviour when none has been saved.
     """
 
     embedding_config: dict[str, Any] | None = Field(
         default=None,
         description=(
-            'Per-source field selection. Shape: {"version": 1, "sources": '
-            '{"<source>": ["message", "attr:user_agent", ...]}}'
+            'Per-artifact field selection. Shape: {"version": 1, "artifacts": '
+            '{"<artifact>": ["message", "attr:k", ...]}}'
         ),
     )
 
@@ -390,7 +568,7 @@ class EmbedRequest(BaseModel):
 def _run_embedding_job(
     job_id: str,
     case_id: str,
-    timeline_id: str,
+    source_id: str,
     job_store: JobStore,
     field_config: dict[str, Any] | None = None,
 ) -> None:
@@ -406,7 +584,7 @@ def _run_embedding_job(
     try:
         pipeline = EmbeddingPipeline(
             case_id=case_id,
-            timeline_id=timeline_id,
+            source_ids=[source_id],
             batch_size=get_settings().embedding_batch_size,
             progress_callback=progress_callback,
             field_config=field_config,
@@ -416,9 +594,9 @@ def _run_embedding_job(
         # Use a fresh PostgresStore inside the worker thread.
         store = PostgresStore()
         asyncio.run(
-            store.update_timeline_counts(
+            store.update_source_counts(
                 case_id=case_id,
-                timeline_id=timeline_id,
+                source_id=source_id,
                 vector_count=result.vectors_inserted,
             )
         )
@@ -432,32 +610,39 @@ def _run_embedding_job(
         job_store.update(job_id, status="failed", error=str(exc))
 
 
-@router.post("/{case_id}/timelines/{timeline_id}/embed")
+@router.post("/{case_id}/sources/{source_id}/embed")
 async def start_embedding(
     case_id: str,
-    timeline_id: str,
+    source_id: str,
     background_tasks: BackgroundTasks,
     body: EmbedRequest | None = None,
 ) -> dict[str, Any]:
-    """Start a background job to generate embeddings for a timeline.
+    """Start a background job to generate embeddings for a source.
+
+    **Legacy endpoint** — the primary embedding workflow is now timeline-level
+    via ``POST /{case_id}/timelines/{timeline_id}/embed``.  This endpoint
+    remains for advanced per-source use and backwards compatibility.
 
     Accepts an optional ``embedding_config`` body produced by the embedding
-    wizard.  When supplied it is persisted on the timeline and used to control
-    which fields of which sources get embedded.  Omit the body to reuse the
-    timeline's previously stored config (or fall back to all-fields behaviour).
+    wizard.  When supplied it is persisted on the source and used to control
+    which fields of which artifacts get embedded.  Omit the body to reuse the
+    source's previously stored config (or fall back to all-fields behaviour).
     """
     store = get_store()
-    timeline = await store.get_timeline(case_id, timeline_id)
-    if timeline is None:
-        raise HTTPException(status_code=404, detail="Timeline not found")
+    source = await store.get_source(case_id, source_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Source not found")
 
-    # Resolve effective field config: request body > stored on timeline > None.
+    # Resolve effective field config: request body > stored on source > None.
     field_config: dict[str, Any] | None = None
+    embedding_model = get_settings().embedding_model
     if body is not None and body.embedding_config is not None:
         field_config = body.embedding_config
-        await store.update_timeline_embedding_config(case_id, timeline_id, field_config)
-    elif timeline.embedding_config is not None:
-        field_config = timeline.embedding_config
+        await store.update_source_embedding_config(
+            case_id, source_id, embedding_model=embedding_model, embedding_config=field_config
+        )
+    elif source.embedding_config is not None:
+        field_config = source.embedding_config
 
     job_store = get_job_store()
     job = job_store.create(
@@ -468,8 +653,130 @@ async def start_embedding(
         _run_embedding_job,
         job.id,
         case_id,
-        timeline_id,
+        source_id,
         job_store,
         field_config,
     )
     return {"job_id": job.id, "status": job.status}
+
+
+def _run_timeline_embedding_job(
+    job_id: str,
+    case_id: str,
+    timeline_id: str,
+    source_ids: list[str],
+    job_store: JobStore,
+    field_config: dict[str, Any] | None = None,
+) -> None:
+    """Embed all sources of a timeline with a shared field config."""
+
+    def progress_callback(total: int, processed: int) -> None:
+        job_store.update(
+            job_id,
+            status="running",
+            progress={"total": total, "processed": processed},
+        )
+
+    try:
+        pipeline = EmbeddingPipeline(
+            case_id=case_id,
+            source_ids=source_ids,
+            batch_size=get_settings().embedding_batch_size,
+            progress_callback=progress_callback,
+            field_config=field_config,
+        )
+        result = pipeline.run()
+
+        store = PostgresStore()
+        embedding_model = get_settings().embedding_model
+        asyncio.run(
+            store.set_timeline_embedding(
+                case_id=case_id,
+                timeline_id=timeline_id,
+                model=embedding_model,
+                config=field_config or {},
+                config_hash=result.config_hash,
+                embedded_source_ids=source_ids,
+            )
+        )
+        # Update vector counts on each source.
+        # EmbeddingPipeline processes all sources in one collection so we set
+        # an approximate per-source count (total / n sources) as a best effort;
+        # the authoritative vector count is queryable from Qdrant directly.
+        per_source = result.vectors_inserted // max(len(source_ids), 1)
+        for sid in source_ids:
+            asyncio.run(
+                store.update_source_counts(
+                    case_id=case_id,
+                    source_id=sid,
+                    vector_count=per_source,
+                )
+            )
+        job_store.update(
+            job_id,
+            status="completed",
+            progress={
+                "total": result.events_processed,
+                "processed": result.events_processed,
+            },
+            result={
+                "vectors_inserted": result.vectors_inserted,
+                "config_hash": result.config_hash,
+                "source_ids": source_ids,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        job_store.update(job_id, status="failed", error=str(exc))
+
+
+@router.post("/{case_id}/timelines/{timeline_id}/embed")
+async def start_timeline_embedding(
+    case_id: str,
+    timeline_id: str,
+    background_tasks: BackgroundTasks,
+    body: EmbedRequest | None = None,
+) -> dict[str, Any]:
+    """Embed all sources in a timeline with a single shared field config.
+
+    This is the primary embedding entry point.  The wizard on the frontend
+    computes a cross-source-cohesive field selection and submits it here.
+
+    On success the timeline is marked as embedded with a snapshot of the
+    current source set.  If sources are later added the timeline becomes
+    *stale* (``is_stale=True`` in ``to_dict()``), prompting a re-embed.
+    """
+    store = get_store()
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    sources = await store.list_timeline_sources(case_id, timeline_id)
+    if not sources:
+        raise HTTPException(
+            status_code=422,
+            detail="Timeline has no sources — add at least one source before embedding.",
+        )
+    source_ids = [s.id for s in sources]
+
+    # Resolve effective field config: request body > timeline's stored config > None.
+    field_config: dict[str, Any] | None = None
+    if body is not None and body.embedding_config is not None:
+        field_config = body.embedding_config
+    elif timeline.embedding_config:
+        field_config = timeline.embedding_config
+
+    job_store = get_job_store()
+    job = job_store.create(
+        kind="embed",
+        progress={"total": 0, "processed": 0},
+    )
+    background_tasks.add_task(
+        _run_timeline_embedding_job,
+        job.id,
+        case_id,
+        timeline_id,
+        source_ids,
+        job_store,
+        field_config,
+    )
+    return {"job_id": job.id, "status": job.status, "source_ids": source_ids}

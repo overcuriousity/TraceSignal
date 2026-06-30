@@ -2,6 +2,7 @@ import { useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { casesApi } from "@/api/cases";
 import { TimelineList } from "@/components/timelines/TimelineList";
+import { SourceList } from "@/components/sources/SourceList";
 import { Spinner } from "@/components/ui/Spinner";
 import { fmtRelative } from "@/lib/time";
 import { FolderOpen } from "lucide-react";
@@ -56,7 +57,10 @@ export function CaseOverviewPage() {
           </div>
         </div>
 
-        <TimelineList caseId={caseId!} />
+        <div className="space-y-8">
+          <SourceList caseId={caseId!} />
+          <TimelineList caseId={caseId!} />
+        </div>
       </div>
     </div>
   );

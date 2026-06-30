@@ -24,16 +24,21 @@ TraceVector is a focused, self-hosted alternative: ingest huge logs, explore the
 - **Forensic rigor**: Immutable ingestion, config-stability checks for embedding models, and offline-by-default operation.
 
 ## 5. Key Concepts / Data Model
+
+The current vocabulary is defined and implemented in
+[`docs/MODEL_REFINEMENT.md`](./MODEL_REFINEMENT.md).
+
 | Concept | Description |
 |--------|-------------|
 | **Case** | An investigation container (e.g. "Compromised endpoint ACME-123"). |
-| **Timeline** | A single imported data source inside a case; has a schema and ingestion metadata. |
-| **Event** | One row in a timeline; the atomic unit of filtering, annotation, and embedding. |
-| **Raw Log** | The original, immutable source file or chunk stored for audit/re-download. |
+| **Source** | One ingested file — the unit of forensic provenance and immutability. Hashed with SHA-256; retained for re-download. |
+| **Timeline** | A named grouping of 1..N Sources — the merged, correlated chronological view. Every case has a default "All sources" timeline. |
+| **Event** | One record from a Source; scoped by `source_id` and stamped with its **Artifact** type. |
+| **Artifact** | The per-event Plaso class and long description (`LOG` / `Syslog line`, `WEBHIST` / `Firefox history`, …). Renamed from `source`/`source_long`. |
 | **Embedding** | A dense vector representation of an event's textual content, produced by a local model. |
-| **Vector Collection** | A Qdrant collection holding event embeddings for a case or timeline. |
-| **View** | A saved set of filters (time range, full-text, field values) applied to events. |
-| **Annotation** | A comment, tag, or highlight attached to one or more events. |
+| **Vector Collection** | A Qdrant collection holding event embeddings for a case, keyed by embedding-config hash. |
+| **View** | A saved set of filters (time range, full-text, artifact, source toggle, field values) applied to a Timeline. |
+| **Annotation** | A comment, tag, or highlight attached to one or more Events. Origin is `user` or `system`. |
 
 ## 6. Proposed MVP Feature Set
 
@@ -55,13 +60,14 @@ TraceVector is a focused, self-hosted alternative: ingest huge logs, explore the
 - Store embedding model configuration (model name, pooling, normalization) alongside vectors and enforce config-match on query.
 
 ### 6.3 Web UI (ELK-like investigation interface)
-- Case / timeline list and management.
+- Case / source / timeline list and management.
 - Event table with configurable columns.
-- Full-text search, field-specific filters, and time-range picker.
+- Full-text search, artifact/source-specific filters, and time-range picker.
 - Pagination and infinite scroll for large result sets.
 - Saved views per case.
 - Multi-select events and add tags/comments.
 - Export filtered results or full annotated timeline as CSV/JSONL.
+- Time histogram and per-source color stripes in the Explorer.
 
 ### 6.4 Anomaly & Similarity Panel
 - Run unsupervised scoring over event embeddings:
@@ -99,15 +105,20 @@ TraceVector is a focused, self-hosted alternative: ingest huge logs, explore the
 - Compute embeddings and surface the top-N anomalous events without leaving the app.
 - Run fully offline after initial model download.
 
-## 10. Open Questions for Tech-Stack Selection
-1. Primary event store: PostgreSQL, SQLite, ClickHouse, DuckDB, or something else?
-2. Backend language/framework: Python (familiar ML ecosystem) vs. Go/Rust (throughput) vs. hybrid?
-3. Frontend stack: lightweight SSR or a modern SPA?
-4. Embedding model: general sentence-transformer vs. a log-trained model (e.g. LogBERT-style) vs. both?
-5. Deployment target: single-node Docker first, or Kubernetes-ready from the start?
+## 10. Tech-Stack Selection (resolved)
+
+Decisions are recorded in [`docs/TECH_STACK.md`](./TECH_STACK.md):
+
+1. ✅ Primary event store: **ClickHouse**.
+2. ✅ Backend language/framework: **Python 3.13 + FastAPI/Uvicorn**.
+3. 🔄 Frontend stack: **TBD** — redesign in progress.
+4. ✅ Embedding model: general sentence-transformer baseline (`all-MiniLM-L6-v2`), with a swappable registry for log-specific models later.
+5. ✅ Deployment target: single-node Docker Compose reference deployment; application runs via `uv`.
 
 ## 11. Next Steps
-1. Finalize and approve this concept.
-2. Answer the five tech-stack questions above.
-3. Produce an architecture/tech-stack decision record.
-4. Implement the ingestion CLI and web UI incrementally.
+1. ✅ Finalize and approve this concept.
+2. ✅ Produce an architecture/tech-stack decision record.
+3. ✅ Implement the Case / Source / Timeline / Artifact model refactor.
+4. ⬜ Implement authentication.
+5. ⬜ Implement strict offline-mode enforcement.
+6. ⬜ Rebuild the frontend UI once the stack is chosen.

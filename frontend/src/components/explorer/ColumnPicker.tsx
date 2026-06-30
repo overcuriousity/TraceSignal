@@ -28,8 +28,9 @@ interface Props {
 /** Human-readable labels for the built-in top-level columns. */
 const TOP_LEVEL_LABELS: Record<string, string> = {
   timestamp: "Timestamp",
-  source: "Source",
-  source_long: "Source (long)",
+  source_id: "Source",
+  artifact: "Artifact",
+  artifact_long: "Artifact (long)",
   display_name: "Display Name",
   message: "Message",
   timestamp_desc: "Timestamp Desc",

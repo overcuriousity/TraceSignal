@@ -38,12 +38,12 @@ export function DeleteTimelineDialog({ caseId, timeline }: Props) {
       </Button>
       <DialogContent
         title={`Delete timeline "${timeline.name}"?`}
-        description="Cascade-deletes all events, vectors, and annotations for this timeline."
+        description="Deletes the timeline grouping. Source events, vectors, and annotations are not affected."
       >
         <div className="space-y-4">
           <p className="rounded border border-[var(--color-danger)]/30 bg-[var(--color-danger-dim)] px-3 py-2 text-xs text-[var(--color-danger)]">
-            {timeline.event_count.toLocaleString()} events and{" "}
-            {timeline.vector_count.toLocaleString()} vectors will be permanently deleted.
+            {timeline.source_ids.length.toLocaleString()} source
+            {timeline.source_ids.length !== 1 ? "s" : ""} will be removed from this grouping.
           </p>
           {error && (
             <p className="text-xs text-[var(--color-danger)]">{(error as Error).message}</p>
