@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Search, Clock, PlusCircle, MinusCircle, BookmarkCheck, PanelLeftClose, X } from "lucide-react";
+import { Search, Clock, PlusCircle, MinusCircle, BookmarkCheck, PanelLeftClose, X, Tag, ShieldAlert } from "lucide-react";
 import { Input } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
 import { Tooltip } from "@/components/ui/Tooltip";
@@ -14,9 +14,19 @@ interface Props {
   onApplyView: (f: EventFilters) => void;
   onSaveView: () => void;
   onClose?: () => void;
+  /** Distinct user tag annotation values, for the "Tagged" value picker. */
+  tagSuggestions?: string[];
 }
 
-export function FilterRail({ filters, onChange, views, onApplyView, onSaveView, onClose }: Props) {
+export function FilterRail({
+  filters,
+  onChange,
+  views,
+  onApplyView,
+  onSaveView,
+  onClose,
+  tagSuggestions = [],
+}: Props) {
   const [fieldKey, setFieldKey] = useState("");
   const [fieldVal, setFieldVal] = useState("");
   const [excludeKey, setExcludeKey] = useState("");
@@ -43,6 +53,21 @@ export function FilterRail({ filters, onChange, views, onApplyView, onSaveView, 
     });
     setExcludeKey("");
     setExcludeVal("");
+  };
+
+  const annotated = filters.annotated ?? [];
+  const toggleAnnotated = (type: "tag" | "anomaly") => {
+    const next = annotated.includes(type)
+      ? annotated.filter((t) => t !== type)
+      : [...annotated, type];
+    const f = { ...filters };
+    if (next.length > 0) {
+      f.annotated = next;
+    } else {
+      delete f.annotated;
+      delete f.annotationTagValue;
+    }
+    onChange(f);
   };
 
   const hasFilters = Object.values(filters).some((v) =>
@@ -173,6 +198,47 @@ export function FilterRail({ filters, onChange, views, onApplyView, onSaveView, 
               onChange({ ...filters, tag: e.target.value || undefined })
             }
           />
+        </div>
+
+        {/* Flagged — annotation tag / anomaly filter */}
+        <div>
+          <label className="mb-1.5 block text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
+            Flagged
+          </label>
+          <div className="space-y-1.5">
+            <label className="flex items-center gap-1.5 text-xs text-[var(--color-fg-secondary)] cursor-pointer">
+              <input
+                type="checkbox"
+                checked={annotated.includes("tag")}
+                onChange={() => toggleAnnotated("tag")}
+              />
+              <Tag size={11} /> Tagged
+            </label>
+            {annotated.includes("tag") && (
+              <select
+                value={filters.annotationTagValue ?? ""}
+                onChange={(e) =>
+                  onChange({ ...filters, annotationTagValue: e.target.value || undefined })
+                }
+                className="ml-5 w-[calc(100%-1.25rem)] rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-1.5 py-0.5 text-xs text-[var(--color-fg-primary)] focus:outline-none focus:border-[var(--color-accent)]"
+              >
+                <option value="">(any tag)</option>
+                {tagSuggestions.map((t) => (
+                  <option key={t} value={t}>
+                    {t}
+                  </option>
+                ))}
+              </select>
+            )}
+            <label className="flex items-center gap-1.5 text-xs text-[var(--color-fg-secondary)] cursor-pointer">
+              <input
+                type="checkbox"
+                checked={annotated.includes("anomaly")}
+                onChange={() => toggleAnnotated("anomaly")}
+              />
+              <ShieldAlert size={11} /> Anomaly
+            </label>
+          </div>
         </div>
 
         {/* Field include */}

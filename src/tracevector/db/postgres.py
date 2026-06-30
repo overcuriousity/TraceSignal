@@ -1021,23 +1021,28 @@ class PostgresStore:
         source_ids: list[str],
         annotation_type: str,
         origin: str = "user",
+        content: str | None = None,
     ) -> list[str]:
         """Return the event_ids that have at least one annotation of the given type.
 
-        Used by the anomaly service to retrieve the analyst-defined normal set.
+        Used by the anomaly service to retrieve the analyst-defined normal set,
+        and by the events API to filter to tagged/anomaly-flagged events.
+        ``content`` optionally narrows to a specific annotation value (e.g. a
+        specific tag label).
         """
         from sqlalchemy import select
 
         async with self.session_factory() as session:
+            conditions = [
+                Annotation.case_id == case_id,
+                Annotation.source_id.in_(source_ids),
+                Annotation.annotation_type == annotation_type,
+                Annotation.origin == origin,
+            ]
+            if content is not None:
+                conditions.append(Annotation.content == content)
             result = await session.execute(
-                select(Annotation.event_id)
-                .where(
-                    Annotation.case_id == case_id,
-                    Annotation.source_id.in_(source_ids),
-                    Annotation.annotation_type == annotation_type,
-                    Annotation.origin == origin,
-                )
-                .distinct()
+                select(Annotation.event_id).where(*conditions).distinct()
             )
             return [row[0] for row in result.all()]
 

@@ -14,8 +14,10 @@ import pytest
 
 from tracevector.db.anomaly_stats import (
     FreqFinding,
+    NoveltyFieldInfo,
     StatisticalAnomalyService,
     ValueFinding,
+    _classify_field,
     _col_expr,
 )
 
@@ -480,12 +482,13 @@ def test_frequency_temporal_baseline():
     baseline_end = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
     min_dt = datetime(2024, 1, 1, tzinfo=UTC)
     max_dt = datetime(2024, 1, 2, tzinfo=UTC)
-    # 3 baseline buckets (flat) + 1 detect bucket (spike).
+    # 3 baseline buckets (slightly varied so std > 0) + 1 detect bucket (spike).
+    # Variation is small relative to the spike so the detect window is anomalous.
     bucket_rows = [
         (min_dt, "LOG", 10),
-        (min_dt + timedelta(hours=4), "LOG", 10),
-        (min_dt + timedelta(hours=8), "LOG", 10),
-        # Detect window (after baseline_end):
+        (min_dt + timedelta(hours=4), "LOG", 12),
+        (min_dt + timedelta(hours=8), "LOG", 11),
+        # Detect window (after baseline_end): massive spike.
         (min_dt + timedelta(hours=14), "LOG", 200),
     ]
     svc = _svc([
@@ -505,3 +508,277 @@ def test_frequency_temporal_baseline():
     spike = result.results[0]
     assert spike.observed == 200
     assert spike.z_score > 0
+
+
+# ---------------------------------------------------------------------------
+# _classify_field unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_classify_field_constant():
+    kind, recommended = _classify_field(distinct=1, non_empty_count=1000)
+    assert kind == "constant"
+    assert recommended is False
+
+
+def test_classify_field_zero_distinct():
+    kind, recommended = _classify_field(distinct=0, non_empty_count=0)
+    assert kind == "constant"
+    assert recommended is False
+
+
+def test_classify_field_identifier():
+    # 900 unique values out of 1000 non-empty → ratio = 0.9 = exact boundary
+    kind, recommended = _classify_field(distinct=900, non_empty_count=1000)
+    assert kind == "identifier"
+    assert recommended is False
+
+
+def test_classify_field_identifier_near_unique():
+    # Near-unique: hash-like field (9800/9800 = 1.0)
+    kind, recommended = _classify_field(distinct=9800, non_empty_count=9800)
+    assert kind == "identifier"
+    assert recommended is False
+
+
+def test_classify_field_sparse():
+    # Only 1% coverage — sparse (50 non-empty out of 5000 total)
+    kind, recommended = _classify_field(distinct=50, non_empty_count=50, total=5000)
+    assert kind == "sparse"
+    assert recommended is False
+
+
+def test_classify_field_categorical():
+    # Good cardinality and coverage: 10 distinct out of 950 non-empty (0.01 ratio)
+    kind, recommended = _classify_field(distinct=10, non_empty_count=950, total=1000)
+    assert kind == "categorical"
+    assert recommended is True
+
+
+def test_classify_field_categorical_moderate():
+    # status_code-like: 5 distinct, 1000 non-empty
+    kind, recommended = _classify_field(distinct=5, non_empty_count=1000, total=1000)
+    assert kind == "categorical"
+    assert recommended is True
+
+
+# ---------------------------------------------------------------------------
+# recommend_novelty_fields tests
+# ---------------------------------------------------------------------------
+
+
+def _svc_with_recommend_responses(
+    top_row: tuple,
+    attr_rows: list[tuple],
+    total: int = 1000,
+) -> StatisticalAnomalyService:
+    """Build a service whose FakeClient provides recommend_novelty_fields responses."""
+    responses = [
+        # Total count
+        FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
+        # Top-level batch (4 columns × 2 agg each = 8 values in one row)
+        FakeQueryResult(result_rows=[top_row], column_names=["c"] * 8),
+        # Attribute keys + cardinality
+        FakeQueryResult(result_rows=attr_rows, column_names=["key", "dist", "cov_count"]),
+    ]
+    return _svc(responses)
+
+
+def test_recommend_novelty_fields_empty_on_no_data():
+    """Returns empty list when no events exist."""
+    svc = _svc([FakeQueryResult(result_rows=[(0,)], column_names=["count()"])])
+    result = svc.recommend_novelty_fields("c1", ["s1"])
+    assert result == []
+
+
+def test_recommend_novelty_fields_categorical_recommended():
+    """Categorical fields (moderate cardinality) should be recommended."""
+    # artifact: 5 distinct, 1000 non-empty  → categorical
+    # timestamp_desc: 20 distinct, 950 non-empty → categorical
+    # display_name: 1 distinct (constant) → not recommended
+    # parser_name: 1000 distinct, 1000 non-empty (identifier, ratio=1.0) → not recommended
+    # (total=1000 for all coverage computations)
+    top_row = (
+        5, 1000,    # artifact: 5 distinct, 1000 non-empty
+        20, 950,    # timestamp_desc: 20 distinct, 950 non-empty
+        1, 900,     # display_name: 1 distinct → constant
+        1000, 1000, # parser_name: 1000/1000 = 1.0 → identifier
+    )
+    attr_rows = [
+        # (key, distinct, non_empty_count)
+        ("status_code", 6, 1000),   # 6/1000=0.006 → categorical
+        ("url_path", 840, 1000),    # 840/1000=0.84 < 0.9 → categorical
+        ("session_id", 980, 980),   # 980/980=1.0 → identifier
+    ]
+    svc = _svc_with_recommend_responses(top_row, attr_rows)
+    result = svc.recommend_novelty_fields("c1", ["s1"])
+
+    assert isinstance(result, list)
+    assert all(isinstance(f, NoveltyFieldInfo) for f in result)
+
+    by_token = {f.token: f for f in result}
+
+    # artifact: categorical
+    assert by_token["artifact"].kind == "categorical"
+    assert by_token["artifact"].recommended is True
+
+    # timestamp_desc: categorical
+    assert by_token["timestamp_desc"].kind == "categorical"
+    assert by_token["timestamp_desc"].recommended is True
+
+    # display_name: constant
+    assert by_token["display_name"].kind == "constant"
+    assert by_token["display_name"].recommended is False
+
+    # parser_name: identifier
+    assert by_token["parser_name"].kind == "identifier"
+    assert by_token["parser_name"].recommended is False
+
+    # status_code: categorical
+    assert by_token["attr:status_code"].kind == "categorical"
+    assert by_token["attr:status_code"].recommended is True
+
+    # session_id: identifier
+    assert by_token["attr:session_id"].kind == "identifier"
+    assert by_token["attr:session_id"].recommended is False
+
+
+def test_recommend_novelty_fields_recommended_first():
+    """Recommended fields should appear before non-recommended ones."""
+    top_row = (
+        5, 1000,    # artifact — categorical
+        20, 950,    # timestamp_desc — categorical
+        1, 900,     # display_name — constant → not recommended
+        1000, 1000, # parser_name — identifier → not recommended
+    )
+    attr_rows: list[tuple] = []
+    svc = _svc_with_recommend_responses(top_row, attr_rows)
+    result = svc.recommend_novelty_fields("c1", ["s1"])
+
+    recommended = [f for f in result if f.recommended]
+    not_recommended = [f for f in result if not f.recommended]
+    # All recommended fields should appear before non-recommended.
+    if recommended and not_recommended:
+        last_rec_idx = max(i for i, f in enumerate(result) if f.recommended)
+        first_not_rec_idx = min(i for i, f in enumerate(result) if not f.recommended)
+        assert last_rec_idx < first_not_rec_idx
+
+
+# ---------------------------------------------------------------------------
+# find_value_novelty — smart default via recommender
+# ---------------------------------------------------------------------------
+
+
+def test_value_novelty_smart_default_calls_recommender():
+    """When fields=None, the recommender is invoked and its tokens are used."""
+    # The smart default path calls recommend_novelty_fields first (3 queries),
+    # then total events (1), then field scans (1 per recommended field).
+    # We'll supply canned responses for: total(recommender) + top_batch +
+    # attr_keys + total(novelty) + one field scan.
+    total = 500
+    responses = [
+        # recommend_novelty_fields:
+        FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),   # total
+        FakeQueryResult(
+            result_rows=[(5, 500, 1, 500, 1, 500, 1, 500)],  # 1 categorical, 3 constant/id
+            column_names=["c"] * 8,
+        ),  # top-level batch
+        FakeQueryResult(
+            result_rows=[("status_code", 6, 500)],  # attr categorical
+            column_names=["key", "dist", "cov_count"],
+        ),  # attribute keys
+        # find_value_novelty (recommended fields = artifact + attr:status_code):
+        FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),   # total
+        FakeQueryResult(
+            result_rows=[("404", 2, "2024-01-01", "evt-1", "s1", "404 not found")],
+            column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
+        ),  # artifact field scan
+        FakeQueryResult(
+            result_rows=[],
+            column_names=[],
+        ),  # attr:status_code field scan
+    ]
+    svc = _svc(responses)
+    result = svc.find_value_novelty("c1", ["s1"], rarity_floor=3)
+    assert result.status == "ok"
+    # Findings from the attribute field should be present.
+    assert len(result.results) >= 1
+
+
+# ---------------------------------------------------------------------------
+# exclude_event_ids suppression
+# ---------------------------------------------------------------------------
+
+
+def test_value_novelty_exclude_event_ids():
+    """Findings whose event_id is in exclude_event_ids should be suppressed."""
+    total = 100
+    responses = [
+        FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
+        FakeQueryResult(
+            result_rows=[
+                ("malware.exe", 1, "2024-01-01", "evt-bad", "s1", "msg"),
+                ("tool.exe", 2, "2024-01-01", "evt-ok", "s1", "msg2"),
+            ],
+            column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_value_novelty(
+        "c1", ["s1"],
+        fields=["artifact"],
+        exclude_event_ids={"evt-bad"},
+    )
+    assert result.status == "ok"
+    event_ids = [r.event_id for r in result.results]
+    assert "evt-bad" not in event_ids
+    assert "evt-ok" in event_ids
+
+
+def test_frequency_exclude_event_ids():
+    """Findings whose event_id is in exclude_event_ids are suppressed after hydration."""
+    from datetime import timedelta
+
+    svc = _svc(_make_freq_responses())
+
+    # Hydrate with a pre-set event_id so we can test suppression.
+    def _fake_hydrate(findings, *a, **kw):
+        out = []
+        for i, f in enumerate(findings):
+            from dataclasses import replace as _replace
+            out.append(_replace(f, event_id=f"evt-{i}"))
+        return out
+
+    svc._hydrate_freq_findings = _fake_hydrate  # type: ignore[method-assign]
+
+    result = svc.find_frequency_anomalies(
+        "c1", ["s1"],
+        z_threshold=2.0,
+        exclude_event_ids={"evt-0"},
+    )
+    assert result.status == "ok"
+    assert all(f.event_id != "evt-0" for f in result.results)
+
+
+# ---------------------------------------------------------------------------
+# get_timeline_midpoint
+# ---------------------------------------------------------------------------
+
+
+def test_get_timeline_midpoint_returns_midpoint():
+    from datetime import datetime, timezone
+
+    min_dt = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    max_dt = datetime(2024, 1, 3, tzinfo=timezone.utc)
+    svc = _svc([
+        FakeQueryResult(result_rows=[(min_dt, max_dt)], column_names=["min", "max"]),
+    ])
+    mid = svc.get_timeline_midpoint("c1", ["s1"])
+    assert mid == datetime(2024, 1, 2, tzinfo=timezone.utc)
+
+
+def test_get_timeline_midpoint_returns_none_when_no_events():
+    svc = _svc([
+        FakeQueryResult(result_rows=[(None, None)], column_names=["min", "max"]),
+    ])
+    assert svc.get_timeline_midpoint("c1", ["s1"]) is None

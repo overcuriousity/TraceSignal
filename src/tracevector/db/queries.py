@@ -31,6 +31,9 @@ class EventQuery:
     end: datetime | None = None
     field_filters: dict[str, str] = field(default_factory=dict)
     field_exclusions: dict[str, list[str]] = field(default_factory=dict)
+    # Optional event_id allowlist (e.g. resolved from an annotation filter).
+    # None means "no restriction"; an empty list matches zero events.
+    event_ids: list[str] | None = None
     limit: int = 50
     offset: int = 0
     order: Literal["asc", "desc"] = "desc"
@@ -240,6 +243,9 @@ class EventQueryService:
                 "timestamp <= :name",
                 _format_clickhouse_datetime(query.end),
             )
+
+        if query.event_ids is not None:
+            builder.add_in_list("event_id", query.event_ids)
 
         for key, value in (query.field_filters or {}).items():
             builder.add_field_filter(key, value)

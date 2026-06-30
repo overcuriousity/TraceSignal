@@ -22,10 +22,12 @@ interface Props {
   onClose: () => void;
   onSelectEvent: (event: Event) => void;
   onSimilarClose: () => void;
-  /** Passed to FrequencyView so clicking an anomalous window zooms the explorer. */
-  onRangeSelect?: (start: string, end: string) => void;
   /** Passed to ValueNoveltyView so clicking a field drills into filtered events. */
   onDrillField?: (field: string, value: string) => void;
+  /** Passed to FrequencyView — narrows the time range and the series field=value. */
+  onFrequencyDrill?: (field: string, value: string, start: string, end: string) => void;
+  /** Called with the active anomaly tab's finding timestamps — feeds the histogram overlay. */
+  onAnomalyMarkers?: (markers: { ts: string; label: string }[]) => void;
 }
 
 export function AnalysisPanel({
@@ -36,8 +38,9 @@ export function AnalysisPanel({
   onClose,
   onSelectEvent,
   onSimilarClose,
-  onRangeSelect,
   onDrillField,
+  onFrequencyDrill,
+  onAnomalyMarkers,
 }: Props) {
   const [tab, setTab] = useState<Tab>(similarAnchor ? "similar" : "anomalies");
   const [anomalySubTab, setAnomalySubTab] = useState<AnomalySubTab>("novelty");
@@ -145,6 +148,7 @@ export function AnalysisPanel({
             timelineId={timelineId}
             onSelectEvent={onSelectEvent}
             onDrillField={onDrillField}
+            onFindingsChange={onAnomalyMarkers}
           />
         )}
 
@@ -152,7 +156,8 @@ export function AnalysisPanel({
           <FrequencyView
             caseId={caseId}
             timelineId={timelineId}
-            onRangeSelect={onRangeSelect}
+            onDrillField={onFrequencyDrill}
+            onFindingsChange={onAnomalyMarkers}
           />
         )}
 

@@ -17,11 +17,18 @@ import { Spinner } from "@/components/ui/Spinner";
 import type { EventFilters, HistogramBucket } from "@/api/types";
 import { cn } from "@/lib/cn";
 
+interface Marker {
+  ts: string;
+  label: string;
+}
+
 interface Props {
   caseId: string;
   timelineId: string;
   filters: EventFilters;
   onRangeSelect: (start: string, end: string) => void;
+  /** Anomaly finding timestamps overlaid as vertical lines on the chart. */
+  markers?: Marker[];
 }
 
 /** Add `seconds` to an ISO string and return a UTC ISO string. */
@@ -40,7 +47,7 @@ function fmtShort(iso: string): string {
   });
 }
 
-export function TimelineHistogram({ caseId, timelineId, filters, onRangeSelect }: Props) {
+export function TimelineHistogram({ caseId, timelineId, filters, onRangeSelect, markers }: Props) {
   const { data, isLoading } = useQuery({
     queryKey: ["histogram", caseId, timelineId, filters],
     queryFn: () => eventsApi.histogram(caseId, timelineId, filters),
@@ -185,6 +192,30 @@ export function TimelineHistogram({ caseId, timelineId, filters, onRangeSelect }
           );
         })}
       </div>
+
+      {/* Anomaly markers — vertical lines at finding timestamps */}
+      {markers && markers.length > 0 && data.min && data.max && (
+        <div className="pointer-events-none absolute inset-x-0 top-0 h-16 px-2">
+          <div className="relative h-full w-full">
+            {markers.map((m, i) => {
+              const minT = new Date(data.min!).getTime();
+              const maxT = new Date(data.max!).getTime();
+              if (maxT <= minT) return null;
+              const t = new Date(m.ts).getTime();
+              if (Number.isNaN(t) || t < minT || t > maxT) return null;
+              const pct = ((t - minT) / (maxT - minT)) * 100;
+              return (
+                <div
+                  key={i}
+                  title={m.label}
+                  className="pointer-events-auto absolute top-0 bottom-0 w-px bg-[var(--color-anomaly)]"
+                  style={{ left: `${pct}%` }}
+                />
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* X-axis labels */}
       <div className="flex justify-between px-2 pb-1 text-[11px] text-[var(--color-fg-muted)]">

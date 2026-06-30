@@ -136,15 +136,23 @@ function NormalToggleButton({
   };
 
   return (
-    <Button
-      variant={isNormal ? "accent" : "outline"}
-      size="sm"
-      onClick={handleClick}
-      disabled={add.isPending || remove.isPending}
+    <Tooltip
+      content={
+        isNormal
+          ? "Unmark — event will re-appear in anomaly results"
+          : "Excludes this event from anomaly detection results"
+      }
     >
-      <ShieldCheck size={11} />
-      {isNormal ? "Normal ✓" : "Mark Normal"}
-    </Button>
+      <Button
+        variant={isNormal ? "accent" : "outline"}
+        size="sm"
+        onClick={handleClick}
+        disabled={add.isPending || remove.isPending}
+      >
+        <ShieldCheck size={11} />
+        {isNormal ? "Normal ✓" : "Mark Normal"}
+      </Button>
+    </Tooltip>
   );
 }
 

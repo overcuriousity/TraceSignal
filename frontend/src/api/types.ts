@@ -189,6 +189,24 @@ export interface TagAnomaliesResponse extends AnomaliesResponse {
   tagged: number;
 }
 
+/** One field candidate returned by GET /anomalies/fields. */
+export interface NoveltyFieldInfo {
+  /** Field token, e.g. "artifact" or "attr:status_code". */
+  token: string;
+  /** Number of distinct non-empty values (uniqExact). */
+  distinct: number;
+  /** Fraction of events with a non-empty value (0–1). */
+  coverage: number;
+  /** "categorical" | "constant" | "identifier" | "sparse" */
+  kind: string;
+  /** True when the field is useful for novelty detection. */
+  recommended: boolean;
+}
+
+export interface NoveltyFieldsResponse {
+  fields: NoveltyFieldInfo[];
+}
+
 /** Per-field heuristic verdict from the wizard recommender. */
 export interface FieldVerdict {
   /** "message" or "attr:<key>" */
@@ -269,6 +287,10 @@ export interface EventFilters {
   filters?: Record<string, string>;
   /** key=[values] field exclusion filters — multiple values per field are OR'd (NOT IN) */
   exclusions?: Record<string, string[]>;
+  /** Annotation types to filter to ("tag" and/or "anomaly"), OR'd together */
+  annotated?: ("tag" | "anomaly")[];
+  /** Narrows the "tag" annotation type to a specific tag value */
+  annotationTagValue?: string;
   limit?: number;
   offset?: number;
   /** Chronological sort direction (default: desc) */
@@ -308,5 +330,7 @@ export interface ExportRequest {
     end?: string;
     fields?: Record<string, string>;
     exclude?: Record<string, string[]>;
+    annotated?: string;
+    annotation_tag_value?: string;
   };
 }

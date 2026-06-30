@@ -8,7 +8,7 @@
  * No chart dependency — hand-rolled div bars (airgap-safe), same idiom as
  * TimelineHistogram.tsx.
  */
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -27,16 +27,21 @@ import { cn } from "@/lib/cn";
 interface Props {
   caseId: string;
   timelineId: string;
-  /** Called when an anomalous window is clicked — zoom the event explorer. */
-  onRangeSelect?: (start: string, end: string) => void;
+  /**
+   * Called when an anomalous window is clicked — narrows the explorer to the
+   * window's time range and filters to series_field=series_value.
+   */
+  onDrillField?: (field: string, value: string, start: string, end: string) => void;
+  /** Called whenever the finding set changes — feeds the histogram overlay. */
+  onFindingsChange?: (markers: { ts: string; label: string }[]) => void;
 }
 
-const SERIES_FIELD_OPTIONS = [
-  { value: "artifact", label: "Artifact type" },
-  { value: "timestamp_desc", label: "Event category" },
-  { value: "display_name", label: "Display name" },
-  { value: "parser_name", label: "Parser" },
-  { value: "source_file", label: "Source file" },
+const STATIC_SERIES_FIELD_OPTIONS = [
+  { value: "artifact", label: "Artifact type", group: "standard" },
+  { value: "timestamp_desc", label: "Event category", group: "standard" },
+  { value: "display_name", label: "Display name", group: "standard" },
+  { value: "parser_name", label: "Parser", group: "standard" },
+  { value: "source_file", label: "Source file", group: "standard" },
 ];
 
 function fmtTs(iso: string): string {
@@ -55,10 +60,10 @@ function fmtTs(iso: string): string {
 
 interface FreqFindingRowProps {
   finding: FrequencyFinding;
-  onRangeSelect?: (start: string, end: string) => void;
+  onDrillField?: (field: string, value: string, start: string, end: string) => void;
 }
 
-function FreqFindingRow({ finding, onRangeSelect }: FreqFindingRowProps) {
+function FreqFindingRow({ finding, onDrillField }: FreqFindingRowProps) {
   const isSpike = finding.z_score > 0;
   const severity =
     Math.abs(finding.z_score) >= 5
@@ -77,8 +82,15 @@ function FreqFindingRow({ finding, onRangeSelect }: FreqFindingRowProps) {
             ? "border-[var(--color-warning)]/50 bg-[var(--color-warning)]/5 hover:bg-[var(--color-warning)]/10"
             : "border-[var(--color-border)] hover:border-[var(--color-border-focus)]",
       )}
-      onClick={() => onRangeSelect?.(finding.window_start, finding.window_end)}
-      title={`Click to zoom to ${fmtTs(finding.window_start)} – ${fmtTs(finding.window_end)}`}
+      onClick={() =>
+        onDrillField?.(
+          finding.series_field,
+          finding.series_value,
+          finding.window_start,
+          finding.window_end,
+        )
+      }
+      title={`Filter to ${finding.series_field}=${finding.series_value} and zoom to ${fmtTs(finding.window_start)} – ${fmtTs(finding.window_end)}`}
     >
       {/* Direction icon */}
       <div className="mt-0.5 shrink-0">
@@ -139,10 +151,28 @@ function FreqFindingRow({ finding, onRangeSelect }: FreqFindingRowProps) {
   );
 }
 
-export function FrequencyView({ caseId, timelineId, onRangeSelect }: Props) {
+export function FrequencyView({ caseId, timelineId, onDrillField, onFindingsChange }: Props) {
   const [seriesField, setSeriesField] = useState("artifact");
   const [zThreshold, _setZThreshold] = useState(2.5);
   const qc = useQueryClient();
+
+  // Fetch dynamic attribute fields to extend the GROUP BY dropdown.
+  const { data: fieldsData } = useQuery({
+    queryKey: ["anomaly-fields", caseId, timelineId],
+    queryFn: () => anomaliesApi.fields(caseId, timelineId),
+    staleTime: 5 * 60 * 1000,
+  });
+
+  const seriesFieldOptions = useMemo(() => {
+    const attrOptions = (fieldsData?.fields ?? [])
+      .filter((f) => f.token.startsWith("attr:"))
+      .map((f) => ({
+        value: f.token,
+        label: f.token.slice(5) + (f.recommended ? "" : " ·"),
+        group: "dynamic",
+      }));
+    return [...STATIC_SERIES_FIELD_OPTIONS, ...attrOptions];
+  }, [fieldsData]);
 
   const { data, isLoading, isFetching, refetch } = useQuery({
     queryKey: ["anomalies-frequency", caseId, timelineId, seriesField],
@@ -171,6 +201,17 @@ export function FrequencyView({ caseId, timelineId, onRangeSelect }: Props) {
     (r): r is FrequencyFinding => r.type === "frequency",
   );
 
+  useEffect(() => {
+    if (!onFindingsChange) return;
+    const markers = findings.map((f) => ({
+      ts: f.window_start,
+      label: `${f.series_field}=${f.series_value} spike`,
+    }));
+    onFindingsChange(markers);
+    return () => onFindingsChange([]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [findings]);
+
   return (
     <div className="space-y-3">
       {/* Toolbar */}
@@ -183,11 +224,26 @@ export function FrequencyView({ caseId, timelineId, onRangeSelect }: Props) {
           onChange={(e) => setSeriesField(e.target.value)}
           className="flex-1 min-w-0 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-2 py-0.5 text-[11px] text-[var(--color-fg-primary)] focus:outline-none focus:border-[var(--color-accent)]"
         >
-          {SERIES_FIELD_OPTIONS.map((o) => (
-            <option key={o.value} value={o.value}>
-              {o.label}
-            </option>
-          ))}
+          <optgroup label="Standard">
+            {seriesFieldOptions
+              .filter((o) => o.group === "standard")
+              .map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+          </optgroup>
+          {seriesFieldOptions.some((o) => o.group === "dynamic") && (
+            <optgroup label="Dynamic fields">
+              {seriesFieldOptions
+                .filter((o) => o.group === "dynamic")
+                .map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
+            </optgroup>
+          )}
         </select>
         <button
           title="Refresh"
@@ -239,7 +295,7 @@ export function FrequencyView({ caseId, timelineId, onRangeSelect }: Props) {
             <FreqFindingRow
               key={`${f.series_value}:${f.window_start}:${i}`}
               finding={f}
-              onRangeSelect={onRangeSelect}
+              onDrillField={onDrillField}
             />
           ))}
         </div>
@@ -273,9 +329,9 @@ export function FrequencyView({ caseId, timelineId, onRangeSelect }: Props) {
       <div className="flex items-start gap-1.5 text-[10px] text-[var(--color-fg-muted)]">
         <AlertTriangle size={10} className="mt-0.5 shrink-0" />
         <span>
-          Click any window to zoom the event explorer to that time range.
-          Z-score measures how many standard deviations above/below the
-          series mean this window's event count is.
+          Click any window to filter the explorer to that series value and
+          time range. Z-score measures how many standard deviations
+          above/below the series mean this window's event count is.
         </span>
       </div>
     </div>

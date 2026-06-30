@@ -27,6 +27,12 @@ export const eventsApi = {
     if (filters.exclusions && Object.keys(filters.exclusions).length > 0) {
       params.exclusions = JSON.stringify(filters.exclusions);
     }
+    if (filters.annotated && filters.annotated.length > 0) {
+      params.annotated = filters.annotated.join(",");
+    }
+    if (filters.annotationTagValue) {
+      params.annotation_tag_value = filters.annotationTagValue;
+    }
     return get<EventPage>(
       `/cases/${caseId}/timelines/${timelineId}/events`,
       params,
@@ -66,6 +72,12 @@ export const eventsApi = {
     }
     if (filters.exclusions && Object.keys(filters.exclusions).length > 0) {
       params.exclusions = JSON.stringify(filters.exclusions);
+    }
+    if (filters.annotated && filters.annotated.length > 0) {
+      params.annotated = filters.annotated.join(",");
+    }
+    if (filters.annotationTagValue) {
+      params.annotation_tag_value = filters.annotationTagValue;
     }
     return get<HistogramResponse>(
       `/cases/${caseId}/timelines/${timelineId}/histogram`,
