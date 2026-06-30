@@ -197,8 +197,14 @@ export function FrequencyView({ caseId, timelineId, onDrillField, onFindingsChan
     },
   });
 
-  const findings = (data?.results ?? []).filter(
-    (r): r is FrequencyFinding => r.type === "frequency",
+  // Memoized against `data` (stable react-query reference) so the marker
+  // effect below doesn't re-fire — and loop — on every render.
+  const findings = useMemo(
+    () =>
+      (data?.results ?? []).filter(
+        (r): r is FrequencyFinding => r.type === "frequency",
+      ),
+    [data],
   );
 
   useEffect(() => {
