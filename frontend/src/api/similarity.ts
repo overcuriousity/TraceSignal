@@ -22,10 +22,11 @@ export const similarityApi = {
     timelineId: string,
     limit = 50,
     sampleSize = 5000,
+    normalizePerSource = false,
   ) =>
     get<AnomaliesResponse>(
       `/cases/${caseId}/timelines/${timelineId}/anomalies`,
-      { limit, sample_size: sampleSize },
+      { limit, sample_size: sampleSize, normalize_per_source: normalizePerSource },
     ),
 
   tagAnomalies: (
@@ -33,9 +34,10 @@ export const similarityApi = {
     timelineId: string,
     limit = 50,
     sampleSize = 5000,
+    normalizePerSource = false,
   ) =>
     post<TagAnomaliesResponse>(
       `/cases/${caseId}/timelines/${timelineId}/anomalies/tag`,
-      { limit, sample_size: sampleSize },
+      { limit, sample_size: sampleSize, normalize_per_source: normalizePerSource },
     ),
 };

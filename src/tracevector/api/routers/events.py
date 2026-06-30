@@ -405,6 +405,15 @@ async def list_anomalies(
     timeline_id: str,
     limit: int = Query(default=50, ge=1, le=500),
     sample_size: int = Query(default=5000, ge=10, le=100000),
+    normalize_per_source: bool = Query(
+        default=False,
+        description=(
+            "When True, subtract each source's mean vector before scoring "
+            "so events are ranked by deviation from their own source's bulk "
+            "rather than by raw cross-source distance. Removes the batch "
+            "effect when sources have different embedding styles."
+        ),
+    ),
 ) -> dict[str, Any]:
     """Return the most unusual events in a timeline (read-only preview).
 
@@ -419,7 +428,12 @@ async def list_anomalies(
         case_id, source_ids, "normal"
     )
     result = svc.find_anomalies(
-        case_id, source_ids, limit=limit, sample_size=sample_size, normal_ids=normal_ids
+        case_id,
+        source_ids,
+        limit=limit,
+        sample_size=sample_size,
+        normal_ids=normal_ids,
+        normalize_per_source=normalize_per_source,
     )
     return {
         "status": result.status,
@@ -444,6 +458,14 @@ class TagAnomaliesRequest(BaseModel):
 
     limit: int = Field(default=50, ge=1, le=500)
     sample_size: int = Field(default=5000, ge=10, le=100000)
+    normalize_per_source: bool = Field(
+        default=False,
+        description=(
+            "When True, subtract each source's mean vector before scoring "
+            "so annotations reflect within-source deviation rather than "
+            "cross-source format distance."
+        ),
+    )
 
 
 @router.post("/{case_id}/timelines/{timeline_id}/anomalies/tag")
@@ -470,8 +492,12 @@ async def tag_anomalies(
         case_id, source_ids, "normal"
     )
     result = svc.find_anomalies(
-        case_id, source_ids, limit=body.limit, sample_size=body.sample_size,
+        case_id,
+        source_ids,
+        limit=body.limit,
+        sample_size=body.sample_size,
         normal_ids=normal_ids,
+        normalize_per_source=body.normalize_per_source,
     )
 
     if result.status != "ok":

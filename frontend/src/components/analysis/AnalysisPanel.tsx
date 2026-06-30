@@ -105,6 +105,7 @@ export function AnalysisPanel({
           <AnomaliesList
             caseId={caseId}
             timelineId={timelineId}
+            sourceCount={timeline?.source_ids?.length ?? 1}
             onSelectEvent={onSelectEvent}
           />
         )}

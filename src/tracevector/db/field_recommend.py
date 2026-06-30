@@ -443,6 +443,81 @@ def recommend_fields_across_sources(
     )
 
 
+def timeline_universal_cohesion(
+    samples_by_source: dict[str, dict[str, Sequence[Any]]],
+    *,
+    encode: Callable[[list[str]], list[list[float]]] | None,
+    tokens: Sequence[str] = ("message", "display_name", "tags", "timestamp_desc"),
+    cohesion_threshold: float = 0.6,
+    max_values: int = 40,
+) -> list[TimelineFieldVerdict]:
+    """Compute cross-source cohesion on universal top-level fields.
+
+    Unlike :func:`recommend_fields_across_sources` — which buckets by artifact
+    and therefore only sees a field as "shared" when the *same* artifact type
+    appears in ≥2 sources — this function pools each source's values **across
+    all its artifacts** for a fixed set of Timesketch-normalised fields
+    (``message``, ``display_name``, ``tags``, ``timestamp_desc``).  This gives an
+    honest measure of whether the fields that exist in *every* source carry
+    comparable content, regardless of whether the sources share artifact types.
+
+    Returns one :class:`TimelineFieldVerdict` per token in ``tokens``.
+    ``encode=None`` produces verdicts with ``cohesion=None`` (heuristic-only
+    path — the caller should still call :func:`timeline_cohesion_summary` to
+    propagate the right "unavailable" level).
+    """
+    verdicts: list[TimelineFieldVerdict] = []
+    for token in tokens:
+        values_by_source: dict[str, list[Any]] = {
+            src: list(samples.get(token, [])) for src, samples in samples_by_source.items()
+        }
+        # Count sources with at least one non-empty value.
+        present_in_sources = sum(
+            1 for vals in values_by_source.values() if _clean(vals)
+        )
+
+        cohesion: float | None = None
+        if encode is not None and present_in_sources >= 2:
+            cohesion = cross_source_cohesion(values_by_source, encode, max_values)
+
+        if present_in_sources < 2 or cohesion is None:
+            # Not shared or not computable — omit from the "shared" pool.
+            # Use kind "source-specific" so timeline_cohesion_summary skips it.
+            verdicts.append(
+                TimelineFieldVerdict(
+                    token=token,
+                    recommended=False,
+                    kind="source-specific",
+                    reason="not present in ≥2 sources or cohesion not computable",
+                    present_in_sources=present_in_sources,
+                    cohesion=cohesion,
+                )
+            )
+        elif cohesion >= cohesion_threshold:
+            verdicts.append(
+                TimelineFieldVerdict(
+                    token=token,
+                    recommended=True,
+                    kind="shared-cohesive",
+                    reason=f"shared across sources with cohesive content ({cohesion:.2f})",
+                    present_in_sources=present_in_sources,
+                    cohesion=cohesion,
+                )
+            )
+        else:
+            verdicts.append(
+                TimelineFieldVerdict(
+                    token=token,
+                    recommended=False,
+                    kind="divergent",
+                    reason=f"diverges across sources ({cohesion:.2f} < {cohesion_threshold})",
+                    present_in_sources=present_in_sources,
+                    cohesion=cohesion,
+                )
+            )
+    return verdicts
+
+
 def timeline_cohesion_summary(
     verdicts: list[TimelineFieldVerdict],
     *,
@@ -486,7 +561,8 @@ def timeline_cohesion_summary(
             source_count=source_count,
             message=(
                 "No shared fields with computable cohesion. "
-                "Cross-source outliers will likely track source format rather than behaviour."
+                "Cross-source outliers will likely track source format rather than behaviour. "
+                "Enable per-source centering to score events against their own source's bulk."
             ),
         )
 
@@ -506,7 +582,7 @@ def timeline_cohesion_summary(
             f"{shared_count} shared field{'s' if shared_count != 1 else ''} with "
             f"moderate cohesion ({mean_c:.2f}). "
             "Results may reflect some source-format variation — "
-            "consider using the analyst-baseline mode."
+            "consider enabling per-source centering or using the analyst-baseline mode."
         )
     else:
         level = "weak"
@@ -514,7 +590,8 @@ def timeline_cohesion_summary(
             f"{shared_count} shared field{'s' if shared_count != 1 else ''} with "
             f"weak cohesion ({mean_c:.2f}). "
             "Cross-source outliers will likely track source format rather than behaviour. "
-            "Mark representative 'Normal' events to switch to nearest-normal baseline scoring."
+            "Enable per-source centering to score events against their own source's bulk, "
+            "or mark representative 'Normal' events to switch to nearest-normal baseline scoring."
         )
 
     return CohesionSummary(

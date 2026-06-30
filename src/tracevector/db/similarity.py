@@ -131,6 +131,45 @@ def _l2_normalize_rows(matrix: np.ndarray) -> np.ndarray:
     return matrix / norms
 
 
+def _per_source_means(
+    records: list[Any],
+) -> dict[str, np.ndarray]:
+    """Compute the unweighted mean vector per source_id from ``records``.
+
+    Each record must have a ``vector`` attribute and a ``payload`` dict
+    containing ``"source_id"``.  Records without a vector or source_id are
+    skipped.  Returns a mapping ``source_id → mean_vector`` (NOT normalised —
+    callers subtract this mean and then re-normalise).
+    """
+    buckets: dict[str, list[np.ndarray]] = {}
+    for rec in records:
+        if rec.vector is None:
+            continue
+        src = (rec.payload or {}).get("source_id")
+        if not src:
+            continue
+        buckets.setdefault(src, []).append(np.asarray(rec.vector, dtype=np.float32))
+    return {src: np.vstack(vecs).mean(axis=0) for src, vecs in buckets.items()}
+
+
+def _center_rows(
+    matrix: np.ndarray,
+    source_ids: list[str],
+    means: dict[str, np.ndarray],
+) -> np.ndarray:
+    """Subtract per-source mean from each row and L2-renormalise.
+
+    ``source_ids[i]`` is the source_id for ``matrix[i]``.  Rows whose
+    source_id has no entry in ``means`` are left unchanged (e.g. single-source
+    events when not all sources contributed samples).
+    """
+    result = matrix.copy()
+    for i, src in enumerate(source_ids):
+        if src in means:
+            result[i] -= means[src]
+    return _l2_normalize_rows(result)
+
+
 def _payload_to_event(payload: dict[str, Any]) -> dict[str, Any]:
     """Convert a Qdrant point payload into a minimal EventRecord-compatible dict."""
     # The pipeline stores timestamps as datetime objects in some versions;
@@ -235,6 +274,7 @@ class SimilarityService:
         limit: int = 50,
         sample_size: int = 5000,
         normal_ids: list[str] | None = None,
+        normalize_per_source: bool = False,
     ) -> AnomalyResult:
         """Return the ``limit`` most unusual events across the given sources.
 
@@ -253,6 +293,14 @@ class SimilarityService:
         ``normal_ids`` must be resolved by the caller (typically the async route
         handler via ``await postgres.list_event_ids_by_annotation_type(...)``).
 
+        **Per-source centering** (``normalize_per_source=True``) subtracts each
+        source's mean vector from its events before scoring, then re-normalises.
+        This removes the batch effect where cross-source distances reflect source
+        format differences rather than behavioural deviation.  Events are then
+        judged by how they deviate from *their own source's* bulk, making
+        cross-source outlier scores comparable regardless of embedding style.
+        No-op when the timeline has only one source.
+
         Returns :class:`AnomalyResult` with ``status="not_embedded"`` when
         the sources have no stored vectors.
         """
@@ -264,6 +312,12 @@ class SimilarityService:
         config_hash = collection.rsplit("_", 1)[-1]
 
         normal_ids = normal_ids or []
+        # Per-source centering is only meaningful with multiple sources and only
+        # in centroid mode (no analyst normals).  In baseline mode the analyst's
+        # Normal annotations already provide per-source calibration — centering
+        # normal events by the source mean would reduce them to near-zero
+        # vectors, destroying their discriminative content.
+        effective_normalize = normalize_per_source and len(set(source_ids)) >= 2
 
         if normal_ids:
             return self._find_anomalies_baseline(
@@ -274,6 +328,8 @@ class SimilarityService:
                 sample_size=sample_size,
                 config_hash=config_hash,
                 normal_ids=normal_ids,
+                # Centering is not applied in baseline mode — see docstring.
+                normalize_per_source=False,
             )
         return self._find_anomalies_centroid(
             collection=collection,
@@ -282,6 +338,7 @@ class SimilarityService:
             limit=limit,
             sample_size=sample_size,
             config_hash=config_hash,
+            normalize_per_source=effective_normalize,
         )
 
     def _find_anomalies_baseline(
@@ -293,6 +350,7 @@ class SimilarityService:
         sample_size: int,
         config_hash: str,
         normal_ids: list[str],
+        normalize_per_source: bool = False,
     ) -> AnomalyResult:
         """Anomaly detection by distance to the *nearest* analyst-marked normal.
 
@@ -302,18 +360,31 @@ class SimilarityService:
         multimodal baseline honest — a candidate only has to resemble one normal
         exemplar to be treated as routine.  Normal events are excluded from the
         returned results.
+
+        ``normalize_per_source`` is accepted but currently unused in baseline
+        mode — the caller always passes ``False``.  The analyst's Normal
+        annotations already provide per-source calibration: centering them by
+        the source mean would reduce typical events to near-zero vectors and
+        destroy their discriminative content.  The flag is preserved in
+        ``details`` for transparency.
         """
         # Retrieve stored vectors for the analyst-marked normal events.  IDs come
         # from Postgres annotations and may predate embedding, so drop any that
         # have no vector in this collection yet.
+        # with_payload=True so we can read source_id for per-source centering.
         normal_points = self.qdrant.client.retrieve(
             collection_name=collection,
             ids=normal_ids,
             with_vectors=True,
-            with_payload=False,
+            with_payload=True,
         )
         normal_vecs = [
             np.asarray(p.vector, dtype=np.float32)
+            for p in normal_points
+            if p.vector is not None
+        ]
+        normal_src_ids = [
+            (p.payload or {}).get("source_id", "") or ""
             for p in normal_points
             if p.vector is not None
         ]
@@ -329,9 +400,6 @@ class SimilarityService:
                 baseline_size=0,
                 method="normal-baseline",
             )
-
-        # Unit-normalise the baseline so a dot product is cosine similarity.
-        normal_matrix = _l2_normalize_rows(np.vstack(normal_vecs))
 
         # Scan candidate vectors for the sources, excluding the normals themselves.
         # Bounded by sample_size for performance; raise it to scan a larger slice
@@ -355,9 +423,28 @@ class SimilarityService:
                 method="normal-baseline",
             )
 
+        cand_src_ids = [
+            (r.payload or {}).get("source_id", "") or "" for r in candidates
+        ]
         cand_matrix = _l2_normalize_rows(
             np.vstack([np.asarray(r.vector, dtype=np.float32) for r in candidates])
         )
+
+        if normalize_per_source:
+            # Estimate per-source means from the candidate sample (largest pool
+            # available); apply the same centering to both candidates and normals
+            # so scores are in the same centered geometry.
+            source_means = _per_source_means(records)
+            cand_matrix = _center_rows(cand_matrix, cand_src_ids, source_means)
+            normal_matrix = _center_rows(
+                _l2_normalize_rows(np.vstack(normal_vecs)),
+                normal_src_ids,
+                source_means,
+            )
+        else:
+            # Unit-normalise the baseline so a dot product is cosine similarity.
+            normal_matrix = _l2_normalize_rows(np.vstack(normal_vecs))
+
         # Cosine similarity of every candidate to every normal exemplar, then the
         # nearest-normal similarity per candidate.  Distance = 1 - nearest_sim.
         sims = cand_matrix @ normal_matrix.T
@@ -386,6 +473,7 @@ class SimilarityService:
                 "of": len(top),
                 "baseline_size": baseline_size,
                 "embedding_config_hash": config_hash,
+                "normalized_per_source": normalize_per_source,
             }
             results.append(
                 OutlierResult(
@@ -413,22 +501,108 @@ class SimilarityService:
         limit: int,
         sample_size: int,
         config_hash: str,
+        normalize_per_source: bool = False,
     ) -> AnomalyResult:
-        """Anomaly detection via distance-to-global-centroid (no baseline)."""
-        # 1. Sample vectors to compute an approximate centroid.
+        """Anomaly detection via distance-to-centroid (no analyst baseline).
+
+        Two sub-modes:
+
+        **Global centroid** (``normalize_per_source=False``, default): queries
+        Qdrant for the ``limit`` nearest points to ``-centroid`` (= farthest from
+        the bulk) and recomputes exact cosine distance.
+
+        **Per-source centroid** (``normalize_per_source=True``): instead of
+        comparing to a single global centroid, each event is scored by its
+        distance to *its own source's* centroid.  This removes the batch effect
+        where cross-source distances reflect format differences rather than
+        behavioural deviation.  Scoring is done entirely over the scanned
+        ``sample_size`` slice — the Qdrant ANN search is replaced by an exact
+        scan of the sample.  Method reported as ``"per-source-centroid"``.
+        """
+        # 1. Sample vectors to compute centroids.
         records = self.qdrant.scroll_vectors(
             collection, source_ids, limit=sample_size, with_vectors=True
         )
         if len(records) < 2:
             return AnomalyResult(status="insufficient_vectors")
 
+        actual_sample = len(records)
+
+        if normalize_per_source:
+            # Per-source-centroid mode: score each record by distance to its
+            # own source's centroid, computed from the same sample.
+            # This replaces the Qdrant ANN search — all scoring is exact over
+            # the scanned slice (same bound as baseline mode).
+            source_means = _per_source_means(records)
+            scored: list[tuple[Any, float]] = []
+            for rec in records:
+                if rec.vector is None:
+                    continue
+                src = (rec.payload or {}).get("source_id", "") or ""
+                if src not in source_means:
+                    continue
+                vec = np.asarray(rec.vector, dtype=np.float32)
+                centroid_src = source_means[src]
+                norm = np.linalg.norm(centroid_src)
+                centroid_norm = centroid_src / norm if norm > 0 else centroid_src
+                distance = _cosine_distance(
+                    _l2_normalize_rows(vec.reshape(1, -1))[0], centroid_norm
+                )
+                scored.append((rec, distance))
+
+            if not scored:
+                return AnomalyResult(
+                    status="ok",
+                    results=[],
+                    sample_size=actual_sample,
+                    embedding_config_hash=config_hash,
+                    method="per-source-centroid",
+                )
+
+            scored.sort(key=lambda t: t[1], reverse=True)
+            top_scored = scored[:limit]
+            event_ids = [str(rec.id) for rec, _ in top_scored]
+            ch_rows = self.clickhouse.get_events_by_ids(case_id, source_ids, event_ids)
+
+            results: list[OutlierResult] = []
+            for rank, (rec, distance) in enumerate(top_scored, start=1):
+                eid = str(rec.id)
+                if eid in ch_rows:
+                    event = _row_to_event(ch_rows[eid])
+                else:
+                    event = _payload_to_event(rec.payload or {})
+                details: dict[str, Any] = {
+                    "method": "per-source-centroid",
+                    "distance": round(distance, 6),
+                    "rank": rank,
+                    "of": len(top_scored),
+                    "sample_size": actual_sample,
+                    "embedding_config_hash": config_hash,
+                    "normalized_per_source": True,
+                }
+                results.append(
+                    OutlierResult(
+                        event_id=eid,
+                        score=round(distance, 6),
+                        event=event,
+                        details=details,
+                    )
+                )
+
+            return AnomalyResult(
+                status="ok",
+                results=results,
+                sample_size=actual_sample,
+                embedding_config_hash=config_hash,
+                method="per-source-centroid",
+            )
+
+        # Global-centroid mode (default).
         vectors = np.array([r.vector for r in records], dtype=np.float32)
         centroid: np.ndarray = vectors.mean(axis=0)
         norm = np.linalg.norm(centroid)
         if norm > 0:
             centroid = centroid / norm
-
-        actual_sample = len(records)
 
         # 2. Query for nearest points to -centroid (= farthest from centroid).
         neg_centroid = (-centroid).tolist()
@@ -452,7 +626,7 @@ class SimilarityService:
         event_ids = [str(h.id) for h in hits]
         ch_rows = self.clickhouse.get_events_by_ids(case_id, source_ids, event_ids)
 
-        results: list[OutlierResult] = []
+        results = []
         for rank, hit in enumerate(hits, start=1):
             eid = str(hit.id)
             vec = np.array(hit.vector, dtype=np.float32)
@@ -464,13 +638,14 @@ class SimilarityService:
             else:
                 event = _payload_to_event(hit.payload or {})
 
-            details: dict[str, Any] = {
+            details = {
                 "method": "centroid-distance",
                 "distance": round(distance, 6),
                 "rank": rank,
                 "of": limit,
                 "sample_size": actual_sample,
                 "embedding_config_hash": config_hash,
+                "normalized_per_source": False,
             }
             results.append(
                 OutlierResult(

@@ -10,6 +10,7 @@ from tracevector.db.field_recommend import (
     recommend_fields,
     recommend_fields_across_sources,
     timeline_cohesion_summary,
+    timeline_universal_cohesion,
 )
 
 # ---------------------------------------------------------------------------
@@ -345,3 +346,119 @@ def test_cohesion_summary_unavailable_no_encoder():
 def test_cohesion_summary_single_source():
     s = timeline_cohesion_summary([], source_count=1, encode_available=True)
     assert s.level == "unavailable"
+
+
+# ---------------------------------------------------------------------------
+# timeline_universal_cohesion
+# ---------------------------------------------------------------------------
+
+
+def test_universal_cohesion_comparable_messages_shared_cohesive():
+    """Two sources with similar message content → shared-cohesive verdict."""
+    # Both sources use login-flavoured messages → same embedding direction in
+    # _fake_encode_factory, so cosine sim ≈ 1.
+    samples_by_source = {
+        "src_a": {"message": ["logon attempt", "login success", "logon from console"]},
+        "src_b": {"message": ["login event", "user logon", "logon completed"]},
+    }
+    verdicts = timeline_universal_cohesion(
+        samples_by_source,
+        encode=_fake_encode_factory(),
+        tokens=["message"],
+        cohesion_threshold=0.6,
+    )
+    assert len(verdicts) == 1
+    v = verdicts[0]
+    assert v.token == "message"
+    assert v.cohesion is not None and v.cohesion >= 0.6
+    assert v.kind == "shared-cohesive"
+    assert v.present_in_sources == 2
+
+
+def test_universal_cohesion_divergent_messages():
+    """Two sources whose message content embeds in different directions → divergent."""
+    # src_a: IP-flavoured (x-axis), src_b: login-flavoured (y-axis).
+    samples_by_source = {
+        "src_a": {"message": ["ip addr 10.0.0.1", "addr block", "ip network scan"]},
+        "src_b": {"message": ["user login event", "logon attempt", "login failed"]},
+    }
+    verdicts = timeline_universal_cohesion(
+        samples_by_source,
+        encode=_fake_encode_factory(),
+        tokens=["message"],
+        cohesion_threshold=0.6,
+    )
+    v = verdicts[0]
+    assert v.token == "message"
+    assert v.cohesion is not None and v.cohesion < 0.6
+    assert v.kind == "divergent"
+
+
+def test_universal_cohesion_skips_absent_tokens():
+    """Tokens absent from a source (empty values) are not counted as present."""
+    samples_by_source = {
+        "src_a": {"message": ["logon from console"], "display_name": []},
+        "src_b": {"message": ["logon event"], "display_name": []},
+    }
+    verdicts = timeline_universal_cohesion(
+        samples_by_source,
+        encode=_fake_encode_factory(),
+        tokens=["message", "display_name"],
+        cohesion_threshold=0.6,
+    )
+    by_token = {v.token: v for v in verdicts}
+    # message is present in both, display_name is absent from both.
+    assert by_token["message"].present_in_sources == 2
+    assert by_token["display_name"].present_in_sources == 0
+    assert by_token["display_name"].kind == "source-specific"
+
+
+def test_universal_cohesion_no_encode_returns_none_cohesion():
+    """Without an encoder, cohesion should be None for all tokens."""
+    samples_by_source = {
+        "src_a": {"message": ["logon attempt"]},
+        "src_b": {"message": ["logon event"]},
+    }
+    verdicts = timeline_universal_cohesion(
+        samples_by_source,
+        encode=None,
+        tokens=["message"],
+    )
+    v = verdicts[0]
+    assert v.cohesion is None
+
+
+def test_universal_cohesion_disjoint_artifacts_gives_honest_banner():
+    """Disjoint-artifact timelines no longer produce the 'no shared fields' weak verdict.
+
+    Regression test for the original bug: per-artifact bucketing made message
+    appear in only one source per bucket even though it existed in all sources.
+    timeline_universal_cohesion pools across artifacts, so comparable messages
+    produce a non-weak (moderate or strong) banner.
+    """
+    # Simulate two sources with disjoint artifact types but comparable messages.
+    # src_a: WEBHIST artifact; src_b: EVTX artifact.
+    # Both have logon-flavoured messages that embed to the same y-axis direction.
+    samples_by_source = {
+        "src_a": {
+            "message": ["user login from browser", "logon session", "logon completed"]
+        },
+        "src_b": {
+            "message": ["login event recorded", "user logon", "session logon"]
+        },
+    }
+    verdicts = timeline_universal_cohesion(
+        samples_by_source,
+        encode=_fake_encode_factory(),
+        tokens=["message", "display_name", "tags", "timestamp_desc"],
+        cohesion_threshold=0.6,
+    )
+    summary = timeline_cohesion_summary(
+        verdicts, source_count=2, encode_available=True
+    )
+    # Must NOT produce the "no shared fields" weak verdict anymore.
+    assert summary.level in ("moderate", "strong"), (
+        f"Expected moderate/strong, got {summary.level}: {summary.message}"
+    )
+    assert summary.mean_cohesion is not None
+    assert summary.shared_field_count >= 1
