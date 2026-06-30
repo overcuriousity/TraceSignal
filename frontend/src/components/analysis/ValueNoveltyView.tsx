@@ -8,7 +8,7 @@
  * No chart dependency — scores rendered as inline proportional bars
  * via MiniSparkline (div-bar idiom, airgap-safe).
  */
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -242,8 +242,14 @@ export function ValueNoveltyView({
     },
   });
 
-  const findings = (data?.results ?? []).filter(
-    (r): r is ValueNoveltyFinding => r.type === "value_novelty",
+  // Memoized against `data` (stable react-query reference) so the marker
+  // effect below doesn't re-fire — and loop — on every render.
+  const findings = useMemo(
+    () =>
+      (data?.results ?? []).filter(
+        (r): r is ValueNoveltyFinding => r.type === "value_novelty",
+      ),
+    [data],
   );
   const maxScore = Math.max(1, ...findings.map((r) => r.score));
 
