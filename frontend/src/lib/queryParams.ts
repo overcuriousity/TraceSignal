@@ -19,6 +19,12 @@ export function filtersToParams(filters: EventFilters): URLSearchParams {
   if (filters.exclusions && Object.keys(filters.exclusions).length > 0) {
     p.set("exclusions", JSON.stringify(filters.exclusions));
   }
+  if (filters.annotated && filters.annotated.length > 0) {
+    p.set("annotated", filters.annotated.join(","));
+  }
+  if (filters.annotationTagValue) {
+    p.set("annotationTagValue", filters.annotationTagValue);
+  }
   return p;
 }
 
@@ -33,6 +39,8 @@ export function paramsToFilters(params: URLSearchParams): EventFilters {
   const end = params.get("end");
   const rawFilters = params.get("filters");
   const rawExclusions = params.get("exclusions");
+  const annotated = params.get("annotated");
+  const annotationTagValue = params.get("annotationTagValue");
 
   if (q) filters.q = q;
   if (artifact) filters.artifact = artifact;
@@ -55,6 +63,13 @@ export function paramsToFilters(params: URLSearchParams): EventFilters {
       // ignore malformed
     }
   }
+  if (annotated) {
+    filters.annotated = annotated
+      .split(",")
+      .map((t) => t.trim())
+      .filter((t): t is "tag" | "anomaly" => t === "tag" || t === "anomaly");
+  }
+  if (annotationTagValue) filters.annotationTagValue = annotationTagValue;
   return filters;
 }
 
@@ -72,6 +87,8 @@ export function filtersToViewPayload(
     end: filters.end ?? null,
     filters: filters.filters ?? {},
     exclusions: filters.exclusions ?? {},
+    annotated: filters.annotated ?? [],
+    annotationTagValue: filters.annotationTagValue ?? null,
   };
 }
 
@@ -95,6 +112,14 @@ export function viewPayloadToFilters(
   }
   if (payload.exclusions && typeof payload.exclusions === "object") {
     f.exclusions = payload.exclusions as Record<string, string[]>;
+  }
+  if (Array.isArray(payload.annotated) && payload.annotated.length > 0) {
+    f.annotated = (payload.annotated as string[]).filter(
+      (t): t is "tag" | "anomaly" => t === "tag" || t === "anomaly",
+    );
+  }
+  if (typeof payload.annotationTagValue === "string" && payload.annotationTagValue) {
+    f.annotationTagValue = payload.annotationTagValue;
   }
   return f;
 }

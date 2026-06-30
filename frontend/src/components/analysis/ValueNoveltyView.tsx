@@ -8,7 +8,7 @@
  * No chart dependency — scores rendered as inline proportional bars
  * via MiniSparkline (div-bar idiom, airgap-safe).
  */
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -20,6 +20,7 @@ import {
   ChevronUp,
 } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
+import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import type { Event, ValueNoveltyFinding } from "@/api/types";
@@ -31,6 +32,8 @@ interface Props {
   onSelectEvent: (event: Event) => void;
   /** Called when analyst drills into findings — passes a field filter. */
   onDrillField?: (field: string, value: string) => void;
+  /** Called whenever the finding set changes — feeds the histogram overlay. */
+  onFindingsChange?: (markers: { ts: string; label: string }[]) => void;
 }
 
 /** Friendly display label for a field token. */
@@ -201,23 +204,39 @@ export function ValueNoveltyView({
   timelineId,
   onSelectEvent,
   onDrillField,
+  onFindingsChange,
 }: Props) {
   const [mode, setMode] = useState<"self" | "temporal">("self");
+  // null = use backend smart default; string[] = explicit analyst selection.
+  const [selectedFields, setSelectedFields] = useState<string[] | null>(null);
   const qc = useQueryClient();
 
+  // Compute comma-separated fields string for the API (null → omit param → backend auto-selects).
+  const fieldsParam =
+    selectedFields !== null && selectedFields.length > 0
+      ? selectedFields.join(",")
+      : undefined;
+
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies-novelty", caseId, timelineId, mode],
+    queryKey: ["anomalies-novelty", caseId, timelineId, mode, fieldsParam ?? "__auto__"],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "value_novelty",
         limit: 50,
+        temporal: mode === "temporal",
+        ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     staleTime: 60_000,
   });
 
   const tagMutation = useMutation({
     mutationFn: () =>
-      anomaliesApi.tag(caseId, timelineId, { detector: "value_novelty", limit: 50 }),
+      anomaliesApi.tag(caseId, timelineId, {
+        detector: "value_novelty",
+        limit: 50,
+        temporal: mode === "temporal",
+        ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
+      }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["annotations"] });
     },
@@ -228,10 +247,23 @@ export function ValueNoveltyView({
   );
   const maxScore = Math.max(1, ...findings.map((r) => r.score));
 
+  useEffect(() => {
+    if (!onFindingsChange) return;
+    const markers = findings
+      .map((f) => ({
+        ts: f.event?.timestamp ?? f.first_seen,
+        label: `${fieldLabel(f.field)}=${f.value}`,
+      }))
+      .filter((m): m is { ts: string; label: string } => !!m.ts);
+    onFindingsChange(markers);
+    return () => onFindingsChange([]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [findings]);
+
   return (
     <div className="space-y-3">
       {/* Toolbar */}
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-2 flex-wrap">
         <span className="text-[10px] font-semibold uppercase tracking-wide text-[var(--color-fg-muted)]">
           Mode
         </span>
@@ -250,6 +282,12 @@ export function ValueNoveltyView({
           </button>
         ))}
         <span className="flex-1" />
+        <AnomalyFieldPicker
+          caseId={caseId}
+          timelineId={timelineId}
+          selected={selectedFields}
+          onChange={setSelectedFields}
+        />
         <button
           title="Refresh"
           className="rounded p-0.5 hover:bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)]"

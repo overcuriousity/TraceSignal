@@ -19,6 +19,8 @@ export async function downloadExport(
       end: filters.end,
       fields: filters.filters ?? {},
       exclude: filters.exclusions ?? {},
+      annotated: filters.annotated && filters.annotated.length > 0 ? filters.annotated.join(",") : undefined,
+      annotation_tag_value: filters.annotationTagValue,
     },
   };
 

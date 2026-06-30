@@ -44,6 +44,14 @@ export function FilterChips({ filters, onRemove }: Props) {
       onRemove: () => onRemove("tag"),
       variant: "include",
     });
+  for (const t of filters.annotated ?? []) {
+    chips.push({
+      label: "flagged",
+      value: t === "tag" && filters.annotationTagValue ? `tag:${filters.annotationTagValue}` : t,
+      onRemove: () => onRemove("annotated", undefined, t),
+      variant: "include",
+    });
+  }
   if (filters.start)
     chips.push({
       label: "from",

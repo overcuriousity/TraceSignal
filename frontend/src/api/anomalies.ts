@@ -1,5 +1,5 @@
 import { get, post } from "./client";
-import type { AnomaliesResponse, TagAnomaliesResponse } from "./types";
+import type { AnomaliesResponse, NoveltyFieldsResponse, TagAnomaliesResponse } from "./types";
 
 export interface AnomalyParams {
   detector?: "value_novelty" | "frequency";
@@ -7,8 +7,10 @@ export interface AnomalyParams {
   fields?: string;
   /** Field to group frequency series by */
   series_field?: string;
-  /** Temporal baseline end: values absent before this time and present after are flagged */
+  /** Explicit temporal baseline end timestamp */
   baseline_start?: string;
+  /** Enable temporal mode (backend uses timeline midpoint when baseline_start is absent) */
+  temporal?: boolean;
   limit?: number;
   [key: string]: string | number | boolean | null | undefined;
 }
@@ -28,5 +30,11 @@ export const anomaliesApi = {
     post<TagAnomaliesResponse>(
       `/cases/${caseId}/timelines/${timelineId}/anomalies/tag`,
       params,
+    ),
+
+  /** Return candidate fields (with cardinality metadata) for the field picker. */
+  fields: (caseId: string, timelineId: string) =>
+    get<NoveltyFieldsResponse>(
+      `/cases/${caseId}/timelines/${timelineId}/anomalies/fields`,
     ),
 };

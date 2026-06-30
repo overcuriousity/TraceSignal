@@ -57,8 +57,20 @@ _TOP_LEVEL_COLUMNS = frozenset({
     "source_id",
 })
 
-# Default fields scanned by value_novelty when no list is supplied.
+# Default fields scanned by value_novelty when no list is supplied (fallback only).
 _DEFAULT_NOVELTY_FIELDS = ["artifact", "timestamp_desc", "display_name"]
+
+# Top-level columns considered by the field recommender (excludes free-text
+# and identifier-like columns that are not useful for novelty detection).
+_NOVELTY_CANDIDATE_TOP_LEVEL = [
+    "artifact",
+    "timestamp_desc",
+    "display_name",
+    "parser_name",
+]
+
+# Maximum number of attribute keys the recommender will evaluate.
+_RECOMMENDER_MAX_ATTR_KEYS = 50
 
 # Minimum buckets in a frequency series for z-scoring to be meaningful.
 _MIN_FREQUENCY_BUCKETS = 3
@@ -137,6 +149,21 @@ class StatAnomalyResult:
     method: str         # "self-baseline" | "temporal" | "z-score" | "temporal-z-score"
     baseline_size: int  # total events (value_novelty) or event-count used for z-score
     results: list[ValueFinding | FreqFinding] = field(default_factory=list)
+
+
+@dataclass
+class NoveltyFieldInfo:
+    """Field recommendation produced by :meth:`recommend_novelty_fields`.
+
+    Used by the API to populate the field picker and frequency GROUP BY dropdown,
+    and internally as the smart default for :meth:`find_value_novelty`.
+    """
+
+    token: str          # e.g. "artifact", "attr:status_code"
+    distinct: int       # uniqExact() count
+    coverage: float     # fraction of events with a non-empty value (0–1)
+    kind: str           # "constant" | "identifier" | "categorical" | "sparse"
+    recommended: bool   # True → include in default scan
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +262,41 @@ def _fetch_event(
 
 
 # ---------------------------------------------------------------------------
+# Field classification helper
+# ---------------------------------------------------------------------------
+
+
+def _classify_field(distinct: int, non_empty_count: int, total: int = 0) -> tuple[str, bool]:
+    """Return (kind, recommended) for a field based on cardinality metrics.
+
+    Parameters
+    ----------
+    distinct:
+        ``uniqExact()`` — number of distinct non-empty values.
+    non_empty_count:
+        ``countIf(col != '')`` — events with a non-empty value.
+    total:
+        Total event count (used for sparse threshold).  When 0, sparse check is
+        skipped.
+
+    Classification rules (no content assumptions — purely numeric):
+
+    * ``constant``   : distinct ≤ 1                           → not recommended
+    * ``sparse``     : non_empty / total < 5 %                → not recommended
+    * ``identifier`` : distinct / non_empty_count ≥ 0.9       → not recommended
+      (hashes, UUIDs, free-text where nearly every value is unique)
+    * ``categorical``: otherwise                               → recommended
+    """
+    if distinct <= 1:
+        return "constant", False
+    if total > 0 and non_empty_count / total < 0.05:
+        return "sparse", False
+    if non_empty_count > 0 and distinct / non_empty_count >= 0.9:
+        return "identifier", False
+    return "categorical", True
+
+
+# ---------------------------------------------------------------------------
 # Service
 # ---------------------------------------------------------------------------
 
@@ -249,6 +311,141 @@ class StatisticalAnomalyService:
         self.ch = clickhouse or ClickHouseStore()
 
     # ------------------------------------------------------------------
+    # Field recommendation
+    # ------------------------------------------------------------------
+
+    def recommend_novelty_fields(
+        self,
+        case_id: str,
+        source_ids: list[str],
+    ) -> list[NoveltyFieldInfo]:
+        """Return a ranked, annotated list of candidate fields for value_novelty.
+
+        Fields are classified by cardinality *without* any content heuristics so
+        the result is valid for any timeseries type (nginx, Windows events, …):
+
+        * ``constant``   — distinct ≤ 1 value; no signal.
+        * ``identifier`` — near-unique (distinct / non-empty ≥ 0.9); hashes, IDs,
+          free-text messages.  Not useful for grouping.
+        * ``sparse``     — non-empty coverage < 5 % of events.  Low signal.
+        * ``categorical``— recommended; moderate cardinality with decent coverage.
+
+        Candidate set = a curated list of categorical top-level columns
+        (``artifact``, ``timestamp_desc``, ``display_name``, ``parser_name``)
+        plus every attribute key found in the events table.
+        """
+        self.ch.init_schema()
+        db = self.ch.database
+        params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+
+        # Total event count used for coverage denominator.
+        total_res = self.ch.client.query(
+            f"SELECT count() FROM {db}.events"
+            f" WHERE case_id = {{cid:String}}"
+            f" AND has({{src:Array(String)}}, source_id)",
+            parameters=params,
+        )
+        total = int(total_res.result_rows[0][0]) if total_res.result_rows else 0
+        if total == 0:
+            return []
+
+        findings: list[NoveltyFieldInfo] = []
+
+        # -- Top-level columns (batched in a single aggregation) ---------------
+        agg_parts = []
+        for col in _NOVELTY_CANDIDATE_TOP_LEVEL:
+            agg_parts.append(
+                f"uniqExact({col}) AS {col}_dist,"
+                f" countIf({col} != '') AS {col}_cov"
+            )
+        top_sql = (
+            f"SELECT {', '.join(agg_parts)}"
+            f" FROM {db}.events"
+            f" WHERE case_id = {{cid:String}}"
+            f" AND has({{src:Array(String)}}, source_id)"
+        )
+        top_res = self.ch.client.query(top_sql, parameters=params)
+        if top_res.result_rows:
+            row = top_res.result_rows[0]
+            for i, col in enumerate(_NOVELTY_CANDIDATE_TOP_LEVEL):
+                dist = int(row[i * 2])
+                cov_count = int(row[i * 2 + 1])
+                coverage = cov_count / total if total else 0.0
+                kind, recommended = _classify_field(dist, cov_count, total)
+                findings.append(
+                    NoveltyFieldInfo(
+                        token=col,
+                        distinct=dist,
+                        coverage=round(coverage, 4),
+                        kind=kind,
+                        recommended=recommended,
+                    )
+                )
+
+        # -- Attribute keys (ARRAY JOIN to enumerate + aggregate in one pass) --
+        attr_sql = f"""
+            SELECT
+                key,
+                uniqExact(attributes[key])        AS dist,
+                countIf(notEmpty(attributes[key])) AS cov_count
+            FROM {db}.events
+            ARRAY JOIN mapKeys(attributes) AS key
+            WHERE case_id = {{cid:String}}
+              AND has({{src:Array(String)}}, source_id)
+            GROUP BY key
+            ORDER BY cov_count DESC
+            LIMIT {{max_keys:UInt32}}
+        """
+        attr_res = self.ch.client.query(
+            attr_sql, parameters={**params, "max_keys": _RECOMMENDER_MAX_ATTR_KEYS}
+        )
+        for key, dist, cov_count in attr_res.result_rows:
+            coverage = int(cov_count) / total if total else 0.0
+            kind, recommended = _classify_field(int(dist), int(cov_count), total)
+            findings.append(
+                NoveltyFieldInfo(
+                    token=f"attr:{key}",
+                    distinct=int(dist),
+                    coverage=round(coverage, 4),
+                    kind=kind,
+                    recommended=recommended,
+                )
+            )
+
+        # Sort: recommended first, then by coverage descending.
+        findings.sort(key=lambda f: (not f.recommended, -f.coverage))
+        return findings
+
+    # ------------------------------------------------------------------
+    # Timeline range helper
+    # ------------------------------------------------------------------
+
+    def get_timeline_midpoint(
+        self,
+        case_id: str,
+        source_ids: list[str],
+    ) -> datetime | None:
+        """Return the midpoint timestamp of the timeline, or None if no events."""
+        self.ch.init_schema()
+        db = self.ch.database
+        params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        res = self.ch.client.query(
+            f"SELECT min(timestamp), max(timestamp) FROM {db}.events"
+            f" WHERE case_id = {{cid:String}}"
+            f" AND has({{src:Array(String)}}, source_id)"
+            f" AND timestamp IS NOT NULL",
+            parameters=params,
+        )
+        if not res.result_rows:
+            return None
+        min_ts, max_ts = res.result_rows[0]
+        if min_ts is None or max_ts is None:
+            return None
+        min_dt = _ensure_utc(min_ts)
+        max_dt = _ensure_utc(max_ts)
+        return min_dt + (max_dt - min_dt) / 2
+
+    # ------------------------------------------------------------------
     # Value / combo novelty
     # ------------------------------------------------------------------
 
@@ -261,12 +458,14 @@ class StatisticalAnomalyService:
         rarity_floor: int = 3,
         baseline_end: datetime | None = None,
         per_field_limit: int = 25,
+        exclude_event_ids: set[str] | None = None,
     ) -> StatAnomalyResult:
         """Return rare or first-seen values per field, ranked by surprise score.
 
         *fields* is a list of field tokens (``"artifact"``, ``"timestamp_desc"``,
-        ``"attr:user_agent"``).  Defaults to ``["artifact", "timestamp_desc",
-        "display_name"]`` when omitted.
+        ``"attr:user_agent"``).  When ``None``, the cardinality-based recommender
+        selects useful attribute fields automatically (falls back to
+        ``_DEFAULT_NOVELTY_FIELDS`` only if recommendation yields nothing).
 
         In *self-baseline* mode values appearing ≤ *rarity_floor* times are
         flagged.  In *temporal* mode (``baseline_end`` provided) any value absent
@@ -274,7 +473,13 @@ class StatisticalAnomalyService:
         """
         self.ch.init_schema()
         db = self.ch.database
-        scan_fields = fields or _DEFAULT_NOVELTY_FIELDS
+
+        if fields is not None:
+            scan_fields = fields
+        else:
+            # Auto-discover useful fields for this specific timeseries.
+            rec = self.recommend_novelty_fields(case_id, source_ids)
+            scan_fields = [f.token for f in rec if f.recommended] or _DEFAULT_NOVELTY_FIELDS
 
         base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
         method = "self-baseline" if baseline_end is None else "temporal"
@@ -432,6 +637,13 @@ class StatisticalAnomalyService:
                     )
                 )
 
+        # Suppress findings whose representative event was marked normal.
+        if exclude_event_ids:
+            all_findings = [
+                f for f in all_findings
+                if not f.event_id or f.event_id not in exclude_event_ids
+            ]
+
         # Sort by surprise descending (rarest first), apply global limit.
         all_findings.sort(key=lambda f: f.score, reverse=True)
         return StatAnomalyResult(
@@ -455,6 +667,7 @@ class StatisticalAnomalyService:
         bucket_count: int = 60,
         z_threshold: float = 2.5,
         baseline_end: datetime | None = None,
+        exclude_event_ids: set[str] | None = None,
     ) -> StatAnomalyResult:
         """Return time windows with anomalous event-count frequency.
 
@@ -605,6 +818,13 @@ class StatisticalAnomalyService:
         top = self._hydrate_freq_findings(
             top, case_id, source_ids, col, db, field_params, interval
         )
+
+        # Suppress findings whose representative event was marked normal.
+        if exclude_event_ids:
+            top = [
+                f for f in top
+                if not f.event_id or f.event_id not in exclude_event_ids
+            ]
 
         return StatAnomalyResult(
             status="ok",

@@ -90,6 +90,16 @@ export function ExplorerPage() {
           const { [fieldKey]: _removed, ...rest } = f.exclusions ?? {};
           f.exclusions = rest;
         }
+      } else if (key === "annotated") {
+        const remaining = value !== undefined
+          ? (f.annotated ?? []).filter((t) => t !== value)
+          : [];
+        if (remaining.length > 0) {
+          f.annotated = remaining as ("tag" | "anomaly")[];
+        } else {
+          delete f.annotated;
+          delete f.annotationTagValue;
+        }
       } else {
         delete f[key as keyof EventFilters];
       }
@@ -99,48 +109,84 @@ export function ExplorerPage() {
   );
 
   /**
-   * Handler wired to the detail panel's filter-in/filter-out buttons.
-   *
    * Special cases:
    *   - filterKey "q"       → sets the top-level full-text search param
    *   - filterKey "artifact" → sets the dedicated artifact param (include only)
    *   - filterKey "tag"     → sets the dedicated tag param (include only)
    *   - everything else     → goes into filters{} or exclusions{}
    */
-  const handleAddFilter = useCallback(
-    (fieldKey: string, value: string, include: boolean) => {
-      const f = { ...filters };
+  const applyFieldFilter = useCallback(
+    (f: EventFilters, fieldKey: string, value: string, include: boolean): EventFilters => {
+      const next = { ...f };
 
       if (fieldKey === "q") {
         // Full-text search: always "include" (no exclusion concept for free text)
-        f.q = value;
+        next.q = value;
       } else if (fieldKey === "artifact") {
         if (include) {
-          f.artifact = value;
+          next.artifact = value;
         } else {
-          const prev = f.exclusions?.artifact ?? [];
+          const prev = next.exclusions?.artifact ?? [];
           if (!prev.includes(value)) {
-            f.exclusions = { ...(f.exclusions ?? {}) as Record<string, string[]>, artifact: [...prev, value] };
+            next.exclusions = { ...(next.exclusions ?? {}) as Record<string, string[]>, artifact: [...prev, value] };
           }
         }
       } else if (fieldKey === "tag") {
         if (include) {
-          f.tag = value;
+          next.tag = value;
         } else {
-          f.excludeTag = value;
+          next.excludeTag = value;
         }
       } else if (include) {
-        f.filters = { ...(f.filters ?? {}), [fieldKey]: value };
+        next.filters = { ...(next.filters ?? {}), [fieldKey]: value };
       } else {
-        const prev = f.exclusions?.[fieldKey] ?? [];
+        const prev = next.exclusions?.[fieldKey] ?? [];
         if (!prev.includes(value)) {
-          f.exclusions = { ...(f.exclusions ?? {}) as Record<string, string[]>, [fieldKey]: [...prev, value] };
+          next.exclusions = { ...(next.exclusions ?? {}) as Record<string, string[]>, [fieldKey]: [...prev, value] };
         }
       }
 
-      setFilters(f);
+      return next;
     },
-    [filters, setFilters],
+    [],
+  );
+
+  /** Handler wired to the detail panel's filter-in/filter-out buttons. */
+  const handleAddFilter = useCallback(
+    (fieldKey: string, value: string, include: boolean) => {
+      setFilters(applyFieldFilter(filters, fieldKey, value, include));
+    },
+    [filters, setFilters, applyFieldFilter],
+  );
+
+  /** Maps an anomaly-finding field token to a filter-rail filterKey. */
+  const mapAnomalyField = useCallback((field: string): string => {
+    if (field.startsWith("attr:")) return field.slice(5);
+    if (field === "tags") return "tag";
+    return field;
+  }, []);
+
+  /** Wired to ValueNoveltyView — sets a field=value filter from a rare-value finding. */
+  const handleDrillField = useCallback(
+    (field: string, value: string) => {
+      setFilters(applyFieldFilter(filters, mapAnomalyField(field), value, true));
+    },
+    [filters, setFilters, applyFieldFilter, mapAnomalyField],
+  );
+
+  /**
+   * Wired to FrequencyView — narrows the time range to the anomalous window
+   * AND filters to the series field=value that spiked, in a single update.
+   */
+  const handleFrequencyDrill = useCallback(
+    (field: string, value: string, start: string, end: string) => {
+      setFilters({
+        ...applyFieldFilter(filters, mapAnomalyField(field), value, true),
+        start,
+        end,
+      });
+    },
+    [filters, setFilters, applyFieldFilter, mapAnomalyField],
   );
 
   // ── Panel visibility state ────────────────────────────────────────────
@@ -151,6 +197,7 @@ export function ExplorerPage() {
   const [expandedEvent, setExpandedEvent] = useState<Event | null>(null);
   const [selection, setSelection] = useState<SelectionState>({ mode: "ids", ids: new Set() });
   const [similarAnchor, setSimilarAnchor] = useState<Event | null>(null);
+  const [anomalyMarkers, setAnomalyMarkers] = useState<{ ts: string; label: string }[]>([]);
   const [saveViewOpen, setSaveViewOpen] = useState(false);
   const tlKey = `${caseId}/${timelineId}`;
   const visibleColumns = useUiStore((s) => s.visibleColumnsByTimeline[tlKey] ?? DEFAULT_COLUMNS);
@@ -311,6 +358,7 @@ const handleFindSimilar = useCallback((event: Event) => {
           onApplyView={setFilters}
           onSaveView={() => setSaveViewOpen(true)}
           onClose={() => setFilterRailOpen(false)}
+          tagSuggestions={tagSuggestions}
         />
       )}
 
@@ -389,6 +437,7 @@ const handleFindSimilar = useCallback((event: Event) => {
             timelineId={timelineId}
             filters={filters}
             onRangeSelect={handleHistogramRange}
+            markers={analysisPanelOpen ? anomalyMarkers : []}
           />
         )}
 
@@ -470,6 +519,9 @@ const handleFindSimilar = useCallback((event: Event) => {
                     }}
                     onSelectEvent={(ev) => setExpandedEvent(ev)}
                     onSimilarClose={() => setSimilarAnchor(null)}
+                    onDrillField={handleDrillField}
+                    onFrequencyDrill={handleFrequencyDrill}
+                    onAnomalyMarkers={setAnomalyMarkers}
                   />
                 )}
               </div>

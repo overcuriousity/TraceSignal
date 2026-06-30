@@ -14,7 +14,12 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from tracevector.core.config import get_settings
-from tracevector.db.anomaly_stats import FreqFinding, StatisticalAnomalyService, ValueFinding
+from tracevector.db.anomaly_stats import (
+    FreqFinding,
+    NoveltyFieldInfo,
+    StatisticalAnomalyService,
+    ValueFinding,
+)
 from tracevector.db.postgres import PostgresStore, generate_id
 from tracevector.db.queries import EventQuery, EventQueryService
 from tracevector.db.similarity import SimilarityService
@@ -114,6 +119,36 @@ async def _resolve_timeline_source_ids(case_id: str, timeline_id: str) -> list[s
     return [s.id for s in sources]
 
 
+async def _resolve_annotated_event_ids(
+    case_id: str,
+    source_ids: list[str],
+    annotated: str | None,
+    tag_value: str | None,
+) -> list[str] | None:
+    """Resolve the ``annotated``/``annotation_tag_value`` filter to an event_id list.
+
+    ``annotated`` is a comma-separated subset of ``{"tag", "anomaly"}``. Matching
+    event_ids across the requested types are unioned (OR semantics). Returns
+    ``None`` when no filter is requested (no restriction).
+    """
+    if not annotated:
+        return None
+    store = get_store()
+    types = {t.strip() for t in annotated.split(",") if t.strip()}
+    event_ids: set[str] = set()
+    if "tag" in types:
+        ids = await store.list_event_ids_by_annotation_type(
+            case_id, source_ids, "tag", origin="user", content=tag_value or None
+        )
+        event_ids.update(ids)
+    if "anomaly" in types:
+        ids = await store.list_event_ids_by_annotation_type(
+            case_id, source_ids, "anomaly", origin="system"
+        )
+        event_ids.update(ids)
+    return list(event_ids)
+
+
 @router.get("/{case_id}/timelines/{timeline_id}/events")
 async def list_events(
     case_id: str,
@@ -133,6 +168,14 @@ async def list_events(
         default=None,
         description='JSON object of field exclusion filters, e.g. {"status_code":"200"}',
     ),
+    annotated: str | None = Query(
+        default=None,
+        description='Comma-separated annotation types to filter to, e.g. "tag,anomaly".',
+    ),
+    annotation_tag_value: str | None = Query(
+        default=None,
+        description="Narrow the 'tag' annotation type to a specific tag value.",
+    ),
     limit: int = Query(default=50, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     order: str = Query(default="desc", description="Sort order: asc or desc"),
@@ -142,6 +185,9 @@ async def list_events(
         order = "desc"
 
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
+    event_ids = await _resolve_annotated_event_ids(
+        case_id, source_ids, annotated, annotation_tag_value
+    )
 
     service = _get_query_service()
     page = service.query(
@@ -157,6 +203,7 @@ async def list_events(
             end=end,
             field_filters=_parse_json_object(filters),
             field_exclusions=_parse_exclusions_object(exclusions),
+            event_ids=event_ids,
             limit=limit,
             offset=offset,
             order=order,  # type: ignore[arg-type]
@@ -316,6 +363,8 @@ async def get_histogram(
     end: datetime | None = Query(default=None),  # noqa: B008
     filters: str | None = Query(default=None),
     exclusions: str | None = Query(default=None),
+    annotated: str | None = Query(default=None),
+    annotation_tag_value: str | None = Query(default=None),
     buckets: int = Query(default=60, ge=10, le=200),
 ) -> dict[str, Any]:
     """Return a bucketed event-count histogram for a timeline.
@@ -326,6 +375,9 @@ async def get_histogram(
     ``max(1, duration / buckets)`` seconds.
     """
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
+    event_ids = await _resolve_annotated_event_ids(
+        case_id, source_ids, annotated, annotation_tag_value
+    )
     service = _get_query_service()
     return service.histogram(
         EventQuery(
@@ -340,6 +392,7 @@ async def get_histogram(
             end=end,
             field_filters=_parse_json_object(filters),
             field_exclusions=_parse_exclusions_object(exclusions),
+            event_ids=event_ids,
         ),
         buckets=buckets,
     )
@@ -361,6 +414,8 @@ class ExportFilter(BaseModel):
     # 'fields' / 'exclude' map to field_filters / field_exclusions in EventQuery.
     fields: dict[str, str] = Field(default_factory=dict)
     exclude: dict[str, list[str]] = Field(default_factory=dict)
+    annotated: str | None = None
+    annotation_tag_value: str | None = None
 
 
 class ExportRequest(BaseModel):
@@ -436,6 +491,9 @@ async def export_events(
 ) -> StreamingResponse:
     """Stream all events matching the given filters as CSV or JSONL."""
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
+    event_ids = await _resolve_annotated_event_ids(
+        case_id, source_ids, body.filter.annotated, body.filter.annotation_tag_value
+    )
 
     eq = EventQuery(
         case_id=case_id,
@@ -449,6 +507,7 @@ async def export_events(
         end=body.filter.end,
         field_filters=body.filter.fields,
         field_exclusions=body.filter.exclude,
+        event_ids=event_ids,
     )
 
     if body.format == "jsonl":
@@ -546,6 +605,37 @@ def _serialize_finding(r: ValueFinding | FreqFinding) -> dict[str, Any]:
     }
 
 
+@router.get("/{case_id}/timelines/{timeline_id}/anomalies/fields")
+async def list_anomaly_fields(
+    case_id: str,
+    timeline_id: str,
+) -> dict[str, Any]:
+    """Return candidate fields for anomaly detection, annotated with cardinality.
+
+    Each entry carries:
+    - ``token``       — field token to pass to the ``fields`` / ``series_field`` params.
+    - ``distinct``    — number of distinct non-empty values.
+    - ``coverage``    — fraction of events with a non-empty value (0–1).
+    - ``kind``        — ``"categorical"`` | ``"constant"`` | ``"identifier"`` | ``"sparse"``.
+    - ``recommended`` — ``true`` when the field is suitable for novelty detection.
+    """
+    source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
+    svc = _get_stat_anomaly_service()
+    fields: list[NoveltyFieldInfo] = svc.recommend_novelty_fields(case_id, source_ids)
+    return {
+        "fields": [
+            {
+                "token": f.token,
+                "distinct": f.distinct,
+                "coverage": f.coverage,
+                "kind": f.kind,
+                "recommended": f.recommended,
+            }
+            for f in fields
+        ]
+    }
+
+
 @router.get("/{case_id}/timelines/{timeline_id}/anomalies")
 async def list_anomalies(
     case_id: str,
@@ -559,7 +649,7 @@ async def list_anomalies(
         description=(
             "Comma-separated field tokens for value_novelty "
             "(e.g. 'artifact,display_name,attr:user_agent'). "
-            "Defaults to artifact, timestamp_desc, display_name."
+            "When omitted the cardinality-based recommender selects fields automatically."
         ),
     ),
     series_field: str = Query(
@@ -568,7 +658,14 @@ async def list_anomalies(
     ),
     baseline_start: datetime | None = Query(  # noqa: B008
         default=None,
-        description="Temporal baseline end timestamp (detect window = after this).",
+        description="Explicit temporal baseline end timestamp (detect window = after this).",
+    ),
+    temporal: bool = Query(
+        default=False,
+        description=(
+            "Enable temporal mode.  When no baseline_start is given the timeline "
+            "midpoint is used as the baseline/detect split."
+        ),
     ),
     limit: int = Query(default=50, ge=1, le=500),
 ) -> dict[str, Any]:
@@ -583,8 +680,20 @@ async def list_anomalies(
     field-value series.
     """
     cfg = get_settings()
+    store = get_store()
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
     svc = _get_stat_anomaly_service()
+
+    # Resolve temporal split point.
+    effective_baseline_end = baseline_start
+    if temporal and effective_baseline_end is None:
+        effective_baseline_end = svc.get_timeline_midpoint(case_id, source_ids)
+
+    # Fetch events marked "normal" by the analyst for suppression.
+    normal_ids = await store.list_event_ids_by_annotation_type(
+        case_id, source_ids, "normal"
+    )
+    exclude_ids: set[str] | None = set(normal_ids) if normal_ids else None
 
     if detector == "frequency":
         result = svc.find_frequency_anomalies(
@@ -594,7 +703,8 @@ async def list_anomalies(
             limit=limit,
             bucket_count=cfg.stat_frequency_buckets,
             z_threshold=cfg.stat_z_threshold,
-            baseline_end=baseline_start,
+            baseline_end=effective_baseline_end,
+            exclude_event_ids=exclude_ids,
         )
     else:
         parsed_fields = (
@@ -608,8 +718,9 @@ async def list_anomalies(
             fields=parsed_fields,
             limit=limit,
             rarity_floor=cfg.stat_rarity_floor,
-            baseline_end=baseline_start,
+            baseline_end=effective_baseline_end,
             per_field_limit=cfg.stat_per_field_limit,
+            exclude_event_ids=exclude_ids,
         )
 
     return {
@@ -638,7 +749,14 @@ class TagAnomaliesRequest(BaseModel):
     )
     baseline_start: datetime | None = Field(
         default=None,
-        description="Temporal baseline end timestamp.",
+        description="Explicit temporal baseline end timestamp.",
+    )
+    temporal: bool = Field(
+        default=False,
+        description=(
+            "Enable temporal mode.  When no baseline_start is given the timeline "
+            "midpoint is used as the baseline/detect split."
+        ),
     )
     limit: int = Field(default=50, ge=1, le=500)
 
@@ -666,6 +784,17 @@ async def tag_anomalies(
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
     svc = _get_stat_anomaly_service()
 
+    # Resolve temporal split point.
+    effective_baseline_end = body.baseline_start
+    if body.temporal and effective_baseline_end is None:
+        effective_baseline_end = svc.get_timeline_midpoint(case_id, source_ids)
+
+    # Fetch events marked "normal" by the analyst for suppression.
+    normal_ids = await store.list_event_ids_by_annotation_type(
+        case_id, source_ids, "normal"
+    )
+    exclude_ids: set[str] | None = set(normal_ids) if normal_ids else None
+
     if body.detector == "frequency":
         result = svc.find_frequency_anomalies(
             case_id=case_id,
@@ -674,7 +803,8 @@ async def tag_anomalies(
             limit=body.limit,
             bucket_count=cfg.stat_frequency_buckets,
             z_threshold=cfg.stat_z_threshold,
-            baseline_end=body.baseline_start,
+            baseline_end=effective_baseline_end,
+            exclude_event_ids=exclude_ids,
         )
     else:
         parsed_fields = (
@@ -688,8 +818,9 @@ async def tag_anomalies(
             fields=parsed_fields,
             limit=body.limit,
             rarity_floor=cfg.stat_rarity_floor,
-            baseline_end=body.baseline_start,
+            baseline_end=effective_baseline_end,
             per_field_limit=cfg.stat_per_field_limit,
+            exclude_event_ids=exclude_ids,
         )
 
     if result.status != "ok":

@@ -58,7 +58,7 @@ export function MethodologyPanel({ caseId: _caseId, timelineId: _timelineId, sou
           <div className="space-y-1.5 text-[var(--color-fg-muted)]">
             <Row label="Method">
               Self-baseline (whole timeline) or temporal (baseline window vs
-              detect window — analyst supplies split point).
+              detect window — defaults to timeline midpoint as split).
             </Row>
             <Row label="Signal">
               Events with field values that appear ≤ rarity floor times in the
@@ -71,8 +71,10 @@ export function MethodologyPanel({ caseId: _caseId, timelineId: _timelineId, sou
               <code className="font-mono text-[10px]">details.surprise</code>.
             </Row>
             <Row label="Fields">
-              artifact, timestamp_desc, display_name (default).
-              Analyst can extend to any top-level column or attributes key.
+              Auto-selected by cardinality: constant and near-unique (identifier)
+              fields are skipped; moderate-cardinality categoricals are
+              recommended. Analyst can override via the Fields picker — any
+              top-level column or <code className="font-mono text-[10px]">attr:key</code> is accepted.
             </Row>
             <Row label="Backend">
               Pure ClickHouse GROUP BY aggregations — no embeddings or ML.

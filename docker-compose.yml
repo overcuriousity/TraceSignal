@@ -48,3 +48,5 @@ volumes:
   postgres_data:
   clickhouse_data:
   qdrant_data:
+
+
