@@ -310,9 +310,8 @@ class PostgresStore:
     async def init_schema(self) -> None:
         """Create metadata tables if they do not exist.
 
-        Also runs additive ALTER TABLE migrations for columns added after the
-        initial schema creation (Postgres ``IF NOT EXISTS`` prevents errors on
-        re-runs).
+        Runs additive ``ALTER TABLE … ADD COLUMN IF NOT EXISTS`` statements for
+        columns that post-date the initial schema.  Safe to call repeatedly.
         """
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
@@ -325,11 +324,6 @@ class PostgresStore:
                     "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedding_config_hash VARCHAR(128)",
                     "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedded_source_ids JSON",
                     "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedded_at TIMESTAMPTZ",
-                    # Model-refactor migration: annotations scoped by source_id instead
-                    # of timeline_id.  Add the new column and back-fill from the old one
-                    # so existing annotations remain visible after upgrade.
-                    "ALTER TABLE annotations ADD COLUMN IF NOT EXISTS source_id VARCHAR(64)",
-                    "UPDATE annotations SET source_id = timeline_id WHERE source_id IS NULL",
                 ):
                     await conn.execute(text(stmt))
 
