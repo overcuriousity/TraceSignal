@@ -317,7 +317,7 @@ export function EventDetailPanel({
           </p>
           <FieldRow
             label="artifact"
-            value={event.artifact || event.source_file || null}
+            value={event.artifact}
             mono
             filterKey="artifact"
             onAddFilter={onAddFilter}
