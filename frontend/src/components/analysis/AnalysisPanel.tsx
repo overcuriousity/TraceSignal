@@ -1,19 +1,20 @@
 import { useState, useEffect } from "react";
 import { X, AlertTriangle, Search, BookOpen } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/Button";
 import { AnomaliesList } from "./AnomaliesList";
 import { SimilarEvents } from "./SimilarEvents";
 import { EmbeddingStatusBanner } from "./EmbeddingStatusBanner";
 import { MethodologyPanel } from "./MethodologyPanel";
+import { timelinesApi } from "@/api/timelines";
 import { cn } from "@/lib/cn";
-import type { Event, Timeline } from "@/api/types";
+import type { Event } from "@/api/types";
 
 type Tab = "anomalies" | "similar" | "methodology";
 
 interface Props {
   caseId: string;
   timelineId: string;
-  timeline: Timeline;
   hasVectors: boolean;
   similarAnchor: Event | null;
   onClose: () => void;
@@ -24,7 +25,6 @@ interface Props {
 export function AnalysisPanel({
   caseId,
   timelineId,
-  timeline,
   hasVectors,
   similarAnchor,
   onClose,
@@ -37,6 +37,21 @@ export function AnalysisPanel({
   useEffect(() => {
     if (similarAnchor) setTab("similar");
   }, [similarAnchor]);
+
+  // Load the timeline to drive stale / not-embedded banners.
+  const { data: timeline } = useQuery({
+    queryKey: ["timeline", caseId, timelineId],
+    queryFn: () => timelinesApi.get(caseId, timelineId),
+    refetchInterval: 30_000,
+  });
+
+  const { data: sources } = useQuery({
+    queryKey: ["timeline-sources", caseId, timelineId],
+    queryFn: () => timelinesApi.listSources(caseId, timelineId),
+  });
+
+  // Show the banner when: not embedded at all, OR embedded-but-stale.
+  const showBanner = !hasVectors || (timeline?.is_stale ?? false);
 
   return (
     <div className="flex h-full w-80 shrink-0 flex-col border-l border-[var(--color-border)] bg-[var(--color-bg-surface)]">
@@ -74,9 +89,13 @@ export function AnalysisPanel({
       </div>
 
       <div className="flex-1 overflow-y-auto p-4">
-        {!hasVectors && (
+        {showBanner && (
           <div className="mb-4">
-            <EmbeddingStatusBanner status="not_embedded" timeline={timeline} />
+            <EmbeddingStatusBanner
+              status={hasVectors ? "ok" : "not_embedded"}
+              timeline={timeline ?? null}
+              caseId={caseId}
+            />
           </div>
         )}
 
@@ -84,6 +103,7 @@ export function AnalysisPanel({
           <AnomaliesList
             caseId={caseId}
             timelineId={timelineId}
+            sourceCount={timeline?.source_ids?.length ?? 1}
             onSelectEvent={onSelectEvent}
           />
         )}
@@ -106,7 +126,7 @@ export function AnalysisPanel({
           <MethodologyPanel
             caseId={caseId}
             timelineId={timelineId}
-            timeline={timeline}
+            sources={sources ?? []}
           />
         )}
       </div>

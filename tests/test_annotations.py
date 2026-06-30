@@ -15,8 +15,9 @@ async def store(tmp_path):
     url = f"sqlite+aiosqlite:///{db_path}"
     s = PostgresStore(url=url)
     await s.init_schema()
-    # Seed a minimal case and timeline so FKs don't block (no FK constraints in SQLite by default).
-    return s
+    # Seed a minimal case and source so FKs don't block (no FK constraints in SQLite by default).
+    yield s
+    await s.engine.dispose()
 
 
 # ---------------------------------------------------------------------------
@@ -31,7 +32,7 @@ def test_annotation_to_dict_shape():
     ann = Annotation(
         id="ann_abc123",
         case_id="case1",
-        timeline_id="tl1",
+        source_id="source1",
         event_id="evt1",
         annotation_type="tag",
         content="malware",
@@ -44,6 +45,7 @@ def test_annotation_to_dict_shape():
     assert set(d.keys()) == {
         "id",
         "event_id",
+        "source_id",
         "annotation_type",
         "content",
         "created_at",
@@ -53,6 +55,7 @@ def test_annotation_to_dict_shape():
     }
     assert d["id"] == "ann_abc123"
     assert d["event_id"] == "evt1"
+    assert d["source_id"] == "source1"
     assert d["annotation_type"] == "tag"
     assert d["content"] == "malware"
     assert d["created_by"] is None
@@ -71,7 +74,7 @@ async def test_create_and_list_annotation(store: PostgresStore):
     """Create an annotation and retrieve it with list_annotations."""
     ann = await store.create_annotation(
         case_id="c1",
-        timeline_id="t1",
+        source_id="s1",
         event_id="e1",
         annotation_id="ann_001",
         annotation_type="tag",
@@ -81,14 +84,14 @@ async def test_create_and_list_annotation(store: PostgresStore):
     assert ann.annotation_type == "tag"
     assert ann.content == "suspicious"
 
-    results = await store.list_annotations("c1", "t1", "e1")
+    results = await store.list_annotations("c1", "s1", "e1")
     assert len(results) == 1
     assert results[0].id == "ann_001"
 
 
 @pytest.mark.asyncio
 async def test_list_annotations_empty(store: PostgresStore):
-    results = await store.list_annotations("c1", "t1", "nonexistent_event")
+    results = await store.list_annotations("c1", "s1", "nonexistent_event")
     assert results == []
 
 
@@ -97,7 +100,7 @@ async def test_list_annotations_ordering(store: PostgresStore):
     """list_annotations returns annotations oldest-first."""
     await store.create_annotation(
         case_id="c1",
-        timeline_id="t1",
+        source_id="s1",
         event_id="e2",
         annotation_id="ann_b",
         annotation_type="comment",
@@ -105,13 +108,13 @@ async def test_list_annotations_ordering(store: PostgresStore):
     )
     await store.create_annotation(
         case_id="c1",
-        timeline_id="t1",
+        source_id="s1",
         event_id="e2",
         annotation_id="ann_a",
         annotation_type="tag",
         content="first",
     )
-    results = await store.list_annotations("c1", "t1", "e2")
+    results = await store.list_annotations("c1", "s1", "e2")
     assert len(results) == 2
     # SQLite insert order matches created_at ordering here.
     contents = [r.content for r in results]
@@ -119,31 +122,31 @@ async def test_list_annotations_ordering(store: PostgresStore):
 
 
 @pytest.mark.asyncio
-async def test_list_timeline_annotations(store: PostgresStore):
-    """list_timeline_annotations returns all annotations for a timeline."""
+async def test_list_source_annotations(store: PostgresStore):
+    """list_source_annotations returns all annotations for one or more sources."""
     for i, event_id in enumerate(["e3", "e4", "e4"]):
         await store.create_annotation(
             case_id="c2",
-            timeline_id="t2",
+            source_id="s2",
             event_id=event_id,
-            annotation_id=f"ann_tl_{i}",
+            annotation_id=f"ann_s_{i}",
             annotation_type="tag",
             content=f"label_{i}",
         )
-    # Unrelated timeline — must not appear.
+    # Unrelated source — must not appear.
     await store.create_annotation(
         case_id="c2",
-        timeline_id="other",
+        source_id="other",
         event_id="e99",
         annotation_id="ann_other",
         annotation_type="tag",
         content="noise",
     )
 
-    results = await store.list_timeline_annotations("c2", "t2")
+    results = await store.list_source_annotations("c2", ["s2"])
     assert len(results) == 3
     ids = {r.id for r in results}
-    assert "ann_tl_0" in ids and "ann_tl_1" in ids and "ann_tl_2" in ids
+    assert "ann_s_0" in ids and "ann_s_1" in ids and "ann_s_2" in ids
     assert "ann_other" not in ids
 
 
@@ -151,7 +154,7 @@ async def test_list_timeline_annotations(store: PostgresStore):
 async def test_delete_annotation_existing(store: PostgresStore):
     await store.create_annotation(
         case_id="c3",
-        timeline_id="t3",
+        source_id="s3",
         event_id="e5",
         annotation_id="ann_del",
         annotation_type="comment",
@@ -159,7 +162,7 @@ async def test_delete_annotation_existing(store: PostgresStore):
     )
     deleted = await store.delete_annotation("c3", "e5", "ann_del")
     assert deleted is True
-    results = await store.list_annotations("c3", "t3", "e5")
+    results = await store.list_annotations("c3", "s3", "e5")
     assert results == []
 
 
@@ -174,7 +177,7 @@ async def test_to_dict_round_trip(store: PostgresStore):
     """to_dict on a persisted annotation matches the Annotation interface."""
     ann = await store.create_annotation(
         case_id="c4",
-        timeline_id="t4",
+        source_id="s4",
         event_id="e6",
         annotation_id="ann_dict",
         annotation_type="comment",
@@ -183,6 +186,7 @@ async def test_to_dict_round_trip(store: PostgresStore):
     )
     d = ann.to_dict()
     assert d["event_id"] == "e6"
+    assert d["source_id"] == "s4"
     assert d["annotation_type"] == "comment"
     assert d["content"] == "looks like C2 traffic"
     assert d["created_by"] == "analyst@example.com"
@@ -209,7 +213,7 @@ async def test_system_annotation_origin_and_details(store: PostgresStore):
     }
     ann = await store.create_annotation(
         case_id="c5",
-        timeline_id="t5",
+        source_id="s5",
         event_id="e7",
         annotation_id="ann_sys",
         annotation_type="outlier",
@@ -230,7 +234,7 @@ async def test_delete_annotation_cannot_delete_system(store: PostgresStore):
     """delete_annotation must not remove system-origin annotations."""
     await store.create_annotation(
         case_id="c6",
-        timeline_id="t6",
+        source_id="s6",
         event_id="e8",
         annotation_id="ann_sys2",
         annotation_type="outlier",
@@ -240,7 +244,7 @@ async def test_delete_annotation_cannot_delete_system(store: PostgresStore):
     # delete_annotation only removes origin='user' rows.
     deleted = await store.delete_annotation("c6", "e8", "ann_sys2")
     assert deleted is False
-    results = await store.list_annotations("c6", "t6", "e8")
+    results = await store.list_annotations("c6", "s6", "e8")
     assert len(results) == 1
 
 
@@ -251,7 +255,7 @@ async def test_bulk_create_annotations(store: PostgresStore):
         {
             "annotation_id": f"bulk_{i}",
             "case_id": "c7",
-            "timeline_id": "t7",
+            "source_id": "s7",
             "event_id": f"e{i}",
             "annotation_type": "outlier",
             "content": f"Outlier rank {i}",
@@ -262,7 +266,7 @@ async def test_bulk_create_annotations(store: PostgresStore):
     ]
     count = await store.bulk_create_annotations(rows)
     assert count == 5
-    results = await store.list_timeline_annotations("c7", "t7")
+    results = await store.list_source_annotations("c7", ["s7"])
     assert len(results) == 5
     assert all(r.origin == "system" for r in results)
 
@@ -276,7 +280,7 @@ async def test_delete_system_annotations(store: PostgresStore):
             {
                 "annotation_id": f"sys_{i}",
                 "case_id": "c8",
-                "timeline_id": "t8",
+                "source_id": "s8",
                 "event_id": f"e{i}",
                 "annotation_type": "outlier",
                 "content": "outlier",
@@ -288,7 +292,7 @@ async def test_delete_system_annotations(store: PostgresStore):
     # Human tag that must survive.
     await store.create_annotation(
         case_id="c8",
-        timeline_id="t8",
+        source_id="s8",
         event_id="e0",
         annotation_id="human_tag",
         annotation_type="tag",
@@ -296,10 +300,10 @@ async def test_delete_system_annotations(store: PostgresStore):
         origin="user",
     )
 
-    deleted_count = await store.delete_system_annotations("c8", "t8", "outlier")
+    deleted_count = await store.delete_system_annotations("c8", ["s8"], "outlier")
     assert deleted_count == 3
 
-    remaining = await store.list_timeline_annotations("c8", "t8")
+    remaining = await store.list_source_annotations("c8", ["s8"])
     assert len(remaining) == 1
     assert remaining[0].id == "human_tag"
 
@@ -307,5 +311,5 @@ async def test_delete_system_annotations(store: PostgresStore):
 @pytest.mark.asyncio
 async def test_delete_system_annotations_idempotent(store: PostgresStore):
     """delete_system_annotations is a no-op when nothing matches."""
-    count = await store.delete_system_annotations("c_empty", "t_empty", "outlier")
+    count = await store.delete_system_annotations("c_empty", ["s_empty"], "outlier")
     assert count == 0

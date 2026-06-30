@@ -1,9 +1,13 @@
 """ClickHouse connection and event storage.
 
 The event table schema is optimised for forensic timeline analysis:
-* MergeTree ordered by (case_id, timeline_id, timestamp)
+* MergeTree ordered by (case_id, source_id, timestamp)
 * Projections or token bloom filters for full-text search
 * Immutable forensic provenance columns
+
+Events are scoped by ``source_id`` (one ingested file) so that a Source can be
+shared across multiple Timelines without duplication. Timeline queries resolve
+member source IDs and use ``source_id IN (...)`` filtering.
 """
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ from tracevector.models.event import Event
 _EVENT_COLUMNS = [
     "event_id",
     "case_id",
-    "timeline_id",
+    "source_id",
     "source_file",
     "byte_offset",
     "line_number",
@@ -30,8 +34,8 @@ _EVENT_COLUMNS = [
     "message",
     "timestamp",
     "timestamp_desc",
-    "source",
-    "source_long",
+    "artifact",
+    "artifact_long",
     "display_name",
     "tags",
     "attributes",
@@ -44,7 +48,7 @@ _EVENTS_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS {database}.events (
     event_id UUID,
     case_id LowCardinality(String),
-    timeline_id LowCardinality(String),
+    source_id LowCardinality(String),
     source_file String,
     byte_offset UInt64,
     line_number UInt64,
@@ -56,8 +60,8 @@ CREATE TABLE IF NOT EXISTS {database}.events (
     message String,
     timestamp Nullable(DateTime64(3)),
     timestamp_desc LowCardinality(String),
-    source LowCardinality(String),
-    source_long LowCardinality(String),
+    artifact LowCardinality(String),
+    artifact_long LowCardinality(String),
     display_name LowCardinality(String),
     tags Array(String),
     attributes Map(String, String),
@@ -68,8 +72,8 @@ CREATE TABLE IF NOT EXISTS {database}.events (
     INDEX content_hash_idx content_hash TYPE bloom_filter GRANULARITY 4
 )
 ENGINE = MergeTree()
-ORDER BY (case_id, timeline_id, timestamp, event_id)
-PARTITION BY (case_id, timeline_id)
+ORDER BY (case_id, source_id, timestamp, event_id)
+PARTITION BY (case_id, source_id)
 SETTINGS index_granularity = 8192, allow_nullable_key = 1
 """.strip()
 
@@ -101,11 +105,6 @@ class ClickHouseStore:
         """Create the target database and events table if they do not exist."""
         self.client.command(f"CREATE DATABASE IF NOT EXISTS {self.database}")
         self.client.command(_EVENTS_TABLE_DDL.format(database=self.database))
-        # Idempotent migration: add file_hash to deployments created before this
-        # column was introduced.
-        self.client.command(
-            f"ALTER TABLE {self.database}.events ADD COLUMN IF NOT EXISTS file_hash FixedString(64)"
-        )
 
     def insert_events(self, events: list[Event]) -> int:
         """Insert a batch of events into ClickHouse.
@@ -128,14 +127,22 @@ class ClickHouseStore:
         )
         return response.written_rows
 
-    def count_events(self, case_id: str | None = None, timeline_id: str | None = None) -> int:
-        """Return the number of events, optionally filtered by case/timeline."""
+    def count_events(
+        self,
+        case_id: str | None = None,
+        source_id: str | None = None,
+        source_ids: list[str] | None = None,
+    ) -> int:
+        """Return the number of events, optionally filtered by case/source."""
         query = f"SELECT count() FROM {self.database}.events"
         conditions: list[str] = []
         if case_id is not None:
             conditions.append(f"case_id = {case_id!r}")
-        if timeline_id is not None:
-            conditions.append(f"timeline_id = {timeline_id!r}")
+        if source_id is not None:
+            conditions.append(f"source_id = {source_id!r}")
+        if source_ids is not None:
+            ids = ", ".join(f"{s!r}" for s in source_ids)
+            conditions.append(f"source_id IN ({ids})")
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
         result = self.client.query(query)
@@ -144,11 +151,11 @@ class ClickHouseStore:
     def list_events(
         self,
         case_id: str,
-        timeline_id: str,
+        source_id: str,
         limit: int,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        """Return a batch of raw event rows for a timeline ordered by event_id.
+        """Return a batch of raw event rows for a source ordered by event_id.
 
         This is used by the embedding pipeline to read events that were
         previously ingested without vectors.
@@ -158,7 +165,7 @@ class ClickHouseStore:
             SELECT
                 event_id,
                 case_id,
-                timeline_id,
+                source_id,
                 source_file,
                 byte_offset,
                 line_number,
@@ -170,8 +177,8 @@ class ClickHouseStore:
                 message,
                 timestamp,
                 timestamp_desc,
-                source,
-                source_long,
+                artifact,
+                artifact_long,
                 display_name,
                 tags,
                 attributes,
@@ -179,44 +186,49 @@ class ClickHouseStore:
                 embedding_config_hash,
                 vector_id
             FROM {self.database}.events
-            WHERE case_id = {{case_id:String}} AND timeline_id = {{timeline_id:String}}
+            WHERE case_id = {{case_id:String}} AND source_id = {{source_id:String}}
             ORDER BY event_id
             LIMIT {limit}
             OFFSET {offset}
             """,
-            parameters={"case_id": case_id, "timeline_id": timeline_id},
+            parameters={"case_id": case_id, "source_id": source_id},
         )
         columns = result.column_names
         return [dict(zip(columns, row, strict=False)) for row in result.result_rows]
 
     def get_events_by_ids(
-        self, case_id: str, timeline_id: str, event_ids: list[str]
+        self,
+        case_id: str,
+        source_ids: list[str],
+        event_ids: list[str],
     ) -> dict[str, dict[str, Any]]:
         """Return a mapping of event_id → event dict for a list of IDs.
 
-        Only returns rows that exist in ClickHouse.  Unknown IDs are silently
+        Only returns rows that exist in ClickHouse. Unknown IDs are silently
         absent from the result (callers should fall back to the Qdrant payload).
         """
         if not event_ids:
             return {}
         self.init_schema()
-        # Build parameterized IN clause: {p0:String},{p1:String},...
-        param_names = [f"p{i}" for i in range(len(event_ids))]
-        in_clause = ", ".join(f"{{{name}:String}}" for name in param_names)
-        parameters: dict[str, str] = dict(zip(param_names, event_ids, strict=False))
+        # Build parameterized IN clauses.
+        event_params = [f"e{i}" for i in range(len(event_ids))]
+        event_in = ", ".join(f"{{{name}:String}}" for name in event_params)
+        source_params = [f"s{i}" for i in range(len(source_ids))]
+        source_in = ", ".join(f"{{{name}:String}}" for name in source_params)
+        parameters: dict[str, str] = dict(zip(event_params, event_ids, strict=False))
+        parameters.update(zip(source_params, source_ids, strict=False))
         parameters["case_id"] = case_id
-        parameters["timeline_id"] = timeline_id
         result = self.client.query(
             f"""
             SELECT
-                event_id, case_id, timeline_id, source_file, byte_offset, line_number,
+                event_id, case_id, source_id, source_file, byte_offset, line_number,
                 content_hash, file_hash, parser_name, parser_version, ingest_time,
-                message, timestamp, timestamp_desc, source, source_long, display_name,
+                message, timestamp, timestamp_desc, artifact, artifact_long, display_name,
                 tags, attributes, embedding_model, embedding_config_hash, vector_id
             FROM {self.database}.events
             WHERE case_id = {{case_id:String}}
-              AND timeline_id = {{timeline_id:String}}
-              AND toString(event_id) IN ({in_clause})
+              AND source_id IN ({source_in})
+              AND toString(event_id) IN ({event_in})
             """,
             parameters=parameters,
         )
@@ -224,26 +236,25 @@ class ClickHouseStore:
         rows = [dict(zip(columns, row, strict=False)) for row in result.result_rows]
         return {str(row["event_id"]): row for row in rows}
 
-    def delete_timeline_events(self, case_id: str, timeline_id: str) -> None:
-        """Remove all events for a timeline by dropping its ClickHouse partition.
+    def delete_source_events(self, case_id: str, source_id: str) -> None:
+        """Remove all events for a source by dropping its ClickHouse partition.
 
-        The ``events`` table is partitioned by ``(case_id, timeline_id)`` so
+        The ``events`` table is partitioned by ``(case_id, source_id)`` so
         ``DROP PARTITION`` is instant and does not require a full-table scan.
-        If the partition does not exist (timeline was never uploaded) the call
-        is a silent no-op.
+        If the partition does not exist the call is a silent no-op.
         """
         try:
-            # clickhouse-connect does not support parameterised DDL.  The IDs
-            # produced by generate_id() contain only [a-zA-Z0-9_-] so
-            # direct interpolation is safe here.
-            partition_expr = f"tuple('{case_id}', '{timeline_id}')"
+            partition_expr = f"tuple('{case_id}', '{source_id}')"
             self.client.command(
                 f"ALTER TABLE {self.database}.events DROP PARTITION {partition_expr}"
             )
         except Exception:  # noqa: BLE001
-            # Partition may not exist (timeline never ingested any events); that
-            # is fine — treat as a no-op.
             pass
+
+    def delete_timeline_events(self, case_id: str, source_ids: list[str]) -> None:
+        """Remove all events for a timeline by dropping partitions for its sources."""
+        for source_id in source_ids:
+            self.delete_source_events(case_id, source_id)
 
     def health(self) -> dict[str, Any]:
         """Return a simple health status for the ClickHouse connection."""

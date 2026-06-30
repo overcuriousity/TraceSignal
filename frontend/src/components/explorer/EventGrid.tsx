@@ -29,9 +29,10 @@ import { Spinner } from "@/components/ui/Spinner";
 import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/Popover";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { useAnnotationMutations } from "@/hooks/useAnnotationMutations";
+import { RETIRED_COLUMN_IDS } from "@/stores/ui";
 import { cn } from "@/lib/cn";
 
-const ROW_HEIGHT = 52; // px — room for message + tag chips below
+const ROW_HEIGHT = 34; // px — compact forensic density (chips inline with message)
 const OVERSCAN = 10;
 
 interface Props {
@@ -42,6 +43,8 @@ interface Props {
   caseId: string;
   timelineId: string;
   onToggleSelect: (id: string) => void;
+  /** Toggles selection of all currently-loaded events. */
+  onToggleSelectAll: () => void;
   expandedId: string | null;
   onExpand: (event: Event | null) => void;
   onLoadMore: () => void;
@@ -57,18 +60,18 @@ interface AnnotationCellProps {
   eventId: string;
   anns: Annotation[];
   caseId: string;
-  timelineId: string;
+  sourceId: string;
 }
 
 function TagPopover({
   eventId,
   anns,
   caseId,
-  timelineId,
+  sourceId,
 }: AnnotationCellProps) {
   const [open, setOpen] = useState(false);
   const [value, setValue] = useState("");
-  const { add, remove } = useAnnotationMutations(caseId, timelineId);
+  const { add, remove } = useAnnotationMutations(caseId, sourceId);
   const userTags = anns.filter((a) => a.annotation_type === "tag" && a.origin === "user");
 
   function submit() {
@@ -154,11 +157,11 @@ function CommentPopover({
   eventId,
   anns,
   caseId,
-  timelineId,
+  sourceId,
 }: AnnotationCellProps) {
   const [open, setOpen] = useState(false);
   const [value, setValue] = useState("");
-  const { add, remove } = useAnnotationMutations(caseId, timelineId);
+  const { add, remove } = useAnnotationMutations(caseId, sourceId);
   const userComments = anns.filter((a) => a.annotation_type === "comment" && a.origin === "user");
 
   function submit() {
@@ -242,8 +245,8 @@ function CommentPopover({
 }
 
 /** Mark-normal toggle button: adds/removes a "normal" user annotation. */
-function NormalToggle({ eventId, anns, caseId, timelineId }: AnnotationCellProps) {
-  const { add, remove } = useAnnotationMutations(caseId, timelineId);
+function NormalToggle({ eventId, anns, caseId, sourceId }: AnnotationCellProps) {
+  const { add, remove } = useAnnotationMutations(caseId, sourceId);
   const normalAnn = anns.find((a) => a.annotation_type === "normal" && a.origin === "user");
   const isNormal = !!normalAnn;
 
@@ -310,6 +313,7 @@ export function EventGrid({
   caseId,
   timelineId,
   onToggleSelect,
+  onToggleSelectAll,
   expandedId,
   onExpand,
   onLoadMore,
@@ -326,7 +330,21 @@ export function EventGrid({
       {
         id: "_select",
         size: 36,
-        header: () => null,
+        header: () => {
+          const allChecked = events.length > 0 && selectedIds.size === events.length;
+          const indeterminate = selectedIds.size > 0 && selectedIds.size < events.length;
+          return (
+            <input
+              type="checkbox"
+              ref={(el) => { if (el) el.indeterminate = indeterminate; }}
+              checked={allChecked}
+              onChange={onToggleSelectAll}
+              className="h-3.5 w-3.5 cursor-pointer rounded border-[var(--color-border-strong)] accent-[var(--color-accent)]"
+              onClick={(e) => e.stopPropagation()}
+              title={allChecked ? "Deselect all" : "Select all loaded"}
+            />
+          );
+        },
         cell: ({ row }) => (
           <input
             type="checkbox"
@@ -347,7 +365,7 @@ export function EventGrid({
             eventId={row.original.event_id}
             anns={annotations.get(row.original.event_id) ?? []}
             caseId={caseId}
-            timelineId={timelineId}
+            sourceId={row.original.source_id}
           />
         ),
       },
@@ -373,13 +391,46 @@ export function EventGrid({
           </span>
         ),
       },
-      source: {
-        id: "source",
-        header: "Source",
+      artifact: {
+        id: "artifact",
+        header: "Artifact",
         size: 140,
+        cell: ({ row }) => {
+          const value = row.original.artifact || row.original.source_file || null;
+          return (
+            <span className="font-mono text-xs truncate text-[var(--color-info)]">
+              {value ?? "—"}
+            </span>
+          );
+        },
+      },
+      artifact_long: {
+        id: "artifact_long",
+        header: "Artifact Long",
+        size: 180,
         cell: ({ row }) => (
           <span className="font-mono text-xs truncate text-[var(--color-info)]">
-            {row.original.source ?? "—"}
+            {row.original.artifact_long ?? "—"}
+          </span>
+        ),
+      },
+      source_id: {
+        id: "source_id",
+        header: "Source ID",
+        size: 160,
+        cell: ({ row }) => (
+          <span className="font-mono text-xs truncate text-[var(--color-fg-secondary)]">
+            {row.original.source_id}
+          </span>
+        ),
+      },
+      timestamp_desc: {
+        id: "timestamp_desc",
+        header: "Time Desc",
+        size: 140,
+        cell: ({ row }) => (
+          <span className="text-xs truncate text-[var(--color-fg-secondary)]">
+            {row.original.timestamp_desc ?? "—"}
           </span>
         ),
       },
@@ -403,26 +454,21 @@ export function EventGrid({
           const userTags = anns.filter(
             (a) => a.annotation_type === "tag" && a.origin === "user",
           );
-          const hasTags = parserTags.length > 0 || userTags.length > 0;
           return (
-            <div className="flex flex-col justify-center gap-0.5 min-w-0 py-0.5">
-              <span className="text-xs text-[var(--color-fg-primary)] truncate leading-tight">
+            <div className="flex items-center gap-1 min-w-0">
+              <span className="text-xs text-[var(--color-fg-primary)] truncate leading-none shrink">
                 {truncate(row.original.message, 300)}
               </span>
-              {hasTags && (
-                <div className="flex flex-wrap gap-0.5">
-                  {parserTags.slice(0, 5).map((t) => (
-                    <Badge key={t} variant="muted" className="text-[11px] py-0 leading-tight">
-                      {t}
-                    </Badge>
-                  ))}
-                  {userTags.map((t) => (
-                    <Badge key={t.id} variant="accent" className="text-[11px] py-0 leading-tight">
-                      {t.content}
-                    </Badge>
-                  ))}
-                </div>
-              )}
+              {parserTags.slice(0, 3).map((t) => (
+                <Badge key={t} variant="muted" className="text-[10px] py-0 px-1 leading-none shrink-0">
+                  {t}
+                </Badge>
+              ))}
+              {userTags.map((t) => (
+                <Badge key={t.id} variant="accent" className="text-[10px] py-0 px-1 leading-none shrink-0">
+                  {t.content}
+                </Badge>
+              ))}
             </div>
           );
         },
@@ -445,9 +491,9 @@ export function EventGrid({
       },
     };
 
-    for (const colId of visibleColumns) {
-      // Retired column IDs that have been superseded
+    for (let colId of visibleColumns) {
       if (colId === "tags" || colId === "_annotations") continue;
+      colId = RETIRED_COLUMN_IDS[colId] ?? colId;
       const def = colDefs[colId];
       if (def) {
         cols.push(def);
@@ -483,7 +529,7 @@ export function EventGrid({
     });
 
     return cols;
-  }, [visibleColumns, selectedIds, annotations, expandedId, onToggleSelect, caseId, timelineId, sortDir, onSortToggle]);
+  }, [visibleColumns, selectedIds, annotations, expandedId, onToggleSelect, onToggleSelectAll, events, caseId, timelineId, sortDir, onSortToggle]);
 
   const table = useReactTable({
     data: events,
@@ -520,7 +566,7 @@ export function EventGrid({
           hg.headers.map((h) => (
             <div
               key={h.id}
-              className="px-2.5 py-2 text-[11px] font-semibold uppercase tracking-wider text-[var(--color-fg-secondary)] select-none"
+              className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--color-fg-secondary)] select-none"
               style={{
                 width: h.column.id === "message" ? undefined : h.getSize(),
                 flex: h.column.id === "message" ? "1 1 0" : undefined,
@@ -579,7 +625,7 @@ export function EventGrid({
                 {row.getVisibleCells().map((cell) => (
                   <div
                     key={cell.id}
-                    className="px-2.5 truncate"
+                    className="px-2 truncate"
                     style={{
                       width:
                         cell.column.id === "message"

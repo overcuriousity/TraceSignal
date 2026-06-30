@@ -33,9 +33,33 @@ interface UiState {
 
 export const DEFAULT_COLUMNS = [
   "timestamp",
-  "source",
+  "artifact",
   "message",
 ];
+
+export const RETIRED_COLUMN_IDS: Record<string, string> = {
+  source: "artifact",
+  source_long: "artifact_long",
+};
+
+const KNOWN_COLUMN_IDS = new Set([
+  ...DEFAULT_COLUMNS,
+  "source_id",
+  "artifact_long",
+  "timestamp_desc",
+  "display_name",
+  "tags",
+  "_annotations",
+]);
+
+function migrateColumns(cols: string[] | undefined): string[] {
+  if (!Array.isArray(cols)) return [...DEFAULT_COLUMNS];
+  const mapped = cols
+    .map((id) => RETIRED_COLUMN_IDS[id] || id)
+    .filter((id) => KNOWN_COLUMN_IDS.has(id) || !id.startsWith("_"));
+  const deduped = [...new Set(mapped)];
+  return deduped.length > 0 ? deduped : [...DEFAULT_COLUMNS];
+}
 
 export const useUiStore = create<UiState>()(
   persist(
@@ -61,6 +85,20 @@ export const useUiStore = create<UiState>()(
       detailPanelWidth: 384,
       setDetailPanelWidth: (w) => set({ detailPanelWidth: w }),
     }),
-    { name: "tv-ui" },
+    {
+      name: "tv-ui",
+      version: 1,
+      migrate: (persistedState, version) => {
+        const state = persistedState as UiState;
+        if (version < 1) {
+          const migrated: Record<string, string[]> = {};
+          for (const [key, cols] of Object.entries(state.visibleColumnsByTimeline || {})) {
+            migrated[key] = migrateColumns(cols);
+          }
+          state.visibleColumnsByTimeline = migrated;
+        }
+        return state;
+      },
+    },
   ),
 );

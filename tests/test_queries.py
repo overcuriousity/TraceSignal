@@ -27,7 +27,7 @@ class FakeClickHouseClient:
         self.event_columns = [
             "event_id",
             "case_id",
-            "timeline_id",
+            "source_id",
             "source_file",
             "byte_offset",
             "line_number",
@@ -39,8 +39,8 @@ class FakeClickHouseClient:
             "message",
             "timestamp",
             "timestamp_desc",
-            "source",
-            "source_long",
+            "artifact",
+            "artifact_long",
             "display_name",
             "tags",
             "attributes",
@@ -102,11 +102,19 @@ def test_basic_query_parameterizes_case_id(service: EventQueryService) -> None:
     assert params.get("p0") == "case-1"
 
 
-def test_timeline_filter_is_parameterized(service: EventQueryService) -> None:
-    service.query(EventQuery(case_id="case-1", timeline_id="tl-1"))
+def test_source_ids_filter_is_parameterized(service: EventQueryService) -> None:
+    service.query(EventQuery(case_id="case-1", source_ids=["s1", "s2"]))
     query, params = _last_query(service)
-    assert "timeline_id = {p1:String}" in query
-    assert params.get("p1") == "tl-1"
+    assert "source_id IN ({p1:String}, {p2:String})" in query
+    assert params.get("p1") == "s1"
+    assert params.get("p2") == "s2"
+
+
+def test_single_source_id_filter_is_parameterized(service: EventQueryService) -> None:
+    service.query(EventQuery(case_id="case-1", source_id="s1"))
+    query, params = _last_query(service)
+    assert "source_id = {p1:String}" in query
+    assert params.get("p1") == "s1"
 
 
 def test_text_search_uses_parameterized_like(service: EventQueryService) -> None:
@@ -116,12 +124,12 @@ def test_text_search_uses_parameterized_like(service: EventQueryService) -> None
     assert params.get("p1") == "%login%"
 
 
-def test_source_and_tag_filters_are_parameterized(
+def test_artifact_and_tag_filters_are_parameterized(
     service: EventQueryService,
 ) -> None:
-    service.query(EventQuery(case_id="case-1", source="auth", tag="success"))
+    service.query(EventQuery(case_id="case-1", artifact="auth", tag="success"))
     query, params = _last_query(service)
-    assert "source = {p1:String}" in query
+    assert "artifact = {p1:String}" in query
     assert "has(tags, {p2:String})" in query
     assert params.get("p1") == "auth"
     assert params.get("p2") == "success"
@@ -193,18 +201,18 @@ def test_combined_query_builds_single_where_clause(
     service.query(
         EventQuery(
             case_id="case-1",
-            timeline_id="tl-1",
+            source_ids=["s1"],
             q="token",
-            source="auth",
+            artifact="auth",
             field_filters={"ip_address_city": "Falkenstein"},
             field_exclusions={"status_code": "200"},
         )
     )
     count_query, count_params = _find_query(service, "SELECT count()")
     assert "case_id = {p0:String}" in count_query
-    assert "timeline_id = {p1:String}" in count_query
+    assert "source_id IN ({p1:String})" in count_query
     assert "message ILIKE {p2:String}" in count_query
-    assert "source = {p3:String}" in count_query
+    assert "artifact = {p3:String}" in count_query
     assert "attributes[{p4:String}] = {p5:String}" in count_query
     assert "attributes[{p6:String}] != {p7:String}" in count_query
     assert count_params is not None
@@ -259,9 +267,9 @@ class _BatchedFakeClient:
 
 
 _EVENT_COLUMNS = [
-    "event_id", "case_id", "timeline_id", "source_file", "byte_offset",
+    "event_id", "case_id", "source_id", "source_file", "byte_offset",
     "line_number", "content_hash", "parser_name", "parser_version", "ingest_time",
-    "message", "timestamp", "timestamp_desc", "source", "source_long",
+    "message", "timestamp", "timestamp_desc", "artifact", "artifact_long",
     "display_name", "tags", "attributes", "embedding_model", "embedding_config_hash",
     "vector_id",
 ]
@@ -305,6 +313,7 @@ def test_iter_events_yields_dicts_with_expected_keys() -> None:
     assert len(rows) == 1
     assert "event_id" in rows[0]
     assert "message" in rows[0]
+    assert "source_id" in rows[0]
 
 
 def test_iter_events_where_clause_is_parameterized() -> None:
@@ -325,7 +334,7 @@ def test_iter_events_where_clause_is_parameterized() -> None:
 def test_iter_events_applies_filters_in_where_clause() -> None:
     svc = _batched_service(batch_size=5, full_batches=0, remainder=0)
     list(svc.iter_events(
-        EventQuery(case_id="c1", source="auth", tag="malware"),
+        EventQuery(case_id="c1", artifact="auth", tag="malware"),
         batch_size=5,
     ))
     select_queries = [
@@ -334,7 +343,7 @@ def test_iter_events_applies_filters_in_where_clause() -> None:
     ]
     assert select_queries
     sql, params = select_queries[0]
-    assert "source = {p1:String}" in sql
+    assert "artifact = {p1:String}" in sql
     assert "has(tags, {p2:String})" in sql
     assert params is not None
     assert params.get("p1") == "auth"
@@ -403,26 +412,26 @@ def _fields_service(keys: list[str]) -> EventQueryService:
 
 def test_list_fields_returns_sorted_attribute_keys() -> None:
     svc = _fields_service(["zebra", "alpha", "middle"])
-    result = svc.list_fields("c1", "tl1")
+    result = svc.list_fields("c1", ["s1"])
     assert result["attributes"] == ["alpha", "middle", "zebra"]
 
 
 def test_list_fields_returns_top_level_columns() -> None:
     from tracevector.db.queries import TOP_LEVEL_DISPLAY_COLUMNS
     svc = _fields_service([])
-    result = svc.list_fields("c1", "tl1")
+    result = svc.list_fields("c1", ["s1"])
     assert result["top_level"] == TOP_LEVEL_DISPLAY_COLUMNS
 
 
 def test_list_fields_empty_dataset() -> None:
     svc = _fields_service([])
-    result = svc.list_fields("c1", "tl1")
+    result = svc.list_fields("c1", ["s1"])
     assert result["attributes"] == []
 
 
 # ── histogram tests ────────────────────────────────────────────────────────────
 
-from datetime import UTC, timedelta  # noqa: E402 (already imported at top, repeated for clarity)
+from datetime import timedelta  # noqa: E402 (already imported at top, repeated for clarity)
 
 
 class _HistogramFakeClient:
@@ -469,7 +478,7 @@ def test_histogram_returns_bucket_count() -> None:
         [min_ts + timedelta(hours=16), 5],
     ]
     svc = _histogram_service(min_ts, max_ts, bucket_rows)
-    result = svc.histogram(EventQuery(case_id="c1", timeline_id="tl1"), buckets=60)
+    result = svc.histogram(EventQuery(case_id="c1", source_ids=["s1"]), buckets=60)
     assert result["interval_seconds"] > 0
     assert len(result["buckets"]) == 3
     assert result["buckets"][1]["count"] == 20
@@ -480,7 +489,7 @@ def test_histogram_respects_explicit_time_range() -> None:
     min_ts = datetime(2024, 3, 1, tzinfo=UTC)
     max_ts = datetime(2024, 3, 2, tzinfo=UTC)
     svc = _histogram_service(min_ts, max_ts, [[min_ts, 7]])
-    eq = EventQuery(case_id="c1", timeline_id="tl1", start=min_ts, end=max_ts)
+    eq = EventQuery(case_id="c1", source_ids=["s1"], start=min_ts, end=max_ts)
     result = svc.histogram(eq, buckets=60)
     # No min/max range query should have been issued
     range_queries = [q for q, _ in svc.store.client.queries if "min(timestamp)" in q]  # type: ignore[union-attr]
@@ -503,6 +512,6 @@ def test_histogram_empty_dataset_returns_empty_buckets() -> None:
 
     store.client = _EmptyClient()  # type: ignore[assignment]
     svc = EventQueryService(store=store)
-    result = svc.histogram(EventQuery(case_id="c1", timeline_id="tl1"))
+    result = svc.histogram(EventQuery(case_id="c1", source_ids=["s1"]))
     assert result["buckets"] == []
     assert result["min"] is None

@@ -7,7 +7,8 @@ export function truncateHash(value: string | null | undefined, len = 12): string
 }
 
 /** Format a byte size as a human-readable string. */
-export function fmtBytes(bytes: number): string {
+export function fmtBytes(bytes: number | null | undefined): string {
+  if (bytes == null) return "—";
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
   if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
@@ -15,12 +16,14 @@ export function fmtBytes(bytes: number): string {
 }
 
 /** Format a number with thousands separators. */
-export function fmtNum(n: number): string {
+export function fmtNum(n: number | null | undefined): string {
+  if (n == null) return "—";
   return n.toLocaleString();
 }
 
 /** Format a percentage to 1 decimal. */
-export function fmtPct(ratio: number): string {
+export function fmtPct(ratio: number | null | undefined): string {
+  if (ratio == null) return "—";
   return `${(ratio * 100).toFixed(1)}%`;
 }
 
@@ -37,6 +40,7 @@ export function fmtParserName(name: string | null | undefined): string {
 }
 
 /** Format a cosine distance score to 4 decimal places. */
-export function fmtScore(score: number): string {
+export function fmtScore(score: number | null | undefined): string {
+  if (score == null) return "—";
   return score.toFixed(4);
 }

@@ -14,7 +14,7 @@
 | **Web backend** | FastAPI + Uvicorn | Async API server; same stack as ScalarForensic web UI |
 | **CLI ingestion** | Typer + Python stdlib | `tv ingest ...` command, streaming parser |
 | **Frontend** | TBD — redesign in progress | Served separately; API-first backend |
-| **Metadata store** | PostgreSQL | Cases, timelines, users, views, annotations |
+| **Metadata store** | PostgreSQL | Cases, sources, timelines, timeline-source membership, views, annotations, users |
 | **Event store** | ClickHouse | Columnar log store for 80 GiB+ filtering and aggregation |
 | **Vector store** | Qdrant | Embeddings + neighbor search; local disk mode supported |
 | **Embedding runtime** | sentence-transformers + ONNX Runtime | Local inference, CPU-friendly, optional GPU |
@@ -51,7 +51,7 @@ The frontend is being redesigned from scratch. The backend exposes a complete RE
 - Already proven in ScalarForensic for forensic vector search.
 - Runs as an external service; also supports a local/embedded mode via the Python client for single-user deployments.
 - Airgapped operation and efficient neighbor search.
-- One collection per case keeps isolation simple; one collection per timeline is also possible if cases grow very large.
+- One collection per `(case_id, embedding_config_hash)` keeps isolation simple; source-level filtering is done via Qdrant payload filters on `source_id`. A case can have multiple collections if different embedding models or field selections are used.
 
 ### 3.6 Embedding Runtime — sentence-transformers + ONNX
 - sentence-transformers provides a broad set of ready-to-use local models (e.g. `all-MiniLM-L6-v2`) that give a strong baseline for log-line similarity.
@@ -118,11 +118,20 @@ For a lone analyst on one machine, Qdrant can run in **local mode** through the 
 
 ## 8. Open Implementation Decisions
 
-1. Exact default embedding model and vector dimension.
-2. ClickHouse table schema and materialized views for common filters.
-3. Authentication backend: local users vs. OIDC.
-4. Frontend tech stack and whether to serve it from Uvicorn directly or via an Nginx sidecar.
+1. ✅ Exact default embedding model and vector dimension — default is `all-MiniLM-L6-v2` (384-dim), swappable via config.
+2. ✅ ClickHouse table schema — implemented; `events` table uses `tokenbf_v1` for full-text and is partitioned by `(case_id, source_id)`.
+3. ⬜ Authentication backend: local users vs. OIDC.
+4. ⬜ Frontend tech stack and whether to serve it from Uvicorn directly or via an Nginx sidecar.
 
-## 9. Next Step
+## 9. Completed Steps
 
-Approve this tech stack and move to implementation: start with the project skeleton (uv, FastAPI, Docker Compose) and the ingestion CLI prototype. Frontend tech stack to be decided separately.
+- ✅ Tech stack approved and recorded.
+- ✅ Project skeleton (`uv`, FastAPI, Docker Compose reference) implemented.
+- ✅ Ingestion CLI prototype implemented and refactored to the Source/Timeline model.
+- ✅ Backend API complete for the current MVP scope.
+
+## 10. Next Steps
+
+1. ⬜ Implement authentication (local or OIDC).
+2. ⬜ Implement strict offline-mode enforcement.
+3. ⬜ Decide on and build the new frontend stack.

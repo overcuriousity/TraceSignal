@@ -3,7 +3,7 @@ import type { EventFilters } from "@/api/types";
 
 interface Props {
   filters: EventFilters;
-  onRemove: (key: keyof EventFilters | string, fieldKey?: string) => void;
+  onRemove: (key: keyof EventFilters | string, fieldKey?: string, value?: string) => void;
 }
 
 interface Chip {
@@ -23,11 +23,18 @@ export function FilterChips({ filters, onRemove }: Props) {
       onRemove: () => onRemove("q"),
       variant: "neutral",
     });
-  if (filters.source)
+  if (filters.artifact)
     chips.push({
-      label: "source",
-      value: filters.source,
-      onRemove: () => onRemove("source"),
+      label: "artifact",
+      value: filters.artifact,
+      onRemove: () => onRemove("artifact"),
+      variant: "include",
+    });
+  if (filters.sourceId)
+    chips.push({
+      label: "sourceId",
+      value: filters.sourceId,
+      onRemove: () => onRemove("sourceId"),
       variant: "include",
     });
   if (filters.tag)
@@ -60,13 +67,15 @@ export function FilterChips({ filters, onRemove }: Props) {
       variant: "include",
     });
   }
-  for (const [k, v] of Object.entries(filters.exclusions ?? {})) {
-    chips.push({
-      label: `!${k}`,
-      value: v,
-      onRemove: () => onRemove("exclusions", k),
-      variant: "exclude",
-    });
+  for (const [k, vs] of Object.entries(filters.exclusions ?? {})) {
+    for (const v of vs) {
+      chips.push({
+        label: `!${k}`,
+        value: v,
+        onRemove: () => onRemove("exclusions", k, v),
+        variant: "exclude",
+      });
+    }
   }
 
   if (chips.length === 0) return null;

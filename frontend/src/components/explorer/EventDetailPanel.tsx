@@ -9,17 +9,20 @@ import { truncateHash } from "@/lib/format";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { useAnnotationMutations } from "@/hooks/useAnnotationMutations";
 import { useUiStore } from "@/stores/ui";
+import { TagInput } from "@/components/explorer/TagInput";
 import type { Event, Annotation } from "@/api/types";
 
 interface Props {
   event: Event;
   annotations: Annotation[];
   caseId: string;
-  timelineId: string;
+  sourceId: string;
   onClose: () => void;
   onFindSimilar: (event: Event) => void;
   /** Called when the user clicks filter-in or filter-out on a field row. */
   onAddFilter: (fieldKey: string, value: string, include: boolean) => void;
+  /** Existing annotation-tag labels for autocomplete. */
+  tagSuggestions?: string[];
 }
 
 function CopyButton({ value }: { value: string }) {
@@ -151,37 +154,56 @@ function AddAnnotationForm({
   onSubmit,
   onCancel,
   isPending,
+  suggestions = [],
 }: {
   type: "tag" | "comment";
   onSubmit: (content: string) => void;
   onCancel: () => void;
   isPending: boolean;
+  suggestions?: string[];
 }) {
   const [value, setValue] = useState("");
   return (
     <div className="flex items-center gap-1.5 mt-2">
-      <Input
-        autoFocus
-        placeholder={type === "tag" ? "tag label…" : "your comment…"}
-        value={value}
-        onChange={(e) => setValue(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" && value.trim()) onSubmit(value.trim());
-          if (e.key === "Escape") onCancel();
-        }}
-        className="flex-1 h-7 text-xs"
-      />
-      <Button
-        variant="accent"
-        size="sm"
-        disabled={!value.trim() || isPending}
-        onClick={() => value.trim() && onSubmit(value.trim())}
-      >
-        {isPending ? <Spinner size={12} /> : "Add"}
-      </Button>
-      <Button variant="ghost" size="sm" onClick={onCancel}>
-        Cancel
-      </Button>
+      {type === "tag" ? (
+        <TagInput
+          autoFocus
+          value={value}
+          onChange={setValue}
+          onSubmit={onSubmit}
+          onCancel={onCancel}
+          suggestions={suggestions}
+          isPending={isPending}
+          className="flex-1"
+        />
+      ) : (
+        <Input
+          autoFocus
+          placeholder="your comment…"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && value.trim()) onSubmit(value.trim());
+            if (e.key === "Escape") onCancel();
+          }}
+          className="flex-1 h-7 text-xs"
+        />
+      )}
+      {type === "comment" && (
+        <>
+          <Button
+            variant="accent"
+            size="sm"
+            disabled={!value.trim() || isPending}
+            onClick={() => value.trim() && onSubmit(value.trim())}
+          >
+            {isPending ? <Spinner size={12} /> : "Add"}
+          </Button>
+          <Button variant="ghost" size="sm" onClick={onCancel}>
+            Cancel
+          </Button>
+        </>
+      )}
     </div>
   );
 }
@@ -190,13 +212,14 @@ export function EventDetailPanel({
   event,
   annotations,
   caseId,
-  timelineId,
+  sourceId,
   onClose,
   onFindSimilar,
   onAddFilter,
+  tagSuggestions = [],
 }: Props) {
   const [addMode, setAddMode] = useState<"tag" | "comment" | null>(null);
-  const { add, remove } = useAnnotationMutations(caseId, timelineId);
+  const { add, remove } = useAnnotationMutations(caseId, sourceId);
 
   // ── Resize drag ────────────────────────────────────────────────────────
   const { detailPanelWidth, setDetailPanelWidth } = useUiStore();
@@ -248,7 +271,7 @@ export function EventDetailPanel({
         style={{ marginLeft: -2 }}
       />
       {/* Header */}
-      <div className="flex items-center gap-2 border-b border-[var(--color-border)] px-4 py-3">
+      <div className="flex items-center gap-2 border-b border-[var(--color-border)] px-3 py-2">
         <h3 className="flex-1 text-sm font-semibold text-[var(--color-fg-primary)]">
           Event Detail
         </h3>
@@ -262,7 +285,7 @@ export function EventDetailPanel({
         </Button>
       </div>
 
-      <div className="flex-1 overflow-y-auto px-4 py-3">
+      <div className="flex-1 overflow-y-auto px-3 py-2">
         {/* Message — filterable on click */}
         <div className="mb-3 rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3">
           <div className="flex items-center justify-between mb-1">
@@ -310,23 +333,23 @@ export function EventDetailPanel({
           />
         </div>
 
-        {/* Source */}
+        {/* Artifact */}
         <div className="mb-3">
           <p className="mb-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-            Source
+            Artifact
           </p>
           <FieldRow
-            label="source"
-            value={event.source}
+            label="artifact"
+            value={event.artifact}
             mono
-            filterKey="source"
+            filterKey="artifact"
             onAddFilter={onAddFilter}
           />
           <FieldRow
-            label="source_long"
-            value={event.source_long}
+            label="artifact_long"
+            value={event.artifact_long}
             mono
-            filterKey="source_long"
+            filterKey="artifact_long"
             onAddFilter={onAddFilter}
           />
           <FieldRow
@@ -448,6 +471,7 @@ export function EventDetailPanel({
               onSubmit={handleAdd}
               onCancel={() => setAddMode(null)}
               isPending={add.isPending}
+              suggestions={tagSuggestions}
             />
           ) : (
             <div className="flex flex-wrap gap-1.5 mt-2">
@@ -485,9 +509,16 @@ export function EventDetailPanel({
             Provenance
           </p>
           <FieldRow label="event_id" value={event.event_id} mono filterKey={null} />
+          <FieldRow label="source_id" value={event.source_id} mono filterKey={null} />
           <FieldRow
             label="content_hash"
             value={truncateHash(event.content_hash, 24)}
+            mono
+            filterKey={null}
+          />
+          <FieldRow
+            label="file_hash"
+            value={truncateHash(event.file_hash, 24)}
             mono
             filterKey={null}
           />

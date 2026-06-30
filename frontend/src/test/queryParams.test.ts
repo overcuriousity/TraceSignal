@@ -17,7 +17,7 @@ describe("filtersToParams / paramsToFilters round-trip", () => {
   it("round-trips simple scalar filters", () => {
     const f: EventFilters = {
       q: "powershell",
-      source: "WinEvtx",
+      artifact: "WinEvtx",
       tag: "suspicious",
       start: "2024-01-01T00:00:00.000Z",
       end: "2024-01-31T23:59:59.000Z",
@@ -25,7 +25,7 @@ describe("filtersToParams / paramsToFilters round-trip", () => {
     const p = filtersToParams(f);
     const out = paramsToFilters(p);
     expect(out.q).toBe("powershell");
-    expect(out.source).toBe("WinEvtx");
+    expect(out.artifact).toBe("WinEvtx");
     expect(out.tag).toBe("suspicious");
     expect(out.start).toBe("2024-01-01T00:00:00.000Z");
     expect(out.end).toBe("2024-01-31T23:59:59.000Z");
@@ -34,18 +34,18 @@ describe("filtersToParams / paramsToFilters round-trip", () => {
   it("round-trips field include/exclude filters", () => {
     const f: EventFilters = {
       filters: { ip_address_city: "Falkenstein", status_code: "200" },
-      exclusions: { user_agent: "bot" },
+      exclusions: { user_agent: ["bot"] },
     };
     const p = filtersToParams(f);
     const out = paramsToFilters(p);
     expect(out.filters).toEqual({ ip_address_city: "Falkenstein", status_code: "200" });
-    expect(out.exclusions).toEqual({ user_agent: "bot" });
+    expect(out.exclusions).toEqual({ user_agent: ["bot"] });
   });
 
   it("omits undefined fields from params", () => {
     const f: EventFilters = { q: "test" };
     const p = filtersToParams(f);
-    expect(p.has("source")).toBe(false);
+    expect(p.has("artifact")).toBe(false);
     expect(p.has("tag")).toBe(false);
     expect(p.has("filters")).toBe(false);
   });
@@ -56,13 +56,13 @@ describe("filtersToViewPayload / viewPayloadToFilters round-trip", () => {
     const f: EventFilters = {
       q: "mimikatz",
       filters: { event_id: "4624" },
-      exclusions: { status: "ok" },
+      exclusions: { status: ["ok"] },
     };
     const payload = filtersToViewPayload(f);
     const out = viewPayloadToFilters(payload);
     expect(out.q).toBe("mimikatz");
     expect(out.filters).toEqual({ event_id: "4624" });
-    expect(out.exclusions).toEqual({ status: "ok" });
+    expect(out.exclusions).toEqual({ status: ["ok"] });
   });
 
   it("handles empty filters gracefully", () => {

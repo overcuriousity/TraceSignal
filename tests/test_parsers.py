@@ -42,25 +42,27 @@ def test_detect_format(tmp_path: Path) -> None:
 
 def test_get_parser_unsupported() -> None:
     with pytest.raises(ValueError, match="Unsupported parser format"):
-        get_parser("unknown", "case1", "timeline1")
+        get_parser("unknown", "case1", "source1", file_hash="h")
 
 
 def test_csv_parser_maps_common_fields(timesketch_csv: Path) -> None:
     config = ParserConfig(name="timesketch_csv", version="0.1.0")
-    parser = TimesketchCsvParser("case1", "timeline1", config)
+    parser = TimesketchCsvParser(
+        "case1", "source1", config, file_hash="hash1", source_name="source.csv"
+    )
     events = list(parser.parse(timesketch_csv))
 
     assert len(events) == 2
     first, second = events
 
     assert first.case_id == "case1"
-    assert first.timeline_id == "timeline1"
+    assert first.source_id == "source1"
     assert first.parser_name == "timesketch_csv"
     assert first.parser_version == "0.1.0"
     assert first.timestamp == "2024-01-01T00:00:00+00:00"
     assert first.timestamp_desc == "Creation Time"
-    assert first.source == "LOG"
-    assert first.source_long == "Syslog"
+    assert first.artifact == "LOG"
+    assert first.artifact_long == "Syslog"
     assert first.message == "User login"
     assert first.display_name == "auth.log"
     assert first.tags == ["login", "success"]
@@ -73,7 +75,9 @@ def test_csv_parser_maps_common_fields(timesketch_csv: Path) -> None:
 
 def test_csv_parser_content_hash_is_raw_line(timesketch_csv: Path) -> None:
     config = ParserConfig(name="timesketch_csv", version="0.1.0")
-    parser = TimesketchCsvParser("case1", "timeline1", config)
+    parser = TimesketchCsvParser(
+        "case1", "source1", config, file_hash="hash1", source_name="source.csv"
+    )
     events = list(parser.parse(timesketch_csv))
 
     raw_lines = timesketch_csv.read_text().splitlines(keepends=True)[1:]
@@ -84,7 +88,9 @@ def test_csv_parser_content_hash_is_raw_line(timesketch_csv: Path) -> None:
 
 def test_csv_parser_event_id_is_deterministic(timesketch_csv: Path) -> None:
     config = ParserConfig(name="timesketch_csv", version="0.1.0")
-    parser = TimesketchCsvParser("case1", "timeline1", config)
+    parser = TimesketchCsvParser(
+        "case1", "source1", config, file_hash="hash1", source_name="source.csv"
+    )
     first_run = [e.event_id for e in parser.parse(timesketch_csv)]
     second_run = [e.event_id for e in parser.parse(timesketch_csv)]
     assert first_run == second_run
@@ -100,10 +106,10 @@ def test_event_id_uses_file_hash_not_path(tmp_path: Path) -> None:
 
     config = ParserConfig(name="timesketch_csv", version="0.1.0")
     parser_a = TimesketchCsvParser(
-        "case1", "timeline1", config, file_hash="same_hash", source_name="source.csv"
+        "case1", "source1", config, file_hash="same_hash", source_name="source.csv"
     )
     parser_b = TimesketchCsvParser(
-        "case1", "timeline1", config, file_hash="same_hash", source_name="source.csv"
+        "case1", "source1", config, file_hash="same_hash", source_name="source.csv"
     )
     ids_a = [e.event_id for e in parser_a.parse(path_a)]
     ids_b = [e.event_id for e in parser_b.parse(path_b)]
@@ -115,10 +121,10 @@ def test_event_id_uses_file_hash_not_path(tmp_path: Path) -> None:
 def test_different_file_hash_produces_different_event_ids(timesketch_csv: Path) -> None:
     config = ParserConfig(name="timesketch_csv", version="0.1.0")
     parser_a = TimesketchCsvParser(
-        "case1", "timeline1", config, file_hash="hash_a", source_name="a.csv"
+        "case1", "source1", config, file_hash="hash_a", source_name="a.csv"
     )
     parser_b = TimesketchCsvParser(
-        "case1", "timeline1", config, file_hash="hash_b", source_name="b.csv"
+        "case1", "source1", config, file_hash="hash_b", source_name="b.csv"
     )
     ids_a = [e.event_id for e in parser_a.parse(timesketch_csv)]
     ids_b = [e.event_id for e in parser_b.parse(timesketch_csv)]
@@ -129,7 +135,9 @@ def test_csv_parser_preserves_unknown_columns(timesketch_csv: Path, tmp_path: Pa
     path = tmp_path / "extra.csv"
     path.write_text("datetime,message,unknown_column\n2024-01-01T00:00:00+00:00,Hello,world\n")
     config = ParserConfig(name="timesketch_csv", version="0.1.0")
-    parser = TimesketchCsvParser("case1", "timeline1", config)
+    parser = TimesketchCsvParser(
+        "case1", "source1", config, file_hash="hash1", source_name="source.csv"
+    )
     events = list(parser.parse(path))
     assert len(events) == 1
     assert events[0].attributes == {"unknown_column": "world"}
@@ -137,7 +145,9 @@ def test_csv_parser_preserves_unknown_columns(timesketch_csv: Path, tmp_path: Pa
 
 def test_jsonl_parser_maps_common_fields(jsonl_file: Path) -> None:
     config = ParserConfig(name="jsonl", version="0.1.0")
-    parser = JsonlParser("case1", "timeline1", config)
+    parser = JsonlParser(
+        "case1", "source1", config, file_hash="hash1", source_name="source.jsonl"
+    )
     events = list(parser.parse(jsonl_file))
 
     assert len(events) == 2
@@ -158,19 +168,28 @@ def test_jsonl_parser_skips_malformed_lines(tmp_path: Path) -> None:
     path = tmp_path / "bad.jsonl"
     path.write_text('{"message":"good"}\nthis is not json\n{"message":"also good"}\n')
     config = ParserConfig(name="jsonl", version="0.1.0")
-    parser = JsonlParser("case1", "timeline1", config)
+    parser = JsonlParser(
+        "case1", "source1", config, file_hash="hash1", source_name="source.jsonl"
+    )
     events = list(parser.parse(path))
     assert len(events) == 2
     assert events[0].message == "good"
     assert events[1].message == "also good"
 
 
-def test_event_text_for_embedding() -> None:
-    from tracevector.models.event import Event
+def test_missing_file_hash_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "x.csv"
+    path.write_text("datetime,message\n2024-01-01T00:00:00+00:00,Hello\n")
+    config = ParserConfig(name="timesketch_csv", version="0.1.0")
+    parser = TimesketchCsvParser("case1", "source1", config)
+    with pytest.raises(ValueError, match="real file hash"):
+        next(parser.parse(path))
 
+
+def test_event_text_for_embedding() -> None:
     event = Event(
         case_id="c",
-        timeline_id="t",
+        source_id="s",
         source_file=Path("/tmp/test.log"),
         byte_offset=0,
         content_hash="abc",
@@ -180,28 +199,29 @@ def test_event_text_for_embedding() -> None:
         message="User login",
         timestamp="2024-01-01T00:00:00+00:00",
         timestamp_desc="created",
-        source="auth",
+        artifact="auth",
         tags=["login"],
         attributes={"ip": "10.0.0.1"},
     )
     text = event.text_for_embedding()
     assert "User login" in text
-    assert "source=auth" in text
+    assert "artifact=auth" in text
     assert "tags=login" in text
     assert "ip=10.0.0.1" in text
 
 
 def test_parse_timestamp_normalizes_common_formats() -> None:
-    from datetime import datetime
-
     from tracevector.models.event import _parse_timestamp
 
     assert _parse_timestamp("2024-01-01T00:00:00+00:00") == datetime(
         2024, 1, 1, 0, 0, 0, tzinfo=UTC
     )
-    assert _parse_timestamp("2024-01-01 00:00:00") == datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+    with pytest.warns(UserWarning, match="Naive timestamp"):
+        assert _parse_timestamp("2024-01-01 00:00:00") == datetime(
+            2024, 1, 1, 0, 0, 0, tzinfo=UTC
+        )
     assert _parse_timestamp("1704067200") == datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
-    assert _parse_timestamp("1704067200000") == datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
+    assert _parse_timestamp("1704067200000") == datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
     assert _parse_timestamp("1764367341913908") == datetime(
         2025, 11, 28, 22, 2, 21, 913908, tzinfo=UTC
     )
@@ -213,7 +233,7 @@ def test_parse_timestamp_normalizes_common_formats() -> None:
 def test_event_to_clickhouse_row_parses_timestamp() -> None:
     event = Event(
         case_id="c",
-        timeline_id="t",
+        source_id="s",
         source_file=Path("/tmp/test.log"),
         byte_offset=0,
         content_hash="abc",
@@ -230,7 +250,7 @@ def test_event_to_clickhouse_row_parses_timestamp() -> None:
 def test_event_to_clickhouse_row_null_for_bad_timestamp() -> None:
     event = Event(
         case_id="c",
-        timeline_id="t",
+        source_id="s",
         source_file=Path("/tmp/test.log"),
         byte_offset=0,
         content_hash="abc",

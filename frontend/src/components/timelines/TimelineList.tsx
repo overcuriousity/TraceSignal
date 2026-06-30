@@ -1,19 +1,42 @@
 import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { Clock, Database, Cpu } from "lucide-react";
+import { Clock, Cpu } from "lucide-react";
 import { timelinesApi } from "@/api/timelines";
 import { fmtRelative } from "@/lib/time";
-import { fmtNum, fmtParserName } from "@/lib/format";
 import { Badge } from "@/components/ui/Badge";
 import { Spinner } from "@/components/ui/Spinner";
 import { CreateTimelineDialog } from "./CreateTimelineDialog";
 import { DeleteTimelineDialog } from "./DeleteTimelineDialog";
-import { UploadDialog } from "./UploadDialog";
 import { EmbedWizard } from "./EmbedWizard";
 import type { Timeline } from "@/api/types";
 
 interface Props {
   caseId: string;
+}
+
+function EmbeddingBadge({ tl }: { tl: Timeline }) {
+  if (!tl.is_embedded) {
+    return (
+      <Badge variant="muted" className="flex items-center gap-1">
+        <Cpu size={9} /> Not embedded
+      </Badge>
+    );
+  }
+  if (tl.is_stale) {
+    return (
+      <Badge
+        variant="muted"
+        className="flex items-center gap-1 border-[var(--color-warning)]/40 text-[var(--color-warning)]"
+      >
+        <Cpu size={9} /> Stale
+      </Badge>
+    );
+  }
+  return (
+    <Badge variant="accent" className="flex items-center gap-1">
+      <Cpu size={9} /> Embedded
+    </Badge>
+  );
 }
 
 function TimelineRow({ caseId, tl }: { caseId: string; tl: Timeline }) {
@@ -28,34 +51,27 @@ function TimelineRow({ caseId, tl }: { caseId: string; tl: Timeline }) {
           <span className="font-medium text-[var(--color-fg-primary)] truncate">
             {tl.name}
           </span>
-          {tl.parser && (
-            <Badge variant="muted">{fmtParserName(tl.parser)}</Badge>
-          )}
+          {tl.is_default && <Badge variant="accent">default</Badge>}
+          <EmbeddingBadge tl={tl} />
         </div>
         <div className="mt-1 flex items-center gap-3 text-xs text-[var(--color-fg-muted)]">
-          <span className="flex items-center gap-1">
-            <Database size={11} /> {fmtNum(tl.event_count)} events
-          </span>
-          {tl.vector_count > 0 && (
-            <span className="flex items-center gap-1">
-              <Cpu size={11} /> {fmtNum(tl.vector_count)} vectors
+          <span>{tl.source_ids.length} source{tl.source_ids.length !== 1 ? "s" : ""}</span>
+          {tl.is_stale && (
+            <span className="text-[var(--color-warning)]">
+              Sources changed — re-embed to update analysis
             </span>
+          )}
+          {!tl.is_stale && tl.embedded_at && (
+            <span>Embedded {fmtRelative(tl.embedded_at)}</span>
           )}
           <span>Updated {fmtRelative(tl.updated_at)}</span>
         </div>
       </Link>
       <div className="flex items-center gap-2 shrink-0">
-        <UploadDialog
-          caseId={caseId}
-          timelineId={tl.id}
-          timelineName={tl.name}
-        />
-        <EmbedWizard
-          caseId={caseId}
-          timelineId={tl.id}
-          timeline={tl}
-        />
-        <DeleteTimelineDialog caseId={caseId} timeline={tl} />
+        {tl.source_ids.length > 0 && (
+          <EmbedWizard caseId={caseId} timeline={tl} />
+        )}
+        {!tl.is_default && <DeleteTimelineDialog caseId={caseId} timeline={tl} />}
       </div>
     </div>
   );
@@ -88,7 +104,7 @@ export function TimelineList({ caseId }: Props) {
       )}
       {timelines && timelines.length === 0 && (
         <p className="py-8 text-center text-sm text-[var(--color-fg-muted)]">
-          No timelines yet. Create one and upload a log file.
+          No timelines yet. Create one to group sources.
         </p>
       )}
       {timelines && (

@@ -1,28 +1,44 @@
-import { Cpu } from "lucide-react";
+import { Cpu, AlertTriangle } from "lucide-react";
 import { EmbedWizard } from "@/components/timelines/EmbedWizard";
 import type { Timeline } from "@/api/types";
 
 interface Props {
   status: "ok" | "not_embedded";
-  /** Pass timeline so the wizard can pre-populate and show model info. */
-  timeline: Timeline;
+  /** The timeline, used to launch the embedding wizard. */
+  timeline: Timeline | null;
+  caseId: string;
 }
 
-export function EmbeddingStatusBanner({ status, timeline }: Props) {
-  if (status === "ok") return null;
+export function EmbeddingStatusBanner({ status, timeline, caseId }: Props) {
+  if (!timeline) return null;
 
-  return (
-    <div className="flex items-center gap-3 rounded border border-[var(--color-warning)]/30 bg-[var(--color-warning)]/10 px-3 py-2.5 text-xs">
-      <Cpu size={14} className="text-[var(--color-warning)] shrink-0" />
-      <p className="flex-1 text-[var(--color-fg-secondary)]">
-        No embeddings found. Generate embeddings to enable similarity search and
-        anomaly detection.
-      </p>
-      <EmbedWizard
-        caseId={timeline.case_id}
-        timelineId={timeline.id}
-        timeline={timeline}
-      />
-    </div>
-  );
+  // Stale: embedded but source set has changed.
+  if (timeline.is_stale) {
+    return (
+      <div className="flex items-center gap-3 rounded border border-[var(--color-warning)]/30 bg-[var(--color-warning)]/10 px-3 py-2.5 text-xs">
+        <AlertTriangle size={14} className="text-[var(--color-warning)] shrink-0" />
+        <p className="flex-1 text-[var(--color-fg-secondary)]">
+          Sources have changed since the last embedding run — similarity and
+          anomaly results may be incomplete. Re-embed to include all sources.
+        </p>
+        <EmbedWizard caseId={caseId} timeline={timeline} />
+      </div>
+    );
+  }
+
+  // Not embedded at all.
+  if (status === "not_embedded") {
+    return (
+      <div className="flex items-center gap-3 rounded border border-[var(--color-warning)]/30 bg-[var(--color-warning)]/10 px-3 py-2.5 text-xs">
+        <Cpu size={14} className="text-[var(--color-warning)] shrink-0" />
+        <p className="flex-1 text-[var(--color-fg-secondary)]">
+          No embeddings found for this timeline. Generate embeddings to enable
+          similarity search and anomaly detection.
+        </p>
+        <EmbedWizard caseId={caseId} timeline={timeline} />
+      </div>
+    );
+  }
+
+  return null;
 }
