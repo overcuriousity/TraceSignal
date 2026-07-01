@@ -29,7 +29,7 @@ import { Spinner } from "@/components/ui/Spinner";
 import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/Popover";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { useAnnotationMutations } from "@/hooks/useAnnotationMutations";
-import { RETIRED_COLUMN_IDS } from "@/stores/ui";
+import { RETIRED_COLUMN_IDS, useUiStore } from "@/stores/ui";
 import { cn } from "@/lib/cn";
 
 const ROW_HEIGHT = 34; // px — compact forensic density (chips inline with message)
@@ -363,6 +363,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
       {
         id: "_select",
         size: 36,
+        enableResizing: false,
         header: () => {
           const allChecked = events.length > 0 && selectedIds.size === events.length;
           const indeterminate = selectedIds.size > 0 && selectedIds.size < events.length;
@@ -392,6 +393,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
       {
         id: "_annotations",
         size: 88,
+        enableResizing: false,
         header: () => null,
         cell: ({ row }) => (
           <AnnotationCell
@@ -419,6 +421,8 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
           </button>
         ),
         size: 170,
+        minSize: 60,
+        maxSize: 600,
         cell: ({ row }) => (
           <span className="font-mono text-xs text-[var(--color-fg-secondary)]">
             {fmtTimestamp(row.original.timestamp)}
@@ -429,6 +433,8 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
         id: "artifact",
         header: "Artifact",
         size: 140,
+        minSize: 60,
+        maxSize: 600,
         cell: ({ row }) => {
           const value = row.original.artifact || row.original.source_file || null;
           return (
@@ -442,6 +448,8 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
         id: "artifact_long",
         header: "Artifact Long",
         size: 180,
+        minSize: 60,
+        maxSize: 600,
         cell: ({ row }) => (
           <span className="font-mono text-xs truncate text-[var(--color-info)]">
             {row.original.artifact_long ?? "—"}
@@ -452,6 +460,8 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
         id: "source_id",
         header: "Source ID",
         size: 160,
+        minSize: 60,
+        maxSize: 600,
         cell: ({ row }) => (
           <span className="font-mono text-xs truncate text-[var(--color-fg-secondary)]">
             {row.original.source_id}
@@ -462,6 +472,8 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
         id: "timestamp_desc",
         header: "Time Desc",
         size: 140,
+        minSize: 60,
+        maxSize: 600,
         cell: ({ row }) => (
           <span className="text-xs truncate text-[var(--color-fg-secondary)]">
             {row.original.timestamp_desc ?? "—"}
@@ -472,6 +484,8 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
         id: "display_name",
         header: "Display Name",
         size: 160,
+        minSize: 60,
+        maxSize: 600,
         cell: ({ row }) => (
           <span className="text-xs truncate text-[var(--color-fg-secondary)]">
             {row.original.display_name ?? "—"}
@@ -482,6 +496,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
         id: "message",
         header: "Message",
         size: 999, // flex
+        enableResizing: false,
         cell: ({ row }) => {
           const anns = annotations.get(row.original.event_id) ?? [];
           const parserTags = row.original.tags;
@@ -512,6 +527,8 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
         id: "tags",
         header: "Parser Tags",
         size: 120,
+        minSize: 60,
+        maxSize: 600,
         cell: ({ row }) =>
           (row.original.tags ?? []).length > 0 ? (
             <span className="flex flex-wrap gap-0.5">
@@ -537,6 +554,8 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
           id: colId,
           header: colId,
           size: 160,
+          minSize: 60,
+          maxSize: 600,
           cell: ({ row }) => (
             <span className="font-mono text-xs truncate text-[var(--color-fg-secondary)]">
               {row.original.attributes[colId] ?? "—"}
@@ -550,6 +569,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
     cols.push({
       id: "_expand",
       size: 32,
+      enableResizing: false,
       header: () => null,
       cell: ({ row }) => (
         <ChevronRight
@@ -565,11 +585,36 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
     return cols;
   }, [visibleColumns, selectedIds, annotations, expandedId, onToggleSelect, onToggleSelectAll, events, caseId, timelineId, sortDir, onSortToggle, liveAnomalies]);
 
+  const columnWidths = useUiStore((s) => s.columnWidths);
+  const setColumnWidth = useUiStore((s) => s.setColumnWidth);
+  // Seeded once from the persisted store; live-updated during drags via
+  // onColumnSizingChange, then flushed back to the store on drag-end below.
+  const [columnSizing, setColumnSizing] = useState<Record<string, number>>(
+    () => ({ ...columnWidths }),
+  );
+
   const table = useReactTable({
     data: events,
     columns,
     getCoreRowModel: getCoreRowModel(),
+    enableColumnResizing: true,
+    columnResizeMode: "onChange",
+    state: { columnSizing },
+    onColumnSizingChange: setColumnSizing,
   });
+
+  // Persist a column's width once per drag gesture (on release), not per
+  // pixel of movement, to avoid hammering localStorage during onChange.
+  const prevResizingColRef = useRef<string | false>(false);
+  const resizingColumnId = table.getState().columnSizingInfo.isResizingColumn;
+  useEffect(() => {
+    const wasResizing = prevResizingColRef.current;
+    if (wasResizing && !resizingColumnId) {
+      const finalWidth = columnSizing[wasResizing];
+      if (finalWidth != null) setColumnWidth(wasResizing, finalWidth);
+    }
+    prevResizingColRef.current = resizingColumnId;
+  }, [resizingColumnId, columnSizing, setColumnWidth]);
 
   const rows = table.getRowModel().rows;
 
@@ -687,13 +732,22 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
           hg.headers.map((h) => (
             <div
               key={h.id}
-              className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--color-fg-secondary)] select-none"
+              className="relative px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--color-fg-secondary)] select-none"
               style={{
                 width: h.column.id === "message" ? undefined : h.getSize(),
                 flex: h.column.id === "message" ? "1 1 0" : undefined,
               }}
             >
               {flexRender(h.column.columnDef.header, h.getContext())}
+              {h.column.getCanResize() && (
+                <div
+                  onMouseDown={(e) => { e.stopPropagation(); h.getResizeHandler()(e); }}
+                  onTouchStart={(e) => { e.stopPropagation(); h.getResizeHandler()(e); }}
+                  onClick={(e) => e.stopPropagation()}
+                  className="absolute right-0 top-0 h-full w-1 cursor-col-resize select-none touch-none opacity-0 hover:opacity-100 hover:bg-[var(--color-accent)] transition-opacity z-10"
+                  style={{ marginRight: -2 }}
+                />
+              )}
             </div>
           )),
         )}
