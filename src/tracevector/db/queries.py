@@ -24,6 +24,7 @@ class EventQuery:
     source_ids: list[str] | None = None
     q: str | None = None
     artifact: str | None = None
+    artifacts: list[str] | None = None
     source_id: str | None = None
     tag: str | None = None
     exclude_tag: str | None = None
@@ -234,6 +235,28 @@ class _ParameterizedQueryBuilder:
         """Exclude events that have *value* in their tags array."""
         self.add_param("NOT has(tags, :name)", value)
 
+    def add_broad_text_search(self, value: str) -> None:
+        """OR-match *value* as a substring across every field an analyst would
+        expect a free-text search to cover: the fixed text columns, parser
+        tags, and every value in the ``attributes`` Map — not just ``message``.
+        """
+        name = self._param_name()
+        self.parameters[name] = f"%{value}%"
+        columns = [
+            "message",
+            "display_name",
+            "artifact",
+            "artifact_long",
+            "timestamp_desc",
+            "source_file",
+        ]
+        clauses = [f"{c} ILIKE {{{name}:String}}" for c in columns]
+        clauses.append(f"arrayExists(v -> v ILIKE {{{name}:String}}, tags)")
+        clauses.append(
+            f"arrayExists(v -> v ILIKE {{{name}:String}}, mapValues(attributes))"
+        )
+        self.conditions.append("(" + " OR ".join(clauses) + ")")
+
     def add_cursor(self, op: str, ts: datetime, event_id: str) -> None:
         """Add a keyset predicate ``(timestamp, event_id) {op} (ts, event_id)``.
 
@@ -288,11 +311,19 @@ class EventQueryService:
 
         if query.q:
             # ClickHouse tokenbf_v1 index supports hasToken and multiSearchAny.
-            # We use ILIKE for substring search as a simple baseline.
-            builder.add_param("message ILIKE :name", f"%{query.q}%")
+            # We use ILIKE for substring search as a simple baseline, broadened
+            # across every field (not just message) so the analyst's free-text
+            # search box behaves like a real "search everything" field.
+            builder.add_broad_text_search(query.q)
 
         if query.artifact:
             builder.add_param("artifact = :name", query.artifact)
+
+        if query.artifacts:
+            if len(query.artifacts) == 1:
+                builder.add_param("artifact = :name", query.artifacts[0])
+            else:
+                builder.add_in_list("artifact", query.artifacts)
 
         if query.tag:
             builder.add_param("has(tags, :name)", query.tag)
@@ -511,6 +542,65 @@ class EventQueryService:
             "top_level": TOP_LEVEL_DISPLAY_COLUMNS,
             "attributes": sorted(raw_keys),
         }
+
+    def list_distinct_artifacts(
+        self, case_id: str, source_ids: list[str], cap: int = 500
+    ) -> list[str]:
+        """Return distinct non-empty ``artifact`` values, for filter autocomplete."""
+        self.store.init_schema()
+        database = self.store.database
+        params: dict[str, Any] = {"p0": case_id, "src": source_ids}
+        result = self.store.client.query(
+            f"""
+            SELECT DISTINCT artifact
+            FROM {database}.events
+            WHERE case_id = {{p0:String}} AND has({{src:Array(String)}}, source_id)
+                AND artifact != ''
+            ORDER BY artifact
+            LIMIT {cap}
+            """,
+            parameters=params,
+        )
+        return [row[0] for row in result.result_rows]
+
+    def list_distinct_parser_tags(
+        self, case_id: str, source_ids: list[str]
+    ) -> list[str]:
+        """Return distinct values from the parser-derived ``tags`` array column.
+
+        Distinct from user annotation tags (stored in Postgres) — these come
+        from the ingested/converted log data itself.
+        """
+        self.store.init_schema()
+        database = self.store.database
+        params: dict[str, Any] = {"p0": case_id, "src": source_ids}
+        result = self.store.client.query(
+            f"""
+            SELECT groupUniqArrayArray(tags) AS tags
+            FROM {database}.events
+            WHERE case_id = {{p0:String}} AND has({{src:Array(String)}}, source_id)
+            """,
+            parameters=params,
+        )
+        return sorted(result.result_rows[0][0]) if result.result_rows else []
+
+    def list_event_ids_by_parser_tag(
+        self, case_id: str, source_ids: list[str], tag_value: str
+    ) -> list[str]:
+        """Return event_ids whose parser-derived ``tags`` array contains *tag_value*."""
+        self.store.init_schema()
+        database = self.store.database
+        params: dict[str, Any] = {"p0": case_id, "src": source_ids, "tag": tag_value}
+        result = self.store.client.query(
+            f"""
+            SELECT toString(event_id)
+            FROM {database}.events
+            WHERE case_id = {{p0:String}} AND has({{src:Array(String)}}, source_id)
+                AND has(tags, {{tag:String}})
+            """,
+            parameters=params,
+        )
+        return [row[0] for row in result.result_rows]
 
     # Top-level fields meaningful for embedding (not IDs/provenance).
     _EMBEDDABLE_TOP_LEVEL = [

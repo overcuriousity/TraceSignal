@@ -8,9 +8,13 @@ export function filtersToParams(filters: EventFilters): URLSearchParams {
   const p = new URLSearchParams();
   if (filters.q) p.set("q", filters.q);
   if (filters.artifact) p.set("artifact", filters.artifact);
+  if (filters.artifacts && filters.artifacts.length > 0) {
+    p.set("artifacts", filters.artifacts.join(","));
+  }
   if (filters.sourceId) p.set("sourceId", filters.sourceId);
   if (filters.tag) p.set("tag", filters.tag);
   if (filters.excludeTag) p.set("excludeTag", filters.excludeTag);
+  if (filters.tagValue) p.set("tagValue", filters.tagValue);
   if (filters.start) p.set("start", filters.start);
   if (filters.end) p.set("end", filters.end);
   if (filters.filters && Object.keys(filters.filters).length > 0) {
@@ -32,9 +36,11 @@ export function paramsToFilters(params: URLSearchParams): EventFilters {
   const filters: EventFilters = {};
   const q = params.get("q");
   const artifact = params.get("artifact");
+  const artifacts = params.get("artifacts");
   const sourceId = params.get("sourceId");
   const tag = params.get("tag");
   const excludeTag = params.get("excludeTag");
+  const tagValue = params.get("tagValue");
   const start = params.get("start");
   const end = params.get("end");
   const rawFilters = params.get("filters");
@@ -44,9 +50,13 @@ export function paramsToFilters(params: URLSearchParams): EventFilters {
 
   if (q) filters.q = q;
   if (artifact) filters.artifact = artifact;
+  if (artifacts) {
+    filters.artifacts = artifacts.split(",").map((a) => a.trim()).filter(Boolean);
+  }
   if (sourceId) filters.sourceId = sourceId;
   if (tag) filters.tag = tag;
   if (excludeTag) filters.excludeTag = excludeTag;
+  if (tagValue) filters.tagValue = tagValue;
   if (start) filters.start = start;
   if (end) filters.end = end;
   if (rawFilters) {
@@ -80,9 +90,11 @@ export function filtersToViewPayload(
   return {
     q: filters.q ?? null,
     artifact: filters.artifact ?? null,
+    artifacts: filters.artifacts ?? [],
     sourceId: filters.sourceId ?? null,
     tag: filters.tag ?? null,
     excludeTag: filters.excludeTag ?? null,
+    tagValue: filters.tagValue ?? null,
     start: filters.start ?? null,
     end: filters.end ?? null,
     filters: filters.filters ?? {},
@@ -100,11 +112,18 @@ export function viewPayloadToFilters(
   if (typeof payload.q === "string" && payload.q) f.q = payload.q;
   if (typeof payload.artifact === "string" && payload.artifact)
     f.artifact = payload.artifact;
+  if (Array.isArray(payload.artifacts) && payload.artifacts.length > 0) {
+    f.artifacts = (payload.artifacts as unknown[]).filter(
+      (a): a is string => typeof a === "string" && a.length > 0,
+    );
+  }
   if (typeof payload.sourceId === "string" && payload.sourceId)
     f.sourceId = payload.sourceId;
   if (typeof payload.tag === "string" && payload.tag) f.tag = payload.tag;
   if (typeof payload.excludeTag === "string" && payload.excludeTag)
     f.excludeTag = payload.excludeTag;
+  if (typeof payload.tagValue === "string" && payload.tagValue)
+    f.tagValue = payload.tagValue;
   if (typeof payload.start === "string" && payload.start) f.start = payload.start;
   if (typeof payload.end === "string" && payload.end) f.end = payload.end;
   if (payload.filters && typeof payload.filters === "object") {

@@ -164,6 +164,58 @@ def _parse_novelty_fields(fields: str | None) -> list[str] | None:
     return [f.strip() for f in fields.split(",") if f.strip()]
 
 
+async def _resolve_tag_value_event_ids(
+    case_id: str, source_ids: list[str], tag_value: str | None
+) -> list[str] | None:
+    """Resolve the unified tag filter to an event_id allowlist.
+
+    Merges two independent tagging systems that share a UI: user annotation
+    tags (Postgres) and parser-derived ``Event.tags`` (ClickHouse) — an event
+    matches if *either* has this exact value, so the analyst doesn't need to
+    know or care which system a given tag value came from.
+    """
+    if not tag_value:
+        return None
+    store = get_store()
+    service = _get_query_service()
+    ann_ids = await store.list_event_ids_by_annotation_type(
+        case_id, source_ids, "tag", origin="user", content=tag_value
+    )
+    parser_ids = service.list_event_ids_by_parser_tag(case_id, source_ids, tag_value)
+    return list(set(ann_ids) | set(parser_ids))
+
+
+def _intersect_optional(*id_lists: list[str] | None) -> list[str] | None:
+    """Intersect any number of optional event_id restriction lists.
+
+    ``None`` means "no restriction" and is ignored; if every list is ``None``
+    the result is ``None`` (no restriction). Otherwise returns the
+    intersection of all non-``None`` lists — each represents an independent
+    filter that must all be satisfied simultaneously.
+    """
+    present = [set(x) for x in id_lists if x is not None]
+    if not present:
+        return None
+    result = present[0]
+    for s in present[1:]:
+        result &= s
+    return list(result)
+
+
+def _parse_id_list(value: str | None) -> list[str] | None:
+    """Parse a comma-separated event_id allowlist query param."""
+    if not value:
+        return None
+    return [v.strip() for v in value.split(",") if v.strip()]
+
+
+def _parse_str_list(value: str | None) -> list[str] | None:
+    """Parse a comma-separated string-list query param (e.g. ``artifacts``)."""
+    if not value:
+        return None
+    return [v.strip() for v in value.split(",") if v.strip()]
+
+
 async def _resolve_annotated_event_ids(
     case_id: str,
     source_ids: list[str],
@@ -208,11 +260,27 @@ async def _resolve_annotated_event_ids(
 async def list_events(
     case_id: str,
     timeline_id: str,
-    q: str | None = Query(default=None, description="Full-text search in message"),
+    q: str | None = Query(
+        default=None, description="Free-text search, broadened across all fields"
+    ),
     artifact: str | None = Query(default=None),
+    artifacts: str | None = Query(
+        default=None, description="Comma-separated artifact values (OR'd)"
+    ),
     source_id: str | None = Query(default=None),
     tag: str | None = Query(default=None),
     exclude_tag: str | None = Query(default=None),
+    tag_value: str | None = Query(
+        default=None,
+        description=(
+            "Unified tag filter — matches either a user annotation tag or a "
+            "parser-derived Event.tags value with this exact content."
+        ),
+    ),
+    ids: str | None = Query(
+        default=None,
+        description="Comma-separated event_id allowlist (e.g. semantic search results).",
+    ),
     start: datetime | None = Query(default=None),  # noqa: B008
     end: datetime | None = Query(default=None),  # noqa: B008
     event_id: str | None = Query(
@@ -275,13 +343,14 @@ async def list_events(
         )
 
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
-    event_ids = (
-        [event_id]
-        if event_id
-        else await _resolve_annotated_event_ids(
+    if event_id:
+        event_ids: list[str] | None = [event_id]
+    else:
+        annotated_ids = await _resolve_annotated_event_ids(
             case_id, source_ids, annotated, annotation_tag_value, live_event_ids
         )
-    )
+        tag_value_ids = await _resolve_tag_value_event_ids(case_id, source_ids, tag_value)
+        event_ids = _intersect_optional(annotated_ids, tag_value_ids, _parse_id_list(ids))
 
     service = _get_query_service()
     page = service.query(
@@ -290,6 +359,7 @@ async def list_events(
             source_ids=source_ids,
             q=q,
             artifact=artifact,
+            artifacts=_parse_str_list(artifacts),
             source_id=source_id,
             tag=tag,
             exclude_tag=exclude_tag,
@@ -324,9 +394,12 @@ class BulkAnnotateByFilterRequest(BaseModel):
     content: str = Field(..., min_length=1, max_length=4096)
     q: str | None = None
     artifact: str | None = None
+    artifacts: str | None = None
     source_id: str | None = None
     tag: str | None = None
     exclude_tag: str | None = None
+    tag_value: str | None = None
+    ids: str | None = None
     start: datetime | None = None
     end: datetime | None = None
     filters: str | None = Field(
@@ -359,6 +432,8 @@ async def bulk_annotate_by_filter(
         )
 
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
+    tag_value_ids = await _resolve_tag_value_event_ids(case_id, source_ids, body.tag_value)
+    event_ids = _intersect_optional(tag_value_ids, _parse_id_list(body.ids))
 
     service = _get_query_service()
     refs = service.query_event_refs(
@@ -367,6 +442,7 @@ async def bulk_annotate_by_filter(
             source_ids=source_ids,
             q=body.q,
             artifact=body.artifact,
+            artifacts=_parse_str_list(body.artifacts),
             source_id=body.source_id,
             tag=body.tag,
             exclude_tag=body.exclude_tag,
@@ -374,6 +450,7 @@ async def bulk_annotate_by_filter(
             end=body.end,
             field_filters=_parse_json_object(body.filters),
             field_exclusions=_parse_exclusions_object(body.exclusions),
+            event_ids=event_ids,
         )
     )
 
@@ -412,6 +489,35 @@ async def list_fields(
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
     service = _get_query_service()
     return service.list_fields(case_id, source_ids)
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/artifacts")
+async def list_artifacts(case_id: str, timeline_id: str) -> dict[str, Any]:
+    """Return distinct ``artifact`` values present in the timeline.
+
+    Powers the artifact filter's autocomplete/multi-select in the UI.
+    """
+    source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
+    service = _get_query_service()
+    return {"artifacts": service.list_distinct_artifacts(case_id, source_ids)}
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/tags/merged")
+async def list_merged_tags(case_id: str, timeline_id: str) -> dict[str, Any]:
+    """Return the union of distinct user annotation tags and parser-derived tags.
+
+    Powers the unified "Tags" filter's autocomplete, which matches a value
+    against either tagging system (see ``_resolve_tag_value_event_ids``).
+    Distinct from ``GET /timelines/{timeline_id}/tags`` (annotation tags
+    only), which is what the "add tag" annotation UI uses — you can only
+    create annotation tags, not parser tags, so that list must stay pure.
+    """
+    source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
+    store = get_store()
+    service = _get_query_service()
+    ann_tags = await store.list_distinct_tag_contents(case_id, source_ids)
+    parser_tags = service.list_distinct_parser_tags(case_id, source_ids)
+    return {"tags": sorted(set(ann_tags) | set(parser_tags))}
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/embedding-fields")
@@ -456,9 +562,12 @@ async def get_histogram(
     timeline_id: str,
     q: str | None = Query(default=None),
     artifact: str | None = Query(default=None),
+    artifacts: str | None = Query(default=None),
     source_id: str | None = Query(default=None),
     tag: str | None = Query(default=None),
     exclude_tag: str | None = Query(default=None),
+    tag_value: str | None = Query(default=None),
+    ids: str | None = Query(default=None),
     start: datetime | None = Query(default=None),  # noqa: B008
     end: datetime | None = Query(default=None),  # noqa: B008
     filters: str | None = Query(default=None),
@@ -476,9 +585,11 @@ async def get_histogram(
     ``max(1, duration / buckets)`` seconds.
     """
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
-    event_ids = await _resolve_annotated_event_ids(
+    annotated_ids = await _resolve_annotated_event_ids(
         case_id, source_ids, annotated, annotation_tag_value, live_event_ids
     )
+    tag_value_ids = await _resolve_tag_value_event_ids(case_id, source_ids, tag_value)
+    event_ids = _intersect_optional(annotated_ids, tag_value_ids, _parse_id_list(ids))
     service = _get_query_service()
     return service.histogram(
         EventQuery(
@@ -486,6 +597,7 @@ async def get_histogram(
             source_ids=source_ids,
             q=q,
             artifact=artifact,
+            artifacts=_parse_str_list(artifacts),
             source_id=source_id,
             tag=tag,
             exclude_tag=exclude_tag,
@@ -507,9 +619,12 @@ class ExportFilter(BaseModel):
 
     q: str | None = None
     artifact: str | None = None
+    artifacts: str | None = None
     source_id: str | None = None
     tag: str | None = None
     exclude_tag: str | None = None
+    tag_value: str | None = None
+    ids: str | None = None
     start: datetime | None = None
     end: datetime | None = None
     # 'fields' / 'exclude' map to field_filters / field_exclusions in EventQuery.
@@ -627,12 +742,18 @@ async def export_events(
     tagging a finding is what makes it show up here.
     """
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
-    event_ids = await _resolve_annotated_event_ids(
+    annotated_ids = await _resolve_annotated_event_ids(
         case_id,
         source_ids,
         body.filter.annotated,
         body.filter.annotation_tag_value,
         body.filter.live_event_ids,
+    )
+    tag_value_ids = await _resolve_tag_value_event_ids(
+        case_id, source_ids, body.filter.tag_value
+    )
+    event_ids = _intersect_optional(
+        annotated_ids, tag_value_ids, _parse_id_list(body.filter.ids)
     )
 
     store = get_store()
@@ -645,6 +766,7 @@ async def export_events(
         source_ids=source_ids,
         q=body.filter.q,
         artifact=body.filter.artifact,
+        artifacts=_parse_str_list(body.filter.artifacts),
         source_id=body.filter.source_id,
         tag=body.filter.tag,
         exclude_tag=body.filter.exclude_tag,
