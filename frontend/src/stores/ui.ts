@@ -29,6 +29,10 @@ interface UiState {
   /** Width of the event detail panel in pixels. */
   detailPanelWidth: number;
   setDetailPanelWidth: (w: number) => void;
+
+  /** Persisted event grid column widths (px), keyed by column id. */
+  columnWidths: Record<string, number>;
+  setColumnWidth: (id: string, width: number) => void;
 }
 
 export const DEFAULT_COLUMNS = [
@@ -84,10 +88,14 @@ export const useUiStore = create<UiState>()(
 
       detailPanelWidth: 384,
       setDetailPanelWidth: (w) => set({ detailPanelWidth: w }),
+
+      columnWidths: {},
+      setColumnWidth: (id, width) =>
+        set((s) => ({ columnWidths: { ...s.columnWidths, [id]: width } })),
     }),
     {
       name: "tv-ui",
-      version: 1,
+      version: 2,
       migrate: (persistedState, version) => {
         const state = persistedState as UiState;
         if (version < 1) {
@@ -96,6 +104,9 @@ export const useUiStore = create<UiState>()(
             migrated[key] = migrateColumns(cols);
           }
           state.visibleColumnsByTimeline = migrated;
+        }
+        if (version < 2) {
+          state.columnWidths = state.columnWidths ?? {};
         }
         return state;
       },
