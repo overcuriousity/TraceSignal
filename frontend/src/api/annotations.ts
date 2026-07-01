@@ -64,8 +64,8 @@ export const annotationsApi = {
         ids: filters.ids && filters.ids.length > 0 ? filters.ids.join(",") : null,
         start: filters.start ?? null,
         end: filters.end ?? null,
-        filters: filters.filters ?? null,
-        exclusions: filters.exclusions ?? null,
+        filters: filters.filters ? JSON.stringify(filters.filters) : null,
+        exclusions: filters.exclusions ? JSON.stringify(filters.exclusions) : null,
       },
     );
   },
