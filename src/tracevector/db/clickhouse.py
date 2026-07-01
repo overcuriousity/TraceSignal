@@ -111,6 +111,15 @@ class ClickHouseStore:
             username=settings.clickhouse_username,
             password=settings.clickhouse_password,
             database="default",
+            # This client is a process-wide singleton shared across FastAPI's
+            # threadpool workers. clickhouse-connect auto-generates a
+            # session_id by default, and the server rejects concurrent
+            # queries within the same session_id — so two overlapping
+            # requests (e.g. the analysis tabs firing several queries at
+            # once) would 500 with "Attempt to execute concurrent queries
+            # within the same session." Nothing here relies on session-scoped
+            # state (temp tables, session settings), so disable it.
+            autogenerate_session_id=False,
         )
 
     @staticmethod
