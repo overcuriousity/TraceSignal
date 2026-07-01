@@ -12,9 +12,12 @@ export async function downloadExport(
     filter: {
       q: filters.q,
       artifact: filters.artifact,
+      artifacts: filters.artifacts && filters.artifacts.length > 0 ? filters.artifacts.join(",") : undefined,
       source_id: filters.sourceId,
       tag: filters.tag,
       exclude_tag: filters.excludeTag,
+      tag_value: filters.tagValue,
+      ids: filters.ids && filters.ids.length > 0 ? filters.ids.join(",") : undefined,
       start: filters.start,
       end: filters.end,
       fields: filters.filters ?? {},

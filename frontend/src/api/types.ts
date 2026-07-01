@@ -319,9 +319,16 @@ export interface HealthResponse {
 export interface EventFilters {
   q?: string;
   artifact?: string;
+  /** Multi-select artifact filter (OR'd); distinct from the single-value `artifact`. */
+  artifacts?: string[];
   sourceId?: string;
   tag?: string;
   excludeTag?: string;
+  /**
+   * Unified tag filter — matches either a user annotation tag or a
+   * parser-derived Event.tags value with this exact content.
+   */
+  tagValue?: string;
   start?: string;
   end?: string;
   /** key=value field equality filters */
@@ -339,6 +346,11 @@ export interface EventFilters {
    * Derived from session state, not serialized to the URL/saved views.
    */
   liveAnomalyEventIds?: string[];
+  /**
+   * Event_id allowlist — e.g. results from a semantic search narrowing the
+   * grid. Derived from session state, not serialized to the URL/saved views.
+   */
+  ids?: string[];
   limit?: number;
   offset?: number;
   /** Chronological sort direction (default: desc) */
@@ -371,9 +383,12 @@ export interface ExportRequest {
   filter: {
     q?: string;
     artifact?: string;
+    artifacts?: string;
     source_id?: string;
     tag?: string;
     exclude_tag?: string;
+    tag_value?: string;
+    ids?: string;
     start?: string;
     end?: string;
     fields?: Record<string, string>;

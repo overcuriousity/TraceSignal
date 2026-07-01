@@ -42,6 +42,17 @@ describe("filtersToParams / paramsToFilters round-trip", () => {
     expect(out.exclusions).toEqual({ user_agent: ["bot"] });
   });
 
+  it("round-trips the merged tag filter and multi-select artifacts", () => {
+    const f: EventFilters = {
+      tagValue: "exfil",
+      artifacts: ["WinEvtx", "Prefetch"],
+    };
+    const p = filtersToParams(f);
+    const out = paramsToFilters(p);
+    expect(out.tagValue).toBe("exfil");
+    expect(out.artifacts).toEqual(["WinEvtx", "Prefetch"]);
+  });
+
   it("omits undefined fields from params", () => {
     const f: EventFilters = { q: "test" };
     const p = filtersToParams(f);

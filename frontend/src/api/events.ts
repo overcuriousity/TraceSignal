@@ -16,6 +16,7 @@ export const eventsApi = {
         source_id: filters.sourceId,
         tag: filters.tag,
         exclude_tag: filters.excludeTag,
+        tag_value: filters.tagValue,
         start: filters.start,
         end: filters.end,
         limit: filters.limit ?? 100,
@@ -24,6 +25,9 @@ export const eventsApi = {
         after: cursor?.after,
         before: cursor?.before,
       };
+    if (filters.artifacts && filters.artifacts.length > 0) {
+      params.artifacts = filters.artifacts.join(",");
+    }
     if (filters.filters && Object.keys(filters.filters).length > 0) {
       params.filters = JSON.stringify(filters.filters);
     }
@@ -38,6 +42,9 @@ export const eventsApi = {
     }
     if (filters.liveAnomalyEventIds && filters.liveAnomalyEventIds.length > 0) {
       params.live_event_ids = filters.liveAnomalyEventIds.join(",");
+    }
+    if (filters.ids && filters.ids.length > 0) {
+      params.ids = filters.ids.join(",");
     }
     return get<EventPage>(
       `/cases/${caseId}/timelines/${timelineId}/events`,
@@ -84,10 +91,14 @@ export const eventsApi = {
       source_id: filters.sourceId,
       tag: filters.tag,
       exclude_tag: filters.excludeTag,
+      tag_value: filters.tagValue,
       start: filters.start,
       end: filters.end,
       buckets,
     };
+    if (filters.artifacts && filters.artifacts.length > 0) {
+      params.artifacts = filters.artifacts.join(",");
+    }
     if (filters.filters && Object.keys(filters.filters).length > 0) {
       params.filters = JSON.stringify(filters.filters);
     }
@@ -103,9 +114,22 @@ export const eventsApi = {
     if (filters.liveAnomalyEventIds && filters.liveAnomalyEventIds.length > 0) {
       params.live_event_ids = filters.liveAnomalyEventIds.join(",");
     }
+    if (filters.ids && filters.ids.length > 0) {
+      params.ids = filters.ids.join(",");
+    }
     return get<HistogramResponse>(
       `/cases/${caseId}/timelines/${timelineId}/histogram`,
       params,
     );
   },
+
+  artifacts: (caseId: string, timelineId: string): Promise<string[]> =>
+    get<{ artifacts: string[] }>(
+      `/cases/${caseId}/timelines/${timelineId}/artifacts`,
+    ).then((r) => r.artifacts),
+
+  mergedTags: (caseId: string, timelineId: string): Promise<string[]> =>
+    get<{ tags: string[] }>(
+      `/cases/${caseId}/timelines/${timelineId}/tags/merged`,
+    ).then((r) => r.tags),
 };

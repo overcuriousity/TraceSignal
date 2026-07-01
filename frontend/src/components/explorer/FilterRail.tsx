@@ -1,8 +1,10 @@
 import { useState } from "react";
-import { Search, Clock, PlusCircle, MinusCircle, BookmarkCheck, PanelLeftClose, X, Tag, ShieldAlert } from "lucide-react";
+import { Search, Clock, PlusCircle, MinusCircle, BookmarkCheck, PanelLeftClose, X, Tag, ShieldAlert, FileText } from "lucide-react";
 import { Input } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
 import { Tooltip } from "@/components/ui/Tooltip";
+import { Spinner } from "@/components/ui/Spinner";
+import { TagInput } from "@/components/explorer/TagInput";
 import type { EventFilters, View } from "@/api/types";
 import { fmtRelative } from "@/lib/time";
 import { viewPayloadToFilters } from "@/lib/queryParams";
@@ -14,8 +16,19 @@ interface Props {
   onApplyView: (f: EventFilters) => void;
   onSaveView: () => void;
   onClose?: () => void;
-  /** Distinct user tag annotation values, for the "Tagged" value picker. */
-  tagSuggestions?: string[];
+  /** Merged (annotation + parser) tag values, for the unified Tags filter. */
+  mergedTagSuggestions?: string[];
+  /** Distinct artifact values in this timeline, for the Artifact filter. */
+  artifactSuggestions?: string[];
+  /**
+   * Submits the search box's free text. The caller decides whether it's an
+   * event_id lookup (jump directly) or a keyword/semantic query (narrows the
+   * grid) — this component just forwards raw input.
+   */
+  onSearchSubmit: (query: string) => void;
+  /** Status line shown under the search box (e.g. "searching…", "no match"). */
+  searchStatus?: string;
+  searchPending?: boolean;
 }
 
 export function FilterRail({
@@ -25,8 +38,15 @@ export function FilterRail({
   onApplyView,
   onSaveView,
   onClose,
-  tagSuggestions = [],
+  mergedTagSuggestions = [],
+  artifactSuggestions = [],
+  onSearchSubmit,
+  searchStatus,
+  searchPending,
 }: Props) {
+  const [searchInput, setSearchInput] = useState(filters.q ?? "");
+  const [tagValueInput, setTagValueInput] = useState("");
+  const [artifactInput, setArtifactInput] = useState("");
   const [fieldKey, setFieldKey] = useState("");
   const [fieldVal, setFieldVal] = useState("");
   const [excludeKey, setExcludeKey] = useState("");
@@ -53,6 +73,33 @@ export function FilterRail({
     });
     setExcludeKey("");
     setExcludeVal("");
+  };
+
+  const addArtifact = (value: string) => {
+    const v = value.trim();
+    if (!v) return;
+    const prev = filters.artifacts ?? [];
+    if (!prev.includes(v)) {
+      onChange({ ...filters, artifacts: [...prev, v] });
+    }
+    setArtifactInput("");
+  };
+
+  const removeArtifact = (value: string) => {
+    const remaining = (filters.artifacts ?? []).filter((a) => a !== value);
+    const f = { ...filters };
+    if (remaining.length > 0) f.artifacts = remaining;
+    else delete f.artifacts;
+    onChange(f);
+  };
+
+  const setTagValue = (value: string) => {
+    const v = value.trim();
+    const f = { ...filters };
+    if (v) f.tagValue = v;
+    else delete f.tagValue;
+    onChange(f);
+    setTagValueInput("");
   };
 
   const annotated = filters.annotated ?? [];
@@ -107,18 +154,44 @@ export function FilterRail({
 
       <div className="flex-1 overflow-y-auto">
       <div className="space-y-2.5 p-2.5">
-        {/* Full-text search */}
+        {/* Unified search — keyword/semantic across all fields, or an event_id to jump to it */}
         <div>
           <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
             <Search size={11} /> Search
           </label>
-          <Input
-            placeholder="keyword in message…"
-            value={filters.q ?? ""}
-            onChange={(e) =>
-              onChange({ ...filters, q: e.target.value || undefined })
-            }
-          />
+          <form
+            className="flex gap-1"
+            onSubmit={(e) => {
+              e.preventDefault();
+              onSearchSubmit(searchInput.trim());
+            }}
+          >
+            <Input
+              placeholder="keyword, phrase, or event id…"
+              value={searchInput}
+              onChange={(e) => setSearchInput(e.target.value)}
+              className="text-xs"
+            />
+            {searchInput && (
+              <Button
+                size="icon"
+                variant="outline"
+                type="button"
+                onClick={() => {
+                  setSearchInput("");
+                  onSearchSubmit("");
+                }}
+              >
+                <X size={12} />
+              </Button>
+            )}
+          </form>
+          {(searchPending || searchStatus) && (
+            <div className="mt-1 flex items-center gap-1 text-[11px] text-[var(--color-fg-muted)]">
+              {searchPending && <Spinner size={10} />}
+              {searchStatus && <span>{searchStatus}</span>}
+            </div>
+          )}
         </div>
 
         {/* Time range */}
@@ -158,48 +231,6 @@ export function FilterRail({
           </div>
         </div>
 
-        {/* Artifact */}
-        <div>
-          <label className="mb-1.5 block text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
-            Artifact
-          </label>
-          <Input
-            placeholder="artifact name…"
-            value={filters.artifact ?? ""}
-            onChange={(e) =>
-              onChange({ ...filters, artifact: e.target.value || undefined })
-            }
-          />
-        </div>
-
-        {/* Source ID */}
-        <div>
-          <label className="mb-1.5 block text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
-            Source ID
-          </label>
-          <Input
-            placeholder="filter by source id…"
-            value={filters.sourceId ?? ""}
-            onChange={(e) =>
-              onChange({ ...filters, sourceId: e.target.value || undefined })
-            }
-          />
-        </div>
-
-        {/* Tag (event.tags) */}
-        <div>
-          <label className="mb-1.5 block text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
-            Parser Tag
-          </label>
-          <Input
-            placeholder="tag value…"
-            value={filters.tag ?? ""}
-            onChange={(e) =>
-              onChange({ ...filters, tag: e.target.value || undefined })
-            }
-          />
-        </div>
-
         {/* Flagged — annotation tag / anomaly filter */}
         <div>
           <label className="mb-1.5 block text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
@@ -214,22 +245,6 @@ export function FilterRail({
               />
               <Tag size={11} /> Tagged
             </label>
-            {annotated.includes("tag") && (
-              <select
-                value={filters.annotationTagValue ?? ""}
-                onChange={(e) =>
-                  onChange({ ...filters, annotationTagValue: e.target.value || undefined })
-                }
-                className="ml-5 w-[calc(100%-1.25rem)] rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-1.5 py-0.5 text-xs text-[var(--color-fg-primary)] focus:outline-none focus:border-[var(--color-accent)]"
-              >
-                <option value="">(any tag)</option>
-                {tagSuggestions.map((t) => (
-                  <option key={t} value={t}>
-                    {t}
-                  </option>
-                ))}
-              </select>
-            )}
             <label className="flex items-center gap-1.5 text-xs text-[var(--color-fg-secondary)] cursor-pointer">
               <input
                 type="checkbox"
@@ -239,6 +254,62 @@ export function FilterRail({
               <ShieldAlert size={11} /> Anomaly
             </label>
           </div>
+        </div>
+
+        {/* Tags — unified autocomplete across annotation + parser tags */}
+        <div>
+          <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
+            <Tag size={11} /> Tags
+          </label>
+          {filters.tagValue ? (
+            <span className="inline-flex items-center gap-1 rounded border border-[var(--color-info)]/30 bg-[var(--color-info-dim)] px-2 py-0.5 text-xs text-[var(--color-info)]">
+              {filters.tagValue}
+              <button onClick={() => setTagValue("")} className="opacity-60 hover:opacity-100">
+                <X size={10} />
+              </button>
+            </span>
+          ) : (
+            <TagInput
+              value={tagValueInput}
+              onChange={setTagValueInput}
+              onSubmit={setTagValue}
+              onCancel={() => setTagValueInput("")}
+              suggestions={mergedTagSuggestions}
+              placeholder="tag value…"
+              className="text-xs"
+            />
+          )}
+        </div>
+
+        {/* Artifact — multi-select autocomplete */}
+        <div>
+          <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
+            <FileText size={11} /> Artifact
+          </label>
+          {(filters.artifacts ?? []).length > 0 && (
+            <div className="mb-1.5 flex flex-wrap gap-1">
+              {(filters.artifacts ?? []).map((a) => (
+                <span
+                  key={a}
+                  className="inline-flex items-center gap-1 rounded border border-[var(--color-info)]/30 bg-[var(--color-info-dim)] px-1.5 py-0.5 text-xs text-[var(--color-info)]"
+                >
+                  {a}
+                  <button onClick={() => removeArtifact(a)} className="opacity-60 hover:opacity-100">
+                    <X size={10} />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+          <TagInput
+            value={artifactInput}
+            onChange={setArtifactInput}
+            onSubmit={addArtifact}
+            onCancel={() => setArtifactInput("")}
+            suggestions={artifactSuggestions.filter((a) => !(filters.artifacts ?? []).includes(a))}
+            placeholder="add artifact…"
+            className="text-xs"
+          />
         </div>
 
         {/* Field include */}

@@ -22,6 +22,7 @@ import {
 
 import { eventsApi } from "@/api/events";
 import { annotationsApi } from "@/api/annotations";
+import { similarityApi } from "@/api/similarity";
 import { viewsApi } from "@/api/views";
 import { timelinesApi } from "@/api/timelines";
 import { useUiStore, DEFAULT_COLUMNS } from "@/stores/ui";
@@ -45,6 +46,10 @@ import { Tooltip } from "@/components/ui/Tooltip";
 import type { AnomalyMarker, Event, EventFilters, EventPage, Annotation } from "@/api/types";
 
 const PAGE_SIZE = 100;
+
+/** Matches a ClickHouse UUID event_id, used to detect an event_id typed into
+ * the filter rail's search box (vs. a keyword/semantic query). */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** Keyset pagination page param — `{}` requests the initial offset-0 page. */
 type EventsPageParam = { after?: string; before?: string };
@@ -97,6 +102,12 @@ export function ExplorerPage() {
           const { [fieldKey]: _removed, ...rest } = f.exclusions ?? {};
           f.exclusions = rest;
         }
+      } else if (key === "artifacts") {
+        const remaining = value !== undefined
+          ? (f.artifacts ?? []).filter((a) => a !== value)
+          : [];
+        if (remaining.length > 0) f.artifacts = remaining;
+        else delete f.artifacts;
       } else if (key === "annotated") {
         const remaining = value !== undefined
           ? (f.annotated ?? []).filter((t) => t !== value)
@@ -207,6 +218,7 @@ export function ExplorerPage() {
   const [anomalyMarkers, setAnomalyMarkers] = useState<AnomalyMarker[]>([]);
   const [scrollPositionTs, setScrollPositionTs] = useState<string | null>(null);
   const [saveViewOpen, setSaveViewOpen] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
   const gridRef = useRef<EventGridHandle>(null);
   // Snapshot of `filters` taken right before a "jump to time" cleared them —
   // drives the "back to filtered view" breadcrumb. `rangeHighlight` is purely
@@ -239,17 +251,6 @@ export function ExplorerPage() {
     [anomalyMarkers],
   );
 
-  // The filter object actually sent to the events/histogram/export queries.
-  // `filters` itself stays URL-serializable/shareable — this augments it
-  // with ephemeral live-finding event IDs only while relevant, so switching
-  // detector tabs or field selections correctly refetches the filtered view.
-  const effectiveFilters = useMemo<EventFilters>(() => {
-    if (!filters.annotated?.includes("anomaly") || liveAnomalyEventIds.length === 0) {
-      return filters;
-    }
-    return { ...filters, liveAnomalyEventIds };
-  }, [filters, liveAnomalyEventIds]);
-
   // ── Data queries ───────────────────────────────────────────────────────
   const { data: timeline } = useQuery({
     queryKey: ["timeline", caseId, timelineId],
@@ -262,6 +263,43 @@ export function ExplorerPage() {
     queryFn: () => timelinesApi.listSources(caseId!, timelineId!),
     enabled: !!(caseId && timelineId),
   });
+
+  const hasVectors = timelineSources?.some((s) => s.vector_count > 0) ?? false;
+
+  // The filter rail's search box runs semantic search in the background once
+  // embeddings exist for this timeline, so a free-text query narrows the grid
+  // to conceptually related events even when they don't literally contain the
+  // typed words. `filters.q` itself stays URL-shareable and drives the
+  // broadened keyword search server-side as a fallback while this is loading
+  // or when there are no embeddings to search.
+  const { data: semanticSearchData, isFetching: semanticSearchPending } = useQuery({
+    queryKey: ["search-filter", caseId, timelineId, filters.q],
+    queryFn: () => similarityApi.semanticSearch(caseId!, filters.q!, 200, timelineId),
+    enabled: !!(caseId && timelineId && hasVectors && filters.q),
+  });
+  const semanticSearchIds = useMemo(() => {
+    if (!filters.q || !hasVectors || semanticSearchData?.status !== "ok") return null;
+    return semanticSearchData.results.map((r) => r.event_id);
+  }, [filters.q, hasVectors, semanticSearchData]);
+
+  // The filter object actually sent to the events/histogram/export queries.
+  // `filters` itself stays URL-serializable/shareable — this augments it
+  // with ephemeral live-finding event IDs and semantic search candidates
+  // only while relevant, so switching detector tabs or field selections
+  // correctly refetches the filtered view.
+  const effectiveFilters = useMemo<EventFilters>(() => {
+    let f = filters;
+    if (filters.annotated?.includes("anomaly") && liveAnomalyEventIds.length > 0) {
+      f = { ...f, liveAnomalyEventIds };
+    }
+    // Semantic candidates replace the broadened keyword search server-side
+    // (rather than ANDing with it) — a semantically relevant event may not
+    // literally contain the typed words, so intersecting would wrongly drop it.
+    if (semanticSearchIds !== null) {
+      f = { ...f, q: undefined, ids: semanticSearchIds };
+    }
+    return f;
+  }, [filters, liveAnomalyEventIds, semanticSearchIds]);
 
   const queryClient = useQueryClient();
   const eventsQueryKey = ["events", caseId, timelineId, effectiveFilters, sortDir];
@@ -318,6 +356,18 @@ export function ExplorerPage() {
     enabled: !!(caseId && timelineId),
   });
 
+  const { data: mergedTagSuggestions = [] } = useQuery({
+    queryKey: ["tags-merged", caseId, timelineId],
+    queryFn: () => eventsApi.mergedTags(caseId!, timelineId!),
+    enabled: !!(caseId && timelineId),
+  });
+
+  const { data: artifactSuggestions = [] } = useQuery({
+    queryKey: ["artifacts", caseId, timelineId],
+    queryFn: () => eventsApi.artifacts(caseId!, timelineId!),
+    enabled: !!(caseId && timelineId),
+  });
+
   // ── Derived ────────────────────────────────────────────────────────────
   const annotationMap = useMemo<Map<string, Annotation[]>>(() => {
     const m = new Map<string, Annotation[]>();
@@ -347,8 +397,6 @@ export function ExplorerPage() {
   // Only the initial, uncursored page carries a real COUNT(*) — later pages
   // (forward, backward, or a jump-to-time seek) return `total: null`.
   const total = eventsData?.pages.find((p) => p.total != null)?.total ?? 0;
-  const hasVectors =
-    (timelineSources?.some((s) => s.vector_count > 0) ?? false);
 
   // Derive a plain Set<string> of selected IDs for components that don't know
   // about the "all" mode (EventGrid checkboxes). In "all" mode we show all
@@ -498,6 +546,50 @@ const handleFindSimilar = useCallback((event: Event) => {
     setRangeHighlight(null);
   }, [preJumpFilters, setFilters]);
 
+  /**
+   * Wired to the filter rail's unified search box. Dispatches on the shape of
+   * the input: an exact event_id (UUID) jumps straight to that event via the
+   * existing jump-to-time machinery; anything else becomes `filters.q`, which
+   * drives a broadened all-fields keyword search server-side and — once
+   * embeddings exist for this timeline — is also narrowed by a background
+   * semantic search (see the `semanticSearchIds` effective-filter override).
+   */
+  const handleSearchSubmit = useCallback(
+    async (raw: string) => {
+      setSearchError(null);
+      const value = raw.trim();
+      if (!value) {
+        if (filters.q) setFilters({ ...filters, q: undefined });
+        return;
+      }
+      if (UUID_RE.test(value) && caseId && timelineId) {
+        const event = await eventsApi.getById(caseId, timelineId, value);
+        if (!event || !event.timestamp) {
+          setSearchError("No event found with that id");
+          return;
+        }
+        handleJumpToTime(event.timestamp, event.event_id);
+        return;
+      }
+      setFilters({ ...filters, q: value });
+    },
+    [filters, setFilters, caseId, timelineId, handleJumpToTime],
+  );
+
+  const searchStatus = useMemo(() => {
+    if (searchError) return searchError;
+    if (!filters.q) return undefined;
+    if (!hasVectors) return "keyword search — no embeddings for this timeline";
+    if (semanticSearchPending) return undefined; // spinner already shown
+    if (semanticSearchData?.status === "ok") {
+      return `${semanticSearchData.results.length} semantic match${semanticSearchData.results.length === 1 ? "" : "es"}`;
+    }
+    if (semanticSearchData?.status === "not_embedded") {
+      return "not embedded — keyword fallback";
+    }
+    return undefined;
+  }, [searchError, filters.q, hasVectors, semanticSearchPending, semanticSearchData]);
+
   // Once the jump target's anchor page has landed in `events`, scroll the
   // grid to it, open its detail panel (so the target is unmistakable — the
   // detail panel's own "expanded" row styling doubles as the highlight),
@@ -533,7 +625,11 @@ const handleFindSimilar = useCallback((event: Event) => {
           onApplyView={setFilters}
           onSaveView={() => setSaveViewOpen(true)}
           onClose={() => setFilterRailOpen(false)}
-          tagSuggestions={tagSuggestions}
+          mergedTagSuggestions={mergedTagSuggestions}
+          artifactSuggestions={artifactSuggestions}
+          onSearchSubmit={handleSearchSubmit}
+          searchStatus={searchStatus}
+          searchPending={hasVectors && !!filters.q && semanticSearchPending}
         />
       )}
 
