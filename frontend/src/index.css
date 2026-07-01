@@ -5,15 +5,75 @@
 @import "@fontsource/jetbrains-mono/400.css";
 @import "@fontsource/jetbrains-mono/500.css";
 
-/* ── Forensic console — dark-first theme tokens ─────────────────────────── */
+/* ── Theme tokens — light-first, dark available via toggle ──────────────── */
 @theme {
+  /* Fonts */
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "Cascadia Code", Consolas, monospace;
+
+  /* Radii */
+  --radius-sm: 3px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+}
+
+:root,
+[data-theme="light"] {
   /* Background tiers: base → surface → elevated → overlay */
-  --color-bg-base: #0b0c10;
-  --color-bg-surface: #111318;
-  --color-bg-elevated: #1a1d25;
-  --color-bg-overlay: #21242e;
-  --color-bg-hover: #252830;
-  --color-bg-active: #2c3040;
+  --color-bg-base: #f8f6f1;
+  --color-bg-surface: #f2f0ea;
+  --color-bg-elevated: #ffffff;
+  --color-bg-overlay: #ffffff;
+  --color-bg-hover: #ece9e2;
+  --color-bg-active: #e2ded3;
+
+  /* Foreground */
+  --color-fg-primary: #2d2d2d;
+  --color-fg-secondary: #5a5a5a;
+  --color-fg-muted: #7a7a72;
+  --color-fg-disabled: #b8b5ac;
+
+  /* Borders */
+  --color-border: #ddd8cc;
+  --color-border-strong: #c9c3b4;
+  --color-border-subtle: #eae7de;
+
+  /* Accent — muted blue/teal */
+  --color-accent: #3b6e91;
+  --color-accent-dim: rgba(59, 110, 145, 0.1);
+  --color-accent-muted: rgba(59, 110, 145, 0.25);
+  --color-accent-fg: #ffffff;
+
+  /* Status */
+  --color-danger: #b3382c;
+  --color-danger-dim: rgba(179, 56, 44, 0.1);
+  --color-warning: #9a6a1a;
+  --color-warning-dim: rgba(154, 106, 26, 0.1);
+  --color-success: #2f7a4f;
+  --color-success-dim: rgba(47, 122, 79, 0.1);
+  --color-info: #3d6f99;
+  --color-info-dim: rgba(61, 111, 153, 0.1);
+
+  /* Anomaly highlight color */
+  --color-anomaly: #8a4bbf;
+  --color-anomaly-dim: rgba(138, 75, 191, 0.1);
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(45, 45, 45, 0.08);
+  --shadow-md: 0 4px 12px rgba(45, 45, 45, 0.1);
+  --shadow-lg: 0 12px 32px rgba(45, 45, 45, 0.14);
+
+  color-scheme: light;
+}
+
+[data-theme="dark"] {
+  /* Background tiers: base → surface → elevated → overlay */
+  --color-bg-base: #0e1015;
+  --color-bg-surface: #14171d;
+  --color-bg-elevated: #1b1e26;
+  --color-bg-overlay: #22252f;
+  --color-bg-hover: #262a34;
+  --color-bg-active: #2d3140;
 
   /* Foreground */
   --color-fg-primary: #e2e4ec;
@@ -26,16 +86,17 @@
   --color-border-strong: #2e3244;
   --color-border-subtle: #191c26;
 
-  /* Accent — restrained amber/gold for forensic warmth */
-  --color-accent: #e8a839;
-  --color-accent-dim: rgba(232, 168, 57, 0.15);
-  --color-accent-muted: rgba(232, 168, 57, 0.35);
-  --color-accent-fg: #0b0c10;
+  /* Accent — muted teal, replaces amber */
+  --color-accent: #5aa8b0;
+  --color-accent-dim: rgba(90, 168, 176, 0.15);
+  --color-accent-muted: rgba(90, 168, 176, 0.35);
+  --color-accent-fg: #0e1015;
 
   /* Status */
   --color-danger: #e05252;
   --color-danger-dim: rgba(224, 82, 82, 0.15);
   --color-warning: #e8a839;
+  --color-warning-dim: rgba(232, 168, 57, 0.15);
   --color-success: #4caf7d;
   --color-success-dim: rgba(76, 175, 125, 0.15);
   --color-info: #5e9ed6;
@@ -45,19 +106,12 @@
   --color-anomaly: #c97fff;
   --color-anomaly-dim: rgba(201, 127, 255, 0.15);
 
-  /* Fonts */
-  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, "Cascadia Code", Consolas, monospace;
-
-  /* Radii */
-  --radius-sm: 3px;
-  --radius-md: 6px;
-  --radius-lg: 10px;
-
   /* Shadows */
   --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.5);
   --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.6);
   --shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.8);
+
+  color-scheme: dark;
 }
 
 /* ── Base resets ─────────────────────────────────────────────────────────── */
@@ -68,7 +122,6 @@
 }
 
 html {
-  color-scheme: dark;
   font-size: 13.5px;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;

@@ -1,10 +1,30 @@
 import { Link, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { Wifi, WifiOff, Activity } from "lucide-react";
+import { Wifi, WifiOff, Activity, Sun, Moon } from "lucide-react";
 import { healthApi } from "@/api/health";
 import { JobTray } from "./JobTray";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { cn } from "@/lib/cn";
+import { useThemeStore } from "@/stores/theme";
+
+function ThemeToggle() {
+  const theme = useThemeStore((s) => s.theme);
+  const toggleTheme = useThemeStore((s) => s.toggleTheme);
+  const isDark = theme === "dark";
+
+  return (
+    <Tooltip content={isDark ? "Switch to light theme" : "Switch to dark theme"}>
+      <button
+        type="button"
+        onClick={toggleTheme}
+        className="flex items-center justify-center rounded p-1.5 text-[var(--color-fg-secondary)] hover:bg-[var(--color-bg-hover)] hover:text-[var(--color-fg-primary)] transition-base"
+        aria-label={isDark ? "Switch to light theme" : "Switch to dark theme"}
+      >
+        {isDark ? <Sun size={14} /> : <Moon size={14} />}
+      </button>
+    </Tooltip>
+  );
+}
 
 function HealthIndicator() {
   const { data, isError } = useQuery({
@@ -92,6 +112,7 @@ export function TopBar() {
       <div className="ml-auto flex items-center gap-2">
         <JobTray />
         <HealthIndicator />
+        <ThemeToggle />
       </div>
     </header>
   );
