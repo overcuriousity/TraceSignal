@@ -921,7 +921,16 @@ class StatisticalAnomalyService:
             "buckets": buckets,
             "iv": interval,
         }
-        agg_cols_sql = ", ".join(f"argMin({c}, timestamp) AS {c}" for c in _EVENT_COLUMNS)
+        # Aliased distinctly from the raw column names (agg_<col>) — reusing
+        # a WHERE-filtered column name (e.g. "case_id", "source_id") as an
+        # argMin(...) alias makes ClickHouse resolve that WHERE reference to
+        # the aggregate expression itself, raising "Aggregate function ...
+        # is found in WHERE" (ILLEGAL_AGGREGATION). Downstream parsing is
+        # positional (_row_to_event), so the alias names themselves are
+        # otherwise unused.
+        agg_cols_sql = ", ".join(
+            f"argMin({c}, timestamp) AS agg_{c}" for c in _EVENT_COLUMNS
+        )
         sql = f"""
             SELECT
                 toStartOfInterval(timestamp, INTERVAL {{iv:UInt32}} second) AS bucket,
