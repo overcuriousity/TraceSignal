@@ -25,12 +25,23 @@ export function useCurrentUser() {
     if (query.isSuccess) {
       setUser(query.data);
       setInitialized(true);
-    } else if (query.isError) {
+    } else if (query.isError && query.fetchStatus === "idle") {
+      // Only trust an error once the query is settled — during a refetch the
+      // previous (possibly stale) 401 is still exposed and must not sign the
+      // user out mid-revalidation.
       const is401 = query.error instanceof ApiError && query.error.status === 401;
       if (is401) setUser(null);
       setInitialized(true);
     }
-  }, [query.isSuccess, query.isError, query.data, query.error, setUser, setInitialized]);
+  }, [
+    query.isSuccess,
+    query.isError,
+    query.fetchStatus,
+    query.data,
+    query.error,
+    setUser,
+    setInitialized,
+  ]);
 
   return query;
 }
