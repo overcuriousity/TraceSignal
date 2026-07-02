@@ -654,9 +654,14 @@ class PostgresStore:
 
     async def list_cases_for_user(self, user_id: str, team_ids: list[str]) -> list[Case]:
         """Return cases visible to a non-admin user: their own, plus their teams'."""
-        from sqlalchemy import or_, select
+        from sqlalchemy import and_, or_, select
 
-        conditions = [Case.owner_id == user_id]
+        # Owner match only applies to personal (team-less) cases — a team
+        # case is governed entirely by current membership (see
+        # deps.resolve_case_access), so an owner removed from the team must
+        # stop seeing it here too, or the case card lists but every click
+        # dead-ends in a 403.
+        conditions = [and_(Case.owner_id == user_id, Case.team_id.is_(None))]
         if team_ids:
             conditions.append(Case.team_id.in_(team_ids))
         async with self.session_factory() as session:
@@ -1660,6 +1665,12 @@ class PostgresStore:
         async with self.session_factory() as session:
             return await session.get(Team, team_id)
 
+    async def get_team_by_name(self, name: str) -> Team | None:
+        """Return a team by its (unique) name, or None if not found."""
+        async with self.session_factory() as session:
+            result = await session.execute(select(Team).where(Team.name == name))
+            return result.scalar_one_or_none()
+
     async def list_teams(self) -> list[Team]:
         """Return all teams ordered by name."""
         async with self.session_factory() as session:
@@ -1739,6 +1750,37 @@ class PostgresStore:
             )
             return list(result.scalars().all())
 
+    async def list_teams_for_user(self, user_id: str) -> list[tuple[Team, str]]:
+        """Return (team, role) for every team the user belongs to, one query."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Team, TeamMembership.role)
+                .join(TeamMembership, TeamMembership.team_id == Team.id)
+                .where(TeamMembership.user_id == user_id)
+            )
+            return list(result.all())
+
+    async def list_members_with_users(self, team_id: str) -> list[tuple[User, str]]:
+        """Return (user, role) for every member of a team, one query."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(User, TeamMembership.role)
+                .join(TeamMembership, TeamMembership.user_id == User.id)
+                .where(TeamMembership.team_id == team_id)
+            )
+            return list(result.all())
+
+    async def list_unassigned_users(self) -> list[User]:
+        """Return users with no team membership at all, one query."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(User)
+                .outerjoin(TeamMembership, TeamMembership.user_id == User.id)
+                .where(TeamMembership.user_id.is_(None))
+                .order_by(User.username.asc())
+            )
+            return list(result.scalars().all())
+
     # ------------------------------------------------------------------
     # Audit log
     # ------------------------------------------------------------------
@@ -1748,6 +1790,7 @@ class PostgresStore:
         action: str,
         user_id: str | None = None,
         username_snapshot: str | None = None,
+        actor: User | None = None,
         method: str | None = None,
         path: str | None = None,
         route: str | None = None,
@@ -1761,7 +1804,18 @@ class PostgresStore:
     ) -> None:
         """Append one audit-log row. Never raises on log-only failures upstream —
         callers should treat this as best-effort so a logging hiccup never blocks
-        the underlying request."""
+        the underlying request.
+
+        Pass ``actor`` (the ``User`` who performed the action) instead of
+        ``user_id``/``username_snapshot`` separately — it derives both,
+        removing the risk of a call site setting one but forgetting the
+        other. ``user_id``/``username_snapshot`` remain for the anonymous
+        cases (failed login, unauthenticated request) where there's no
+        ``User`` to pass.
+        """
+        if actor is not None:
+            user_id = actor.id
+            username_snapshot = actor.username
         row = AuditLog(
             id=generate_id(f"audit_{action}"),
             user_id=user_id,

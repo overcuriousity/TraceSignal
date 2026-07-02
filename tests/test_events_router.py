@@ -14,9 +14,10 @@ import pytest
 import pytest_asyncio
 from fastapi import HTTPException
 
+from tests.conftest import _fake_user
 from tracevector.api import deps
 from tracevector.api.routers import events
-from tracevector.db.postgres import Case, PostgresStore, User
+from tracevector.db.postgres import Case, PostgresStore
 
 
 @pytest_asyncio.fixture()
@@ -35,11 +36,6 @@ async def patched_store(store, monkeypatch):
     """Point deps.get_store() (shared by every router) at the in-memory test store."""
     monkeypatch.setattr(deps, "_store", store)
     return store
-
-
-def _fake_user(user_id: str = "u1") -> User:
-    """A non-persisted User for calling route handlers directly (bypassing FastAPI DI)."""
-    return User(id=user_id, username="tester", is_admin=True, is_active=True)
 
 
 async def _make_run(store, case_id: str, timeline_id: str, event_ids: list[str]) -> str:

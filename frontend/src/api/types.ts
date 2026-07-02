@@ -387,6 +387,7 @@ export interface UploadResult {
 export interface HealthResponse {
   status: "ok";
   version: string;
+  oidc_enabled: boolean;
 }
 
 /** Filter params for the events query */

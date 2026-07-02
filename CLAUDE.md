@@ -17,8 +17,10 @@ Frontend: React 19 + Vite 8 + TypeScript, in `frontend/`.
 
 Read `docs/CONCEPT.md` and `docs/MODEL_REFINEMENT.md` before touching the data model
 (Case/Source/Timeline/Event/Artifact) — the vocabulary is deliberate and recently refactored.
-`docs/TECH_STACK.md` records *why* each backing service was chosen and what's still open
-(auth backend, frontend stack was TBD but has since been decided — see `frontend/`).
+`docs/TECH_STACK.md` records *why* each backing service was chosen. Auth backend and frontend
+stack were both TBD in that doc but have since been decided and implemented — session-cookie
+auth with optional OIDC, case-RBAC, teams, and an audit trail (see `api/routers/auth.py`,
+`admin.py`, `deps.py`) and React 19 + Vite (see `frontend/`).
 there are multiple plans and roadmaps, which should be consulted, kept up to date and removed when done.
 
 ## Commands
@@ -114,7 +116,8 @@ Case → Source (immutable ingested file, SHA-256 hashed) → Timeline (named gr
   persistence there without a deliberate design discussion; it changes the deployment model.
 - Forensic reproducibility/explainability is a hard requirement for basically any subsystem. 
 - Airgapped/offline-by-default is a design goal (`TV_ALLOW_ONLINE`, `docs/TECH_STACK.md` §6).
-  Don't add code paths that reach the network unconditionally.
+  Don't add code paths that reach the network unconditionally. Exception: optional OIDC SSO
+  (`TV_OIDC_ENABLED`) is deliberately independent of `TV_ALLOW_ONLINE` — see `TECH_STACK.md` §6.
   
 ## References
 This project is inspired heavily by the existing projects https://github.com/ait-aecid/logdata-anomaly-miner and google/timesketch. Our goal is to become the perfect combination of them, evolving to the best forensic log analysis system in existence. Consult these for how they solve problems and their features and get inspiration there.

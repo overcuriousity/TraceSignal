@@ -19,14 +19,19 @@ def test_login_and_mutation_are_audited(client, admin_bootstrap, store):
     assert "case.create" in actions
 
 
-def test_read_requests_are_also_audited(client, admin_bootstrap, store):
-    """The audit scope is 'everything incl. reads' — a plain GET must show up too."""
+def test_mutating_requests_are_audited_but_reads_are_not(client, admin_bootstrap, store):
+    """The generic api.request row covers mutating methods only — plain GETs
+
+    are excluded so polling (JobTray, TopBar, list refetches) doesn't bury
+    the security-relevant mutating rows this audit log exists to surface.
+    """
     as_admin(client, admin_bootstrap)
     case = client.post("/api/cases/", json={"name": "read-me"}).json()["case"]
     client.get(f"/api/cases/{case['id']}")
 
     rows = client.get("/api/admin/audit", params={"action": "api.request"}).json()["audit"]
-    assert any(r["route"] and "case_id" in r["route"] for r in rows)
+    assert rows  # the POST that created the case produced a generic row
+    assert not any(r["method"] == "GET" for r in rows)
 
 
 def test_failed_login_is_audited_without_leaking_password(client, admin_bootstrap, store):

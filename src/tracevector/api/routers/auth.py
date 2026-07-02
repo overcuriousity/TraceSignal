@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 from collections.abc import Generator
@@ -58,13 +59,10 @@ def _user_response(user: User, teams: list[dict[str, Any]]) -> dict[str, Any]:
 
 async def _teams_for_user(user: User) -> list[dict[str, Any]]:
     store = get_store()
-    memberships = await store.list_user_memberships(user.id)
-    teams = []
-    for m in memberships:
-        team = await store.get_team(m.team_id)
-        if team is not None:
-            teams.append({"id": team.id, "name": team.name, "role": m.role})
-    return teams
+    return [
+        {"id": team.id, "name": team.name, "role": role}
+        for team, role in await store.list_teams_for_user(user.id)
+    ]
 
 
 def _set_session_cookie(response: Response, session_id: str) -> None:
@@ -98,12 +96,11 @@ async def _issue_session(user: User, request: Request, response: Response) -> No
 async def login(payload: LoginRequest, request: Request, response: Response) -> dict[str, Any]:
     """Authenticate with a local username/password and start a session."""
     store = get_store()
-    await store.init_schema()
     user = await store.get_user_by_username(payload.username)
     if (
         user is None
         or user.auth_provider != "local"
-        or not verify_password(payload.password, user.password_hash)
+        or not await asyncio.to_thread(verify_password, payload.password, user.password_hash)
     ):
         await store.record_audit(
             action="auth.login_failed",
@@ -118,8 +115,7 @@ async def login(payload: LoginRequest, request: Request, response: Response) -> 
     await _issue_session(user, request, response)
     await store.record_audit(
         action="auth.login",
-        user_id=user.id,
-        username_snapshot=user.username,
+        actor=user,
         ip=request.client.host if request.client else None,
         user_agent=request.headers.get("user-agent"),
     )
@@ -139,7 +135,7 @@ async def logout(
         await store.revoke_session(session_id)
     settings = get_settings()
     response.delete_cookie(settings.auth_cookie_name, path="/")
-    await store.record_audit(action="auth.logout", user_id=user.id, username_snapshot=user.username)
+    await store.record_audit(action="auth.logout", actor=user)
     return {"logged_out": True}
 
 
@@ -162,9 +158,7 @@ async def update_me(
     updated = await store.update_user(
         user.id, username=payload.username, display_name=payload.display_name
     )
-    await store.record_audit(
-        action="auth.update_profile", user_id=user.id, username_snapshot=user.username
-    )
+    await store.record_audit(action="auth.update_profile", actor=user)
     return {"user": _user_response(updated, await _teams_for_user(updated))}
 
 
@@ -186,19 +180,16 @@ async def change_my_password(
     so a stolen old cookie stops working the moment the password changes.
     """
     store = get_store()
-    if user.password_hash is not None and not verify_password(
-        payload.current_password or "", user.password_hash
+    if user.password_hash is not None and not await asyncio.to_thread(
+        verify_password, payload.current_password or "", user.password_hash
     ):
         raise HTTPException(status_code=401, detail="Current password is incorrect")
 
-    await store.set_password(
-        user.id, hash_password(payload.new_password), must_change_password=False
-    )
+    new_hash = await asyncio.to_thread(hash_password, payload.new_password)
+    await store.set_password(user.id, new_hash, must_change_password=False)
     await store.revoke_user_sessions(user.id)
     await _issue_session(user, request, response)
-    await store.record_audit(
-        action="auth.change_password", user_id=user.id, username_snapshot=user.username
-    )
+    await store.record_audit(action="auth.change_password", actor=user)
     refreshed = await store.get_user(user.id)
     return {"user": _user_response(refreshed, await _teams_for_user(refreshed))}
 
@@ -218,6 +209,7 @@ def _audit_rows_to_csv(rows: list[dict[str, Any]]) -> Generator[str]:
             "status_code",
         ],
         extrasaction="ignore",
+        lineterminator="\n",
     )
     writer.writeheader()
     yield buf.getvalue()
@@ -324,7 +316,6 @@ async def oidc_callback(
         raise HTTPException(status_code=502, detail="OIDC provider did not return a subject claim")
 
     store = get_store()
-    await store.init_schema()
     user = await store.get_user_by_oidc_subject(subject)
     if user is None:
         username = (
@@ -341,9 +332,7 @@ async def oidc_callback(
             display_name=userinfo.get("name"),
             email=userinfo.get("email"),
         )
-        await store.record_audit(
-            action="auth.oidc_provisioned", user_id=user.id, username_snapshot=user.username
-        )
+        await store.record_audit(action="auth.oidc_provisioned", actor=user)
 
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account disabled")
@@ -353,8 +342,7 @@ async def oidc_callback(
     response.delete_cookie(_OIDC_STATE_COOKIE)
     await store.record_audit(
         action="auth.login",
-        user_id=user.id,
-        username_snapshot=user.username,
+        actor=user,
         detail={"provider": "oidc"},
     )
     return response

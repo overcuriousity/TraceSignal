@@ -9,10 +9,11 @@ import pytest
 import pytest_asyncio
 from fastapi import HTTPException
 
+from tests.conftest import _fake_user
 from tracevector.api import deps
 from tracevector.api.routers import cases
 from tracevector.api.routers.cases import upload_source
-from tracevector.db.postgres import PostgresStore, User
+from tracevector.db.postgres import PostgresStore
 from tracevector.ingestion.files import hash_file
 from tracevector.ingestion.pipeline import IngestionResult
 
@@ -71,11 +72,6 @@ async def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PostgresStor
 async def case(store: PostgresStore) -> str:
     c = await store.create_case("case1", "Test case")
     return c.id
-
-
-def _fake_user() -> User:
-    """A non-persisted User for calling the route handler directly (bypassing FastAPI DI)."""
-    return User(id="u1", username="tester", is_admin=True, is_active=True)
 
 
 @pytest.mark.asyncio

@@ -7,8 +7,11 @@ import asyncio
 import pytest
 
 from tests.conftest import as_admin, login
+from tracevector.api.routers import stream as stream_module
 from tracevector.api.routers.stream import _event_stream
+from tracevector.core.config import get_settings
 from tracevector.core.events_bus import CaseEventBus, get_event_bus
+from tracevector.core.security import new_session_token, session_expiry
 
 
 class _ImmediatelyDisconnectingRequest:
@@ -27,6 +30,15 @@ class _ImmediatelyDisconnectingRequest:
 
     async def is_disconnected(self) -> bool:
         return True
+
+
+class _FakeCase:
+    """Minimal stand-in for a `Case` row — the generator only reads `.id`
+    (for bus subscribe/unsubscribe) and, on a keepalive re-validation tick,
+    passes the object straight through to `resolve_case_access`."""
+
+    def __init__(self, case_id: str) -> None:
+        self.id = case_id
 
 
 @pytest.mark.asyncio
@@ -59,6 +71,55 @@ def test_get_event_bus_is_a_process_wide_singleton():
     assert get_event_bus() is get_event_bus()
 
 
+class _NeverDisconnectingRequest:
+    """Stand-in for a Request whose session cookie can be swapped/revoked
+    mid-test, to exercise the keepalive-tick re-validation path."""
+
+    def __init__(self, session_id: str) -> None:
+        settings = get_settings()
+        self.cookies = {settings.auth_cookie_name: session_id}
+        self.state = type("State", (), {})()
+
+    async def is_disconnected(self) -> bool:
+        return False
+
+
+@pytest.mark.asyncio
+async def test_stream_closes_when_session_is_revoked_mid_stream(client, admin_bootstrap, store):
+    """PR #7 review finding #2: auth/case-access was only checked once, at
+    connect time — a revoked session kept receiving the SSE stream forever.
+    Re-validation now happens on every keepalive tick."""
+    me = as_admin(client, admin_bootstrap)
+    case = client.post("/api/cases/", json={"name": "revoke-me"}).json()["case"]
+
+    session = await store.create_session(
+        session_id=new_session_token(),
+        user_id=me["id"],
+        expires_at=session_expiry(1),
+    )
+
+    # Force the generator to hit its keepalive branch (and therefore
+    # re-validate) on the very next loop iteration instead of waiting a real
+    # 20 seconds.
+    stream_module._KEEPALIVE_SECONDS = 0.01
+    try:
+        from tracevector.db.postgres import Case as CaseModel
+
+        case_row = CaseModel(id=case["id"], name=case["name"], owner_id=me["id"])
+        request = _NeverDisconnectingRequest(session.id)
+        gen = _event_stream(request, case_row)
+
+        assert await gen.__anext__() == "retry: 3000\n\n"
+        assert await gen.__anext__() == ": keepalive\n\n"  # session still valid
+
+        await store.revoke_session(session.id)
+
+        with pytest.raises(StopAsyncIteration):
+            await gen.__anext__()
+    finally:
+        stream_module._KEEPALIVE_SECONDS = 20
+
+
 def test_non_member_cannot_open_the_case_stream(client, admin_bootstrap, store):
     as_admin(client, admin_bootstrap)
     case = client.post("/api/cases/", json={"name": "streamed-case"}).json()["case"]
@@ -73,7 +134,7 @@ def test_non_member_cannot_open_the_case_stream(client, admin_bootstrap, store):
 @pytest.mark.asyncio
 async def test_stream_generator_yields_retry_line_then_exits_on_disconnect():
     events = []
-    async for chunk in _event_stream(_ImmediatelyDisconnectingRequest(), "case-x"):
+    async for chunk in _event_stream(_ImmediatelyDisconnectingRequest(), _FakeCase("case-x")):
         events.append(chunk)
     assert events == ["retry: 3000\n\n"]
 
@@ -96,7 +157,7 @@ async def test_stream_generator_delivers_a_published_event_before_checking_disco
     bus = get_event_bus()
     request = DisconnectAfterOneCheck()
     collected = []
-    gen = _event_stream(request, "case-y")
+    gen = _event_stream(request, _FakeCase("case-y"))
     collected.append(await gen.__anext__())  # "retry:" line
     bus.publish("case-y", {"type": "annotation.changed", "event_id": "evt-1"})
     collected.append(await gen.__anext__())

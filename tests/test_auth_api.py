@@ -16,6 +16,26 @@ def test_health_is_exempt_from_auth(client):
     assert client.get("/api/health").status_code == 200
 
 
+def test_health_reports_oidc_enabled_flag(client):
+    assert client.get("/api/health").json()["oidc_enabled"] is False
+
+
+def test_cross_origin_preflight_gets_cors_headers_not_a_bare_401(client):
+    """PR #7 review finding #3: AuthAuditMiddleware was added after
+    CORSMiddleware, making it outermost — an OPTIONS preflight (which never
+    carries cookies) got a header-less 401 before CORS ever answered.
+    CORSMiddleware must be the outer layer so it always gets to respond."""
+    resp = client.options(
+        "/api/cases/",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.headers.get("access-control-allow-origin") == "http://localhost:5173"
+
+
 def test_seeded_admin_must_change_password_on_first_login(client, admin_bootstrap):
     payload = login(client, admin_bootstrap["username"], admin_bootstrap["password"])
     assert payload["user"]["is_admin"] is True
@@ -31,6 +51,34 @@ def test_mutating_action_blocked_until_password_rotated(client, admin_bootstrap)
     login(client, admin_bootstrap["username"], admin_bootstrap["password"])
     resp = client.post("/api/cases/", json={"name": "should-be-blocked"})
     assert resp.status_code == 403
+
+
+def test_admin_mutation_blocked_until_password_rotated(client, admin_bootstrap):
+    """PR #7 review finding #1: admin.py never opted in to
+    require_password_current, so the bootstrap admin could mint a permanent
+    admin via POST /api/admin/users before ever rotating the one-time
+    TV_ADMIN_PASSWORD. The gate now lives in AuthAuditMiddleware, applied to
+    every mutating /api/* request regardless of router opt-in."""
+    login(client, admin_bootstrap["username"], admin_bootstrap["password"])
+    resp = client.post(
+        "/api/admin/users", json={"username": "sneaky", "password": "abcdefgh12", "is_admin": True}
+    )
+    assert resp.status_code == 403
+
+
+def test_logout_and_password_change_still_reachable_during_forced_rotation(client, admin_bootstrap):
+    login(client, admin_bootstrap["username"], admin_bootstrap["password"])
+    # The self-service /api/auth/* routes must stay reachable, or a user
+    # stuck in forced rotation could never actually clear the flag.
+    resp = client.post(
+        "/api/auth/me/password",
+        json={
+            "current_password": admin_bootstrap["password"],
+            "new_password": "cleared-pass-789",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["user"]["must_change_password"] is False
 
 
 def test_seeded_password_is_invalidated_after_rotation(client, admin_bootstrap):

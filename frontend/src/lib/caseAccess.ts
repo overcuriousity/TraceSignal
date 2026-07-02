@@ -2,7 +2,13 @@ import type { Case, User } from "@/api/types";
 
 /** Mirrors the backend's `resolve_case_access` (api/deps.py) access levels,
  * computed client-side purely to decide what UI to show/hide — the backend
- * remains the source of truth and re-checks on every request. */
+ * remains the source of truth and re-checks on every request.
+ *
+ * Follow-up (PR #7 review, cleanup): returning a computed `access_level`
+ * field from the case list/detail API would collapse this duplication to a
+ * field read. Not done here — `list_cases_for_user` would need a bulk
+ * access-resolution path to avoid an N+1 (one `resolve_case_access` call
+ * per case), which is a bigger API-shape change than this cleanup pass. */
 export type CaseAccessLevel = "none" | "read" | "contribute" | "manage";
 
 export function resolveCaseAccess(case_: Case, user: User | null): CaseAccessLevel {
