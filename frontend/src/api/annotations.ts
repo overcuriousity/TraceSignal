@@ -1,5 +1,6 @@
 import { del, get, post } from "./client";
 import type { Annotation, AnnotationType, EventFilters } from "./types";
+import { serializeEventFilterFields } from "@/lib/queryParams";
 
 export const annotationsApi = {
   listDistinctTags: (caseId: string, timelineId: string) =>
@@ -54,15 +55,9 @@ export const annotationsApi = {
       {
         annotation_type: params.annotation_type,
         content: params.content,
-        q: filters.q ?? null,
-        artifact: filters.artifact ?? null,
-        source_id: filters.sourceId ?? null,
-        tag: filters.tag ?? null,
-        exclude_tag: filters.excludeTag ?? null,
-        start: filters.start ?? null,
-        end: filters.end ?? null,
-        filters: filters.filters ?? null,
-        exclusions: filters.exclusions ?? null,
+        ...serializeEventFilterFields(filters),
+        filters: filters.filters ? JSON.stringify(filters.filters) : null,
+        exclusions: filters.exclusions ? JSON.stringify(filters.exclusions) : null,
       },
     );
   },

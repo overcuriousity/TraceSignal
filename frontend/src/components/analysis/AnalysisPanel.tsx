@@ -1,16 +1,19 @@
 import { useState, useEffect } from "react";
-import { X, AlertTriangle, Search, BookOpen } from "lucide-react";
+import { X, AlertTriangle, Search, BookOpen, Hash, Activity } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/Button";
-import { AnomaliesList } from "./AnomaliesList";
+import { ValueNoveltyView } from "./ValueNoveltyView";
+import { FrequencyView } from "./FrequencyView";
 import { SimilarEvents } from "./SimilarEvents";
+import { SemanticSearch } from "./SemanticSearch";
 import { EmbeddingStatusBanner } from "./EmbeddingStatusBanner";
 import { MethodologyPanel } from "./MethodologyPanel";
 import { timelinesApi } from "@/api/timelines";
 import { cn } from "@/lib/cn";
-import type { Event } from "@/api/types";
+import type { AnomalyMarker, Event } from "@/api/types";
 
 type Tab = "anomalies" | "similar" | "methodology";
+type AnomalySubTab = "novelty" | "frequency";
 
 interface Props {
   caseId: string;
@@ -20,6 +23,16 @@ interface Props {
   onClose: () => void;
   onSelectEvent: (event: Event) => void;
   onSimilarClose: () => void;
+  /** Passed to ValueNoveltyView so clicking a field drills into filtered events. */
+  onDrillField?: (field: string, value: string) => void;
+  /** Passed to FrequencyView — narrows the time range and the series field=value. */
+  onFrequencyDrill?: (field: string, value: string, start: string, end: string) => void;
+  /** Called with the active anomaly tab's findings — feeds the histogram overlay and event grid. */
+  onAnomalyMarkers?: (markers: AnomalyMarker[]) => void;
+  /** Called with the active anomaly tab's persisted run_id, so the grid can filter to it. */
+  onAnomalyRunId?: (runId: string | undefined) => void;
+  /** Scrolls the main grid to a finding's timestamp, clearing filters first. */
+  onJumpToTime?: (ts: string, eventId?: string, windowEnd?: string) => void;
 }
 
 export function AnalysisPanel({
@@ -30,15 +43,21 @@ export function AnalysisPanel({
   onClose,
   onSelectEvent,
   onSimilarClose,
+  onDrillField,
+  onFrequencyDrill,
+  onAnomalyMarkers,
+  onAnomalyRunId,
+  onJumpToTime,
 }: Props) {
   const [tab, setTab] = useState<Tab>(similarAnchor ? "similar" : "anomalies");
+  const [anomalySubTab, setAnomalySubTab] = useState<AnomalySubTab>("novelty");
 
   // Auto-switch to the similar tab when the anchor event is set.
   useEffect(() => {
     if (similarAnchor) setTab("similar");
   }, [similarAnchor]);
 
-  // Load the timeline to drive stale / not-embedded banners.
+  // Load the timeline to drive stale banners.
   const { data: timeline } = useQuery({
     queryKey: ["timeline", caseId, timelineId],
     queryFn: () => timelinesApi.get(caseId, timelineId),
@@ -50,7 +69,7 @@ export function AnalysisPanel({
     queryFn: () => timelinesApi.listSources(caseId, timelineId),
   });
 
-  // Show the banner when: not embedded at all, OR embedded-but-stale.
+  // Show the similarity banner when: not embedded at all, OR embedded-but-stale.
   const showBanner = !hasVectors || (timeline?.is_stale ?? false);
 
   return (
@@ -65,7 +84,7 @@ export function AnalysisPanel({
         </Button>
       </div>
 
-      {/* Tabs */}
+      {/* Top-level tabs */}
       <div className="flex border-b border-[var(--color-border)]">
         {([
           ["anomalies", AlertTriangle, "Anomalies"],
@@ -88,8 +107,39 @@ export function AnalysisPanel({
         ))}
       </div>
 
+      {/* Anomaly sub-tabs (only visible on the anomalies tab) */}
+      {tab === "anomalies" && (
+        <div className="flex gap-px border-b border-[var(--color-border)] bg-[var(--color-bg-base)] px-2 py-1.5">
+          <button
+            className={cn(
+              "flex flex-1 items-center justify-center gap-1 rounded py-1 text-xs font-medium transition-colors",
+              anomalySubTab === "novelty"
+                ? "bg-[var(--color-bg-elevated)] text-[var(--color-fg-primary)]"
+                : "text-[var(--color-fg-muted)] hover:text-[var(--color-fg-secondary)]",
+            )}
+            onClick={() => setAnomalySubTab("novelty")}
+          >
+            <Hash size={11} />
+            Rare values
+          </button>
+          <button
+            className={cn(
+              "flex flex-1 items-center justify-center gap-1 rounded py-1 text-xs font-medium transition-colors",
+              anomalySubTab === "frequency"
+                ? "bg-[var(--color-bg-elevated)] text-[var(--color-fg-primary)]"
+                : "text-[var(--color-fg-muted)] hover:text-[var(--color-fg-secondary)]",
+            )}
+            onClick={() => setAnomalySubTab("frequency")}
+          >
+            <Activity size={11} />
+            Frequency
+          </button>
+        </div>
+      )}
+
       <div className="flex-1 overflow-y-auto p-4">
-        {showBanner && (
+        {/* Similarity banner — only relevant for the similarity tab */}
+        {tab === "similar" && showBanner && (
           <div className="mb-4">
             <EmbeddingStatusBanner
               status={hasVectors ? "ok" : "not_embedded"}
@@ -99,28 +149,53 @@ export function AnalysisPanel({
           </div>
         )}
 
-        {tab === "anomalies" && (
-          <AnomaliesList
+        {tab === "anomalies" && anomalySubTab === "novelty" && (
+          <ValueNoveltyView
             caseId={caseId}
             timelineId={timelineId}
-            sourceCount={timeline?.source_ids?.length ?? 1}
             onSelectEvent={onSelectEvent}
+            onDrillField={onDrillField}
+            onFindingsChange={onAnomalyMarkers}
+            onRunIdChange={onAnomalyRunId}
+            onJumpToTime={onJumpToTime}
           />
         )}
 
-        {tab === "similar" && similarAnchor ? (
-          <SimilarEvents
+        {tab === "anomalies" && anomalySubTab === "frequency" && (
+          <FrequencyView
             caseId={caseId}
             timelineId={timelineId}
-            anchorEvent={similarAnchor}
-            onClose={onSimilarClose}
-            onSelectEvent={onSelectEvent}
+            onDrillField={onFrequencyDrill}
+            onFindingsChange={onAnomalyMarkers}
+            onRunIdChange={onAnomalyRunId}
+            onJumpToTime={onJumpToTime}
           />
-        ) : tab === "similar" ? (
-          <p className="text-xs text-[var(--color-fg-muted)]">
-            Click the search icon on any event row to find similar events.
-          </p>
-        ) : null}
+        )}
+
+        {tab === "similar" && (
+          <div className="space-y-5">
+            <SemanticSearch
+              caseId={caseId}
+              timelineId={timelineId}
+              onSelectEvent={onSelectEvent}
+            />
+            <div className="border-t border-[var(--color-border)] pt-4">
+              {similarAnchor ? (
+                <SimilarEvents
+                  caseId={caseId}
+                  timelineId={timelineId}
+                  anchorEvent={similarAnchor}
+                  onClose={onSimilarClose}
+                  onSelectEvent={onSelectEvent}
+                />
+              ) : (
+                <p className="text-xs text-[var(--color-fg-muted)]">
+                  Click the search icon on any event row to find similar events.
+                </p>
+              )}
+            </div>
+          </div>
+        )}
 
         {tab === "methodology" && (
           <MethodologyPanel

@@ -1,5 +1,6 @@
 import { get } from "./client";
-import type { EmbeddingFieldsResponse, EventFilters, EventPage, FieldsResponse, HistogramResponse } from "./types";
+import type { EmbeddingFieldsResponse, Event, EventCursor, EventFilters, EventPage, FieldsResponse, HistogramResponse } from "./types";
+import { serializeEventFilterFields } from "@/lib/queryParams";
 
 export const eventsApi = {
   list: (
@@ -7,19 +8,16 @@ export const eventsApi = {
     timelineId: string,
     filters: EventFilters = {},
     signal?: AbortSignal,
+    cursor?: EventCursor,
   ): Promise<EventPage> => {
     const params: Record<string, string | number | boolean | undefined | null> =
       {
-        q: filters.q,
-        artifact: filters.artifact,
-        source_id: filters.sourceId,
-        tag: filters.tag,
-        exclude_tag: filters.excludeTag,
-        start: filters.start,
-        end: filters.end,
+        ...serializeEventFilterFields(filters),
         limit: filters.limit ?? 100,
         offset: filters.offset ?? 0,
         order: filters.order ?? "desc",
+        after: cursor?.after,
+        before: cursor?.before,
       };
     if (filters.filters && Object.keys(filters.filters).length > 0) {
       params.filters = JSON.stringify(filters.filters);
@@ -32,6 +30,21 @@ export const eventsApi = {
       params,
       signal,
     );
+  },
+
+  /** Fetch a single full event by id — e.g. to hydrate a partial finding
+   * object (analysis detectors return lightweight event stubs) before
+   * displaying it in the Event Detail panel. */
+  getById: async (
+    caseId: string,
+    timelineId: string,
+    eventId: string,
+  ): Promise<Event | null> => {
+    const page = await get<EventPage>(
+      `/cases/${caseId}/timelines/${timelineId}/events`,
+      { event_id: eventId, limit: 1 },
+    );
+    return page.events[0] ?? null;
   },
 
   fields: (caseId: string, timelineId: string): Promise<FieldsResponse> =>
@@ -52,13 +65,7 @@ export const eventsApi = {
     buckets = 60,
   ): Promise<HistogramResponse> => {
     const params: Record<string, string | number | undefined | null> = {
-      q: filters.q,
-      artifact: filters.artifact,
-      source_id: filters.sourceId,
-      tag: filters.tag,
-      exclude_tag: filters.excludeTag,
-      start: filters.start,
-      end: filters.end,
+      ...serializeEventFilterFields(filters),
       buckets,
     };
     if (filters.filters && Object.keys(filters.filters).length > 0) {
@@ -72,4 +79,14 @@ export const eventsApi = {
       params,
     );
   },
+
+  artifacts: (caseId: string, timelineId: string): Promise<string[]> =>
+    get<{ artifacts: string[] }>(
+      `/cases/${caseId}/timelines/${timelineId}/artifacts`,
+    ).then((r) => r.artifacts),
+
+  mergedTags: (caseId: string, timelineId: string): Promise<string[]> =>
+    get<{ tags: string[] }>(
+      `/cases/${caseId}/timelines/${timelineId}/tags/merged`,
+    ).then((r) => r.tags),
 };

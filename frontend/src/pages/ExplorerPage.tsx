@@ -9,9 +9,9 @@
  * All filter state lives in the URL so investigation links are shareable.
  * Filter-in / Filter-out from the detail panel adds directly to the URL.
  */
-import { useState, useCallback, useMemo, useEffect } from "react";
+import { useState, useCallback, useMemo, useEffect, useRef } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
-import { useQuery, useInfiniteQuery } from "@tanstack/react-query";
+import { useQuery, useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import {
   FlaskConical,
   RefreshCw,
@@ -22,14 +22,16 @@ import {
 
 import { eventsApi } from "@/api/events";
 import { annotationsApi } from "@/api/annotations";
+import { similarityApi } from "@/api/similarity";
 import { viewsApi } from "@/api/views";
 import { timelinesApi } from "@/api/timelines";
 import { useUiStore, DEFAULT_COLUMNS } from "@/stores/ui";
+import { useScrollPositionStore } from "@/stores/scrollPosition";
 import { paramsToFilters, filtersToParams } from "@/lib/queryParams";
 
 import { FilterRail } from "@/components/explorer/FilterRail";
 import { FilterChips } from "@/components/explorer/FilterChips";
-import { EventGrid } from "@/components/explorer/EventGrid";
+import { EventGrid, type EventGridHandle } from "@/components/explorer/EventGrid";
 import { EventDetailPanel } from "@/components/explorer/EventDetailPanel";
 import { BulkActionBar } from "@/components/explorer/BulkActionBar";
 import { ExportDialog } from "@/components/explorer/ExportDialog";
@@ -42,9 +44,20 @@ import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
 
-import type { Event, EventFilters, Annotation } from "@/api/types";
+import type { AnomalyMarker, Event, EventFilters, EventPage, Annotation } from "@/api/types";
 
 const PAGE_SIZE = 100;
+
+/** Matches a ClickHouse UUID event_id, used to detect an event_id typed into
+ * the filter rail's search box (vs. a keyword/semantic query). */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Keyset pagination page param — `{}` requests the initial offset-0 page. */
+type EventsPageParam = { after?: string; before?: string };
+
+function cursorParam(cursor: [string, string] | null): string | undefined {
+  return cursor ? `${cursor[0]},${cursor[1]}` : undefined;
+}
 
 /** Discriminated selection state.
  *  "ids"  — explicit per-row selection (IDs of in-memory events).
@@ -90,6 +103,34 @@ export function ExplorerPage() {
           const { [fieldKey]: _removed, ...rest } = f.exclusions ?? {};
           f.exclusions = rest;
         }
+      } else if (key === "artifacts") {
+        const remaining = value !== undefined
+          ? (f.artifacts ?? []).filter((a) => a !== value)
+          : [];
+        if (remaining.length > 0) f.artifacts = remaining;
+        else delete f.artifacts;
+      } else if (key === "tagsInclude") {
+        const remaining = value !== undefined
+          ? (f.tagsInclude ?? []).filter((t) => t !== value)
+          : [];
+        if (remaining.length > 0) f.tagsInclude = remaining;
+        else delete f.tagsInclude;
+      } else if (key === "tagsExclude") {
+        const remaining = value !== undefined
+          ? (f.tagsExclude ?? []).filter((t) => t !== value)
+          : [];
+        if (remaining.length > 0) f.tagsExclude = remaining;
+        else delete f.tagsExclude;
+      } else if (key === "annotated") {
+        const remaining = value !== undefined
+          ? (f.annotated ?? []).filter((t) => t !== value)
+          : [];
+        if (remaining.length > 0) {
+          f.annotated = remaining as ("tag" | "anomaly")[];
+        } else {
+          delete f.annotated;
+          delete f.annotationTagValue;
+        }
       } else {
         delete f[key as keyof EventFilters];
       }
@@ -99,48 +140,84 @@ export function ExplorerPage() {
   );
 
   /**
-   * Handler wired to the detail panel's filter-in/filter-out buttons.
-   *
    * Special cases:
    *   - filterKey "q"       → sets the top-level full-text search param
    *   - filterKey "artifact" → sets the dedicated artifact param (include only)
    *   - filterKey "tag"     → sets the dedicated tag param (include only)
    *   - everything else     → goes into filters{} or exclusions{}
    */
-  const handleAddFilter = useCallback(
-    (fieldKey: string, value: string, include: boolean) => {
-      const f = { ...filters };
+  const applyFieldFilter = useCallback(
+    (f: EventFilters, fieldKey: string, value: string, include: boolean): EventFilters => {
+      const next = { ...f };
 
       if (fieldKey === "q") {
         // Full-text search: always "include" (no exclusion concept for free text)
-        f.q = value;
+        next.q = value;
       } else if (fieldKey === "artifact") {
         if (include) {
-          f.artifact = value;
+          next.artifact = value;
         } else {
-          const prev = f.exclusions?.artifact ?? [];
+          const prev = next.exclusions?.artifact ?? [];
           if (!prev.includes(value)) {
-            f.exclusions = { ...(f.exclusions ?? {}) as Record<string, string[]>, artifact: [...prev, value] };
+            next.exclusions = { ...(next.exclusions ?? {}) as Record<string, string[]>, artifact: [...prev, value] };
           }
         }
       } else if (fieldKey === "tag") {
         if (include) {
-          f.tag = value;
+          next.tag = value;
         } else {
-          f.excludeTag = value;
+          next.excludeTag = value;
         }
       } else if (include) {
-        f.filters = { ...(f.filters ?? {}), [fieldKey]: value };
+        next.filters = { ...(next.filters ?? {}), [fieldKey]: value };
       } else {
-        const prev = f.exclusions?.[fieldKey] ?? [];
+        const prev = next.exclusions?.[fieldKey] ?? [];
         if (!prev.includes(value)) {
-          f.exclusions = { ...(f.exclusions ?? {}) as Record<string, string[]>, [fieldKey]: [...prev, value] };
+          next.exclusions = { ...(next.exclusions ?? {}) as Record<string, string[]>, [fieldKey]: [...prev, value] };
         }
       }
 
-      setFilters(f);
+      return next;
     },
-    [filters, setFilters],
+    [],
+  );
+
+  /** Handler wired to the detail panel's filter-in/filter-out buttons. */
+  const handleAddFilter = useCallback(
+    (fieldKey: string, value: string, include: boolean) => {
+      setFilters(applyFieldFilter(filters, fieldKey, value, include));
+    },
+    [filters, setFilters, applyFieldFilter],
+  );
+
+  /** Maps an anomaly-finding field token to a filter-rail filterKey. */
+  const mapAnomalyField = useCallback((field: string): string => {
+    if (field.startsWith("attr:")) return field.slice(5);
+    if (field === "tags") return "tag";
+    return field;
+  }, []);
+
+  /** Wired to ValueNoveltyView — sets a field=value filter from a rare-value finding. */
+  const handleDrillField = useCallback(
+    (field: string, value: string) => {
+      setFilters(applyFieldFilter(filters, mapAnomalyField(field), value, true));
+    },
+    [filters, setFilters, applyFieldFilter, mapAnomalyField],
+  );
+
+  /**
+   * Wired to FrequencyView — narrows the time range to the anomalous window
+   * AND filters to the series field=value that spiked, in a single update.
+   */
+  const handleFrequencyDrill = useCallback(
+    (field: string, value: string, start: string, end: string) => {
+      setFilters({
+        ...applyFieldFilter(filters, mapAnomalyField(field), value, true),
+        start,
+        end,
+      });
+    },
+    [filters, setFilters, applyFieldFilter, mapAnomalyField],
   );
 
   // ── Panel visibility state ────────────────────────────────────────────
@@ -151,7 +228,26 @@ export function ExplorerPage() {
   const [expandedEvent, setExpandedEvent] = useState<Event | null>(null);
   const [selection, setSelection] = useState<SelectionState>({ mode: "ids", ids: new Set() });
   const [similarAnchor, setSimilarAnchor] = useState<Event | null>(null);
+  const [anomalyMarkers, setAnomalyMarkers] = useState<AnomalyMarker[]>([]);
+  const [anomalyRunId, setAnomalyRunId] = useState<string | undefined>(undefined);
+  // Scroll position feeds TimelineHistogram only, via a store subscribed
+  // solely by that component (C15) — not page state, so scrolling doesn't
+  // re-render EventGrid/FilterRail/AnalysisPanel on every row crossed.
+  const setCurrentPositionTs = useScrollPositionStore((s) => s.setCurrentPositionTs);
   const [saveViewOpen, setSaveViewOpen] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const gridRef = useRef<EventGridHandle>(null);
+  // Snapshot of `filters` taken right before a "jump to time" cleared them —
+  // drives the "back to filtered view" breadcrumb. `rangeHighlight` is purely
+  // visual (a Frequency finding's anomalous window), never a URL filter.
+  const [preJumpFilters, setPreJumpFilters] = useState<EventFilters | null>(null);
+  const [rangeHighlight, setRangeHighlight] = useState<{ start: string; end: string } | null>(null);
+  const pendingJumpRef = useRef<{ ts: string; eventId?: string; seq: number } | null>(null);
+  // Bumped on every jump; the pending-jump effect only trusts `events` once
+  // `seededSeqRef` catches up, so a stray automatic fetch landing mid-jump
+  // (or a second jump superseding the first) can't be mistaken for "ready".
+  const jumpSeqRef = useRef(0);
+  const seededSeqRef = useRef(0);
   const tlKey = `${caseId}/${timelineId}`;
   const visibleColumns = useUiStore((s) => s.visibleColumnsByTimeline[tlKey] ?? DEFAULT_COLUMNS);
   const histogramOpen = useUiStore((s) => s.histogramOpen);
@@ -178,6 +274,46 @@ export function ExplorerPage() {
     enabled: !!(caseId && timelineId),
   });
 
+  const hasVectors = timelineSources?.some((s) => s.vector_count > 0) ?? false;
+
+  // The filter rail's search box runs semantic search in the background once
+  // embeddings exist for this timeline, so a free-text query narrows the grid
+  // to conceptually related events even when they don't literally contain the
+  // typed words. `filters.q` itself stays URL-shareable and drives the
+  // broadened keyword search server-side as a fallback while this is loading
+  // or when there are no embeddings to search.
+  const { data: semanticSearchData, isFetching: semanticSearchPending } = useQuery({
+    queryKey: ["search-filter", caseId, timelineId, filters.q],
+    queryFn: () => similarityApi.semanticSearch(caseId!, filters.q!, 200, timelineId),
+    enabled: !!(caseId && timelineId && hasVectors && filters.q),
+  });
+  const semanticSearchIds = useMemo(() => {
+    if (!filters.q || !hasVectors || semanticSearchData?.status !== "ok") return null;
+    return semanticSearchData.results.map((r) => r.event_id);
+  }, [filters.q, hasVectors, semanticSearchData]);
+
+  // The filter object actually sent to the events/histogram/export queries.
+  // `filters` itself stays URL-serializable/shareable — this augments it
+  // with the active Analysis tab's persisted run_id and semantic search
+  // candidates only while relevant, so switching detector tabs or field
+  // selections correctly refetches the filtered view.
+  const effectiveFilters = useMemo<EventFilters>(() => {
+    let f = filters;
+    if (filters.annotated?.includes("anomaly") && anomalyRunId) {
+      f = { ...f, anomalyRunId };
+    }
+    // Semantic candidates replace the broadened keyword search server-side
+    // (rather than ANDing with it) — a semantically relevant event may not
+    // literally contain the typed words, so intersecting would wrongly drop it.
+    if (semanticSearchIds !== null) {
+      f = { ...f, q: undefined, ids: semanticSearchIds };
+    }
+    return f;
+  }, [filters, anomalyRunId, semanticSearchIds]);
+
+  const queryClient = useQueryClient();
+  const eventsQueryKey = ["events", caseId, timelineId, effectiveFilters, sortDir];
+
   const {
     data: eventsData,
     isLoading: eventsLoading,
@@ -186,20 +322,40 @@ export function ExplorerPage() {
     refetch,
     fetchNextPage,
     hasNextPage,
+    fetchPreviousPage,
+    hasPreviousPage,
   } = useInfiniteQuery({
-    queryKey: ["events", caseId, timelineId, filters, sortDir],
+    queryKey: eventsQueryKey,
     queryFn: ({ pageParam, signal }) =>
       eventsApi.list(
         caseId!,
         timelineId!,
-        { ...filters, limit: PAGE_SIZE, offset: pageParam, order: sortDir },
+        { ...effectiveFilters, limit: PAGE_SIZE, order: sortDir },
         signal,
+        pageParam,
       ),
-    initialPageParam: 0,
-    getNextPageParam: (lastPage, allPages) => {
-      const loaded = allPages.reduce((sum, p) => sum + p.events.length, 0);
-      return loaded < lastPage.total ? loaded : undefined;
+    initialPageParam: {} as EventsPageParam,
+    getNextPageParam: (lastPage, _allPages, lastPageParam) => {
+      if (lastPage.has_more_after && lastPage.next_cursor) {
+        return { after: cursorParam(lastPage.next_cursor) };
+      }
+      // A jump-to-time anchor with no target event is seeded from a
+      // `before`-mode fetch (see handleJumpToTime), and before-mode only
+      // ever computes `has_more_before` — `has_more_after` is always false
+      // regardless of whether more events actually follow. Synthesize the
+      // forward cursor from this page's own last row instead of reporting
+      // "no more" when we simply don't know; the resulting `after` fetch is
+      // a normal cursor fetch that correctly reports its own has_more_after,
+      // so this synthesis is only needed for the seeded page itself.
+      if (lastPageParam?.before && lastPage.next_cursor) {
+        return { after: cursorParam(lastPage.next_cursor) };
+      }
+      return undefined;
     },
+    getPreviousPageParam: (firstPage) =>
+      firstPage.has_more_before && firstPage.prev_cursor
+        ? { before: cursorParam(firstPage.prev_cursor) }
+        : undefined,
     enabled: !!(caseId && timelineId),
     placeholderData: (prev) => prev,
   });
@@ -223,6 +379,18 @@ export function ExplorerPage() {
     enabled: !!(caseId && timelineId),
   });
 
+  const { data: mergedTagSuggestions = [] } = useQuery({
+    queryKey: ["tags-merged", caseId, timelineId],
+    queryFn: () => eventsApi.mergedTags(caseId!, timelineId!),
+    enabled: !!(caseId && timelineId),
+  });
+
+  const { data: artifactSuggestions = [] } = useQuery({
+    queryKey: ["artifacts", caseId, timelineId],
+    queryFn: () => eventsApi.artifacts(caseId!, timelineId!),
+    enabled: !!(caseId && timelineId),
+  });
+
   // ── Derived ────────────────────────────────────────────────────────────
   const annotationMap = useMemo<Map<string, Annotation[]>>(() => {
     const m = new Map<string, Annotation[]>();
@@ -234,10 +402,27 @@ export function ExplorerPage() {
     return m;
   }, [annotations]);
 
+  // Findings from the active (not-yet-tagged) analysis tab, keyed by event ID —
+  // lets the grid mark rows and the detail panel show/persist findings before
+  // they're saved as annotations via the "Tag" button.
+  const liveAnomaliesByEvent = useMemo<Map<string, AnomalyMarker[]>>(() => {
+    const m = new Map<string, AnomalyMarker[]>();
+    for (const marker of anomalyMarkers) {
+      if (!marker.eventId) continue;
+      const list = m.get(marker.eventId) ?? [];
+      list.push(marker);
+      m.set(marker.eventId, list);
+    }
+    return m;
+  }, [anomalyMarkers]);
+
   const events = useMemo(() => eventsData?.pages.flatMap((p) => p.events) ?? [], [eventsData]);
-  const total = eventsData?.pages[0]?.total ?? 0;
-  const hasVectors =
-    (timelineSources?.some((s) => s.vector_count > 0) ?? false);
+  // Only the initial, uncursored page carries a real COUNT(*) — later pages
+  // (forward, backward, or a jump-to-time seek) return `total: null`. Keep it
+  // `null` rather than defaulting to 0 — a jump-to-time session may never load
+  // an offset-mode page, and 0 would read as "no matching events" when the
+  // true count is simply unknown.
+  const total = eventsData?.pages.find((p) => p.total != null)?.total ?? null;
 
   // Derive a plain Set<string> of selected IDs for components that don't know
   // about the "all" mode (EventGrid checkboxes). In "all" mode we show all
@@ -248,7 +433,7 @@ export function ExplorerPage() {
   }, [selection, events]);
 
   // Total count shown in BulkActionBar label
-  const selectionCount = selection.mode === "all" ? total : selection.ids.size;
+  const selectionCount = selection.mode === "all" ? (total ?? events.length) : selection.ids.size;
 
   // Show the "select all N matching" banner when all loaded rows are in "ids"
   // mode selection and there are more events not yet loaded.
@@ -256,7 +441,7 @@ export function ExplorerPage() {
     selection.mode === "ids" &&
     selection.ids.size === events.length &&
     events.length > 0 &&
-    total > events.length;
+    (total === null || total > events.length);
 
   // ── Handlers ───────────────────────────────────────────────────────────
   const handleToggleSelect = useCallback((id: string) => {
@@ -284,10 +469,14 @@ export function ExplorerPage() {
     if (!isFetching && hasNextPage) fetchNextPage();
   }, [isFetching, hasNextPage, fetchNextPage]);
 
-const handleFindSimilar = useCallback((event: Event) => {
+  const handleLoadEarlier = useCallback(() => {
+    if (!isFetching && hasPreviousPage) fetchPreviousPage();
+  }, [isFetching, hasPreviousPage, fetchPreviousPage]);
+
+  const handleFindSimilar = useCallback((event: Event) => {
     setSimilarAnchor(event);
     setAnalysisPanelOpen(true);
-  }, []);
+  }, [setAnalysisPanelOpen]);
 
   const handleHistogramRange = useCallback(
     (start: string, end: string) => {
@@ -295,6 +484,186 @@ const handleFindSimilar = useCallback((event: Event) => {
     },
     [filters, setFilters],
   );
+
+  /**
+   * Wired to the Analysis panel's "jump to time" buttons and the Event
+   * Detail panel's "locate in timeline" button. The finding's timestamp may
+   * not match the currently active filters at all, so this clears them
+   * outright (guaranteeing the target is visible) rather than trying to
+   * merge — the analyst can restore the prior view via the breadcrumb this
+   * leaves behind. Since the target likely isn't in the already-loaded
+   * window, this also seeds the query cache with a fresh page anchored at
+   * the target, so bidirectional scroll continues correctly from there.
+   *
+   * A plain `before`-cursor seek would exclude the target event itself
+   * (cursors are strict boundaries — that's correct for normal pagination,
+   * where the caller already has the anchor row and wants the *next* batch).
+   * For a seek we need the target row present so it can be scrolled to,
+   * highlighted (via the detail panel's "expanded" row styling), and opened
+   * — so when `eventId` is known, fetch the surrounding pages on both sides
+   * and splice the target event itself (via `getById`) in between.
+   */
+  const handleJumpToTime = useCallback(
+    async (ts: string, eventId?: string, windowEnd?: string) => {
+      if (!caseId || !timelineId) return;
+      setPreJumpFilters((prev) => prev ?? filters);
+      setRangeHighlight(windowEnd ? { start: ts, end: windowEnd } : null);
+      const seq = ++jumpSeqRef.current;
+      pendingJumpRef.current = { ts, eventId, seq };
+      setFilters({});
+
+      // `filters` is about to become `{}` (above), so the live query key is
+      // about to become this — not the current-render `eventsQueryKey`
+      // closure, which still reflects the pre-jump filters. Cancel whatever
+      // the automatic refetch triggered by that key change is doing before
+      // seeding the cache, or it can resolve after `setQueryData` below and
+      // silently overwrite the anchor page with the un-jumped top-of-list page.
+      const targetKey = ["events", caseId, timelineId, {}, sortDir];
+      await queryClient.cancelQueries({ queryKey: targetKey });
+
+      let anchorPage: EventPage;
+      if (eventId) {
+        const halfBefore = Math.floor(PAGE_SIZE / 2);
+        const halfAfter = PAGE_SIZE - halfBefore - 1;
+        const [targetEvent, beforePage, afterPage] = await Promise.all([
+          eventsApi.getById(caseId, timelineId, eventId),
+          eventsApi.list(
+            caseId,
+            timelineId,
+            { limit: halfBefore, order: sortDir },
+            undefined,
+            { before: `${ts},${eventId}` },
+          ),
+          eventsApi.list(
+            caseId,
+            timelineId,
+            { limit: halfAfter, order: sortDir },
+            undefined,
+            { after: `${ts},${eventId}` },
+          ),
+        ]);
+        const combinedEvents = [
+          ...beforePage.events,
+          ...(targetEvent ? [targetEvent] : []),
+          ...afterPage.events,
+        ];
+        const first = combinedEvents[0];
+        const last = combinedEvents[combinedEvents.length - 1];
+        anchorPage = {
+          total: null,
+          offset: 0,
+          limit: PAGE_SIZE,
+          events: combinedEvents,
+          has_more_after: afterPage.has_more_after,
+          has_more_before: beforePage.has_more_before,
+          next_cursor: last ? [last.timestamp ?? "", last.event_id] : null,
+          prev_cursor: first ? [first.timestamp ?? "", first.event_id] : null,
+        };
+      } else {
+        anchorPage = await eventsApi.list(
+          caseId,
+          timelineId,
+          { limit: PAGE_SIZE, order: sortDir },
+          undefined,
+          { before: `${ts},` },
+        );
+      }
+
+      // A newer jump started while this one was in flight — let it win.
+      if (jumpSeqRef.current !== seq) return;
+
+      // The no-eventId branch fetches in `before` mode, and before-mode
+      // pagination only ever computes `has_more_before` on the backend —
+      // `has_more_after` comes back false even when more events follow.
+      // Recording `before` in this page's own pageParam lets
+      // `getNextPageParam` know its `has_more_after` can't be trusted and
+      // synthesize the forward cursor instead of reporting "all loaded".
+      const anchorPageParam: EventsPageParam = eventId
+        ? {}
+        : { before: cursorParam(anchorPage.prev_cursor) };
+      queryClient.setQueryData(targetKey, {
+        pages: [anchorPage],
+        pageParams: [anchorPageParam],
+      });
+      seededSeqRef.current = seq;
+    },
+    [caseId, timelineId, filters, setFilters, sortDir, queryClient],
+  );
+
+  const handleBackToFiltered = useCallback(() => {
+    if (preJumpFilters) setFilters(preJumpFilters);
+    setPreJumpFilters(null);
+    setRangeHighlight(null);
+  }, [preJumpFilters, setFilters]);
+
+  /**
+   * Wired to the filter rail's unified search box. Dispatches on the shape of
+   * the input: an exact event_id (UUID) jumps straight to that event via the
+   * existing jump-to-time machinery; anything else becomes `filters.q`, which
+   * drives a broadened all-fields keyword search server-side and — once
+   * embeddings exist for this timeline — is also narrowed by a background
+   * semantic search (see the `semanticSearchIds` effective-filter override).
+   */
+  const handleSearchSubmit = useCallback(
+    async (raw: string) => {
+      setSearchError(null);
+      const value = raw.trim();
+      if (!value) {
+        if (filters.q) setFilters({ ...filters, q: undefined });
+        return;
+      }
+      if (UUID_RE.test(value) && caseId && timelineId) {
+        const event = await eventsApi.getById(caseId, timelineId, value);
+        if (!event || !event.timestamp) {
+          setSearchError("No event found with that id");
+          return;
+        }
+        handleJumpToTime(event.timestamp, event.event_id);
+        return;
+      }
+      setFilters({ ...filters, q: value });
+    },
+    [filters, setFilters, caseId, timelineId, handleJumpToTime],
+  );
+
+  const searchStatus = useMemo(() => {
+    if (searchError) return searchError;
+    if (!filters.q) return undefined;
+    if (!hasVectors) return "keyword search — no embeddings for this timeline";
+    if (semanticSearchPending) return undefined; // spinner already shown
+    if (semanticSearchData?.status === "ok") {
+      return `${semanticSearchData.results.length} semantic match${semanticSearchData.results.length === 1 ? "" : "es"}`;
+    }
+    if (semanticSearchData?.status === "not_embedded") {
+      return "not embedded — keyword fallback";
+    }
+    return undefined;
+  }, [searchError, filters.q, hasVectors, semanticSearchPending, semanticSearchData]);
+
+  // Once the jump target's anchor page has landed in `events`, scroll the
+  // grid to it, open its detail panel (so the target is unmistakable — the
+  // detail panel's own "expanded" row styling doubles as the highlight),
+  // and clear the pending marker. Findings without a specific event (e.g. a
+  // Frequency window) have nothing to expand — the range highlight already
+  // marks the window instead.
+  useEffect(() => {
+    const pending = pendingJumpRef.current;
+    if (!pending) return;
+    // `events` can change for reasons unrelated to this jump — e.g. a
+    // still-in-flight automatic fetch resolving, or annotation refetches —
+    // so only treat it as "ready" once we know it reflects the page we
+    // ourselves seeded for this specific jump.
+    if (seededSeqRef.current !== pending.seq) return;
+    const foundEvent = pending.eventId
+      ? events.find((e) => e.event_id === pending.eventId)
+      : undefined;
+    const ready = pending.eventId ? !!foundEvent : events.length > 0;
+    if (ready) {
+      gridRef.current?.scrollToTimestamp(pending.ts, pending.eventId);
+      if (foundEvent) setExpandedEvent(foundEvent);
+      pendingJumpRef.current = null;
+    }
+  }, [events]);
 
   const hasActiveFilters = Object.values(filters).some((v) =>
     v && (typeof v === "string" ? v.length > 0 : Object.keys(v).length > 0),
@@ -311,6 +680,11 @@ const handleFindSimilar = useCallback((event: Event) => {
           onApplyView={setFilters}
           onSaveView={() => setSaveViewOpen(true)}
           onClose={() => setFilterRailOpen(false)}
+          mergedTagSuggestions={mergedTagSuggestions}
+          artifactSuggestions={artifactSuggestions}
+          onSearchSubmit={handleSearchSubmit}
+          searchStatus={searchStatus}
+          searchPending={hasVectors && !!filters.q && semanticSearchPending}
         />
       )}
 
@@ -363,7 +737,7 @@ const handleFindSimilar = useCallback((event: Event) => {
             <ExportDialog
               caseId={caseId!}
               timelineId={timelineId!}
-              filters={filters}
+              filters={effectiveFilters}
               total={total}
             />
 
@@ -387,9 +761,24 @@ const handleFindSimilar = useCallback((event: Event) => {
           <TimelineHistogram
             caseId={caseId}
             timelineId={timelineId}
-            filters={filters}
+            filters={effectiveFilters}
             onRangeSelect={handleHistogramRange}
+            markers={analysisPanelOpen ? anomalyMarkers : []}
+            highlightRange={rangeHighlight}
           />
+        )}
+
+        {/* "Jumped to time" breadcrumb — shown after a jump-to-time cleared filters */}
+        {preJumpFilters && (
+          <div className="flex shrink-0 items-center gap-2 bg-[var(--color-accent-dim)] px-3 py-1 text-xs text-[var(--color-fg-primary)]">
+            <span>Jumped to a point in time — filters cleared.</span>
+            <button
+              className="font-semibold text-[var(--color-accent)] hover:underline"
+              onClick={handleBackToFiltered}
+            >
+              Back to filtered view
+            </button>
+          </div>
         )}
 
         {/* Main area */}
@@ -412,7 +801,8 @@ const handleFindSimilar = useCallback((event: Event) => {
                     className="font-semibold underline hover:no-underline"
                     onClick={() => setSelection({ mode: "all" })}
                   >
-                    Select all {total.toLocaleString()} matching this filter
+                    Select all {total !== null ? `${total.toLocaleString()} ` : ""}matching this
+                    filter
                   </button>
                   <span className="opacity-50">·</span>
                   <button
@@ -426,21 +816,27 @@ const handleFindSimilar = useCallback((event: Event) => {
               <div className="flex flex-1 min-h-0 overflow-hidden">
                 {/* Event grid — always present, fills all available width */}
                 <EventGrid
+                  ref={gridRef}
                   events={events}
                   total={total}
                   annotations={annotationMap}
                   selectedIds={selectedIds}
                   caseId={caseId!}
-                  timelineId={timelineId!}
                   onToggleSelect={handleToggleSelect}
                   onToggleSelectAll={handleToggleSelectAll}
                   expandedId={expandedEvent?.event_id ?? null}
                   onExpand={setExpandedEvent}
                   onLoadMore={handleLoadMore}
+                  onLoadEarlier={handleLoadEarlier}
+                  hasPreviousPage={!!hasPreviousPage}
+                  hasNextPage={!!hasNextPage}
                   isFetching={isFetching}
                   visibleColumns={visibleColumns}
                   sortDir={sortDir}
                   onSortToggle={() => setSortDir(sortDir === "desc" ? "asc" : "desc")}
+                  liveAnomalies={liveAnomaliesByEvent}
+                  onVisibleTimestampChange={setCurrentPositionTs}
+                  highlightRange={rangeHighlight}
                 />
 
                 {/* Detail panel */}
@@ -448,11 +844,13 @@ const handleFindSimilar = useCallback((event: Event) => {
                   <EventDetailPanel
                     event={expandedEvent}
                     annotations={annotationMap.get(expandedEvent.event_id) ?? []}
+                    liveFindings={liveAnomaliesByEvent.get(expandedEvent.event_id) ?? []}
                     caseId={caseId!}
                     sourceId={expandedEvent.source_id}
                     onClose={() => setExpandedEvent(null)}
                     onFindSimilar={handleFindSimilar}
                     onAddFilter={handleAddFilter}
+                    onJumpToTime={handleJumpToTime}
                     tagSuggestions={tagSuggestions}
                   />
                 )}
@@ -470,6 +868,11 @@ const handleFindSimilar = useCallback((event: Event) => {
                     }}
                     onSelectEvent={(ev) => setExpandedEvent(ev)}
                     onSimilarClose={() => setSimilarAnchor(null)}
+                    onDrillField={handleDrillField}
+                    onFrequencyDrill={handleFrequencyDrill}
+                    onAnomalyMarkers={setAnomalyMarkers}
+                    onAnomalyRunId={setAnomalyRunId}
+                    onJumpToTime={handleJumpToTime}
                   />
                 )}
               </div>

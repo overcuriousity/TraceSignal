@@ -189,8 +189,8 @@ class QdrantStore:
                     points_selector=self._source_filter(source_id),
                 )
 
-    def delete_timeline_points(self, case_id: str, source_ids: list[str]) -> None:
-        """Delete all vector points for a timeline's sources across all case collections."""
+    def delete_points_for_sources(self, case_id: str, source_ids: list[str]) -> None:
+        """Delete all vector points for a set of sources across all case collections."""
         for name in self.case_collections(case_id):
             with contextlib.suppress(Exception):
                 self.client.delete(
@@ -224,13 +224,13 @@ class QdrantStore:
 
         return best[1] if best is not None else None
 
-    def find_timeline_collection(
-        self, case_id: str, source_ids: list[str]
-    ) -> str | None:
-        """Return the Qdrant collection name that holds vectors for a timeline.
+    def find_collection_for_sources(self, case_id: str, source_ids: list[str]) -> str | None:
+        """Return the Qdrant collection name that holds vectors for these sources.
 
-        Returns the collection with the most points matching any of the timeline's
-        source IDs. Returns ``None`` when no embeddings exist.
+        Returns the collection with the most points matching any of the given
+        source IDs. Returns ``None`` when no embeddings exist. Not tied to any
+        particular Timeline — callers may pass a timeline's sources, a whole
+        case's sources, or any other subset.
         """
         names = self.case_collections(case_id)
         if not names or not source_ids:
@@ -296,9 +296,7 @@ class QdrantStore:
             with_payload=True,
         ).points
 
-    def retrieve_vector(
-        self, collection_name: str, event_id: str
-    ) -> list[float] | None:
+    def retrieve_vector(self, collection_name: str, event_id: str) -> list[float] | None:
         """Retrieve the stored vector for a single point by its event_id.
 
         Returns ``None`` if the point does not exist in the collection.

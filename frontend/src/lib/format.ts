@@ -44,3 +44,34 @@ export function fmtScore(score: number | null | undefined): string {
   if (score == null) return "—";
   return score.toFixed(4);
 }
+
+const ANOMALY_FIELD_LABELS: Record<string, string> = {
+  artifact: "Artifact",
+  timestamp_desc: "Event category",
+  display_name: "Display name",
+  parser_name: "Parser",
+  message: "Message",
+  source_file: "Source file",
+};
+
+/** Render label for a "Tag N findings" mutation result (tagged count, plus
+ * a note for any findings whose representative event no longer exists).
+ * Shared between FrequencyView and ValueNoveltyView. */
+export function tagResultLabel(
+  data: { tagged: number; skipped_unresolved: number } | undefined,
+): string {
+  if (!data) return "";
+  const skipped = data.skipped_unresolved
+    ? ` (${data.skipped_unresolved} skipped — event no longer exists)`
+    : "";
+  return `✓ ${data.tagged} tagged${skipped}`;
+}
+
+/** Friendly display label for an anomaly-detector field token (e.g.
+ * "attr:user_agent" -> "user_agent", "parser_name" -> "Parser"). Shared
+ * between AnomalyFieldPicker and ValueNoveltyView so the same token reads
+ * identically wherever it's shown. */
+export function anomalyFieldLabel(token: string): string {
+  if (token.startsWith("attr:")) return token.slice(5);
+  return ANOMALY_FIELD_LABELS[token] ?? token;
+}

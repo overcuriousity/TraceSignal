@@ -145,9 +145,7 @@ def test_csv_parser_preserves_unknown_columns(timesketch_csv: Path, tmp_path: Pa
 
 def test_jsonl_parser_maps_common_fields(jsonl_file: Path) -> None:
     config = ParserConfig(name="jsonl", version="0.1.0")
-    parser = JsonlParser(
-        "case1", "source1", config, file_hash="hash1", source_name="source.jsonl"
-    )
+    parser = JsonlParser("case1", "source1", config, file_hash="hash1", source_name="source.jsonl")
     events = list(parser.parse(jsonl_file))
 
     assert len(events) == 2
@@ -168,9 +166,7 @@ def test_jsonl_parser_skips_malformed_lines(tmp_path: Path) -> None:
     path = tmp_path / "bad.jsonl"
     path.write_text('{"message":"good"}\nthis is not json\n{"message":"also good"}\n')
     config = ParserConfig(name="jsonl", version="0.1.0")
-    parser = JsonlParser(
-        "case1", "source1", config, file_hash="hash1", source_name="source.jsonl"
-    )
+    parser = JsonlParser("case1", "source1", config, file_hash="hash1", source_name="source.jsonl")
     events = list(parser.parse(path))
     assert len(events) == 2
     assert events[0].message == "good"
@@ -217,9 +213,7 @@ def test_parse_timestamp_normalizes_common_formats() -> None:
         2024, 1, 1, 0, 0, 0, tzinfo=UTC
     )
     with pytest.warns(UserWarning, match="Naive timestamp"):
-        assert _parse_timestamp("2024-01-01 00:00:00") == datetime(
-            2024, 1, 1, 0, 0, 0, tzinfo=UTC
-        )
+        assert _parse_timestamp("2024-01-01 00:00:00") == datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
     assert _parse_timestamp("1704067200") == datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
     assert _parse_timestamp("1704067200000") == datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
     assert _parse_timestamp("1764367341913908") == datetime(

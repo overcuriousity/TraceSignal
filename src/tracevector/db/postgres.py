@@ -15,6 +15,7 @@ from sqlalchemy import (
     String,
     delete,
     func,
+    inspect,
     select,
     text,
     update,
@@ -69,9 +70,7 @@ class Source(Base):
     """
 
     __tablename__ = "sources"
-    __table_args__ = (
-        Index("ix_sources_case_id_file_hash", "case_id", "file_hash", unique=True),
-    )
+    __table_args__ = (Index("ix_sources_case_id_file_hash", "case_id", "file_hash", unique=True),)
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
@@ -165,9 +164,7 @@ class Timeline(Base):
     embedding_config_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # Snapshot of source_ids at embed time; used to derive staleness.
     embedded_source_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
-    embedded_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    embedded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     sources: Mapped[list[Source]] = relationship(
         "Source", secondary="timeline_sources", back_populates="timelines"
@@ -246,6 +243,51 @@ class View(Base):
         }
 
 
+class DetectorRun(Base):
+    """A persisted statistical-anomaly-detector scan result.
+
+    Exists so the client can reference a scan's finding-event-id list by a
+    short ``run_id`` instead of re-uploading it as a URL query param on every
+    subsequent request (the ``live_event_ids`` approach this replaces — see
+    ``_resolve_event_id_filters`` in ``api/routers/events.py``). Rows
+    accumulate rather than being overwritten, matching the forensic-
+    reproducibility posture of ``Annotation``/``View``: a case's history of
+    what was scanned, with what parameters, and what it found, stays
+    auditable rather than being silently replaced by the next scan.
+    """
+
+    __tablename__ = "detector_runs"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    timeline_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    detector: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Request params the scan was run with (fields/series_field, z_threshold,
+    # baseline_end, temporal, limit, ...) — kept for forensic reproducibility.
+    params: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    # Serialized StatAnomalyResult (status/method/baseline_size/z_threshold/
+    # results), the same shape returned to the client by list_anomalies —
+    # see _serialize_finding in api/routers/events.py.
+    result: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary for the DetectorRun API response."""
+        return {
+            "id": self.id,
+            "case_id": self.case_id,
+            "timeline_id": self.timeline_id,
+            "detector": self.detector,
+            "params": self.params,
+            "result": self.result,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class Annotation(Base):
     """A tag or comment annotation attached to a single event.
 
@@ -274,6 +316,19 @@ class Annotation(Base):
     )
     # Structured math for system annotations (null for human annotations).
     details: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Which detector produced this system annotation (e.g. "value_novelty",
+    # "frequency"); null for human annotations. Scopes pin/clear behavior so a
+    # pinned finding from one detector doesn't suppress a distinct finding
+    # from another detector on the same event.
+    detector: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # True only for a system annotation created via the per-event "Persist"
+    # action. Bulk "Tag N as anomaly" re-runs clear and rewrite system
+    # annotations wholesale (see delete_system_annotations) — pinned rows are
+    # excluded from that clear so a manually-confirmed finding survives a
+    # later re-scan that no longer surfaces it.
+    pinned: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
@@ -292,6 +347,8 @@ class Annotation(Base):
             "created_by": self.created_by,
             "origin": self.origin,
             "details": self.details,
+            "pinned": self.pinned,
+            "detector": self.detector,
         }
 
 
@@ -308,30 +365,37 @@ class PostgresStore:
         )
 
     async def init_schema(self) -> None:
-        """Create metadata tables if they do not exist.
+        """Create metadata tables if they do not exist, then apply additive migrations.
 
-        Also runs additive ALTER TABLE migrations for columns added after the
-        initial schema creation (Postgres ``IF NOT EXISTS`` prevents errors on
-        re-runs).
+        ``create_all`` only creates missing tables — it never adds columns to
+        a table that already exists, so any model field added after a
+        table's first creation must be migrated explicitly below. Column
+        presence is checked via the dialect-agnostic inspector rather than
+        ``ADD COLUMN IF NOT EXISTS``, since SQLite (used in tests) doesn't
+        support that clause.
         """
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-            # Additive migrations — only supported on PostgreSQL; SQLite (used
-            # in tests) handles all columns via create_all on fresh databases.
-            if conn.dialect.name == "postgresql":
-                for stmt in (
-                    "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedding_model VARCHAR(255)",
-                    "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedding_config JSON",
-                    "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedding_config_hash VARCHAR(128)",
-                    "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedded_source_ids JSON",
-                    "ALTER TABLE timelines ADD COLUMN IF NOT EXISTS embedded_at TIMESTAMPTZ",
-                    # Model-refactor migration: annotations scoped by source_id instead
-                    # of timeline_id.  Add the new column and back-fill from the old one
-                    # so existing annotations remain visible after upgrade.
-                    "ALTER TABLE annotations ADD COLUMN IF NOT EXISTS source_id VARCHAR(64)",
-                    "UPDATE annotations SET source_id = timeline_id WHERE source_id IS NULL",
-                ):
-                    await conn.execute(text(stmt))
+            existing_columns = await conn.run_sync(
+                lambda sync_conn: {
+                    col["name"] for col in inspect(sync_conn).get_columns("annotations")
+                }
+            )
+            for column, ddl in (
+                (
+                    "pinned",
+                    "ALTER TABLE annotations ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT false",
+                ),
+                ("detector", "ALTER TABLE annotations ADD COLUMN detector VARCHAR(32)"),
+            ):
+                if column not in existing_columns:
+                    await conn.execute(text(ddl))
+            # No migration for the earlier `annotation_type="outlier"` rows
+            # (renamed to "anomaly" when the statistical anomaly engine
+            # landed): no releases exist yet and pre-this-branch databases
+            # are already documented as deprecated, so a stale-value UPDATE
+            # isn't worth carrying. Revisit if in-place upgrades from a
+            # pre-anomaly-engine database ever need to be supported.
 
     async def get_case(self, case_id: str) -> Case | None:
         """Return a case by ID, or None if not found."""
@@ -399,9 +463,7 @@ class PostgresStore:
 
         async with self.session_factory() as session:
             result = await session.execute(
-                select(Source)
-                .where(Source.case_id == case_id)
-                .order_by(Source.created_at.desc())
+                select(Source).where(Source.case_id == case_id).order_by(Source.created_at.desc())
             )
             return list(result.scalars().all())
 
@@ -469,29 +531,6 @@ class PostgresStore:
                     .where(Source.id == source_id, Source.case_id == case_id)
                     .values(**values)
                 )
-            await session.commit()
-
-    async def update_source_embedding_config(
-        self,
-        case_id: str,
-        source_id: str,
-        embedding_model: str | None = None,
-        embedding_config: dict | None = None,
-    ) -> None:
-        """Persist the analyst's per-source field selection on the source."""
-        async with self.session_factory() as session:
-            values: dict = {"updated_at": datetime.now(UTC)}
-            if embedding_model is not None:
-                values["embedding_model"] = embedding_model
-            if embedding_config is not None:
-                values["embedding_config"] = embedding_config
-            result = await session.execute(
-                update(Source)
-                .where(Source.case_id == case_id, Source.id == source_id)
-                .values(**values)
-            )
-            if result.rowcount == 0:
-                return
             await session.commit()
 
     async def delete_source(self, case_id: str, source_id: str) -> bool:
@@ -770,9 +809,15 @@ class PostgresStore:
             return True
 
     async def delete_case(self, case_id: str) -> bool:
-        """Delete a case and all its timelines and sources in one transaction.
+        """Delete a case and all its owned rows in one transaction.
 
         Returns True if the case existed and was removed, False otherwise.
+
+        ``View``, ``Annotation``, and ``DetectorRun`` are case-scoped by a
+        plain ``case_id`` column (no FK/cascade — they aren't declared with
+        a ``ForeignKey`` to ``cases.id``), so they must be deleted explicitly
+        here alongside ``Timeline``/``Source`` or they'd silently orphan on
+        every case delete.
         """
         from sqlalchemy import delete
 
@@ -782,6 +827,9 @@ class PostgresStore:
                 return False
             await session.execute(delete(Timeline).where(Timeline.case_id == case_id))
             await session.execute(delete(Source).where(Source.case_id == case_id))
+            await session.execute(delete(View).where(View.case_id == case_id))
+            await session.execute(delete(Annotation).where(Annotation.case_id == case_id))
+            await session.execute(delete(DetectorRun).where(DetectorRun.case_id == case_id))
             await session.delete(case)
             await session.commit()
             return True
@@ -851,6 +899,43 @@ class PostgresStore:
             return True
 
     # ------------------------------------------------------------------
+    # Detector runs
+    # ------------------------------------------------------------------
+
+    async def create_detector_run(
+        self,
+        case_id: str,
+        timeline_id: str,
+        detector: str,
+        params: dict,
+        result: dict,
+    ) -> DetectorRun:
+        """Persist a detector scan result and return the created row."""
+        run = DetectorRun(
+            id=generate_id(f"run_{detector}"),
+            case_id=case_id,
+            timeline_id=timeline_id,
+            detector=detector,
+            params=params,
+            result=result,
+        )
+        async with self.session_factory() as session:
+            session.add(run)
+            await session.commit()
+            await session.refresh(run)
+            return run
+
+    async def get_detector_run(self, case_id: str, run_id: str) -> DetectorRun | None:
+        """Return a persisted detector run by case and run IDs."""
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(DetectorRun).where(DetectorRun.case_id == case_id, DetectorRun.id == run_id)
+            )
+            return result.scalar_one_or_none()
+
+    # ------------------------------------------------------------------
     # Annotations
     # ------------------------------------------------------------------
 
@@ -905,6 +990,8 @@ class PostgresStore:
         created_by: str | None = None,
         origin: str = "user",
         details: dict | None = None,
+        pinned: bool = False,
+        detector: str | None = None,
     ) -> Annotation:
         """Persist a new annotation and return it."""
         annotation = Annotation(
@@ -917,6 +1004,8 @@ class PostgresStore:
             created_by=created_by,
             origin=origin,
             details=details,
+            pinned=pinned,
+            detector=detector,
         )
         async with self.session_factory() as session:
             session.add(annotation)
@@ -943,6 +1032,8 @@ class PostgresStore:
                 created_by=row.get("created_by"),
                 origin=row.get("origin", "user"),
                 details=row.get("details"),
+                pinned=row.get("pinned", False),
+                detector=row.get("detector"),
             )
             for row in rows
         ]
@@ -956,26 +1047,68 @@ class PostgresStore:
         case_id: str,
         source_ids: list[str],
         annotation_type: str,
+        detector: str | None = None,
     ) -> int:
-        """Delete all system-origin annotations of a given type for sources.
+        """Delete all non-pinned system-origin annotations of a given type.
 
         Used before re-writing outlier tags so that a fresh "Tag outliers" run
-        does not accumulate duplicate machine annotations.  Returns the count of
-        deleted rows.
+        does not accumulate duplicate machine annotations. Rows with
+        ``pinned=True`` (created via the per-event "Persist" action) are
+        excluded, so a manually-confirmed finding survives even if a later
+        re-scan no longer surfaces it. When ``detector`` is given, only rows
+        from that detector are cleared — findings from a different detector
+        (e.g. ``frequency`` vs ``value_novelty``) on the same sources are left
+        untouched. Returns the count of deleted rows.
         """
         from sqlalchemy import delete
 
+        conditions = [
+            Annotation.case_id == case_id,
+            Annotation.source_id.in_(source_ids),
+            Annotation.annotation_type == annotation_type,
+            Annotation.origin == "system",
+            Annotation.pinned.is_(False),
+        ]
+        if detector is not None:
+            conditions.append(Annotation.detector == detector)
         async with self.session_factory() as session:
-            result = await session.execute(
-                delete(Annotation).where(
-                    Annotation.case_id == case_id,
-                    Annotation.source_id.in_(source_ids),
-                    Annotation.annotation_type == annotation_type,
-                    Annotation.origin == "system",
-                )
-            )
+            result = await session.execute(delete(Annotation).where(*conditions))
             await session.commit()
             return result.rowcount
+
+    async def list_pinned_event_ids(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        annotation_type: str,
+        detector: str | None = None,
+    ) -> list[str]:
+        """Return event_ids with a pinned (manually-persisted) annotation.
+
+        Used by the bulk tag endpoint to avoid writing a second, duplicate
+        system annotation for an event that already has a pinned one. When
+        ``detector`` is given, only pins from that detector count — a pinned
+        ``value_novelty`` finding no longer suppresses a distinct
+        ``frequency`` finding on the same event.
+        """
+        conditions = [
+            Annotation.case_id == case_id,
+            Annotation.source_id.in_(source_ids),
+            Annotation.annotation_type == annotation_type,
+            Annotation.origin == "system",
+        ]
+        if detector is not None:
+            conditions.append(Annotation.detector == detector)
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Annotation.event_id)
+                .where(
+                    *conditions,
+                    Annotation.pinned.is_(True),
+                )
+                .distinct()
+            )
+            return [row[0] for row in result.all()]
 
     async def delete_annotation(
         self,
@@ -1039,23 +1172,32 @@ class PostgresStore:
         source_ids: list[str],
         annotation_type: str,
         origin: str = "user",
+        content: str | None = None,
+        content_in: list[str] | None = None,
     ) -> list[str]:
         """Return the event_ids that have at least one annotation of the given type.
 
-        Used by the anomaly service to retrieve the analyst-defined normal set.
+        Used by the anomaly service to retrieve the analyst-defined normal set,
+        and by the events API to filter to tagged/anomaly-flagged events.
+        ``content`` optionally narrows to a specific annotation value (e.g. a
+        specific tag label); ``content_in`` narrows to any of several values
+        (OR semantics) — the two are mutually exclusive.
         """
         from sqlalchemy import select
 
         async with self.session_factory() as session:
+            conditions = [
+                Annotation.case_id == case_id,
+                Annotation.source_id.in_(source_ids),
+                Annotation.annotation_type == annotation_type,
+                Annotation.origin == origin,
+            ]
+            if content is not None:
+                conditions.append(Annotation.content == content)
+            if content_in is not None:
+                conditions.append(Annotation.content.in_(content_in))
             result = await session.execute(
-                select(Annotation.event_id)
-                .where(
-                    Annotation.case_id == case_id,
-                    Annotation.source_id.in_(source_ids),
-                    Annotation.annotation_type == annotation_type,
-                    Annotation.origin == origin,
-                )
-                .distinct()
+                select(Annotation.event_id).where(*conditions).distinct()
             )
             return [row[0] for row in result.all()]
 

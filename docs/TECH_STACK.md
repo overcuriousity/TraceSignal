@@ -13,7 +13,7 @@
 | **Language & packaging** | Python | 3.13, managed with `uv` (3.14 support planned as deps mature) |
 | **Web backend** | FastAPI + Uvicorn | Async API server; same stack as ScalarForensic web UI |
 | **CLI ingestion** | Typer + Python stdlib | `tv ingest ...` command, streaming parser |
-| **Frontend** | TBD — redesign in progress | Served separately; API-first backend |
+| **Frontend** | React 19 + Vite 8 + TypeScript | Zustand (client state) + TanStack Query/Table/Virtual (server state, grid); served as a static build from `frontend/dist`, API-first backend |
 | **Metadata store** | PostgreSQL | Cases, sources, timelines, timeline-source membership, views, annotations, users |
 | **Event store** | ClickHouse | Columnar log store for 80 GiB+ filtering and aggregation |
 | **Vector store** | Qdrant | Embeddings + neighbor search; local disk mode supported |
@@ -28,13 +28,25 @@
 - Aligns with ScalarForensic and the broader ML/Python tooling ecosystem.
 - FastAPI gives async request handling and auto-generated OpenAPI docs with minimal boilerplate.
 - `uv` provides fast dependency resolution and lockfiles; supports PyTorch ROCm/CUDA index overrides.
-- CPU-only PyTorch is the default to keep installs small. GPU acceleration is opt-in:
+- CPU-only PyTorch is the default in `pyproject.toml` (`tool.uv.index`/`tool.uv.sources`), so
+  `uv sync` works out of the box on any machine with no GPU-specific setup — this is the
+  right choice for evaluation and for deployments that don't run the embedding pipeline.
+  GPU acceleration is opt-in and is the recommended path for **production use of the
+  embedding features** (`tv embed`, semantic search, similarity) — embedding large
+  timelines on CPU is significantly slower:
   - **AMD ROCm 6.4** is the primary GPU target (mirrors ScalarForensic).
   - **NVIDIA CUDA 12.8** is also supported.
+  - To switch, uncomment the matching index block in `pyproject.toml` and comment out the
+    CPU block, then `uv lock && uv sync`. See the comments in `pyproject.toml` for the
+    caveats (`explicit = true` on every index; ROCm needs `pytorch-triton-rocm` added as a
+    direct dependency since it's a transitive-only dep of `torch`).
 
-### 3.2 Frontend — TBD
+### 3.2 Frontend — React 19 + Vite
 
-The frontend is being redesigned from scratch. The backend exposes a complete REST API (`/api/docs`) and the new UI will consume it. Tech stack decision pending.
+Resolved. The backend exposes a complete REST API (`/api/docs`); the frontend (`frontend/`)
+is a React 19 + Vite 8 + TypeScript SPA, using Zustand for client state, TanStack Query for
+server state, and TanStack Table/Virtual for the event grid. It builds to `frontend/dist`,
+which `tv-web` serves directly (auto-built on first run if missing).
 
 ### 3.3 Metadata Store — PostgreSQL
 - External service, provided by the operator.
@@ -120,8 +132,8 @@ For a lone analyst on one machine, Qdrant can run in **local mode** through the 
 
 1. ✅ Exact default embedding model and vector dimension — default is `all-MiniLM-L6-v2` (384-dim), swappable via config.
 2. ✅ ClickHouse table schema — implemented; `events` table uses `tokenbf_v1` for full-text and is partitioned by `(case_id, source_id)`.
-3. ⬜ Authentication backend: local users vs. OIDC.
-4. ⬜ Frontend tech stack and whether to serve it from Uvicorn directly or via an Nginx sidecar.
+3. ✅ Frontend tech stack — React 19 + Vite, served as a static build directly from Uvicorn (no Nginx sidecar).
+4. ⬜ Authentication backend: local users vs. OIDC.
 
 ## 9. Completed Steps
 
@@ -129,9 +141,13 @@ For a lone analyst on one machine, Qdrant can run in **local mode** through the 
 - ✅ Project skeleton (`uv`, FastAPI, Docker Compose reference) implemented.
 - ✅ Ingestion CLI prototype implemented and refactored to the Source/Timeline model.
 - ✅ Backend API complete for the current MVP scope.
+- ✅ Frontend built (React 19 + Vite + TypeScript) and wired to the full API surface.
+- ✅ Statistical anomaly engine (`value_novelty` + `frequency` detectors) added, replacing
+  the original embedding-distance-only anomaly panel described in §5.
 
 ## 10. Next Steps
 
-1. ⬜ Implement authentication (local or OIDC).
-2. ⬜ Implement strict offline-mode enforcement.
-3. ⬜ Decide on and build the new frontend stack.
+1. ⬜ Implement authentication (local or OIDC) — nothing built yet.
+2. ⬜ Implement strict offline-mode enforcement — `allow_online` flag exists
+   (`core/config.py`) but is not checked at any network call site yet.
+3. ⬜ GPU acceleration (ROCm/CUDA) — still aspirational; no GPU-specific code exists.

@@ -39,6 +39,7 @@ def test_annotation_to_dict_shape():
         created_by=None,
         origin="user",
         details=None,
+        pinned=False,
         created_at=datetime(2024, 1, 1, tzinfo=UTC),
     )
     d = ann.to_dict()
@@ -52,6 +53,8 @@ def test_annotation_to_dict_shape():
         "created_by",
         "origin",
         "details",
+        "pinned",
+        "detector",
     }
     assert d["id"] == "ann_abc123"
     assert d["event_id"] == "evt1"
@@ -61,6 +64,7 @@ def test_annotation_to_dict_shape():
     assert d["created_by"] is None
     assert d["origin"] == "user"
     assert d["details"] is None
+    assert d["pinned"] is False
     assert "2024-01-01" in d["created_at"]
 
 
@@ -204,29 +208,30 @@ async def test_to_dict_round_trip(store: PostgresStore):
 async def test_system_annotation_origin_and_details(store: PostgresStore):
     """System annotations store origin='system' and structured details."""
     details = {
-        "method": "centroid-distance",
-        "distance": 0.87,
-        "rank": 1,
-        "of": 50,
-        "sample_size": 5000,
-        "embedding_config_hash": "abc123",
+        "detector": "value_novelty",
+        "method": "self-baseline",
+        "field": "artifact",
+        "value": "suspicious.exe",
+        "count": 1,
+        "total_events": 5000,
+        "surprise": 8.517,
     }
     ann = await store.create_annotation(
         case_id="c5",
         source_id="s5",
         event_id="e7",
         annotation_id="ann_sys",
-        annotation_type="outlier",
-        content="Outlier — distance 0.87",
+        annotation_type="anomaly",
+        content="Rare value — artifact='suspicious.exe' (count 1, surprise 8.52)",
         origin="system",
         details=details,
     )
     assert ann.origin == "system"
     assert ann.details is not None
-    assert ann.details["rank"] == 1
+    assert ann.details["count"] == 1
     d = ann.to_dict()
     assert d["origin"] == "system"
-    assert d["details"]["distance"] == 0.87
+    assert d["details"]["surprise"] == 8.517
 
 
 @pytest.mark.asyncio
@@ -237,7 +242,7 @@ async def test_delete_annotation_cannot_delete_system(store: PostgresStore):
         source_id="s6",
         event_id="e8",
         annotation_id="ann_sys2",
-        annotation_type="outlier",
+        annotation_type="anomaly",
         content="system content",
         origin="system",
     )
@@ -257,7 +262,7 @@ async def test_bulk_create_annotations(store: PostgresStore):
             "case_id": "c7",
             "source_id": "s7",
             "event_id": f"e{i}",
-            "annotation_type": "outlier",
+            "annotation_type": "anomaly",
             "content": f"Outlier rank {i}",
             "origin": "system",
             "details": {"rank": i},
@@ -273,8 +278,8 @@ async def test_bulk_create_annotations(store: PostgresStore):
 
 @pytest.mark.asyncio
 async def test_delete_system_annotations(store: PostgresStore):
-    """delete_system_annotations removes only system outlier rows."""
-    # System outlier annotations.
+    """delete_system_annotations removes only system anomaly rows."""
+    # System anomaly annotations.
     await store.bulk_create_annotations(
         [
             {
@@ -282,8 +287,8 @@ async def test_delete_system_annotations(store: PostgresStore):
                 "case_id": "c8",
                 "source_id": "s8",
                 "event_id": f"e{i}",
-                "annotation_type": "outlier",
-                "content": "outlier",
+                "annotation_type": "anomaly",
+                "content": "rare value detected",
                 "origin": "system",
             }
             for i in range(3)
@@ -300,7 +305,7 @@ async def test_delete_system_annotations(store: PostgresStore):
         origin="user",
     )
 
-    deleted_count = await store.delete_system_annotations("c8", ["s8"], "outlier")
+    deleted_count = await store.delete_system_annotations("c8", ["s8"], "anomaly")
     assert deleted_count == 3
 
     remaining = await store.list_source_annotations("c8", ["s8"])
@@ -311,5 +316,74 @@ async def test_delete_system_annotations(store: PostgresStore):
 @pytest.mark.asyncio
 async def test_delete_system_annotations_idempotent(store: PostgresStore):
     """delete_system_annotations is a no-op when nothing matches."""
-    count = await store.delete_system_annotations("c_empty", ["s_empty"], "outlier")
+    count = await store.delete_system_annotations("c8", ["s8"], "anomaly")
     assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_delete_system_annotations_preserves_pinned(store: PostgresStore):
+    """A pinned system annotation (from the per-event 'Persist' action) must
+    survive the bulk 'Tag N as anomaly' re-run's clear-and-replace, even if a
+    later detector pass no longer surfaces that finding."""
+    await store.create_annotation(
+        case_id="c9",
+        source_id="s9",
+        event_id="pinned-evt",
+        annotation_id="pinned_ann",
+        annotation_type="anomaly",
+        content="manually confirmed finding",
+        origin="system",
+        pinned=True,
+    )
+    await store.bulk_create_annotations(
+        [
+            {
+                "annotation_id": "bulk_ann",
+                "case_id": "c9",
+                "source_id": "s9",
+                "event_id": "bulk-evt",
+                "annotation_type": "anomaly",
+                "content": "bulk-tagged finding",
+                "origin": "system",
+                "pinned": False,
+            }
+        ]
+    )
+
+    deleted_count = await store.delete_system_annotations("c9", ["s9"], "anomaly")
+    assert deleted_count == 1  # only the non-pinned bulk row
+
+    remaining = await store.list_source_annotations("c9", ["s9"])
+    assert len(remaining) == 1
+    assert remaining[0].id == "pinned_ann"
+    assert remaining[0].pinned is True
+
+
+@pytest.mark.asyncio
+async def test_list_pinned_event_ids(store: PostgresStore):
+    """list_pinned_event_ids returns only events with a pinned system
+    anomaly annotation — used by the bulk tag endpoint to avoid writing a
+    second, duplicate row for an event that already has a pinned one."""
+    await store.create_annotation(
+        case_id="c10",
+        source_id="s10",
+        event_id="pinned-evt",
+        annotation_id="pinned_ann2",
+        annotation_type="anomaly",
+        content="confirmed",
+        origin="system",
+        pinned=True,
+    )
+    await store.create_annotation(
+        case_id="c10",
+        source_id="s10",
+        event_id="unpinned-evt",
+        annotation_id="unpinned_ann",
+        annotation_type="anomaly",
+        content="not confirmed",
+        origin="system",
+        pinned=False,
+    )
+
+    pinned_ids = await store.list_pinned_event_ids("c10", ["s10"], "anomaly")
+    assert pinned_ids == ["pinned-evt"]

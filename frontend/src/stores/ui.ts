@@ -5,7 +5,13 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 
+export type Density = "comfortable" | "compact";
+
 interface UiState {
+  /** Layout density — comfortable (default) or compact. */
+  density: Density;
+  setDensity: (density: Density) => void;
+
   /** Per-timeline column selections, keyed by "caseId/timelineId". */
   visibleColumnsByTimeline: Record<string, string[]>;
   setVisibleColumns: (key: string, cols: string[]) => void;
@@ -29,6 +35,10 @@ interface UiState {
   /** Width of the event detail panel in pixels. */
   detailPanelWidth: number;
   setDetailPanelWidth: (w: number) => void;
+
+  /** Persisted event grid column widths (px), keyed by column id. */
+  columnWidths: Record<string, number>;
+  setColumnWidth: (id: string, width: number) => void;
 }
 
 export const DEFAULT_COLUMNS = [
@@ -64,6 +74,9 @@ function migrateColumns(cols: string[] | undefined): string[] {
 export const useUiStore = create<UiState>()(
   persist(
     (set) => ({
+      density: "comfortable",
+      setDensity: (density) => set({ density }),
+
       visibleColumnsByTimeline: {},
       setVisibleColumns: (key, cols) =>
         set((s) => ({
@@ -82,12 +95,16 @@ export const useUiStore = create<UiState>()(
       sortDir: "desc",
       setSortDir: (dir) => set({ sortDir: dir }),
 
-      detailPanelWidth: 384,
+      detailPanelWidth: 420,
       setDetailPanelWidth: (w) => set({ detailPanelWidth: w }),
+
+      columnWidths: {},
+      setColumnWidth: (id, width) =>
+        set((s) => ({ columnWidths: { ...s.columnWidths, [id]: width } })),
     }),
     {
       name: "tv-ui",
-      version: 1,
+      version: 3,
       migrate: (persistedState, version) => {
         const state = persistedState as UiState;
         if (version < 1) {
@@ -96,6 +113,12 @@ export const useUiStore = create<UiState>()(
             migrated[key] = migrateColumns(cols);
           }
           state.visibleColumnsByTimeline = migrated;
+        }
+        if (version < 2) {
+          state.columnWidths = state.columnWidths ?? {};
+        }
+        if (version < 3) {
+          state.density = state.density ?? "comfortable";
         }
         return state;
       },

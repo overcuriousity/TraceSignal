@@ -19,6 +19,28 @@ export class ApiError extends Error {
   }
 }
 
+/** Extract a human-readable message from a FastAPI error body's `detail`,
+ * which may be a plain string or a Pydantic validation error array. */
+function extractErrorDetail(json: unknown, fallback: string): string {
+  const detail = (json as { detail?: unknown } | undefined)?.detail;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail
+      .map((e) => {
+        if (e && typeof e === "object" && "msg" in e) {
+          const loc = Array.isArray((e as { loc?: unknown }).loc)
+            ? (e as { loc: unknown[] }).loc.join(".")
+            : undefined;
+          const msg = String((e as { msg: unknown }).msg);
+          return loc ? `${loc}: ${msg}` : msg;
+        }
+        return String(e);
+      })
+      .join("; ");
+  }
+  return fallback;
+}
+
 async function request<T>(
   method: string,
   path: string,
@@ -55,7 +77,7 @@ async function request<T>(
     let detail = res.statusText;
     try {
       const j = await res.json();
-      detail = j.detail ?? detail;
+      detail = extractErrorDetail(j, detail);
     } catch {
       // ignore
     }
@@ -85,7 +107,7 @@ export async function postForm<T>(path: string, form: FormData): Promise<T> {
     let detail = res.statusText;
     try {
       const j = await res.json();
-      detail = j.detail ?? detail;
+      detail = extractErrorDetail(j, detail);
     } catch {
       // ignore
     }
@@ -105,7 +127,7 @@ export async function fetchBlob(path: string, body: unknown): Promise<Blob> {
     let detail = res.statusText;
     try {
       const j = await res.json();
-      detail = j.detail ?? detail;
+      detail = extractErrorDetail(j, detail);
     } catch {
       // ignore
     }
