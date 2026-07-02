@@ -87,10 +87,21 @@ export interface Event {
 }
 
 export interface EventPage {
-  total: number;
+  /** Only computed on the initial, uncursored fetch — null on cursor pages. */
+  total: number | null;
   offset: number;
   limit: number;
   events: Event[];
+  has_more_after: boolean;
+  has_more_before: boolean;
+  next_cursor: [string, string] | null;
+  prev_cursor: [string, string] | null;
+}
+
+/** Keyset pagination cursor: "<iso-timestamp>,<event_id>". */
+export interface EventCursor {
+  after?: string;
+  before?: string;
 }
 
 export interface View {
@@ -102,7 +113,7 @@ export interface View {
   created_at: string;
 }
 
-export type AnnotationType = "comment" | "tag" | "outlier" | "normal";
+export type AnnotationType = "comment" | "tag" | "anomaly" | "normal";
 export type AnnotationOrigin = "user" | "system";
 
 export interface Annotation {
@@ -116,6 +127,10 @@ export interface Annotation {
   created_by: string | null;
   details: Record<string, unknown> | null;
   created_at: string;
+  /** True only for a system annotation created via the per-event "Persist" action. */
+  pinned: boolean;
+  /** Which detector produced this system annotation ("value_novelty" | "frequency"); null for human annotations. */
+  detector: string | null;
 }
 
 export interface Job {
@@ -138,38 +153,109 @@ export interface SimilarityResponse {
   results: SimilarResult[];
 }
 
-export interface OutlierDetails {
-  /** "centroid-distance" | "normal-baseline" */
-  method: string;
-  distance: number;
-  rank: number;
-  of: number;
-  /** Number of events sampled for global centroid. Present in centroid-distance mode. */
-  sample_size?: number;
-  /** Number of analyst-marked normal events. Present in normal-baseline mode. */
-  baseline_size?: number;
-  embedding_config_hash: string;
+// ---------------------------------------------------------------------------
+// Statistical anomaly detection types
+// ---------------------------------------------------------------------------
+
+/** One rare / first-seen value finding from the value_novelty detector. */
+export interface ValueNoveltyFinding {
+  type: "value_novelty";
+  field: string;
+  value: string;
+  count: number;
+  /** -log(count/total) — higher is rarer. */
+  score: number;
+  first_seen: string | null;
+  event_id: string | null;
+  event: Event | null;
+  details: Record<string, unknown>;
 }
 
-export interface AnomalyResult {
-  event_id: string;
+/** One anomalous time window from the frequency detector. */
+export interface FrequencyFinding {
+  type: "frequency";
+  series_field: string;
+  series_value: string;
+  window_start: string;
+  window_end: string;
+  observed: number;
+  expected: number;
+  z_score: number;
+  /** |z_score| — used for ranking. */
   score: number;
-  event: Event;
-  details: OutlierDetails;
+  event_id: string | null;
+  event: Event | null;
+  details: Record<string, unknown>;
 }
+
+export type AnomalyFinding = ValueNoveltyFinding | FrequencyFinding;
 
 export interface AnomaliesResponse {
-  status: "ok" | "not_embedded" | "insufficient_vectors";
-  /** "centroid-distance" | "normal-baseline" */
+  status: "ok" | "no_data" | "insufficient_data";
+  /** "value_novelty" | "frequency" */
+  detector: string;
+  /** "self-baseline" | "temporal" | "z-score" | "temporal-z-score" */
   method: string;
-  sample_size: number;
   baseline_size: number;
-  embedding_config_hash: string | null;
-  results: AnomalyResult[];
+  results: AnomalyFinding[];
+  /** Effective |z| cutoff used by the frequency detector; null for value_novelty. */
+  z_threshold: number | null;
+  /**
+   * ID of the persisted DetectorRun for this scan (null when `status` isn't
+   * "ok", or when the request opted out via `persist=false`). Reference this
+   * by `EventFilters.anomalyRunId` to filter the grid/histogram/export to
+   * this scan's findings instead of re-uploading event IDs.
+   */
+  run_id: string | null;
+}
+
+/** One active finding fed to the histogram overlay / event grid highlighting. */
+export interface AnomalyMarker {
+  ts: string;
+  /** Short "field=value" form — used for compact contexts (histogram flag hover). */
+  label: string;
+  /**
+   * Full, human-readable explanation of the finding (field/value/count/score,
+   * or window/observed/expected/z-score) — shown in the event detail panel so
+   * an analyst can see *why* an event was flagged without re-opening the
+   * Analysis panel. Falls back to `label` when a fuller explanation isn't
+   * available.
+   */
+  detail: string;
+  /** Representative event for this finding, when the detector supplied one. */
+  eventId?: string | null;
+  /** Source id of the representative event — required to persist this finding. */
+  sourceId?: string | null;
+  /** Which detector produced this finding — required to persist this finding. */
+  detector: "value_novelty" | "frequency";
+  /** Raw structured finding data — stored verbatim on the persisted annotation. */
+  rawDetails: Record<string, unknown>;
+  /** End of the anomalous window, for frequency findings — enables a range highlight. */
+  windowEnd?: string | null;
 }
 
 export interface TagAnomaliesResponse extends AnomaliesResponse {
   tagged: number;
+  /** Findings whose representative event couldn't be resolved and were skipped. */
+  skipped_unresolved: number;
+}
+
+/** One field candidate returned by GET /anomalies/fields. */
+export interface NoveltyFieldInfo {
+  /** Field token, e.g. "artifact" or "attr:status_code". */
+  token: string;
+  /** Number of distinct non-empty values (uniqExact). */
+  distinct: number;
+  /** Fraction of events with a non-empty value (0–1). */
+  coverage: number;
+  /** "categorical" | "constant" | "identifier" | "sparse" */
+  kind: string;
+  /** True when the field is useful for novelty detection. */
+  recommended: boolean;
+}
+
+export interface NoveltyFieldsResponse {
+  fields: NoveltyFieldInfo[];
 }
 
 /** Per-field heuristic verdict from the wizard recommender. */
@@ -243,15 +329,41 @@ export interface HealthResponse {
 export interface EventFilters {
   q?: string;
   artifact?: string;
+  /** Multi-select artifact filter (OR'd); distinct from the single-value `artifact`. */
+  artifacts?: string[];
   sourceId?: string;
   tag?: string;
   excludeTag?: string;
+  /**
+   * Unified tag filter (OR'd) — matches either a user annotation tag or a
+   * parser-derived Event.tags value with this exact content.
+   */
+  tagsInclude?: string[];
+  /** Unified tag values to exclude — an event is dropped if it has any of these. */
+  tagsExclude?: string[];
   start?: string;
   end?: string;
   /** key=value field equality filters */
   filters?: Record<string, string>;
   /** key=[values] field exclusion filters — multiple values per field are OR'd (NOT IN) */
   exclusions?: Record<string, string[]>;
+  /** Annotation types to filter to ("tag" and/or "anomaly"), OR'd together */
+  annotated?: ("tag" | "anomaly")[];
+  /** Narrows the "tag" annotation type to a specific tag value */
+  annotationTagValue?: string;
+  /**
+   * ID of a persisted detector run (from the Analysis tab's most recent
+   * scan) — merged server-side with persisted anomaly annotations when
+   * `annotated` includes "anomaly", so the filter also matches not-yet-
+   * tagged findings. Derived from session state, not serialized to the
+   * URL/saved views.
+   */
+  anomalyRunId?: string;
+  /**
+   * Event_id allowlist — e.g. results from a semantic search narrowing the
+   * grid. Derived from session state, not serialized to the URL/saved views.
+   */
+  ids?: string[];
   limit?: number;
   offset?: number;
   /** Chronological sort direction (default: desc) */
@@ -284,12 +396,19 @@ export interface ExportRequest {
   filter: {
     q?: string;
     artifact?: string;
+    artifacts?: string;
     source_id?: string;
     tag?: string;
     exclude_tag?: string;
+    tags_include?: string;
+    tags_exclude?: string;
+    ids?: string;
     start?: string;
     end?: string;
     fields?: Record<string, string>;
     exclude?: Record<string, string[]>;
+    annotated?: string;
+    annotation_tag_value?: string;
+    run_id?: string;
   };
 }

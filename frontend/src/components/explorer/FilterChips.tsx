@@ -30,6 +30,14 @@ export function FilterChips({ filters, onRemove }: Props) {
       onRemove: () => onRemove("artifact"),
       variant: "include",
     });
+  for (const a of filters.artifacts ?? []) {
+    chips.push({
+      label: "artifact",
+      value: a,
+      onRemove: () => onRemove("artifacts", undefined, a),
+      variant: "include",
+    });
+  }
   if (filters.sourceId)
     chips.push({
       label: "sourceId",
@@ -44,6 +52,30 @@ export function FilterChips({ filters, onRemove }: Props) {
       onRemove: () => onRemove("tag"),
       variant: "include",
     });
+  for (const t of filters.tagsInclude ?? []) {
+    chips.push({
+      label: "tag",
+      value: t,
+      onRemove: () => onRemove("tagsInclude", undefined, t),
+      variant: "include",
+    });
+  }
+  for (const t of filters.tagsExclude ?? []) {
+    chips.push({
+      label: "!tag",
+      value: t,
+      onRemove: () => onRemove("tagsExclude", undefined, t),
+      variant: "exclude",
+    });
+  }
+  for (const t of filters.annotated ?? []) {
+    chips.push({
+      label: "flagged",
+      value: t === "tag" && filters.annotationTagValue ? `tag:${filters.annotationTagValue}` : t,
+      onRemove: () => onRemove("annotated", undefined, t),
+      variant: "include",
+    });
+  }
   if (filters.start)
     chips.push({
       label: "from",

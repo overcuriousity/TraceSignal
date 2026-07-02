@@ -182,7 +182,9 @@ async def upload_source(
     ``name`` is supplied as a form field, but the function may also be called
     directly from tests with a plain ``str`` or ``None`` value.
 
-    Embeddings are *not* generated here; use the embed endpoint for that.
+    Embeddings are *not* generated here; use the timeline embed endpoint
+    (``POST /{case_id}/timelines/{timeline_id}/embed``) for that.
+
     Uploading a file whose SHA-256 hash already exists in this case is
     idempotent and returns the existing source without creating duplicate
     events.
@@ -608,56 +610,6 @@ def _run_embedding_job(
         )
     except Exception as exc:  # noqa: BLE001
         job_store.update(job_id, status="failed", error=str(exc))
-
-
-@router.post("/{case_id}/sources/{source_id}/embed")
-async def start_embedding(
-    case_id: str,
-    source_id: str,
-    background_tasks: BackgroundTasks,
-    body: EmbedRequest | None = None,
-) -> dict[str, Any]:
-    """Start a background job to generate embeddings for a source.
-
-    **Legacy endpoint** — the primary embedding workflow is now timeline-level
-    via ``POST /{case_id}/timelines/{timeline_id}/embed``.  This endpoint
-    remains for advanced per-source use and backwards compatibility.
-
-    Accepts an optional ``embedding_config`` body produced by the embedding
-    wizard.  When supplied it is persisted on the source and used to control
-    which fields of which artifacts get embedded.  Omit the body to reuse the
-    source's previously stored config (or fall back to all-fields behaviour).
-    """
-    store = get_store()
-    source = await store.get_source(case_id, source_id)
-    if source is None:
-        raise HTTPException(status_code=404, detail="Source not found")
-
-    # Resolve effective field config: request body > stored on source > None.
-    field_config: dict[str, Any] | None = None
-    embedding_model = get_settings().embedding_model
-    if body is not None and body.embedding_config is not None:
-        field_config = body.embedding_config
-        await store.update_source_embedding_config(
-            case_id, source_id, embedding_model=embedding_model, embedding_config=field_config
-        )
-    elif source.embedding_config is not None:
-        field_config = source.embedding_config
-
-    job_store = get_job_store()
-    job = job_store.create(
-        kind="embed",
-        progress={"total": 0, "processed": 0},
-    )
-    background_tasks.add_task(
-        _run_embedding_job,
-        job.id,
-        case_id,
-        source_id,
-        job_store,
-        field_config,
-    )
-    return {"job_id": job.id, "status": job.status}
 
 
 def _run_timeline_embedding_job(

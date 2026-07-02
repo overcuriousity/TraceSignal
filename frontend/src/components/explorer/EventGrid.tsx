@@ -10,7 +10,7 @@
  * Parser tags and user annotation tags both appear as chips under the message.
  * The annotation column shows outlier/tag/comment icons that open edit popovers.
  */
-import { useMemo, useRef, useCallback, useState } from "react";
+import { useMemo, useRef, useCallback, useState, useEffect, useLayoutEffect, forwardRef, useImperativeHandle } from "react";
 import {
   useReactTable,
   getCoreRowModel,
@@ -19,7 +19,7 @@ import {
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { ChevronRight, AlertTriangle, Tag, MessageSquare, Trash2, ArrowUp, ArrowDown, ShieldCheck } from "lucide-react";
-import type { Event, Annotation } from "@/api/types";
+import type { AnomalyMarker, Event, Annotation } from "@/api/types";
 import { fmtTimestamp, fmtRelative, fmtTimestampFull } from "@/lib/time";
 import { truncate } from "@/lib/format";
 import { Badge } from "@/components/ui/Badge";
@@ -29,29 +29,48 @@ import { Spinner } from "@/components/ui/Spinner";
 import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/Popover";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { useAnnotationMutations } from "@/hooks/useAnnotationMutations";
-import { RETIRED_COLUMN_IDS } from "@/stores/ui";
+import { RETIRED_COLUMN_IDS, useUiStore } from "@/stores/ui";
 import { cn } from "@/lib/cn";
 
-const ROW_HEIGHT = 34; // px — compact forensic density (chips inline with message)
+// Keep in sync with --grid-row-height in index.css.
+const ROW_HEIGHT_BY_DENSITY = { comfortable: 42, compact: 34 } as const;
 const OVERSCAN = 10;
 
 interface Props {
   events: Event[];
-  total: number;
+  /** Total matching event count, or `null` when unknown (e.g. after a jump-to-time seek). */
+  total: number | null;
   annotations: Map<string, Annotation[]>; // eventId → annotations
   selectedIds: Set<string>;
   caseId: string;
-  timelineId: string;
   onToggleSelect: (id: string) => void;
   /** Toggles selection of all currently-loaded events. */
   onToggleSelectAll: () => void;
   expandedId: string | null;
   onExpand: (event: Event | null) => void;
   onLoadMore: () => void;
+  /** Fetches the page immediately preceding the currently-loaded window. */
+  onLoadEarlier: () => void;
+  /** Whether an earlier (older/newer, depending on sort) page is known to exist. */
+  hasPreviousPage: boolean;
+  /** Whether a further page is known to exist — independent of `total`, which can be unknown. */
+  hasNextPage: boolean;
   isFetching: boolean;
   visibleColumns: string[];
   sortDir: "asc" | "desc";
   onSortToggle: () => void;
+  /** Active (not-yet-tagged) analysis findings, keyed by event ID. */
+  liveAnomalies?: Map<string, AnomalyMarker[]>;
+  /** Called with the timestamp of the topmost visible row whenever scroll position changes. */
+  onVisibleTimestampChange?: (ts: string | null) => void;
+  /** Soft visual highlight for a time window (e.g. a Frequency finding's anomalous window). */
+  highlightRange?: { start: string; end: string } | null;
+}
+
+export interface EventGridHandle {
+  /** Scrolls to the row closest to `ts` — prefers an exact `eventId` match when loaded. */
+  scrollToTimestamp: (ts: string, eventId?: string) => void;
+  scrollToIndex: (index: number) => void;
 }
 
 // ── Annotation column ────────────────────────────────────────────────────────
@@ -61,6 +80,8 @@ interface AnnotationCellProps {
   anns: Annotation[];
   caseId: string;
   sourceId: string;
+  /** Active, not-yet-tagged findings for this event. */
+  liveFindings?: AnomalyMarker[];
 }
 
 function TagPopover({
@@ -75,9 +96,11 @@ function TagPopover({
   const userTags = anns.filter((a) => a.annotation_type === "tag" && a.origin === "user");
 
   function submit() {
-    if (!value.trim()) return;
+    const tag = value.trim();
+    if (!tag) return;
+    if (userTags.some((t) => t.content === tag)) { setValue(""); return; }
     add.mutate(
-      { eventId, type: "tag", content: value.trim() },
+      { eventId, type: "tag", content: tag },
       { onSuccess: () => setValue("") },
     );
   }
@@ -96,7 +119,7 @@ function TagPopover({
         >
           <Tag size={13} />
           {userTags.length > 0 && (
-            <span className="ml-0.5 text-[11px] font-mono">{userTags.length}</span>
+            <span className="ml-0.5 text-xs font-mono">{userTags.length}</span>
           )}
         </PopoverTrigger>
       </Tooltip>
@@ -107,18 +130,17 @@ function TagPopover({
               {userTags.map((t) => (
                 <div
                   key={t.id}
-                  className="group/tag flex items-center gap-1.5 rounded bg-[var(--color-accent-dim)] px-2 py-1"
+                  className="group/tag flex items-center gap-1 min-w-0 rounded bg-[var(--color-accent-dim)] px-2 py-1"
                 >
                   <Tag size={9} className="shrink-0 text-[var(--color-accent)]" />
-                  <span className="flex-1 text-[11px] text-[var(--color-accent)] font-medium">{t.content}</span>
-                  <Tooltip content={fmtTimestampFull(t.created_at)} side="top">
-                    <span className="text-[11px] text-[var(--color-fg-muted)] whitespace-nowrap">
-                      {t.created_by ? `${t.created_by} · ` : ""}{fmtRelative(t.created_at)}
+                  <Tooltip content={`${t.created_by ? t.created_by + " · " : ""}${fmtRelative(t.created_at)} — ${fmtTimestampFull(t.created_at)}`} side="top">
+                    <span className="flex-1 min-w-0 truncate text-xs text-[var(--color-accent)] font-medium cursor-default">
+                      {t.content}
                     </span>
                   </Tooltip>
                   <button
                     onClick={() => remove.mutate({ eventId, annotationId: t.id })}
-                    className="opacity-0 group-hover/tag:opacity-100 text-[var(--color-fg-muted)] hover:text-[var(--color-danger)] transition-base"
+                    className="shrink-0 opacity-0 group-hover/tag:opacity-100 text-[var(--color-fg-muted)] hover:text-[var(--color-danger)] transition-base"
                   >
                     <Trash2 size={9} />
                   </button>
@@ -136,7 +158,7 @@ function TagPopover({
                 if (e.key === "Enter") submit();
                 if (e.key === "Escape") { setOpen(false); setValue(""); }
               }}
-              className="flex-1 h-7 text-xs"
+              className="flex-1"
             />
             <Button
               variant="accent"
@@ -186,7 +208,7 @@ function CommentPopover({
         >
           <MessageSquare size={13} />
           {userComments.length > 0 && (
-            <span className="ml-0.5 text-[11px] font-mono">{userComments.length}</span>
+            <span className="ml-0.5 text-xs font-mono">{userComments.length}</span>
           )}
         </PopoverTrigger>
       </Tooltip>
@@ -209,7 +231,7 @@ function CommentPopover({
                     </button>
                   </div>
                   <Tooltip content={fmtTimestampFull(c.created_at)} side="bottom">
-                    <p className="mt-1 text-[11px] text-[var(--color-fg-muted)]">
+                    <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
                       {c.created_by ?? "anonymous"} · {fmtRelative(c.created_at)}
                     </p>
                   </Tooltip>
@@ -227,7 +249,7 @@ function CommentPopover({
                 if (e.key === "Enter") submit();
                 if (e.key === "Escape") { setOpen(false); setValue(""); }
               }}
-              className="flex-1 h-7 text-xs"
+              className="flex-1"
             />
             <Button
               variant="accent"
@@ -279,17 +301,26 @@ function NormalToggle({ eventId, anns, caseId, sourceId }: AnnotationCellProps) 
   );
 }
 
-/** Combined annotation column: outlier indicator + normal toggle + tag popover + comment popover. */
+/** Combined annotation column: anomaly indicator + normal toggle + tag popover + comment popover. */
 function AnnotationCell(props: AnnotationCellProps) {
-  const hasOutlier = props.anns.some((a) => a.annotation_type === "outlier");
+  const persistedAnomalies = props.anns.filter((a) => a.annotation_type === "anomaly");
+  // Once tagged, the persisted annotation is the durable record — suppress
+  // the live (still-active, not-yet-saved) copy so the tooltip doesn't list
+  // the same finding twice.
+  const liveFindings = persistedAnomalies.length > 0 ? [] : (props.liveFindings ?? []);
+  const hasAnomaly = persistedAnomalies.length > 0 || liveFindings.length > 0;
+  const tooltipLines = [
+    ...persistedAnomalies.map((a) => a.content),
+    ...liveFindings.map((f) => `${f.detail} (not yet tagged)`),
+  ];
   return (
     <div
       className="flex items-center gap-0.5"
       onClick={(e) => e.stopPropagation()}
     >
-      {hasOutlier ? (
-        <Tooltip content="System-flagged outlier" side="top">
-          <span className="p-1 text-[var(--color-outlier)]">
+      {hasAnomaly ? (
+        <Tooltip content={tooltipLines.join(" · ")} side="top">
+          <span className="p-1 text-[var(--color-anomaly)]">
             <AlertTriangle size={13} />
           </span>
         </Tooltip>
@@ -305,31 +336,39 @@ function AnnotationCell(props: AnnotationCellProps) {
 
 // ── Main grid ────────────────────────────────────────────────────────────────
 
-export function EventGrid({
+export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
   events,
   total,
   annotations,
   selectedIds,
   caseId,
-  timelineId,
   onToggleSelect,
   onToggleSelectAll,
   expandedId,
   onExpand,
   onLoadMore,
+  onLoadEarlier,
+  hasPreviousPage,
+  hasNextPage,
   isFetching,
   visibleColumns,
   sortDir,
   onSortToggle,
-}: Props) {
+  liveAnomalies,
+  onVisibleTimestampChange,
+  highlightRange,
+}, ref) {
   const parentRef = useRef<HTMLDivElement>(null);
+  const density = useUiStore((s) => s.density);
+  const ROW_HEIGHT = ROW_HEIGHT_BY_DENSITY[density];
 
   const columns = useMemo<ColumnDef<Event>[]>(() => {
     const cols: ColumnDef<Event>[] = [
       // Checkbox
       {
         id: "_select",
-        size: 36,
+        size: 44,
+        enableResizing: false,
         header: () => {
           const allChecked = events.length > 0 && selectedIds.size === events.length;
           const indeterminate = selectedIds.size > 0 && selectedIds.size < events.length;
@@ -339,7 +378,7 @@ export function EventGrid({
               ref={(el) => { if (el) el.indeterminate = indeterminate; }}
               checked={allChecked}
               onChange={onToggleSelectAll}
-              className="h-3.5 w-3.5 cursor-pointer rounded border-[var(--color-border-strong)] accent-[var(--color-accent)]"
+              className="h-4 w-4 cursor-pointer rounded border-[var(--color-border-strong)] accent-[var(--color-accent)]"
               onClick={(e) => e.stopPropagation()}
               title={allChecked ? "Deselect all" : "Select all loaded"}
             />
@@ -350,7 +389,7 @@ export function EventGrid({
             type="checkbox"
             checked={selectedIds.has(row.original.event_id)}
             onChange={() => onToggleSelect(row.original.event_id)}
-            className="h-3.5 w-3.5 cursor-pointer rounded border-[var(--color-border-strong)] accent-[var(--color-accent)]"
+            className="h-4 w-4 cursor-pointer rounded border-[var(--color-border-strong)] accent-[var(--color-accent)]"
             onClick={(e) => e.stopPropagation()}
           />
         ),
@@ -359,6 +398,7 @@ export function EventGrid({
       {
         id: "_annotations",
         size: 88,
+        enableResizing: false,
         header: () => null,
         cell: ({ row }) => (
           <AnnotationCell
@@ -366,6 +406,7 @@ export function EventGrid({
             anns={annotations.get(row.original.event_id) ?? []}
             caseId={caseId}
             sourceId={row.original.source_id}
+            liveFindings={liveAnomalies?.get(row.original.event_id)}
           />
         ),
       },
@@ -385,8 +426,10 @@ export function EventGrid({
           </button>
         ),
         size: 170,
+        minSize: 60,
+        maxSize: 600,
         cell: ({ row }) => (
-          <span className="font-mono text-xs text-[var(--color-fg-secondary)]">
+          <span className="font-mono text-sm leading-snug text-[var(--color-fg-secondary)]">
             {fmtTimestamp(row.original.timestamp)}
           </span>
         ),
@@ -395,10 +438,12 @@ export function EventGrid({
         id: "artifact",
         header: "Artifact",
         size: 140,
+        minSize: 60,
+        maxSize: 600,
         cell: ({ row }) => {
           const value = row.original.artifact || row.original.source_file || null;
           return (
-            <span className="font-mono text-xs truncate text-[var(--color-info)]">
+            <span className="font-mono text-sm leading-snug truncate text-[var(--color-info)]">
               {value ?? "—"}
             </span>
           );
@@ -408,8 +453,10 @@ export function EventGrid({
         id: "artifact_long",
         header: "Artifact Long",
         size: 180,
+        minSize: 60,
+        maxSize: 600,
         cell: ({ row }) => (
-          <span className="font-mono text-xs truncate text-[var(--color-info)]">
+          <span className="font-mono text-sm leading-snug truncate text-[var(--color-info)]">
             {row.original.artifact_long ?? "—"}
           </span>
         ),
@@ -418,8 +465,10 @@ export function EventGrid({
         id: "source_id",
         header: "Source ID",
         size: 160,
+        minSize: 60,
+        maxSize: 600,
         cell: ({ row }) => (
-          <span className="font-mono text-xs truncate text-[var(--color-fg-secondary)]">
+          <span className="font-mono text-sm leading-snug truncate text-[var(--color-fg-secondary)]">
             {row.original.source_id}
           </span>
         ),
@@ -428,8 +477,10 @@ export function EventGrid({
         id: "timestamp_desc",
         header: "Time Desc",
         size: 140,
+        minSize: 60,
+        maxSize: 600,
         cell: ({ row }) => (
-          <span className="text-xs truncate text-[var(--color-fg-secondary)]">
+          <span className="text-sm leading-snug truncate text-[var(--color-fg-secondary)]">
             {row.original.timestamp_desc ?? "—"}
           </span>
         ),
@@ -438,8 +489,10 @@ export function EventGrid({
         id: "display_name",
         header: "Display Name",
         size: 160,
+        minSize: 60,
+        maxSize: 600,
         cell: ({ row }) => (
-          <span className="text-xs truncate text-[var(--color-fg-secondary)]">
+          <span className="text-sm leading-snug truncate text-[var(--color-fg-secondary)]">
             {row.original.display_name ?? "—"}
           </span>
         ),
@@ -448,6 +501,7 @@ export function EventGrid({
         id: "message",
         header: "Message",
         size: 999, // flex
+        enableResizing: false,
         cell: ({ row }) => {
           const anns = annotations.get(row.original.event_id) ?? [];
           const parserTags = row.original.tags;
@@ -456,16 +510,16 @@ export function EventGrid({
           );
           return (
             <div className="flex items-center gap-1 min-w-0">
-              <span className="text-xs text-[var(--color-fg-primary)] truncate leading-none shrink">
+              <span className="text-sm text-[var(--color-fg-primary)] truncate leading-snug shrink">
                 {truncate(row.original.message, 300)}
               </span>
               {parserTags.slice(0, 3).map((t) => (
-                <Badge key={t} variant="muted" className="text-[10px] py-0 px-1 leading-none shrink-0">
+                <Badge key={t} variant="muted" className="text-xs py-0.5 px-1.5 shrink-0">
                   {t}
                 </Badge>
               ))}
               {userTags.map((t) => (
-                <Badge key={t.id} variant="accent" className="text-[10px] py-0 px-1 leading-none shrink-0">
+                <Badge key={t.id} variant="accent" className="text-xs py-0.5 px-1.5 shrink-0">
                   {t.content}
                 </Badge>
               ))}
@@ -478,6 +532,8 @@ export function EventGrid({
         id: "tags",
         header: "Parser Tags",
         size: 120,
+        minSize: 60,
+        maxSize: 600,
         cell: ({ row }) =>
           (row.original.tags ?? []).length > 0 ? (
             <span className="flex flex-wrap gap-0.5">
@@ -503,8 +559,10 @@ export function EventGrid({
           id: colId,
           header: colId,
           size: 160,
+          minSize: 60,
+          maxSize: 600,
           cell: ({ row }) => (
-            <span className="font-mono text-xs truncate text-[var(--color-fg-secondary)]">
+            <span className="font-mono text-sm leading-snug truncate text-[var(--color-fg-secondary)]">
               {row.original.attributes[colId] ?? "—"}
             </span>
           ),
@@ -515,7 +573,8 @@ export function EventGrid({
     // Expand toggle
     cols.push({
       id: "_expand",
-      size: 32,
+      size: 38,
+      enableResizing: false,
       header: () => null,
       cell: ({ row }) => (
         <ChevronRight
@@ -529,13 +588,38 @@ export function EventGrid({
     });
 
     return cols;
-  }, [visibleColumns, selectedIds, annotations, expandedId, onToggleSelect, onToggleSelectAll, events, caseId, timelineId, sortDir, onSortToggle]);
+  }, [visibleColumns, selectedIds, annotations, expandedId, onToggleSelect, onToggleSelectAll, events, caseId, sortDir, onSortToggle, liveAnomalies]);
+
+  const columnWidths = useUiStore((s) => s.columnWidths);
+  const setColumnWidth = useUiStore((s) => s.setColumnWidth);
+  // Seeded once from the persisted store; live-updated during drags via
+  // onColumnSizingChange, then flushed back to the store on drag-end below.
+  const [columnSizing, setColumnSizing] = useState<Record<string, number>>(
+    () => ({ ...columnWidths }),
+  );
 
   const table = useReactTable({
     data: events,
     columns,
     getCoreRowModel: getCoreRowModel(),
+    enableColumnResizing: true,
+    columnResizeMode: "onChange",
+    state: { columnSizing },
+    onColumnSizingChange: setColumnSizing,
   });
+
+  // Persist a column's width once per drag gesture (on release), not per
+  // pixel of movement, to avoid hammering localStorage during onChange.
+  const prevResizingColRef = useRef<string | false>(false);
+  const resizingColumnId = table.getState().columnSizingInfo.isResizingColumn;
+  useEffect(() => {
+    const wasResizing = prevResizingColRef.current;
+    if (wasResizing && !resizingColumnId) {
+      const finalWidth = columnSizing[wasResizing];
+      if (finalWidth != null) setColumnWidth(wasResizing, finalWidth);
+    }
+    prevResizingColRef.current = resizingColumnId;
+  }, [resizingColumnId, columnSizing, setColumnWidth]);
 
   const rows = table.getRowModel().rows;
 
@@ -549,14 +633,101 @@ export function EventGrid({
   const virtualItems = rowVirtualizer.getVirtualItems();
   const totalHeight = rowVirtualizer.getTotalSize();
 
+  // Report the timestamp of the topmost visible row so the histogram can show
+  // a "current position" indicator. Guarded against redundant calls.
+  const lastReportedTsRef = useRef<string | null>(null);
+  const reportVisibleTimestamp = useCallback(() => {
+    if (!onVisibleTimestampChange) return;
+    const el = parentRef.current;
+    const ts =
+      el && rows.length > 0
+        ? (rows[Math.min(rows.length - 1, Math.max(0, Math.floor(el.scrollTop / ROW_HEIGHT)))]
+            ?.original.timestamp ?? null)
+        : null;
+    if (ts !== lastReportedTsRef.current) {
+      lastReportedTsRef.current = ts;
+      onVisibleTimestampChange(ts);
+    }
+  }, [rows, onVisibleTimestampChange]);
+
+  useEffect(() => {
+    reportVisibleTimestamp();
+  }, [reportVisibleTimestamp]);
+
+  // Prepending earlier events shifts every existing row's index by the
+  // prepended count — the virtualizer's scrollOffset doesn't auto-adjust,
+  // which would otherwise cause a visible jump. Capture an anchor right
+  // before requesting the earlier page, then correct scrollTop once the new
+  // rows land (row height is fixed, so this is exact, cheap arithmetic).
+  const prependAnchorRef = useRef<{ scrollTop: number; firstEventId: string } | null>(null);
+
+  const handleLoadEarlier = useCallback(() => {
+    const el = parentRef.current;
+    const firstEventId = events[0]?.event_id;
+    if (el && firstEventId) {
+      prependAnchorRef.current = { scrollTop: el.scrollTop, firstEventId };
+    }
+    onLoadEarlier();
+  }, [events, onLoadEarlier]);
+
+  useLayoutEffect(() => {
+    const anchor = prependAnchorRef.current;
+    const el = parentRef.current;
+    if (!anchor || !el) return;
+    const newIndex = events.findIndex((e) => e.event_id === anchor.firstEventId);
+    if (newIndex > 0) {
+      el.scrollTop = anchor.scrollTop + newIndex * ROW_HEIGHT;
+    }
+    prependAnchorRef.current = null;
+  }, [events]);
+
   const handleScroll = useCallback(() => {
     const el = parentRef.current;
-    if (!el || isFetching) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 200;
-    if (nearBottom && events.length < total) {
-      onLoadMore();
+    if (el && !isFetching) {
+      const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 200;
+      if (nearBottom) {
+        onLoadMore();
+      }
+      const nearTop = el.scrollTop < 200;
+      if (nearTop && hasPreviousPage) {
+        handleLoadEarlier();
+      }
     }
-  }, [isFetching, events.length, total, onLoadMore]);
+    reportVisibleTimestamp();
+  }, [isFetching, onLoadMore, hasPreviousPage, handleLoadEarlier, reportVisibleTimestamp]);
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      scrollToIndex: (index: number) => {
+        rowVirtualizer.scrollToIndex(index, { align: "center" });
+      },
+      scrollToTimestamp: (ts: string, eventId?: string) => {
+        if (events.length === 0) return;
+        if (eventId) {
+          const exact = events.findIndex((e) => e.event_id === eventId);
+          if (exact >= 0) {
+            rowVirtualizer.scrollToIndex(exact, { align: "center" });
+            return;
+          }
+        }
+        // Events are sorted by timestamp in `sortDir` order — binary-search
+        // for the first row at or past the target.
+        const targetTime = new Date(ts).getTime();
+        let lo = 0;
+        let hi = events.length - 1;
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1;
+          const midTime = new Date(events[mid].timestamp ?? 0).getTime();
+          const pastTarget = sortDir === "desc" ? midTime <= targetTime : midTime >= targetTime;
+          if (pastTarget) hi = mid;
+          else lo = mid + 1;
+        }
+        rowVirtualizer.scrollToIndex(lo, { align: "center" });
+      },
+    }),
+    [events, sortDir, rowVirtualizer],
+  );
 
   return (
     <div className="flex flex-1 min-w-0 flex-col h-full">
@@ -566,13 +737,22 @@ export function EventGrid({
           hg.headers.map((h) => (
             <div
               key={h.id}
-              className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--color-fg-secondary)] select-none"
+              className="relative px-[var(--grid-cell-x)] py-2 text-xs font-semibold uppercase tracking-wider text-[var(--color-fg-secondary)] select-none"
               style={{
                 width: h.column.id === "message" ? undefined : h.getSize(),
                 flex: h.column.id === "message" ? "1 1 0" : undefined,
               }}
             >
               {flexRender(h.column.columnDef.header, h.getContext())}
+              {h.column.getCanResize() && (
+                <div
+                  onMouseDown={(e) => { e.stopPropagation(); h.getResizeHandler()(e); }}
+                  onTouchStart={(e) => { e.stopPropagation(); h.getResizeHandler()(e); }}
+                  onClick={(e) => e.stopPropagation()}
+                  className="absolute right-0 top-0 h-full w-1 cursor-col-resize select-none touch-none opacity-0 hover:opacity-100 hover:bg-[var(--color-accent)] transition-opacity z-10"
+                  style={{ marginRight: -2 }}
+                />
+              )}
             </div>
           )),
         )}
@@ -591,12 +771,25 @@ export function EventGrid({
             const isExpanded = expandedId === event.event_id;
             const isSelected = selectedIds.has(event.event_id);
             const eventAnns = annotations.get(event.event_id) ?? [];
-            const hasOutlier = eventAnns.some(
-              (a) => a.annotation_type === "outlier",
-            );
+            const hasAnomaly =
+              eventAnns.some((a) => a.annotation_type === "anomaly") ||
+              (liveAnomalies?.get(event.event_id)?.length ?? 0) > 0;
             const hasNormal = eventAnns.some(
               (a) => a.annotation_type === "normal" && a.origin === "user",
             );
+            const inHighlightRange = (() => {
+              if (!highlightRange || !event.timestamp) return false;
+              const t = new Date(event.timestamp).getTime();
+              const start = new Date(highlightRange.start).getTime();
+              const end = new Date(highlightRange.end).getTime();
+              return (
+                Number.isFinite(t) &&
+                Number.isFinite(start) &&
+                Number.isFinite(end) &&
+                t >= start &&
+                t <= end
+              );
+            })();
 
             return (
               <div
@@ -615,17 +808,19 @@ export function EventGrid({
                     ? "bg-[var(--color-bg-active)] border-[var(--color-accent)]/40"
                     : isSelected
                       ? "bg-[var(--color-accent-dim)]"
-                      : "hover:bg-[var(--color-bg-hover)]",
-                  hasOutlier && !isSelected && !isExpanded &&
-                    "border-l-2 border-l-[var(--color-outlier)]/50",
-                  hasNormal && !hasOutlier && !isSelected && !isExpanded &&
+                      : inHighlightRange
+                        ? "bg-[var(--color-accent)]/10 hover:bg-[var(--color-bg-hover)]"
+                        : "hover:bg-[var(--color-bg-hover)]",
+                  hasAnomaly && !isSelected && !isExpanded &&
+                    "border-l-2 border-l-[var(--color-anomaly)]/50",
+                  hasNormal && !hasAnomaly && !isSelected && !isExpanded &&
                     "border-l-2 border-l-[var(--color-success)]/50",
                 )}
               >
                 {row.getVisibleCells().map((cell) => (
                   <div
                     key={cell.id}
-                    className="px-2 truncate"
+                    className="px-[var(--grid-cell-x)] truncate"
                     style={{
                       width:
                         cell.column.id === "message"
@@ -649,10 +844,12 @@ export function EventGrid({
       {/* Footer */}
       <div className="flex shrink-0 items-center justify-between border-t border-[var(--color-border)] bg-[var(--color-bg-surface)] px-4 py-1.5 text-xs text-[var(--color-fg-muted)]">
         <span>
-          {events.length.toLocaleString()} of {total.toLocaleString()} events loaded
-          {events.length >= total && total > 0 && " · all loaded"}
+          {total != null
+            ? `${events.length.toLocaleString()} of ${total.toLocaleString()} events loaded`
+            : `${events.length.toLocaleString()} events loaded`}
+          {!hasNextPage && " · all loaded"}
         </span>
-        {events.length < total && (
+        {hasNextPage && (
           <button
             className="text-[var(--color-accent)] hover:underline transition-base"
             onClick={onLoadMore}
@@ -663,4 +860,4 @@ export function EventGrid({
       </div>
     </div>
   );
-}
+});

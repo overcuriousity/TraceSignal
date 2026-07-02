@@ -1,8 +1,11 @@
 import { useState } from "react";
-import { Search, Clock, PlusCircle, MinusCircle, BookmarkCheck, PanelLeftClose, X } from "lucide-react";
+import { Search, Clock, PlusCircle, MinusCircle, BookmarkCheck, PanelLeftClose, X, Tag, ShieldAlert, FileText, Database } from "lucide-react";
 import { Input } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
 import { Tooltip } from "@/components/ui/Tooltip";
+import { Spinner } from "@/components/ui/Spinner";
+import { TagInput } from "@/components/explorer/TagInput";
+import { TagFacetPanel } from "@/components/explorer/TagFacetPanel";
 import type { EventFilters, View } from "@/api/types";
 import { fmtRelative } from "@/lib/time";
 import { viewPayloadToFilters } from "@/lib/queryParams";
@@ -14,9 +17,36 @@ interface Props {
   onApplyView: (f: EventFilters) => void;
   onSaveView: () => void;
   onClose?: () => void;
+  /** Merged (annotation + parser) tag values, for the unified Tags filter. */
+  mergedTagSuggestions?: string[];
+  /** Distinct artifact values in this timeline, for the Artifact filter. */
+  artifactSuggestions?: string[];
+  /**
+   * Submits the search box's free text. The caller decides whether it's an
+   * event_id lookup (jump directly) or a keyword/semantic query (narrows the
+   * grid) — this component just forwards raw input.
+   */
+  onSearchSubmit: (query: string) => void;
+  /** Status line shown under the search box (e.g. "searching…", "no match"). */
+  searchStatus?: string;
+  searchPending?: boolean;
 }
 
-export function FilterRail({ filters, onChange, views, onApplyView, onSaveView, onClose }: Props) {
+export function FilterRail({
+  filters,
+  onChange,
+  views,
+  onApplyView,
+  onSaveView,
+  onClose,
+  mergedTagSuggestions = [],
+  artifactSuggestions = [],
+  onSearchSubmit,
+  searchStatus,
+  searchPending,
+}: Props) {
+  const [searchInput, setSearchInput] = useState(filters.q ?? "");
+  const [artifactInput, setArtifactInput] = useState("");
   const [fieldKey, setFieldKey] = useState("");
   const [fieldVal, setFieldVal] = useState("");
   const [excludeKey, setExcludeKey] = useState("");
@@ -45,12 +75,54 @@ export function FilterRail({ filters, onChange, views, onApplyView, onSaveView, 
     setExcludeVal("");
   };
 
+  const addArtifact = (value: string) => {
+    const v = value.trim();
+    if (!v) return;
+    const prev = filters.artifacts ?? [];
+    if (!prev.includes(v)) {
+      onChange({ ...filters, artifacts: [...prev, v] });
+    }
+    setArtifactInput("");
+  };
+
+  const removeArtifact = (value: string) => {
+    const remaining = (filters.artifacts ?? []).filter((a) => a !== value);
+    const f = { ...filters };
+    if (remaining.length > 0) f.artifacts = remaining;
+    else delete f.artifacts;
+    onChange(f);
+  };
+
+  const setTagSelection = (include: string[], exclude: string[]) => {
+    const f = { ...filters };
+    if (include.length > 0) f.tagsInclude = include;
+    else delete f.tagsInclude;
+    if (exclude.length > 0) f.tagsExclude = exclude;
+    else delete f.tagsExclude;
+    onChange(f);
+  };
+
+  const annotated = filters.annotated ?? [];
+  const toggleAnnotated = (type: "tag" | "anomaly") => {
+    const next = annotated.includes(type)
+      ? annotated.filter((t) => t !== type)
+      : [...annotated, type];
+    const f = { ...filters };
+    if (next.length > 0) {
+      f.annotated = next;
+    } else {
+      delete f.annotated;
+      delete f.annotationTagValue;
+    }
+    onChange(f);
+  };
+
   const hasFilters = Object.values(filters).some((v) =>
     v && (typeof v === "string" ? v.length > 0 : Object.keys(v).length > 0),
   );
 
   return (
-    <aside className="flex h-full w-64 shrink-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-bg-surface)]">
+    <aside className="flex h-full w-72 shrink-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-bg-surface)]">
       {/* Rail header */}
       <div className="flex items-center justify-between border-b border-[var(--color-border)] px-2.5 py-1.5 shrink-0">
         <span className="text-xs font-semibold uppercase tracking-wider text-[var(--color-fg-muted)]">
@@ -82,24 +154,49 @@ export function FilterRail({ filters, onChange, views, onApplyView, onSaveView, 
 
       <div className="flex-1 overflow-y-auto">
       <div className="space-y-2.5 p-2.5">
-        {/* Full-text search */}
+        {/* Unified search — keyword/semantic across all fields, or an event_id to jump to it */}
         <div>
-          <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
-            <Search size={11} /> Search
+          <label className="mb-2 flex items-center gap-2 text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
+            <Search size={13} /> Search
           </label>
-          <Input
-            placeholder="keyword in message…"
-            value={filters.q ?? ""}
-            onChange={(e) =>
-              onChange({ ...filters, q: e.target.value || undefined })
-            }
-          />
+          <form
+            className="flex gap-1"
+            onSubmit={(e) => {
+              e.preventDefault();
+              onSearchSubmit(searchInput.trim());
+            }}
+          >
+            <Input
+              placeholder="keyword, phrase, or event id…"
+              value={searchInput}
+              onChange={(e) => setSearchInput(e.target.value)}
+            />
+            {searchInput && (
+              <Button
+                size="icon"
+                variant="outline"
+                type="button"
+                onClick={() => {
+                  setSearchInput("");
+                  onSearchSubmit("");
+                }}
+              >
+                <X size={12} />
+              </Button>
+            )}
+          </form>
+          {(searchPending || searchStatus) && (
+            <div className="mt-1 flex items-center gap-1 text-xs text-[var(--color-fg-muted)]">
+              {searchPending && <Spinner size={10} />}
+              {searchStatus && <span>{searchStatus}</span>}
+            </div>
+          )}
         </div>
 
         {/* Time range */}
         <div>
-          <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
-            <Clock size={11} /> Time Range
+          <label className="mb-2 flex items-center gap-2 text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
+            <Clock size={13} /> Time Range
           </label>
           <div className="space-y-1.5">
             <Input
@@ -114,7 +211,6 @@ export function FilterRail({ filters, onChange, views, onApplyView, onSaveView, 
                     : undefined,
                 })
               }
-              className="text-xs"
             />
             <Input
               type="datetime-local"
@@ -128,70 +224,127 @@ export function FilterRail({ filters, onChange, views, onApplyView, onSaveView, 
                     : undefined,
                 })
               }
-              className="text-xs"
             />
           </div>
         </div>
 
-        {/* Artifact */}
+        {/* Flagged — annotation tag / anomaly filter */}
         <div>
-          <label className="mb-1.5 block text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
-            Artifact
+          <label className="mb-2 block text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
+            Flagged
           </label>
-          <Input
-            placeholder="artifact name…"
-            value={filters.artifact ?? ""}
-            onChange={(e) =>
-              onChange({ ...filters, artifact: e.target.value || undefined })
-            }
+          <div className="space-y-1.5">
+            <label className="flex items-center gap-1.5 text-xs text-[var(--color-fg-secondary)] cursor-pointer">
+              <input
+                type="checkbox"
+                checked={annotated.includes("tag")}
+                onChange={() => toggleAnnotated("tag")}
+              />
+              <Tag size={13} /> Tagged
+            </label>
+            <label className="flex items-center gap-1.5 text-xs text-[var(--color-fg-secondary)] cursor-pointer">
+              <input
+                type="checkbox"
+                checked={annotated.includes("anomaly")}
+                onChange={() => toggleAnnotated("anomaly")}
+              />
+              <ShieldAlert size={13} /> Anomaly
+            </label>
+          </div>
+        </div>
+
+        {/* Tags — unified autocomplete across annotation + parser tags */}
+        <div>
+          <label className="mb-2 flex items-center gap-2 text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
+            <Tag size={13} /> Tags
+          </label>
+          <TagFacetPanel
+            tags={Array.from(
+              new Set([
+                ...mergedTagSuggestions,
+                ...(filters.tagsInclude ?? []),
+                ...(filters.tagsExclude ?? []),
+              ]),
+            ).sort()}
+            include={filters.tagsInclude ?? []}
+            exclude={filters.tagsExclude ?? []}
+            onChange={setTagSelection}
           />
         </div>
 
-        {/* Source ID */}
+        {/* Artifact — multi-select autocomplete */}
         <div>
-          <label className="mb-1.5 block text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
-            Source ID
+          <label className="mb-2 flex items-center gap-2 text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
+            <FileText size={13} /> Artifact
           </label>
-          <Input
-            placeholder="filter by source id…"
-            value={filters.sourceId ?? ""}
-            onChange={(e) =>
-              onChange({ ...filters, sourceId: e.target.value || undefined })
-            }
+          {(filters.artifacts ?? []).length > 0 && (
+            <div className="mb-1.5 flex flex-wrap gap-1">
+              {(filters.artifacts ?? []).map((a) => (
+                <span
+                  key={a}
+                  className="inline-flex items-center gap-1 rounded border border-[var(--color-info)]/30 bg-[var(--color-info-dim)] px-1.5 py-0.5 text-xs text-[var(--color-info)]"
+                >
+                  {a}
+                  <button onClick={() => removeArtifact(a)} className="opacity-60 hover:opacity-100">
+                    <X size={10} />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+          <TagInput
+            value={artifactInput}
+            onChange={setArtifactInput}
+            onSubmit={addArtifact}
+            onCancel={() => setArtifactInput("")}
+            suggestions={artifactSuggestions.filter((a) => !(filters.artifacts ?? []).includes(a))}
+            placeholder="add artifact…"
           />
         </div>
 
-        {/* Tag (event.tags) */}
+        {/* Source ID — filter to events from one ingested source */}
         <div>
-          <label className="mb-1.5 block text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
-            Parser Tag
+          <label className="mb-2 flex items-center gap-2 text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
+            <Database size={13} /> Source ID
           </label>
-          <Input
-            placeholder="tag value…"
-            value={filters.tag ?? ""}
-            onChange={(e) =>
-              onChange({ ...filters, tag: e.target.value || undefined })
-            }
-          />
+          <div className="flex gap-1">
+            <Input
+              placeholder="source_id…"
+              value={filters.sourceId ?? ""}
+              onChange={(e) =>
+                onChange({ ...filters, sourceId: e.target.value.trim() || undefined })
+              }
+            />
+            {filters.sourceId && (
+              <Button
+                size="icon"
+                variant="outline"
+                type="button"
+                onClick={() => onChange({ ...filters, sourceId: undefined })}
+              >
+                <X size={12} />
+              </Button>
+            )}
+          </div>
         </div>
 
         {/* Field include */}
         <div>
-          <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-[var(--color-info)] uppercase tracking-wide">
-            <PlusCircle size={11} /> Field = Value
+          <label className="mb-2 flex items-center gap-2 text-xs font-medium text-[var(--color-info)] uppercase tracking-wide">
+            <PlusCircle size={13} /> Field = Value
           </label>
           <div className="flex gap-1">
             <Input
               placeholder="field"
               value={fieldKey}
               onChange={(e) => setFieldKey(e.target.value)}
-              className="w-24 text-xs"
+              className="w-24"
             />
             <Input
               placeholder="value"
               value={fieldVal}
               onChange={(e) => setFieldVal(e.target.value)}
-              className="flex-1 text-xs"
+              className="flex-1"
               onKeyDown={(e) => e.key === "Enter" && addFilter()}
             />
             <Button size="icon" variant="outline" onClick={addFilter}>
@@ -202,21 +355,21 @@ export function FilterRail({ filters, onChange, views, onApplyView, onSaveView, 
 
         {/* Field exclude */}
         <div>
-          <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-[var(--color-danger)] uppercase tracking-wide">
-            <MinusCircle size={11} /> Field ≠ Value
+          <label className="mb-2 flex items-center gap-2 text-xs font-medium text-[var(--color-danger)] uppercase tracking-wide">
+            <MinusCircle size={13} /> Field ≠ Value
           </label>
           <div className="flex gap-1">
             <Input
               placeholder="field"
               value={excludeKey}
               onChange={(e) => setExcludeKey(e.target.value)}
-              className="w-24 text-xs"
+              className="w-24"
             />
             <Input
               placeholder="value"
               value={excludeVal}
               onChange={(e) => setExcludeVal(e.target.value)}
-              className="flex-1 text-xs"
+              className="flex-1"
               onKeyDown={(e) => e.key === "Enter" && addExclusion()}
             />
             <Button size="icon" variant="outline" onClick={addExclusion}>
@@ -228,8 +381,8 @@ export function FilterRail({ filters, onChange, views, onApplyView, onSaveView, 
         {/* Saved views */}
         {views.length > 0 && (
           <div>
-            <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
-              <BookmarkCheck size={11} /> Saved Views
+            <label className="mb-2 flex items-center gap-2 text-xs font-medium text-[var(--color-fg-muted)] uppercase tracking-wide">
+              <BookmarkCheck size={13} /> Saved Views
             </label>
             <div className="space-y-1">
               {views.map((v) => (

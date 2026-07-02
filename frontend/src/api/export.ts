@@ -1,5 +1,6 @@
 import { fetchBlob } from "./client";
 import type { ExportRequest, EventFilters } from "./types";
+import { serializeEventFilterFields } from "@/lib/queryParams";
 
 export async function downloadExport(
   caseId: string,
@@ -10,13 +11,10 @@ export async function downloadExport(
   const body: ExportRequest = {
     format,
     filter: {
-      q: filters.q,
-      artifact: filters.artifact,
-      source_id: filters.sourceId,
-      tag: filters.tag,
-      exclude_tag: filters.excludeTag,
-      start: filters.start,
-      end: filters.end,
+      ...serializeEventFilterFields(filters),
+      // Sent as raw objects, not JSON strings — this is already a
+      // structured JSON POST body, unlike the query-param-shaped requests
+      // (list/histogram/bulk-annotate) that stringify these.
       fields: filters.filters ?? {},
       exclude: filters.exclusions ?? {},
     },

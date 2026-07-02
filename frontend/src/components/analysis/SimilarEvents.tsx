@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { X } from "lucide-react";
 import { similarityApi } from "@/api/similarity";
@@ -10,7 +11,8 @@ import type { Event } from "@/api/types";
 
 interface Props {
   caseId: string;
-  timelineId: string;
+  /** Present when opened from within a timeline view; enables the scope toggle. */
+  timelineId?: string;
   anchorEvent: Event;
   onClose: () => void;
   onSelectEvent?: (event: Event) => void;
@@ -23,10 +25,15 @@ export function SimilarEvents({
   onClose,
   onSelectEvent,
 }: Props) {
+  // Default to scoping down to the current timeline when opened from one —
+  // matches prior behavior; the case-wide search is an opt-in broadening.
+  const [thisTimelineOnly, setThisTimelineOnly] = useState(!!timelineId);
+  const scopeTimelineId = thisTimelineOnly ? timelineId : undefined;
+
   const { data, isLoading, error } = useQuery({
-    queryKey: ["similar", caseId, timelineId, anchorEvent.event_id],
+    queryKey: ["similar", caseId, anchorEvent.event_id, scopeTimelineId],
     queryFn: () =>
-      similarityApi.findSimilar(caseId, timelineId, anchorEvent.event_id, 15),
+      similarityApi.findSimilar(caseId, anchorEvent.event_id, 15, scopeTimelineId),
   });
 
   return (
@@ -39,6 +46,17 @@ export function SimilarEvents({
           <X size={13} />
         </Button>
       </div>
+
+      {timelineId && (
+        <label className="flex items-center gap-1.5 text-xs text-[var(--color-fg-muted)]">
+          <input
+            type="checkbox"
+            checked={thisTimelineOnly}
+            onChange={(e) => setThisTimelineOnly(e.target.checked)}
+          />
+          This timeline only
+        </label>
+      )}
 
       {/* Anchor event */}
       <div className="rounded border border-[var(--color-accent)]/30 bg-[var(--color-accent-dim)] px-3 py-2 text-xs">

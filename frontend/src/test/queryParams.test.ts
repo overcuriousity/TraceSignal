@@ -4,6 +4,7 @@ import {
   paramsToFilters,
   filtersToViewPayload,
   viewPayloadToFilters,
+  serializeEventFilterFields,
 } from "@/lib/queryParams";
 import type { EventFilters } from "@/api/types";
 
@@ -42,6 +43,19 @@ describe("filtersToParams / paramsToFilters round-trip", () => {
     expect(out.exclusions).toEqual({ user_agent: ["bot"] });
   });
 
+  it("round-trips the merged tag filter and multi-select artifacts", () => {
+    const f: EventFilters = {
+      tagsInclude: ["exfil", "malware"],
+      tagsExclude: ["benign"],
+      artifacts: ["WinEvtx", "Prefetch"],
+    };
+    const p = filtersToParams(f);
+    const out = paramsToFilters(p);
+    expect(out.tagsInclude).toEqual(["exfil", "malware"]);
+    expect(out.tagsExclude).toEqual(["benign"]);
+    expect(out.artifacts).toEqual(["WinEvtx", "Prefetch"]);
+  });
+
   it("omits undefined fields from params", () => {
     const f: EventFilters = { q: "test" };
     const p = filtersToParams(f);
@@ -68,5 +82,51 @@ describe("filtersToViewPayload / viewPayloadToFilters round-trip", () => {
   it("handles empty filters gracefully", () => {
     const out = viewPayloadToFilters({});
     expect(out).toEqual({});
+  });
+});
+
+describe("serializeEventFilterFields (C17 — shared by list/histogram/bulk-annotate/export)", () => {
+  it("returns an empty object for no filters", () => {
+    expect(serializeEventFilterFields({})).toEqual({});
+  });
+
+  it("joins array fields with commas and maps to snake_case API names", () => {
+    const f: EventFilters = {
+      artifacts: ["WinEvtx", "Prefetch"],
+      tagsInclude: ["exfil", "malware"],
+      tagsExclude: ["benign"],
+      ids: ["evt-1", "evt-2"],
+      annotated: ["tag", "anomaly"],
+      anomalyRunId: "run-1",
+      sourceId: "src-1",
+      excludeTag: "noisy",
+      annotationTagValue: "reviewed",
+    };
+    expect(serializeEventFilterFields(f)).toEqual({
+      artifacts: "WinEvtx,Prefetch",
+      tags_include: "exfil,malware",
+      tags_exclude: "benign",
+      ids: "evt-1,evt-2",
+      annotated: "tag,anomaly",
+      run_id: "run-1",
+      source_id: "src-1",
+      exclude_tag: "noisy",
+      annotation_tag_value: "reviewed",
+    });
+  });
+
+  it("omits empty arrays and falsy scalars rather than sending empty strings", () => {
+    const f: EventFilters = { artifacts: [], tagsInclude: [], q: "" };
+    const out = serializeEventFilterFields(f);
+    expect(out.artifacts).toBeUndefined();
+    expect(out.tags_include).toBeUndefined();
+    expect(out.q).toBeUndefined();
+  });
+
+  it("does not touch the object-shaped filters/exclusions fields", () => {
+    const f: EventFilters = { filters: { a: "b" }, exclusions: { c: ["d"] } };
+    const out = serializeEventFilterFields(f) as Record<string, unknown>;
+    expect(out.filters).toBeUndefined();
+    expect(out.exclusions).toBeUndefined();
   });
 });

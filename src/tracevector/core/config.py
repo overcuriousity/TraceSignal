@@ -39,6 +39,21 @@ class Settings(BaseSettings):
     embedding_model: str = "all-MiniLM-L6-v2"
     embedding_device: str = "cpu"
     embedding_batch_size: int = 64
+    # When set, embeddings are computed via this OpenAI-compatible endpoint
+    # (POST {embedding_api_base_url}/embeddings) instead of a local model.
+    # embedding_model is used as the request's "model" field in that case.
+    embedding_api_base_url: str | None = None
+    embedding_api_key: str | None = None
+
+    # Statistical anomaly detection
+    # Maximum occurrence count below which a value is flagged as rare (value_novelty).
+    stat_rarity_floor: int = 3
+    # Z-score threshold for flagging a frequency window as anomalous.
+    stat_z_threshold: float = 2.5
+    # Number of time buckets for frequency analysis (same math as histogram).
+    stat_frequency_buckets: int = 60
+    # Default per-field limit when scanning for rare values.
+    stat_per_field_limit: int = 25
 
     # Source file retention
     source_retention_path: str = "data/sources"

@@ -299,8 +299,7 @@ def _parse_timestamp(value: str | int | float | datetime | None) -> datetime | N
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         if dt.tzinfo is None:
             warnings.warn(
-                f"Naive timestamp {s!r} assumed UTC; "
-                "configure per-source timezone when available.",
+                f"Naive timestamp {s!r} assumed UTC; configure per-source timezone when available.",
                 stacklevel=2,
             )
             return dt.replace(tzinfo=UTC)

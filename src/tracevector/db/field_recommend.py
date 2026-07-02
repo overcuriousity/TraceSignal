@@ -73,9 +73,7 @@ def _clean(values: Sequence[Any]) -> list[str]:
     return out
 
 
-def classify_field(
-    token: str, values: Sequence[Any], *, always_text: bool = False
-) -> FieldVerdict:
+def classify_field(token: str, values: Sequence[Any], *, always_text: bool = False) -> FieldVerdict:
     """Classify a field by sampling its values.
 
     ``always_text`` forces a positive verdict (used for ``message``, which is the
@@ -145,9 +143,7 @@ def _group_related_fields(
     token order for stable output.
     """
     tokens = list(samples.keys())
-    centroids = {
-        t: _field_centroid(samples[t], encode, max_values) for t in tokens
-    }
+    centroids = {t: _field_centroid(samples[t], encode, max_values) for t in tokens}
     usable = [t for t in tokens if centroids[t] is not None]
     if len(usable) < 2:
         return []
@@ -341,9 +337,7 @@ def recommend_fields_across_sources(
         # Cohesion (Stage 2, only when encode is available and ≥2 sources).
         cohesion: float | None = None
         if encode is not None and present >= 2:
-            cohesion = cross_source_cohesion(
-                source_values[token], encode, max_values_for_embedding
-            )
+            cohesion = cross_source_cohesion(source_values[token], encode, max_values_for_embedding)
 
         if token in always:
             verdicts.append(
@@ -472,9 +466,7 @@ def timeline_universal_cohesion(
             src: list(samples.get(token, [])) for src, samples in samples_by_source.items()
         }
         # Count sources with at least one non-empty value.
-        present_in_sources = sum(
-            1 for vals in values_by_source.values() if _clean(vals)
-        )
+        present_in_sources = sum(1 for vals in values_by_source.values() if _clean(vals))
 
         cohesion: float | None = None
         if encode is not None and present_in_sources >= 2:
@@ -550,9 +542,7 @@ def timeline_cohesion_summary(
             message="Single-source timeline — cross-source cohesion does not apply.",
         )
 
-    shared = [
-        v for v in verdicts if v.present_in_sources >= 2 and v.cohesion is not None
-    ]
+    shared = [v for v in verdicts if v.present_in_sources >= 2 and v.cohesion is not None]
     if not shared:
         return CohesionSummary(
             level="weak",
@@ -561,8 +551,8 @@ def timeline_cohesion_summary(
             source_count=source_count,
             message=(
                 "No shared fields with computable cohesion. "
-                "Cross-source outliers will likely track source format rather than behaviour. "
-                "Enable per-source centering to score events against their own source's bulk."
+                "Similarity search across sources may reflect source format rather than content. "
+                "Consider limiting search to events within a single source."
             ),
         )
 
@@ -581,17 +571,16 @@ def timeline_cohesion_summary(
         msg = (
             f"{shared_count} shared field{'s' if shared_count != 1 else ''} with "
             f"moderate cohesion ({mean_c:.2f}). "
-            "Results may reflect some source-format variation — "
-            "consider enabling per-source centering or using the analyst-baseline mode."
+            "Similarity search results may reflect some source-format variation. "
+            "Consider deselecting divergent fields in the embedding wizard."
         )
     else:
         level = "weak"
         msg = (
             f"{shared_count} shared field{'s' if shared_count != 1 else ''} with "
             f"weak cohesion ({mean_c:.2f}). "
-            "Cross-source outliers will likely track source format rather than behaviour. "
-            "Enable per-source centering to score events against their own source's bulk, "
-            "or mark representative 'Normal' events to switch to nearest-normal baseline scoring."
+            "Similarity scores across sources may reflect log format rather than content. "
+            "Deselect divergent fields in the embedding wizard for better results."
         )
 
     return CohesionSummary(

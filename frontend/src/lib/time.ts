@@ -31,6 +31,30 @@ export function fmtTimestampFull(value: string | null | undefined): string {
   }
 }
 
+const MONTH_ABBR = [
+  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/** Compact UTC timestamp for anomaly-panel finding rows (e.g. "Jul 1, 14:30 UTC").
+ * Always UTC, like fmtTimestampFull, for forensic reproducibility across analysts
+ * in different timezones — deliberately diverges from the grid's local-time
+ * fmtTimestamp. */
+export function fmtTimestampCompactUtc(value: string | null | undefined): string {
+  if (!value) return "—";
+  try {
+    const d = parseISO(value);
+    if (!isValid(d)) return value;
+    const month = MONTH_ABBR[d.getUTCMonth()];
+    const day = d.getUTCDate();
+    const hours = String(d.getUTCHours()).padStart(2, "0");
+    const minutes = String(d.getUTCMinutes()).padStart(2, "0");
+    return `${month} ${day}, ${hours}:${minutes} UTC`;
+  } catch {
+    return value;
+  }
+}
+
 /** Relative time ago for ingest_time / created_at. */
 export function fmtRelative(value: string | null | undefined): string {
   if (!value) return "—";
