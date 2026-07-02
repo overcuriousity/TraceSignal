@@ -4,6 +4,13 @@ Last updated: 2026-07-02 (session 8 — authentication, RBAC, teams, audit trail
 collaboration implemented and hardened through a full security review; see
 `docs/archive/PR7_REVIEW_FINDINGS.md`)
 
+**Open follow-up:** PR #8 (per-value histograms + visualization page,
+`feat/viz-histograms-and-visualization-page`) has an unresolved review with 7 confirmed
+correctness bugs (zero-fill bucket drop, `field=timestamp` 500, degenerate-domain chart
+collapse, color-collision/"Other"-label bugs, axis truncation, unsanitized export filenames)
+plus 9 cleanup/design items — see `docs/archive/PR8_REVIEW_FINDINGS.md` for the full list and
+fix pointers before merging.
+
 This document tracks implementation progress against the MVP defined in
 [`CONCEPT.md`](./CONCEPT.md) and the tech-stack decisions in [`TECH_STACK.md`](./TECH_STACK.md).
 See [`ROADMAP.md`](./ROADMAP.md) for the detailed scope breakdown and remaining work.
