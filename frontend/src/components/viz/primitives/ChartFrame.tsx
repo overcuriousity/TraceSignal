@@ -8,7 +8,10 @@ export interface ChartMargin {
   left: number;
 }
 
-export const DEFAULT_MARGIN: ChartMargin = { top: 16, right: 16, bottom: 32, left: 48 };
+// `bottom: 56` leaves room for AxisBottom's default -40° rotated tick labels
+// (time/number axes) — charts with short, unrotated bottom labels (band axes,
+// BarChart's count axis) override this per-instance.
+export const DEFAULT_MARGIN: ChartMargin = { top: 16, right: 16, bottom: 56, left: 48 };
 
 interface ChartDims {
   width: number;

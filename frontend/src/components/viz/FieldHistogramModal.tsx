@@ -62,21 +62,40 @@ export function FieldHistogramModal({
     setActiveValue(value);
   }
 
+  const totalHistogramQuery = useQuery({
+    queryKey: ["field-histogram-total", caseId, timelineId, filters, buckets],
+    queryFn: () => eventsApi.histogram(caseId, timelineId, filters, buckets),
+    enabled: open,
+  });
+
+  // The scoped (blue) and total (grey) histograms must share an identical
+  // time range and bucket count, or each independently picks its own
+  // min/max — a focused value that doesn't span the full filtered range
+  // then gets a *different* bin width than the total series, and the two
+  // overlays visibly misalign ("distort") instead of lining up. Deriving
+  // the scoped range from the already-fetched total range (falling back to
+  // any explicit range the Explorer already had set) guarantees both
+  // queries compute the same interval.
+  const rangeStart = filters.start ?? totalHistogramQuery.data?.min ?? undefined;
+  const rangeEnd = filters.end ?? totalHistogramQuery.data?.max ?? undefined;
+
   const scopedFilters = useMemo<EventFilters>(
-    () => ({ ...filters, filters: { ...(filters.filters ?? {}), [fieldKey]: activeValue } }),
-    [filters, fieldKey, activeValue],
+    () => ({
+      ...filters,
+      start: rangeStart,
+      end: rangeEnd,
+      filters: { ...(filters.filters ?? {}), [fieldKey]: activeValue },
+    }),
+    [filters, fieldKey, activeValue, rangeStart, rangeEnd],
   );
 
   const histogramQuery = useQuery({
     queryKey: ["field-histogram", caseId, timelineId, scopedFilters, buckets],
     queryFn: () => eventsApi.histogram(caseId, timelineId, scopedFilters, buckets),
-    enabled: open,
-  });
-
-  const totalHistogramQuery = useQuery({
-    queryKey: ["field-histogram-total", caseId, timelineId, filters, buckets],
-    queryFn: () => eventsApi.histogram(caseId, timelineId, filters, buckets),
-    enabled: open,
+    // Wait for the shared range from `totalHistogramQuery` before firing —
+    // otherwise the first paint would briefly show a self-ranged (and thus
+    // misaligned) scoped histogram before this refetches.
+    enabled: open && rangeStart != null && rangeEnd != null,
   });
 
   const termsQuery = useQuery({
@@ -97,8 +116,8 @@ export function FieldHistogramModal({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         title={`Histogram: ${fieldKey}`}
-        description={`Occurrences of "${activeValue}" over the currently filtered range.`}
-        className="max-w-3xl"
+        description={`Blue: "${activeValue}" occurrences per bin. Grey: total events per bin, for scale.`}
+        className="max-w-6xl w-[92vw]"
       >
         <div className="flex items-center justify-between gap-3 pb-2">
           <div className="flex items-center gap-2 text-xs text-[var(--color-fg-secondary)]">
@@ -126,18 +145,31 @@ export function FieldHistogramModal({
           />
         </div>
 
-        <div className="grid grid-cols-[1fr_260px] gap-4">
+        <div className="grid grid-cols-[1fr_280px] gap-4">
           <div>
             {histogramQuery.isLoading || totalHistogramQuery.isLoading ? (
-              <div className="flex h-[220px] items-center justify-center">
+              <div className="flex h-[320px] items-center justify-center">
                 <Spinner size={20} />
               </div>
             ) : (
-              <TimeHistogram
-                svgRef={svgRef}
-                buckets={histogramQuery.data?.buckets ?? []}
-                contextBuckets={totalHistogramQuery.data?.buckets}
-              />
+              <>
+                <TimeHistogram
+                  svgRef={svgRef}
+                  height={320}
+                  buckets={histogramQuery.data?.buckets ?? []}
+                  contextBuckets={totalHistogramQuery.data?.buckets}
+                />
+                <div className="mt-1.5 flex items-center gap-4 text-xs text-[var(--color-fg-muted)]">
+                  <span className="flex items-center gap-1.5">
+                    <span className="inline-block h-2.5 w-2.5 rounded-sm bg-[var(--color-accent)]" />
+                    {fieldKey} = {activeValue}
+                  </span>
+                  <span className="flex items-center gap-1.5">
+                    <span className="inline-block h-2.5 w-2.5 rounded-sm bg-[var(--color-fg-disabled)] opacity-60" />
+                    All events (any {fieldKey})
+                  </span>
+                </div>
+              </>
             )}
           </div>
 
@@ -150,7 +182,7 @@ export function FieldHistogramModal({
                 </span>
               )}
             </p>
-            <div className="max-h-[260px] flex-1 overflow-y-auto pr-1">
+            <div className="max-h-[360px] flex-1 overflow-y-auto pr-1">
               {termsQuery.isLoading ? (
                 <div className="flex justify-center py-4">
                   <Spinner size={16} />

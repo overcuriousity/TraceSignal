@@ -58,6 +58,7 @@ export function EcdfChart({ stats, svgRef, height = 220, color = "var(--color-ac
               />
               <AxisBottom
                 scale={x}
+                innerWidth={innerWidth}
                 innerHeight={innerHeight}
                 tickFormat={(v) => fmtValue(v as number)}
               />

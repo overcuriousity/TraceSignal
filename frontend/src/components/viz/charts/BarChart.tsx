@@ -71,8 +71,10 @@ export function BarChart({ terms, svgRef, height, rowHeight = 26 }: BarChartProp
             <>
               <AxisBottom
                 scale={x}
+                innerWidth={innerWidth}
                 innerHeight={innerHeight}
                 ticks={4}
+                rotate={false}
                 tickFormat={(v) => fmtCount(v as number)}
               />
               {rows.map((r) => {

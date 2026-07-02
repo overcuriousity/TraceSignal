@@ -4,20 +4,33 @@ type NumericOrTimeScale = ScaleLinear<number, number> | ScaleTime<number, number
 
 const TICK_LEN = 5;
 
+/** Minimum horizontal pixels a rotated time/number tick label needs before
+ * the next one starts overlapping it — used to cap tick count by available
+ * width rather than a fixed count that overlaps on a narrow chart. */
+const MIN_TICK_SPACING = 70;
+
 /** Bottom axis for a linear or time scale — gridline-free, recessive per the
- * dataviz skill (axis line + tick label only; no chart border, no full grid). */
+ * dataviz skill (axis line + tick label only; no chart border, no full grid).
+ * Tick count is capped by `innerWidth` so labels never overlap regardless of
+ * chart size; labels rotate -40° by default since time/number ticks are
+ * wider than the space between them once there's more than a couple. */
 export function AxisBottom({
   scale,
+  innerWidth,
   innerHeight,
-  ticks = 6,
+  ticks = 8,
   tickFormat,
+  rotate = true,
 }: {
   scale: NumericOrTimeScale;
+  innerWidth: number;
   innerHeight: number;
   ticks?: number;
   tickFormat: (value: number | Date) => string;
+  rotate?: boolean;
 }) {
-  const tickValues = scale.ticks(ticks);
+  const maxByWidth = Math.max(2, Math.floor(innerWidth / MIN_TICK_SPACING));
+  const tickValues = scale.ticks(Math.min(ticks, maxByWidth));
   return (
     <g transform={`translate(0,${innerHeight})`}>
       <line x1={0} x2={scale.range()[1]} stroke="var(--viz-axis)" strokeWidth={1} />
@@ -27,8 +40,9 @@ export function AxisBottom({
           <g key={i} transform={`translate(${x},0)`}>
             <line y1={0} y2={TICK_LEN} stroke="var(--viz-axis)" strokeWidth={1} />
             <text
-              y={TICK_LEN + 12}
-              textAnchor="middle"
+              y={rotate ? TICK_LEN + 4 : TICK_LEN + 12}
+              textAnchor={rotate ? "end" : "middle"}
+              transform={rotate ? "rotate(-40)" : undefined}
               fontSize={10}
               fill="var(--viz-ink-muted)"
             >
