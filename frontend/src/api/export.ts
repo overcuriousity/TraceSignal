@@ -1,5 +1,6 @@
 import { fetchBlob } from "./client";
 import type { ExportRequest, EventFilters } from "./types";
+import { serializeEventFilterFields } from "@/lib/queryParams";
 
 export async function downloadExport(
   caseId: string,
@@ -10,25 +11,12 @@ export async function downloadExport(
   const body: ExportRequest = {
     format,
     filter: {
-      q: filters.q,
-      artifact: filters.artifact,
-      artifacts: filters.artifacts && filters.artifacts.length > 0 ? filters.artifacts.join(",") : undefined,
-      source_id: filters.sourceId,
-      tag: filters.tag,
-      exclude_tag: filters.excludeTag,
-      tags_include: filters.tagsInclude && filters.tagsInclude.length > 0 ? filters.tagsInclude.join(",") : undefined,
-      tags_exclude: filters.tagsExclude && filters.tagsExclude.length > 0 ? filters.tagsExclude.join(",") : undefined,
-      ids: filters.ids && filters.ids.length > 0 ? filters.ids.join(",") : undefined,
-      start: filters.start,
-      end: filters.end,
+      ...serializeEventFilterFields(filters),
+      // Sent as raw objects, not JSON strings — this is already a
+      // structured JSON POST body, unlike the query-param-shaped requests
+      // (list/histogram/bulk-annotate) that stringify these.
       fields: filters.filters ?? {},
       exclude: filters.exclusions ?? {},
-      annotated: filters.annotated && filters.annotated.length > 0 ? filters.annotated.join(",") : undefined,
-      annotation_tag_value: filters.annotationTagValue,
-      live_event_ids:
-        filters.liveAnomalyEventIds && filters.liveAnomalyEventIds.length > 0
-          ? filters.liveAnomalyEventIds.join(",")
-          : undefined,
     },
   };
 

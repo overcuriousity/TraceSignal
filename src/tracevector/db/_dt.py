@@ -33,3 +33,19 @@ def ensure_utc_iso(value: Any) -> Any:
     if not hasattr(value, "isoformat"):
         return str(value)
     return ensure_utc(value).isoformat()
+
+
+def to_clickhouse_utc(value: datetime, *, precise: bool = False) -> str:
+    """Format *value* as a naive-UTC string literal for ClickHouse comparisons.
+
+    ClickHouse timestamps are stored naive-UTC. ``ensure_utc`` alone is not
+    enough to build a comparable string literal: it only *attaches* UTC to a
+    naive datetime and leaves an already-aware, non-UTC datetime (e.g. a
+    FastAPI-parsed ``+02:00`` timestamp) untouched, so a bare ``strftime``
+    afterward would silently emit wall-clock digits in the wrong zone. This
+    always converts to true UTC first via ``.astimezone(UTC)``.
+    """
+    naive_utc = ensure_utc(value).astimezone(UTC)
+    if precise:
+        return naive_utc.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    return naive_utc.strftime("%Y-%m-%d %H:%M:%S")

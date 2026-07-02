@@ -24,6 +24,8 @@ import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import type { AnomalyMarker, Event, ValueNoveltyFinding } from "@/api/types";
 import { cn } from "@/lib/cn";
+import { anomalyFieldLabel as fieldLabel, tagResultLabel } from "@/lib/format";
+import { fmtTimestampCompactUtc as fmtTs } from "@/lib/time";
 
 interface Props {
   caseId: string;
@@ -35,36 +37,6 @@ interface Props {
   onFindingsChange?: (markers: AnomalyMarker[]) => void;
   /** Scrolls the main grid to this finding's timestamp, clearing filters first. */
   onJumpToTime?: (ts: string, eventId?: string) => void;
-}
-
-/** Friendly display label for a field token. */
-function fieldLabel(token: string): string {
-  if (token.startsWith("attr:")) return token.slice(5);
-  const map: Record<string, string> = {
-    artifact: "artifact",
-    timestamp_desc: "desc",
-    display_name: "display",
-    message: "message",
-    artifact_long: "artifact_long",
-    parser_name: "parser",
-    source_file: "source_file",
-  };
-  return map[token] ?? token;
-}
-
-/** Format an ISO timestamp for compact display. */
-function fmtTs(iso: string): string {
-  try {
-    return new Date(iso).toLocaleString(undefined, {
-      month: "short",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
-    });
-  } catch {
-    return iso;
-  }
 }
 
 interface FindingRowProps {
@@ -408,16 +380,7 @@ export function ValueNoveltyView({
           </Button>
           {tagMutation.isSuccess && (
             <span className="text-xs text-[var(--color-success)]">
-              ✓ {(tagMutation.data as { tagged?: number } | undefined)?.tagged ?? 0} tagged
-              {!!(tagMutation.data as { skipped_unresolved?: number } | undefined)
-                ?.skipped_unresolved && (
-                <>
-                  {" "}
-                  (
-                  {(tagMutation.data as { skipped_unresolved?: number }).skipped_unresolved}{" "}
-                  skipped — event no longer exists)
-                </>
-              )}
+              {tagResultLabel(tagMutation.data)}
             </span>
           )}
           {tagMutation.isError && (

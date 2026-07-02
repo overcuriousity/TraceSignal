@@ -44,24 +44,14 @@ from typing import Any
 
 import numpy as np
 
-from tracevector.db._dt import ensure_utc, ensure_utc_iso
+from tracevector.db._buckets import bucket_interval_seconds, query_timestamp_range
+from tracevector.db._columns import EVENT_SELECT_COLUMNS, resolve_column_token
+from tracevector.db._dt import ensure_utc, ensure_utc_iso, to_clickhouse_utc
 from tracevector.db.clickhouse import ClickHouseStore
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
-# Top-level event columns usable directly in SQL (vs attributes map lookup).
-_TOP_LEVEL_COLUMNS = frozenset({
-    "artifact",
-    "timestamp_desc",
-    "display_name",
-    "message",
-    "artifact_long",
-    "parser_name",
-    "source_file",
-    "source_id",
-})
 
 # Default fields scanned by value_novelty when no list is supplied (fallback only).
 _DEFAULT_NOVELTY_FIELDS = ["artifact", "timestamp_desc", "display_name"]
@@ -78,6 +68,15 @@ _NOVELTY_CANDIDATE_TOP_LEVEL = [
 # Maximum number of attribute keys the recommender will evaluate.
 _RECOMMENDER_MAX_ATTR_KEYS = 50
 
+# Cap on how many auto-selected fields find_value_novelty scans per call.
+# Each field is a separate sequential full-partition-scan query (no batching
+# across fields today), so an uncapped recommended set (up to ~54 fields —
+# _NOVELTY_CANDIDATE_TOP_LEVEL plus _RECOMMENDER_MAX_ATTR_KEYS) could turn
+# one panel-open into dozens of serial ClickHouse round-trips. Capped to the
+# highest-coverage recommended fields, since recommend_novelty_fields already
+# sorts by (recommended, -coverage).
+_MAX_AUTO_SCAN_FIELDS = 15
+
 # Minimum buckets in a frequency series for z-scoring to be meaningful.
 _MIN_FREQUENCY_BUCKETS = 3
 
@@ -87,31 +86,9 @@ _MIN_FREQUENCY_BUCKETS = 3
 # real deviation, large enough to avoid blowing up the z-score to inf/NaN).
 _MIN_FREQUENCY_STD = 0.5
 
-# Columns selected when hydrating a representative event.
-_EVENT_COLUMNS = (
-    "event_id",
-    "case_id",
-    "source_id",
-    "message",
-    "timestamp",
-    "timestamp_desc",
-    "artifact",
-    "artifact_long",
-    "display_name",
-    "tags",
-    "attributes",
-    "content_hash",
-    "file_hash",
-    "parser_name",
-    "parser_version",
-    "source_file",
-    "byte_offset",
-    "line_number",
-    "embedding_model",
-    "embedding_config_hash",
-    "vector_id",
-    "ingest_time",
-)
+# Columns selected when hydrating a representative event — shared with
+# queries.py's per-event projection, see _columns.EVENT_SELECT_COLUMNS.
+_EVENT_COLUMNS = EVENT_SELECT_COLUMNS
 
 
 # ---------------------------------------------------------------------------
@@ -156,9 +133,9 @@ class FreqFinding:
 class StatAnomalyResult:
     """Return value of statistical anomaly detection."""
 
-    status: str         # "ok" | "no_data" | "insufficient_data"
-    detector: str       # "value_novelty" | "frequency"
-    method: str         # "self-baseline" | "temporal" | "z-score" | "temporal-z-score"
+    status: str  # "ok" | "no_data" | "insufficient_data"
+    detector: str  # "value_novelty" | "frequency"
+    method: str  # "self-baseline" | "temporal" | "z-score" | "temporal-z-score"
     baseline_size: int  # total events (value_novelty) or event-count used for z-score
     results: list[ValueFinding | FreqFinding] = field(default_factory=list)
     # Effective |z| cutoff used by the frequency detector; None for value_novelty.
@@ -173,11 +150,11 @@ class NoveltyFieldInfo:
     and internally as the smart default for :meth:`find_value_novelty`.
     """
 
-    token: str          # e.g. "artifact", "attr:status_code"
-    distinct: int       # uniqExact() count
-    coverage: float     # fraction of events with a non-empty value (0–1)
-    kind: str           # "constant" | "identifier" | "categorical" | "sparse"
-    recommended: bool   # True → include in default scan
+    token: str  # e.g. "artifact", "attr:status_code"
+    distinct: int  # uniqExact() count
+    coverage: float  # fraction of events with a non-empty value (0–1)
+    kind: str  # "constant" | "identifier" | "categorical" | "sparse"
+    recommended: bool  # True → include in default scan
 
 
 # ---------------------------------------------------------------------------
@@ -185,31 +162,25 @@ class NoveltyFieldInfo:
 # ---------------------------------------------------------------------------
 
 
-def _col_expr(
-    field_token: str,
-    params: dict[str, Any],
-    ctr: list[int],
-) -> str:
+def _col_expr(field_token: str, params: dict[str, Any]) -> str:
     """Return a ClickHouse SQL expression for a field token.
 
-    Top-level columns (``"artifact"``, ``"display_name"``, …) are returned as-is.
-    Attribute keys prefixed with ``"attr:"`` (``"attr:user_agent"``) or bare
-    attribute names are returned as ``attributes[{fkN:String}]`` with the key
-    injected into *params*.  *ctr* is a single-element mutable list used as an
-    auto-incrementing counter for unique parameter names.
+    Top-level columns (``"artifact"``, ``"display_name"``, …) are returned as-is,
+    case/whitespace-insensitively, sharing the same allowlist `queries.py`
+    uses for the events-view filter — a field like `parser_version` must
+    resolve to the real column in both places, or a detector can silently
+    score against an always-empty attribute lookup instead of the values the
+    events view shows for that field. Attribute keys prefixed with
+    ``"attr:"`` (``"attr:user_agent"``) or any other non-top-level token are
+    returned as ``attributes[{fk:String}]`` with the key injected into
+    *params*. Every call site uses a fresh *params* dict for a single field
+    token, so a fixed parameter name is safe — no counter needed.
     """
-    if field_token in _TOP_LEVEL_COLUMNS:
-        return field_token
-    key = field_token[5:] if field_token.startswith("attr:") else field_token
-    name = f"fk{ctr[0]}"
-    ctr[0] += 1
-    params[name] = key
-    return f"attributes[{{{name}:String}}]"
-
-
-def _fmt_dt(dt: datetime) -> str:
-    """Format a datetime for ClickHouse comparison (no timezone)."""
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+    column, attr_key = resolve_column_token(field_token)
+    if column is not None:
+        return column
+    params["fk"] = attr_key
+    return "attributes[{fk:String}]"
 
 
 def _freq_finding(
@@ -323,10 +294,23 @@ class StatisticalAnomalyService:
     # Field recommendation
     # ------------------------------------------------------------------
 
+    def _count_events(self, case_id: str, source_ids: list[str]) -> int:
+        """Return the total event count for a case/source scope."""
+        self.ch.init_schema()
+        db = self.ch.database
+        total_res = self.ch.client.query(
+            f"SELECT count() FROM {db}.events"
+            f" WHERE case_id = {{cid:String}}"
+            f" AND has({{src:Array(String)}}, source_id)",
+            parameters={"cid": case_id, "src": source_ids},
+        )
+        return int(total_res.result_rows[0][0]) if total_res.result_rows else 0
+
     def recommend_novelty_fields(
         self,
         case_id: str,
         source_ids: list[str],
+        total: int | None = None,
     ) -> list[NoveltyFieldInfo]:
         """Return a ranked, annotated list of candidate fields for value_novelty.
 
@@ -342,19 +326,18 @@ class StatisticalAnomalyService:
         Candidate set = a curated list of categorical top-level columns
         (``artifact``, ``timestamp_desc``, ``display_name``, ``parser_name``)
         plus every attribute key found in the events table.
+
+        *total*, the event count used as the coverage denominator, is queried
+        internally when omitted — pass it when the caller already has it
+        (e.g. ``find_value_novelty``'s auto-field-selection path) to avoid a
+        redundant identical round-trip.
         """
         self.ch.init_schema()
         db = self.ch.database
         params: dict[str, Any] = {"cid": case_id, "src": source_ids}
 
-        # Total event count used for coverage denominator.
-        total_res = self.ch.client.query(
-            f"SELECT count() FROM {db}.events"
-            f" WHERE case_id = {{cid:String}}"
-            f" AND has({{src:Array(String)}}, source_id)",
-            parameters=params,
-        )
-        total = int(total_res.result_rows[0][0]) if total_res.result_rows else 0
+        if total is None:
+            total = self._count_events(case_id, source_ids)
         if total == 0:
             return []
 
@@ -363,10 +346,7 @@ class StatisticalAnomalyService:
         # -- Top-level columns (batched in a single aggregation) ---------------
         agg_parts = []
         for col in _NOVELTY_CANDIDATE_TOP_LEVEL:
-            agg_parts.append(
-                f"uniqExact({col}) AS {col}_dist,"
-                f" countIf({col} != '') AS {col}_cov"
-            )
+            agg_parts.append(f"uniqExact({col}) AS {col}_dist, countIf({col} != '') AS {col}_cov")
         top_sql = (
             f"SELECT {', '.join(agg_parts)}"
             f" FROM {db}.events"
@@ -438,20 +418,15 @@ class StatisticalAnomalyService:
         self.ch.init_schema()
         db = self.ch.database
         params: dict[str, Any] = {"cid": case_id, "src": source_ids}
-        res = self.ch.client.query(
-            f"SELECT min(timestamp), max(timestamp) FROM {db}.events"
-            f" WHERE case_id = {{cid:String}}"
-            f" AND has({{src:Array(String)}}, source_id)"
-            f" AND timestamp IS NOT NULL",
-            parameters=params,
+        min_dt, max_dt = query_timestamp_range(
+            self.ch.client,
+            db,
+            "case_id = {cid:String} AND has({src:Array(String)}, source_id)"
+            " AND timestamp IS NOT NULL",
+            params,
         )
-        if not res.result_rows:
+        if min_dt is None or max_dt is None:
             return None
-        min_ts, max_ts = res.result_rows[0]
-        if min_ts is None or max_ts is None:
-            return None
-        min_dt = ensure_utc(min_ts)
-        max_dt = ensure_utc(max_ts)
         return min_dt + (max_dt - min_dt) / 2
 
     # ------------------------------------------------------------------
@@ -482,25 +457,26 @@ class StatisticalAnomalyService:
         """
         self.ch.init_schema()
         db = self.ch.database
-
-        if fields is not None:
-            scan_fields = fields
-        else:
-            # Auto-discover useful fields for this specific timeseries.
-            rec = self.recommend_novelty_fields(case_id, source_ids)
-            scan_fields = [f.token for f in rec if f.recommended] or _DEFAULT_NOVELTY_FIELDS
-
         base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
         method = "self-baseline" if baseline_end is None else "temporal"
 
         # Total event count for surprise score denominator.
-        total_res = self.ch.client.query(
-            f"SELECT count() FROM {db}.events"
-            f" WHERE case_id = {{cid:String}}"
-            f" AND has({{src:Array(String)}}, source_id)",
-            parameters=base_params,
-        )
-        total_events = int(total_res.result_rows[0][0]) if total_res.result_rows else 0
+        total_events = self._count_events(case_id, source_ids)
+
+        if fields is not None:
+            scan_fields = fields
+        else:
+            # Auto-discover useful fields for this specific timeseries. Pass
+            # the total we already have — recommend_novelty_fields would
+            # otherwise re-run the exact same count() query.
+            rec = self.recommend_novelty_fields(case_id, source_ids, total=total_events)
+            scan_fields = [f.token for f in rec if f.recommended] or _DEFAULT_NOVELTY_FIELDS
+            # Each field below is a separate sequential ClickHouse round-trip
+            # (no cross-field batching); cap how many an auto-selected set can
+            # trigger per call. recommend_novelty_fields already sorts
+            # recommended fields by coverage descending, so this keeps the
+            # most useful ones.
+            scan_fields = scan_fields[:_MAX_AUTO_SCAN_FIELDS]
 
         if total_events == 0:
             return StatAnomalyResult(
@@ -518,16 +494,15 @@ class StatisticalAnomalyService:
                 f" WHERE case_id = {{cid:String}}"
                 f" AND has({{src:Array(String)}}, source_id)"
                 f" AND timestamp < {{bl:String}}",
-                parameters={**base_params, "bl": _fmt_dt(baseline_end)},
+                parameters={**base_params, "bl": to_clickhouse_utc(baseline_end)},
             )
             baseline_size = int(bl_res.result_rows[0][0]) if bl_res.result_rows else 0
 
         all_findings: list[ValueFinding] = []
 
         for field_token in scan_fields:
-            ctr: list[int] = [0]
             params: dict[str, Any] = {**base_params}
-            col = _col_expr(field_token, params, ctr)
+            col = _col_expr(field_token, params)
 
             if baseline_end is None:
                 # Self-baseline: flag values with count ≤ rarity_floor.
@@ -552,7 +527,7 @@ class StatisticalAnomalyService:
                 """
             else:
                 # Temporal: flag values seen in detect window but not in baseline.
-                params["bl"] = _fmt_dt(baseline_end)
+                params["bl"] = to_clickhouse_utc(baseline_end)
                 params["lim"] = per_field_limit
                 sql = f"""
                     SELECT
@@ -655,8 +630,7 @@ class StatisticalAnomalyService:
         # Suppress findings whose representative event was marked normal.
         if exclude_event_ids:
             all_findings = [
-                f for f in all_findings
-                if not f.event_id or f.event_id not in exclude_event_ids
+                f for f in all_findings if not f.event_id or f.event_id not in exclude_event_ids
             ]
 
         # Sort by surprise descending (rarest first), apply global limit.
@@ -699,22 +673,19 @@ class StatisticalAnomalyService:
             baseline_end = ensure_utc(baseline_end)
         self.ch.init_schema()
         db = self.ch.database
-        ctr: list[int] = [0]
         field_params: dict[str, Any] = {}
-        col = _col_expr(series_field, field_params, ctr)
+        col = _col_expr(series_field, field_params)
 
         src_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
 
         # Resolve time range.
-        range_res = self.ch.client.query(
-            f"SELECT min(timestamp), max(timestamp) FROM {db}.events"
-            f" WHERE case_id = {{cid:String}}"
-            f" AND has({{src:Array(String)}}, source_id)"
-            f" AND timestamp IS NOT NULL",
-            parameters=src_params,
+        min_ts, max_ts = query_timestamp_range(
+            self.ch.client,
+            db,
+            "case_id = {cid:String} AND has({src:Array(String)}, source_id)"
+            " AND timestamp IS NOT NULL",
+            src_params,
         )
-        row0 = range_res.result_rows[0] if range_res.result_rows else (None, None)
-        min_ts, max_ts = row0[0], row0[1]
         if min_ts is None or max_ts is None:
             return StatAnomalyResult(
                 status="no_data",
@@ -724,10 +695,7 @@ class StatisticalAnomalyService:
                 z_threshold=z_threshold,
             )
 
-        min_ts = ensure_utc(min_ts)
-        max_ts = ensure_utc(max_ts)
-        duration = (max_ts - min_ts).total_seconds()
-        interval = max(1, int(duration / bucket_count))
+        interval = bucket_interval_seconds(min_ts, max_ts, bucket_count)
 
         # Fetch per-bucket, per-series event counts.
         params: dict[str, Any] = {**src_params, **field_params, "iv": interval}
@@ -794,8 +762,14 @@ class StatisticalAnomalyService:
                         if abs(z) >= z_threshold:
                             findings.append(
                                 _freq_finding(
-                                    series_field, sv, bucket_dt, interval, cnt,
-                                    0.0, z, method,
+                                    series_field,
+                                    sv,
+                                    bucket_dt,
+                                    interval,
+                                    cnt,
+                                    0.0,
+                                    z,
+                                    method,
                                 )
                             )
                     continue
@@ -813,8 +787,14 @@ class StatisticalAnomalyService:
                     if abs(z) >= z_threshold:
                         findings.append(
                             _freq_finding(
-                                series_field, sv, bucket_dt, interval, cnt,
-                                mean_val, z, method,
+                                series_field,
+                                sv,
+                                bucket_dt,
+                                interval,
+                                cnt,
+                                mean_val,
+                                z,
+                                method,
                             )
                         )
             else:
@@ -833,9 +813,7 @@ class StatisticalAnomalyService:
                 for (bucket_dt, cnt), c in zip(pts_aware, counts, strict=False):
                     n_loo = n - 1
                     mean_val = (total - c) / n_loo
-                    var_loo = (total_sq - c * c - n_loo * mean_val * mean_val) / (
-                        n_loo - 1
-                    )
+                    var_loo = (total_sq - c * c - n_loo * mean_val * mean_val) / (n_loo - 1)
                     # Floor the leave-one-out std rather than skipping when the
                     # rest of the series is constant (or near it) — otherwise a
                     # single outlier bucket, scored against a baseline it was
@@ -846,8 +824,14 @@ class StatisticalAnomalyService:
                     if abs(z) >= z_threshold:
                         findings.append(
                             _freq_finding(
-                                series_field, sv, bucket_dt, interval, int(cnt),
-                                mean_val, z, method,
+                                series_field,
+                                sv,
+                                bucket_dt,
+                                interval,
+                                int(cnt),
+                                mean_val,
+                                z,
+                                method,
                             )
                         )
 
@@ -872,8 +856,7 @@ class StatisticalAnomalyService:
         )
         if exclude_event_ids:
             findings = [
-                f for f in findings
-                if not f.event_id or f.event_id not in exclude_event_ids
+                f for f in findings if not f.event_id or f.event_id not in exclude_event_ids
             ]
 
         findings.sort(key=lambda f: f.score, reverse=True)
@@ -909,10 +892,9 @@ class StatisticalAnomalyService:
             return findings
 
         series_values = sorted({f.series_value for f in findings})
-        buckets = sorted({
-            datetime.fromisoformat(f.window_start).replace(tzinfo=None)
-            for f in findings
-        })
+        buckets = sorted(
+            {datetime.fromisoformat(f.window_start).replace(tzinfo=None) for f in findings}
+        )
         params: dict[str, Any] = {
             **field_params,
             "cid": case_id,
@@ -928,9 +910,7 @@ class StatisticalAnomalyService:
         # is found in WHERE" (ILLEGAL_AGGREGATION). Downstream parsing is
         # positional (_row_to_event), so the alias names themselves are
         # otherwise unused.
-        agg_cols_sql = ", ".join(
-            f"argMin({c}, timestamp) AS agg_{c}" for c in _EVENT_COLUMNS
-        )
+        agg_cols_sql = ", ".join(f"argMin({c}, timestamp) AS agg_{c}" for c in _EVENT_COLUMNS)
         sql = f"""
             SELECT
                 toStartOfInterval(timestamp, INTERVAL {{iv:UInt32}} second) AS bucket,
@@ -955,9 +935,7 @@ class StatisticalAnomalyService:
         for f in findings:
             evt = by_key.get((f.series_value, f.window_start))
             if evt is not None:
-                hydrated.append(
-                    replace(f, event_id=str(evt.get("event_id", "")), event=evt)
-                )
+                hydrated.append(replace(f, event_id=str(evt.get("event_id", "")), event=evt))
             else:
                 hydrated.append(f)
         return hydrated

@@ -94,9 +94,7 @@ class FakeQdrantStore:
     def case_collections(self, case_id: str) -> list[str]:
         return list(self._points.keys())
 
-    def find_collection_for_sources(
-        self, case_id: str, source_ids: list[str]
-    ) -> str | None:
+    def find_collection_for_sources(self, case_id: str, source_ids: list[str]) -> str | None:
         source_set = set(source_ids)
         for name, points in self._points.items():
             for p in points:
@@ -113,9 +111,7 @@ class FakeQdrantStore:
     ) -> list[FakeScoredPoint]:
         points = self._points.get(collection_name, [])
         source_set = set(source_ids)
-        filtered = [
-            p for p in points if p.payload.get("source_id") in source_set
-        ]
+        filtered = [p for p in points if p.payload.get("source_id") in source_set]
         return filtered[:limit]
 
     def search(
@@ -130,20 +126,14 @@ class FakeQdrantStore:
 
         points = self._points.get(collection_name, [])
         source_set = set(source_ids)
-        filtered = [
-            p for p in points if p.payload.get("source_id") in source_set
-        ]
+        filtered = [p for p in points if p.payload.get("source_id") in source_set]
         q = np.array(query_vector, dtype=np.float32)
         scored = []
         for p in filtered:
             v = np.array(p.vector, dtype=np.float32)
             norm_q = np.linalg.norm(q)
             norm_v = np.linalg.norm(v)
-            score = (
-                0.0
-                if norm_q == 0 or norm_v == 0
-                else float(np.dot(q, v) / (norm_q * norm_v))
-            )
+            score = 0.0 if norm_q == 0 or norm_v == 0 else float(np.dot(q, v) / (norm_q * norm_v))
             scored.append(
                 FakeScoredPoint(
                     id=p.id,
@@ -155,9 +145,7 @@ class FakeQdrantStore:
         scored.sort(key=lambda x: x.score, reverse=True)
         return scored[:limit]
 
-    def retrieve_vector(
-        self, collection_name: str, event_id: str
-    ) -> list[float] | None:
+    def retrieve_vector(self, collection_name: str, event_id: str) -> list[float] | None:
         for p in self._points.get(collection_name, []):
             if p.id == event_id:
                 return p.vector
@@ -251,7 +239,7 @@ def test_find_similar_returns_nearest_first():
     qdrant = FakeQdrantStore()
     qdrant._add_point("col1", "query", _unit([1.0, 0.0]), "s1")
     qdrant._add_point("col1", "close", _unit([0.99, 0.14]), "s1")  # very similar
-    qdrant._add_point("col1", "far", _unit([0.0, 1.0]), "s1")     # orthogonal
+    qdrant._add_point("col1", "far", _unit([0.0, 1.0]), "s1")  # orthogonal
 
     ch = FakeClickHouseStore()
     svc = SimilarityService(qdrant=qdrant, clickhouse=ch)
@@ -349,3 +337,28 @@ def test_find_similar_by_text_returns_nearest_first():
     assert len(result.results) == 2
     assert result.results[0].event_id == "close"
     assert result.results[0].score > result.results[1].score
+
+
+def test_get_embedding_model_does_not_eagerly_load(monkeypatch):
+    """_get_embedding_model must not call .load() itself — encode() routes
+    to the local/remote path on its own, and load() raises in remote mode
+    (RuntimeError), which would turn every remote-mode free-text search
+    into an unhandled 500 before encode() is ever reached."""
+    import tracevector.db.similarity as similarity_module
+
+    class ExplodingLoadModel:
+        def __init__(self) -> None:
+            self.is_remote = True
+
+        def load(self):
+            raise RuntimeError("load() is not available when using a remote embedding endpoint")
+
+        def encode(self, texts):
+            return [[0.0] for _ in texts]
+
+    monkeypatch.setattr(similarity_module, "EmbeddingModel", ExplodingLoadModel)
+    svc = similarity_module.SimilarityService(
+        qdrant=FakeQdrantStore(), clickhouse=FakeClickHouseStore()
+    )
+    model = svc._get_embedding_model()
+    assert model.encode(["q"]) == [[0.0]]

@@ -36,9 +36,11 @@ class FakeClient:
         # Responses are consumed in order (FIFO) for each query call.
         self._responses: list[FakeQueryResult] = list(responses)
         self._calls: list[str] = []
+        self._all_parameters: list[dict] = []
 
     def query(self, sql: str, parameters: dict | None = None) -> FakeQueryResult:
         self._calls.append(sql.strip().split("\n")[0].strip())
+        self._all_parameters.append(parameters or {})
         if self._responses:
             return self._responses.pop(0)
         return FakeQueryResult(result_rows=[], column_names=[])
@@ -74,38 +76,34 @@ def _svc(responses: list[FakeQueryResult]) -> StatisticalAnomalyService:
 
 def test_col_expr_top_level_column():
     params: dict[str, Any] = {}
-    ctr = [0]
-    assert _col_expr("artifact", params, ctr) == "artifact"
+    assert _col_expr("artifact", params) == "artifact"
     assert params == {}
-    assert ctr == [0]
+
+
+def test_col_expr_top_level_column_shared_with_queries_allowlist():
+    """F10: anomaly_stats and queries.py share one top-level-column allowlist
+    (via db._columns), so a field like `parser_version` — a real top-level
+    column, not previously in anomaly_stats' narrower local list — resolves
+    to the column here too instead of silently becoming an always-empty
+    attribute lookup."""
+    params: dict[str, Any] = {}
+    assert _col_expr("parser_version", params) == "parser_version"
+    assert params == {}
 
 
 def test_col_expr_attr_prefix():
     params: dict[str, Any] = {}
-    ctr = [0]
-    expr = _col_expr("attr:user_agent", params, ctr)
-    assert expr == "attributes[{fk0:String}]"
-    assert params == {"fk0": "user_agent"}
-    assert ctr == [1]
+    expr = _col_expr("attr:user_agent", params)
+    assert expr == "attributes[{fk:String}]"
+    assert params == {"fk": "user_agent"}
 
 
 def test_col_expr_bare_attr_name():
     """Bare names not in the top-level set are treated as attribute keys."""
     params: dict[str, Any] = {}
-    ctr = [0]
-    expr = _col_expr("ip_address", params, ctr)
-    assert expr == "attributes[{fk0:String}]"
-    assert params["fk0"] == "ip_address"
-
-
-def test_col_expr_counter_increments():
-    params: dict[str, Any] = {}
-    ctr = [0]
-    _col_expr("attr:a", params, ctr)
-    _col_expr("attr:b", params, ctr)
-    assert "fk0" in params
-    assert "fk1" in params
-    assert ctr == [2]
+    expr = _col_expr("ip_address", params)
+    assert expr == "attributes[{fk:String}]"
+    assert params["fk"] == "ip_address"
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +152,8 @@ def test_value_novelty_self_baseline_returns_rare_values():
     ]
     svc = _svc(responses)
     result = svc.find_value_novelty(
-        "c1", ["s1"],
+        "c1",
+        ["s1"],
         fields=["artifact", "timestamp_desc", "display_name"],
         rarity_floor=3,
         limit=50,
@@ -195,19 +194,22 @@ def test_value_novelty_self_baseline_limit_applied():
     per_field = [
         FakeQueryResult(
             result_rows=[
-                (f"val_{i}", 1, datetime(2024, 1, 1), f"evt-{j*3+i}", "s1", "m")
+                (f"val_{i}", 1, datetime(2024, 1, 1), f"evt-{j * 3 + i}", "s1", "m")
                 for i in range(3)
             ],
             column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
         )
         for j in range(3)
     ]
-    svc = _svc([
-        FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
-        *per_field,
-    ])
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
+            *per_field,
+        ]
+    )
     result = svc.find_value_novelty(
-        "c1", ["s1"],
+        "c1",
+        ["s1"],
         fields=["artifact", "timestamp_desc", "display_name"],
         limit=4,
     )
@@ -217,13 +219,15 @@ def test_value_novelty_self_baseline_limit_applied():
 
 def test_value_novelty_event_id_populated():
     """Each finding carries the event_id of its first occurrence."""
-    svc = _svc([
-        FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
-        FakeQueryResult(
-            result_rows=[("backdoor.exe", 1, datetime(2024, 1, 1), "evt-abc", "s1", "bad msg")],
-            column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
-        ),
-    ])
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[("backdoor.exe", 1, datetime(2024, 1, 1), "evt-abc", "s1", "bad msg")],
+                column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
+            ),
+        ]
+    )
     result = svc.find_value_novelty("c1", ["s1"], fields=["artifact"])
     assert result.status == "ok"
     assert len(result.results) == 1
@@ -243,16 +247,18 @@ def test_value_novelty_event_id_populated():
 
 def test_value_novelty_skips_empty_values():
     """Rows with empty string values must be filtered out."""
-    svc = _svc([
-        FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
-        FakeQueryResult(
-            result_rows=[
-                ("", 1, datetime(2024, 1, 1), "evt-1", "s1", "msg"),
-                ("real_value", 2, datetime(2024, 1, 1), "evt-2", "s1", "msg2"),
-            ],
-            column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
-        ),
-    ])
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[
+                    ("", 1, datetime(2024, 1, 1), "evt-1", "s1", "msg"),
+                    ("real_value", 2, datetime(2024, 1, 1), "evt-2", "s1", "msg2"),
+                ],
+                column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
+            ),
+        ]
+    )
     result = svc.find_value_novelty("c1", ["s1"], fields=["artifact"])
     assert result.status == "ok"
     values = [r.value for r in result.results]
@@ -268,21 +274,40 @@ def test_value_novelty_skips_empty_values():
 def test_value_novelty_temporal_baseline_first_seen():
     """Temporal mode flags values absent in baseline but present in detect window."""
     baseline_end = datetime(2024, 1, 15, tzinfo=UTC)
-    svc = _svc([
-        # Total events
-        FakeQueryResult(result_rows=[(500,)], column_names=["count()"]),
-        # Baseline size
-        FakeQueryResult(result_rows=[(300,)], column_names=["count()"]),
-        # artifact field: one first-seen value
-        FakeQueryResult(
-            result_rows=[
-                ("first_time_process.exe", 3, 0, datetime(2024, 1, 16), "evt-9", "s1", "new exe"),
-            ],
-            column_names=["val", "detect_cnt", "baseline_cnt", "first_seen", "evt_id", "src_id", "msg"],
-        ),
-    ])
+    svc = _svc(
+        [
+            # Total events
+            FakeQueryResult(result_rows=[(500,)], column_names=["count()"]),
+            # Baseline size
+            FakeQueryResult(result_rows=[(300,)], column_names=["count()"]),
+            # artifact field: one first-seen value
+            FakeQueryResult(
+                result_rows=[
+                    (
+                        "first_time_process.exe",
+                        3,
+                        0,
+                        datetime(2024, 1, 16),
+                        "evt-9",
+                        "s1",
+                        "new exe",
+                    ),
+                ],
+                column_names=[
+                    "val",
+                    "detect_cnt",
+                    "baseline_cnt",
+                    "first_seen",
+                    "evt_id",
+                    "src_id",
+                    "msg",
+                ],
+            ),
+        ]
+    )
     result = svc.find_value_novelty(
-        "c1", ["s1"],
+        "c1",
+        ["s1"],
         fields=["artifact"],
         baseline_end=baseline_end,
     )
@@ -295,6 +320,44 @@ def test_value_novelty_temporal_baseline_first_seen():
     assert r.count == 3
     assert r.details["method"] == "temporal"
     assert "baseline_size" in r.details
+
+
+def test_value_novelty_temporal_baseline_converts_non_utc_offset_for_sql():
+    """A `baseline_end` with a non-UTC offset (e.g. FastAPI-parsed `+02:00`)
+    must be converted to the equivalent UTC instant before being spliced
+    into the ClickHouse SQL string literal — otherwise the temporal split
+    lands 2 hours later than intended (F8)."""
+    from datetime import timedelta, timezone
+
+    plus_two = timezone(timedelta(hours=2))
+    baseline_end = datetime(2024, 1, 15, 14, 0, 0, tzinfo=plus_two)
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(500,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(300,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[],
+                column_names=[
+                    "val",
+                    "detect_cnt",
+                    "baseline_cnt",
+                    "first_seen",
+                    "evt_id",
+                    "src_id",
+                    "msg",
+                ],
+            ),
+        ]
+    )
+    svc.find_value_novelty(
+        "c1",
+        ["s1"],
+        fields=["artifact"],
+        baseline_end=baseline_end,
+    )
+    bl_values = [p["bl"] for p in svc.ch.client._all_parameters if "bl" in p]
+    assert bl_values
+    assert all(v == "2024-01-15 12:00:00" for v in bl_values)
 
 
 # ---------------------------------------------------------------------------
@@ -334,9 +397,11 @@ def _make_freq_responses(
 
 def test_frequency_no_data_when_no_events():
     """Returns no_data when the events table has no timestamps."""
-    svc = _svc([
-        FakeQueryResult(result_rows=[(None, None)], column_names=["min", "max"]),
-    ])
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(None, None)], column_names=["min", "max"]),
+        ]
+    )
     result = svc.find_frequency_anomalies("c1", ["s1"])
     assert result.status == "no_data"
 
@@ -347,10 +412,12 @@ def test_frequency_no_data_when_no_bucket_rows():
 
     min_dt = datetime(2024, 1, 1, tzinfo=UTC)
     max_dt = datetime(2024, 1, 2, tzinfo=UTC)
-    svc = _svc([
-        FakeQueryResult(result_rows=[(min_dt, max_dt)], column_names=["min", "max"]),
-        FakeQueryResult(result_rows=[], column_names=[]),
-    ])
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(min_dt, max_dt)], column_names=["min", "max"]),
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ]
+    )
     result = svc.find_frequency_anomalies("c1", ["s1"])
     assert result.status == "no_data"
 
@@ -364,7 +431,8 @@ def test_frequency_spike_detected():
     svc._hydrate_freq_findings = lambda findings, *a, **kw: findings  # type: ignore[method-assign]
 
     result = svc.find_frequency_anomalies(
-        "c1", ["s1"],
+        "c1",
+        ["s1"],
         series_field="artifact",
         z_threshold=2.0,
         limit=10,
@@ -411,14 +479,13 @@ def test_frequency_constant_series_ignored():
     min_dt = datetime(2024, 1, 1, tzinfo=UTC)
     max_dt = datetime(2024, 1, 2, tzinfo=UTC)
     # 6 perfectly uniform buckets.
-    bucket_rows = [
-        (min_dt.replace(hour=h * 4), "LOG", 10)
-        for h in range(6)
-    ]
-    svc = _svc([
-        FakeQueryResult(result_rows=[(min_dt, max_dt)], column_names=["min", "max"]),
-        FakeQueryResult(result_rows=bucket_rows, column_names=["bucket", "series_val", "cnt"]),
-    ])
+    bucket_rows = [(min_dt.replace(hour=h * 4), "LOG", 10) for h in range(6)]
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(min_dt, max_dt)], column_names=["min", "max"]),
+            FakeQueryResult(result_rows=bucket_rows, column_names=["bucket", "series_val", "cnt"]),
+        ]
+    )
     svc._hydrate_freq_findings = lambda findings, *a, **kw: findings  # type: ignore[method-assign]
 
     result = svc.find_frequency_anomalies("c1", ["s1"], z_threshold=2.0)
@@ -439,10 +506,12 @@ def test_frequency_insufficient_buckets_series_skipped():
         (min_dt, "LOG", 10),
         (min_dt.replace(hour=12), "LOG", 100),
     ]
-    svc = _svc([
-        FakeQueryResult(result_rows=[(min_dt, max_dt)], column_names=["min", "max"]),
-        FakeQueryResult(result_rows=bucket_rows, column_names=["bucket", "series_val", "cnt"]),
-    ])
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(min_dt, max_dt)], column_names=["min", "max"]),
+            FakeQueryResult(result_rows=bucket_rows, column_names=["bucket", "series_val", "cnt"]),
+        ]
+    )
     svc._hydrate_freq_findings = lambda findings, *a, **kw: findings  # type: ignore[method-assign]
 
     result = svc.find_frequency_anomalies("c1", ["s1"], z_threshold=1.0)
@@ -461,11 +530,19 @@ def test_frequency_limit_applied():
     for i, sv in enumerate(["A", "B", "C"]):
         for h in range(5):
             cnt = 10 if h < 4 else 100  # spike on last bucket
-            bucket_rows.append((min_dt.replace(hour=0) + __import__("datetime").timedelta(hours=h * 12 + i * 2), sv, cnt))
-    svc = _svc([
-        FakeQueryResult(result_rows=[(min_dt, max_dt)], column_names=["min", "max"]),
-        FakeQueryResult(result_rows=bucket_rows, column_names=["bucket", "series_val", "cnt"]),
-    ])
+            bucket_rows.append(
+                (
+                    min_dt.replace(hour=0) + __import__("datetime").timedelta(hours=h * 12 + i * 2),
+                    sv,
+                    cnt,
+                )
+            )
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(min_dt, max_dt)], column_names=["min", "max"]),
+            FakeQueryResult(result_rows=bucket_rows, column_names=["bucket", "series_val", "cnt"]),
+        ]
+    )
     svc._hydrate_freq_findings = lambda findings, *a, **kw: findings  # type: ignore[method-assign]
 
     result = svc.find_frequency_anomalies("c1", ["s1"], limit=2, z_threshold=2.0)
@@ -498,14 +575,17 @@ def test_frequency_temporal_baseline():
         # Detect window (after baseline_end): massive spike.
         (min_dt + timedelta(hours=14), "LOG", 200),
     ]
-    svc = _svc([
-        FakeQueryResult(result_rows=[(min_dt, max_dt)], column_names=["min", "max"]),
-        FakeQueryResult(result_rows=bucket_rows, column_names=["bucket", "series_val", "cnt"]),
-    ])
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(min_dt, max_dt)], column_names=["min", "max"]),
+            FakeQueryResult(result_rows=bucket_rows, column_names=["bucket", "series_val", "cnt"]),
+        ]
+    )
     svc._hydrate_freq_findings = lambda findings, *a, **kw: findings  # type: ignore[method-assign]
 
     result = svc.find_frequency_anomalies(
-        "c1", ["s1"],
+        "c1",
+        ["s1"],
         baseline_end=baseline_end,
         z_threshold=2.0,
     )
@@ -535,14 +615,17 @@ def test_frequency_temporal_baseline_zero_baseline_flagged():
         (min_dt + timedelta(hours=13), "NEWPROC", 50),
         (min_dt + timedelta(hours=14), "NEWPROC", 60),
     ]
-    svc = _svc([
-        FakeQueryResult(result_rows=[(min_dt, max_dt)], column_names=["min", "max"]),
-        FakeQueryResult(result_rows=bucket_rows, column_names=["bucket", "series_val", "cnt"]),
-    ])
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(min_dt, max_dt)], column_names=["min", "max"]),
+            FakeQueryResult(result_rows=bucket_rows, column_names=["bucket", "series_val", "cnt"]),
+        ]
+    )
     svc._hydrate_freq_findings = lambda findings, *a, **kw: findings  # type: ignore[method-assign]
 
     result = svc.find_frequency_anomalies(
-        "c1", ["s1"],
+        "c1",
+        ["s1"],
         baseline_end=baseline_end,
         z_threshold=2.0,
     )
@@ -584,7 +667,8 @@ def test_frequency_exclude_event_ids_backfills_from_next_ranked():
     svc._hydrate_freq_findings = _fake_hydrate  # type: ignore[method-assign]
 
     result = svc.find_frequency_anomalies(
-        "c1", ["s1"],
+        "c1",
+        ["s1"],
         z_threshold=1.0,
         limit=1,
         exclude_event_ids={"evt-0"},
@@ -685,16 +769,20 @@ def test_recommend_novelty_fields_categorical_recommended():
     # parser_name: 1000 distinct, 1000 non-empty (identifier, ratio=1.0) → not recommended
     # (total=1000 for all coverage computations)
     top_row = (
-        5, 1000,    # artifact: 5 distinct, 1000 non-empty
-        20, 950,    # timestamp_desc: 20 distinct, 950 non-empty
-        1, 900,     # display_name: 1 distinct → constant
-        1000, 1000, # parser_name: 1000/1000 = 1.0 → identifier
+        5,
+        1000,  # artifact: 5 distinct, 1000 non-empty
+        20,
+        950,  # timestamp_desc: 20 distinct, 950 non-empty
+        1,
+        900,  # display_name: 1 distinct → constant
+        1000,
+        1000,  # parser_name: 1000/1000 = 1.0 → identifier
     )
     attr_rows = [
         # (key, distinct, non_empty_count)
-        ("status_code", 6, 1000),   # 6/1000=0.006 → categorical
-        ("url_path", 840, 1000),    # 840/1000=0.84 < 0.9 → categorical
-        ("session_id", 980, 980),   # 980/980=1.0 → identifier
+        ("status_code", 6, 1000),  # 6/1000=0.006 → categorical
+        ("url_path", 840, 1000),  # 840/1000=0.84 < 0.9 → categorical
+        ("session_id", 980, 980),  # 980/980=1.0 → identifier
     ]
     svc = _svc_with_recommend_responses(top_row, attr_rows)
     result = svc.recommend_novelty_fields("c1", ["s1"])
@@ -732,10 +820,14 @@ def test_recommend_novelty_fields_categorical_recommended():
 def test_recommend_novelty_fields_recommended_first():
     """Recommended fields should appear before non-recommended ones."""
     top_row = (
-        5, 1000,    # artifact — categorical
-        20, 950,    # timestamp_desc — categorical
-        1, 900,     # display_name — constant → not recommended
-        1000, 1000, # parser_name — identifier → not recommended
+        5,
+        1000,  # artifact — categorical
+        20,
+        950,  # timestamp_desc — categorical
+        1,
+        900,  # display_name — constant → not recommended
+        1000,
+        1000,  # parser_name — identifier → not recommended
     )
     attr_rows: list[tuple] = []
     svc = _svc_with_recommend_responses(top_row, attr_rows)
@@ -756,15 +848,17 @@ def test_recommend_novelty_fields_recommended_first():
 
 
 def test_value_novelty_smart_default_calls_recommender():
-    """When fields=None, the recommender is invoked and its tokens are used."""
-    # The smart default path calls recommend_novelty_fields first (3 queries),
-    # then total events (1), then field scans (1 per recommended field).
-    # We'll supply canned responses for: total(recommender) + top_batch +
-    # attr_keys + total(novelty) + one field scan.
+    """When fields=None, the recommender is invoked and its tokens are used.
+
+    find_value_novelty computes `total` once and passes it into
+    recommend_novelty_fields, which then skips its own identical count()
+    query (C12) — so the total is queried only once, not twice.
+    """
     total = 500
     responses = [
-        # recommend_novelty_fields:
-        FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),   # total
+        # find_value_novelty's own total (reused by recommend_novelty_fields):
+        FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
+        # recommend_novelty_fields (total supplied, no count() query of its own):
         FakeQueryResult(
             result_rows=[(5, 500, 1, 500, 1, 500, 1, 500)],  # 1 categorical, 3 constant/id
             column_names=["c"] * 8,
@@ -773,8 +867,7 @@ def test_value_novelty_smart_default_calls_recommender():
             result_rows=[("status_code", 6, 500)],  # attr categorical
             column_names=["key", "dist", "cov_count"],
         ),  # attribute keys
-        # find_value_novelty (recommended fields = artifact + attr:status_code):
-        FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),   # total
+        # find_value_novelty field scans (recommended fields = artifact + attr:status_code):
         FakeQueryResult(
             result_rows=[("404", 2, datetime(2024, 1, 1), "evt-1", "s1", "404 not found")],
             column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
@@ -789,6 +882,36 @@ def test_value_novelty_smart_default_calls_recommender():
     assert result.status == "ok"
     # Findings from the attribute field should be present.
     assert len(result.results) >= 1
+    # Only one total-count round trip, not one per caller (C12).
+    total_count_calls = [c for c in svc.ch.client._calls if c.startswith("SELECT count()")]
+    assert len(total_count_calls) == 1
+
+
+def test_value_novelty_auto_mode_caps_scanned_fields():
+    """C11: auto-selected fields are capped at _MAX_AUTO_SCAN_FIELDS — each
+    field is a separate sequential ClickHouse round-trip, so an uncapped
+    recommended set could turn one panel-open into dozens of them."""
+    from tracevector.db.anomaly_stats import _MAX_AUTO_SCAN_FIELDS, NoveltyFieldInfo
+
+    total = 1000
+    many_fields = [
+        NoveltyFieldInfo(
+            token=f"attr:field_{i}",
+            distinct=10,
+            coverage=0.9,
+            kind="categorical",
+            recommended=True,
+        )
+        for i in range(_MAX_AUTO_SCAN_FIELDS + 10)
+    ]
+    svc = _svc([FakeQueryResult(result_rows=[(total,)], column_names=["count()"])])
+    svc.recommend_novelty_fields = lambda *a, **k: many_fields  # noqa: ARG005
+
+    svc.find_value_novelty("c1", ["s1"], rarity_floor=3)
+
+    # First call is the total() count; every call after it is one field scan.
+    field_scan_calls = svc.ch.client._calls[1:]
+    assert len(field_scan_calls) == _MAX_AUTO_SCAN_FIELDS
 
 
 # ---------------------------------------------------------------------------
@@ -811,7 +934,8 @@ def test_value_novelty_exclude_event_ids():
     ]
     svc = _svc(responses)
     result = svc.find_value_novelty(
-        "c1", ["s1"],
+        "c1",
+        ["s1"],
         fields=["artifact"],
         exclude_event_ids={"evt-bad"},
     )
@@ -830,13 +954,15 @@ def test_frequency_exclude_event_ids():
         out = []
         for i, f in enumerate(findings):
             from dataclasses import replace as _replace
+
             out.append(_replace(f, event_id=f"evt-{i}"))
         return out
 
     svc._hydrate_freq_findings = _fake_hydrate  # type: ignore[method-assign]
 
     result = svc.find_frequency_anomalies(
-        "c1", ["s1"],
+        "c1",
+        ["s1"],
         z_threshold=2.0,
         exclude_event_ids={"evt-0"},
     )
@@ -859,35 +985,59 @@ def test_hydrate_freq_findings_batches_into_a_single_query():
     bucket_b = datetime(2024, 1, 1, 4, 0, 0, tzinfo=UTC)
     findings = [
         FreqFinding(
-            series_field="artifact", series_value="A",
+            series_field="artifact",
+            series_value="A",
             window_start=bucket_a.isoformat(),
             window_end=(bucket_a + timedelta(hours=1)).isoformat(),
-            observed=100, expected=10.0, z_score=90.0, score=90.0,
-            event_id=None, event=None, details={},
+            observed=100,
+            expected=10.0,
+            z_score=90.0,
+            score=90.0,
+            event_id=None,
+            event=None,
+            details={},
         ),
         FreqFinding(
-            series_field="artifact", series_value="B",
+            series_field="artifact",
+            series_value="B",
             window_start=bucket_b.isoformat(),
             window_end=(bucket_b + timedelta(hours=1)).isoformat(),
-            observed=40, expected=10.0, z_score=30.0, score=30.0,
-            event_id=None, event=None, details={},
+            observed=40,
+            expected=10.0,
+            z_score=30.0,
+            score=30.0,
+            event_id=None,
+            event=None,
+            details={},
         ),
     ]
 
-    row_a = ("evt-a", "c1", "s1", "spike A") + (None,) * (len(_EVENT_COLUMNS) - 4)
-    row_b = ("evt-b", "c1", "s1", "spike B") + (None,) * (len(_EVENT_COLUMNS) - 4)
-    svc = _svc([
-        FakeQueryResult(
-            result_rows=[
-                (bucket_a.replace(tzinfo=None), "A", *row_a),
-                (bucket_b.replace(tzinfo=None), "B", *row_b),
-            ],
-            column_names=["bucket", "series_val", *_EVENT_COLUMNS],
-        ),
-    ])
+    def _build_row(event_id: str, message: str) -> tuple:
+        values = {"event_id": event_id, "case_id": "c1", "source_id": "s1", "message": message}
+        return tuple(values.get(col) for col in _EVENT_COLUMNS)
+
+    row_a = _build_row("evt-a", "spike A")
+    row_b = _build_row("evt-b", "spike B")
+    svc = _svc(
+        [
+            FakeQueryResult(
+                result_rows=[
+                    (bucket_a.replace(tzinfo=None), "A", *row_a),
+                    (bucket_b.replace(tzinfo=None), "B", *row_b),
+                ],
+                column_names=["bucket", "series_val", *_EVENT_COLUMNS],
+            ),
+        ]
+    )
 
     hydrated = svc._hydrate_freq_findings(
-        findings, "c1", ["s1"], "artifact", "tracevector", {}, 3600,
+        findings,
+        "c1",
+        ["s1"],
+        "artifact",
+        "tracevector",
+        {},
+        3600,
     )
 
     assert len(svc.ch.client._calls) == 1
@@ -905,15 +1055,19 @@ def test_hydrate_freq_findings_batches_into_a_single_query():
 def test_get_timeline_midpoint_returns_midpoint():
     min_dt = datetime(2024, 1, 1, tzinfo=UTC)
     max_dt = datetime(2024, 1, 3, tzinfo=UTC)
-    svc = _svc([
-        FakeQueryResult(result_rows=[(min_dt, max_dt)], column_names=["min", "max"]),
-    ])
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(min_dt, max_dt)], column_names=["min", "max"]),
+        ]
+    )
     mid = svc.get_timeline_midpoint("c1", ["s1"])
     assert mid == datetime(2024, 1, 2, tzinfo=UTC)
 
 
 def test_get_timeline_midpoint_returns_none_when_no_events():
-    svc = _svc([
-        FakeQueryResult(result_rows=[(None, None)], column_names=["min", "max"]),
-    ])
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(None, None)], column_names=["min", "max"]),
+        ]
+    )
     assert svc.get_timeline_midpoint("c1", ["s1"]) is None

@@ -10,8 +10,8 @@ export interface AnomalyParams {
   /** |z| cutoff for the frequency detector. Omit to use the server default. */
   z_threshold?: number;
   /** Explicit temporal baseline end timestamp */
-  baseline_start?: string;
-  /** Enable temporal mode (backend uses timeline midpoint when baseline_start is absent) */
+  baseline_end?: string;
+  /** Enable temporal mode (backend uses timeline midpoint when baseline_end is absent) */
   temporal?: boolean;
   limit?: number;
   [key: string]: string | number | boolean | null | undefined;

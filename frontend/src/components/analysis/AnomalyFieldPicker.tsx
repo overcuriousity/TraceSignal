@@ -23,6 +23,7 @@ import {
   PopoverContent,
 } from "@/components/ui/Popover";
 import { cn } from "@/lib/cn";
+import { anomalyFieldLabel as tokenLabel } from "@/lib/format";
 import type { NoveltyFieldInfo } from "@/api/types";
 
 interface Props {
@@ -31,20 +32,6 @@ interface Props {
   /** Currently selected field tokens. null = "use backend smart default". */
   selected: string[] | null;
   onChange: (tokens: string[] | null) => void;
-}
-
-/** Friendly display label for a field token. */
-function tokenLabel(token: string): string {
-  if (token.startsWith("attr:")) return token.slice(5);
-  const LABELS: Record<string, string> = {
-    artifact: "Artifact",
-    timestamp_desc: "Event category",
-    display_name: "Display name",
-    parser_name: "Parser",
-    message: "Message",
-    source_file: "Source file",
-  };
-  return LABELS[token] ?? token;
 }
 
 const KIND_HINT: Record<string, string> = {

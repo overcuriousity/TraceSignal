@@ -24,9 +24,7 @@ class FakeClickHouseStore:
         self.events.extend(events)
         return len(events)
 
-    def count_events(
-        self, case_id: str | None = None, source_id: str | None = None
-    ) -> int:
+    def count_events(self, case_id: str | None = None, source_id: str | None = None) -> int:
         events = self.events
         if case_id is not None:
             events = [e for e in events if e.case_id == case_id]
@@ -42,9 +40,7 @@ class FakeClickHouseStore:
         offset: int = 0,
     ) -> list[dict[str, Any]]:
         events = [
-            e.as_dict()
-            for e in self.events
-            if e.case_id == case_id and e.source_id == source_id
+            e.as_dict() for e in self.events if e.case_id == case_id and e.source_id == source_id
         ]
         return events[offset : offset + limit]
 

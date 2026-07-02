@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
-from fastapi import BackgroundTasks
 
 from tracevector.api.routers import cases
 from tracevector.api.routers.cases import upload_source
@@ -82,7 +81,6 @@ async def test_duplicate_upload_is_idempotent(
 
     first = await upload_source(
         case_id=case,
-        background_tasks=BackgroundTasks(),
         file=upload_file,
         parser=None,
     )
@@ -97,7 +95,6 @@ async def test_duplicate_upload_is_idempotent(
     # Second upload of the same bytes must be a no-op.
     second = await upload_source(
         case_id=case,
-        background_tasks=BackgroundTasks(),
         file=_UploadFile("events.jsonl", content),
         parser=None,
     )
@@ -118,7 +115,6 @@ async def test_uploading_different_file_adds_events(
 
     first = await upload_source(
         case_id=case,
-        background_tasks=BackgroundTasks(),
         file=_UploadFile("first.jsonl", first_content),
         parser=None,
     )
@@ -126,7 +122,6 @@ async def test_uploading_different_file_adds_events(
 
     second = await upload_source(
         case_id=case,
-        background_tasks=BackgroundTasks(),
         file=_UploadFile("second.jsonl", second_content),
         parser=None,
     )
@@ -145,7 +140,6 @@ async def test_upload_to_missing_case_returns_404(
     with pytest.raises(Exception) as exc_info:  # noqa: PT011
         await upload_source(
             case_id="missing",
-            background_tasks=BackgroundTasks(),
             file=_UploadFile("events.jsonl", b'{"message":"x"}\n'),
             parser=None,
         )
@@ -159,7 +153,6 @@ async def test_source_added_to_default_timeline(
 ) -> None:
     await upload_source(
         case_id=case,
-        background_tasks=BackgroundTasks(),
         file=_UploadFile("events.jsonl", b'{"message":"x"}\n'),
         parser=None,
     )

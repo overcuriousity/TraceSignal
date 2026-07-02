@@ -4,6 +4,72 @@
  */
 import type { EventFilters } from "@/api/types";
 
+/** Scalar/comma-joined API fields shared by every request that carries
+ * `EventFilters` — GET query params (events list, histogram) and JSON POST
+ * bodies that mirror the same param names (bulk-annotate, export). */
+export interface SerializedEventFilterFields {
+  q?: string;
+  artifact?: string;
+  artifacts?: string;
+  source_id?: string;
+  tag?: string;
+  exclude_tag?: string;
+  tags_include?: string;
+  tags_exclude?: string;
+  ids?: string;
+  start?: string;
+  end?: string;
+  annotated?: string;
+  annotation_tag_value?: string;
+  live_event_ids?: string;
+}
+
+/**
+ * Serialize the scalar/comma-joined fields of `EventFilters` shared by
+ * `eventsApi.list`, `eventsApi.histogram`, `annotationsApi.bulkByFilter`, and
+ * `downloadExport` — previously reimplemented ~13 fields deep in each of the
+ * four, with real risk of one being updated and the others silently missing
+ * a new filter.
+ *
+ * Deliberately excludes `filters`/`exclusions` (the object-shaped field
+ * filter/exclusion maps): whether those get JSON-stringified (query params,
+ * bulk-annotate's JSON body mirroring query-param conventions) or sent as
+ * raw objects (export's already-structured JSON body) depends on the
+ * transport, so each caller still sets those itself.
+ */
+export function serializeEventFilterFields(
+  filters: EventFilters,
+): SerializedEventFilterFields {
+  const out: SerializedEventFilterFields = {};
+  if (filters.q) out.q = filters.q;
+  if (filters.artifact) out.artifact = filters.artifact;
+  if (filters.artifacts && filters.artifacts.length > 0) {
+    out.artifacts = filters.artifacts.join(",");
+  }
+  if (filters.sourceId) out.source_id = filters.sourceId;
+  if (filters.tag) out.tag = filters.tag;
+  if (filters.excludeTag) out.exclude_tag = filters.excludeTag;
+  if (filters.tagsInclude && filters.tagsInclude.length > 0) {
+    out.tags_include = filters.tagsInclude.join(",");
+  }
+  if (filters.tagsExclude && filters.tagsExclude.length > 0) {
+    out.tags_exclude = filters.tagsExclude.join(",");
+  }
+  if (filters.ids && filters.ids.length > 0) {
+    out.ids = filters.ids.join(",");
+  }
+  if (filters.start) out.start = filters.start;
+  if (filters.end) out.end = filters.end;
+  if (filters.annotated && filters.annotated.length > 0) {
+    out.annotated = filters.annotated.join(",");
+  }
+  if (filters.annotationTagValue) out.annotation_tag_value = filters.annotationTagValue;
+  if (filters.liveAnomalyEventIds && filters.liveAnomalyEventIds.length > 0) {
+    out.live_event_ids = filters.liveAnomalyEventIds.join(",");
+  }
+  return out;
+}
+
 export function filtersToParams(filters: EventFilters): URLSearchParams {
   const p = new URLSearchParams();
   if (filters.q) p.set("q", filters.q);

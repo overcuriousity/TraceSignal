@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Literal
 
-from tracevector.db._dt import ensure_utc, ensure_utc_iso
+from tracevector.db._buckets import bucket_interval_seconds, query_timestamp_range
+from tracevector.db._columns import EVENT_SELECT_COLUMNS, resolve_column_token
+from tracevector.db._dt import ensure_utc, ensure_utc_iso, to_clickhouse_utc
 from tracevector.db.clickhouse import ClickHouseStore
 from tracevector.db.field_recommend import (
     recommend_fields,
@@ -15,6 +17,27 @@ from tracevector.db.field_recommend import (
     timeline_cohesion_summary,
     timeline_universal_cohesion,
 )
+
+# `timestamp` is `Nullable(DateTime64(3))` — unparsable/missing datetimes at
+# ingest genuinely produce NULL rows. ClickHouse sorts NULL after every real
+# value in `ORDER BY timestamp {ASC|DESC}` (empirically verified: NULLS LAST
+# regardless of direction), but a tuple predicate like `(timestamp, event_id)
+# > (:ts, :id)` evaluates to NULL — not true/false — whenever the `timestamp`
+# column itself is NULL, so those rows are silently unreachable by keyset
+# pagination. Cursors and predicates instead treat a NULL timestamp as this
+# sentinel: the maximum value DateTime64(3) can represent, guaranteed later
+# than any real forensic log timestamp, so NULL-timestamp rows sort/seek
+# exactly where they already land in ORDER BY (last).
+_NULL_TIMESTAMP_SENTINEL = datetime(2299, 12, 31, 23, 59, 59, 999000, tzinfo=UTC)
+_NULL_TIMESTAMP_SENTINEL_ISO = _NULL_TIMESTAMP_SENTINEL.isoformat()
+
+# The minimum possible UUID sorts before every real event_id under native
+# UUID comparison — used as the synthetic "any event at this timestamp"
+# lower/upper bound for jump-to-time, which only knows a target time and not
+# a specific anchor event (see `_parse_cursor`'s empty-event_id case in
+# events.py). `toString(event_id) > ""` served the same purpose before the
+# cursor predicate compared native UUIDs instead of strings.
+_MIN_EVENT_ID = "00000000-0000-0000-0000-000000000000"
 
 
 @dataclass
@@ -82,27 +105,8 @@ class EventPage:
     prev_cursor: tuple[str, str] | None = None
 
 
-# Columns that exist directly on the events table. Any other field key is
-# treated as a key in the ``attributes`` Map column.
-_TOP_LEVEL_FILTER_COLUMNS = frozenset(
-    {
-        "message",
-        "timestamp",
-        "timestamp_desc",
-        "artifact",
-        "artifact_long",
-        "display_name",
-        "parser_name",
-        "parser_version",
-        "source_file",
-        "source_id",
-        "content_hash",
-        "file_hash",
-    }
-)
-
 # Top-level columns surfaced as choosable display columns in the UI.
-# Separate from _TOP_LEVEL_FILTER_COLUMNS (which is for filter routing).
+# Separate from TOP_LEVEL_EVENT_COLUMNS (which is for filter routing).
 TOP_LEVEL_DISPLAY_COLUMNS = [
     "timestamp",
     "source_id",
@@ -126,24 +130,8 @@ def _escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def _format_clickhouse_datetime(value: datetime) -> str:
-    """Format a datetime for ClickHouse SQL."""
-    return value.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _format_clickhouse_datetime_precise(value: datetime) -> str:
-    """Format a datetime with millisecond precision for keyset cursors.
-
-    Unlike `_format_clickhouse_datetime` (second precision, fine for range
-    boundaries), cursor comparisons must match the `timestamp` column's
-    DateTime64(3) precision exactly, or events sharing a truncated second
-    could be skipped or duplicated across a page boundary.
-    """
-    return value.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-
-
-def _normalize_event_datetimes(row: dict[str, Any]) -> dict[str, Any]:
-    """Attach an explicit UTC offset to an event row's timestamp columns.
+def _normalize_event_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Attach an explicit UTC offset to timestamps and stringify `event_id`.
 
     The `events` table's `timestamp`/`ingest_time` columns have no explicit
     timezone component, so clickhouse-connect returns naive `datetime`
@@ -152,39 +140,27 @@ def _normalize_event_datetimes(row: dict[str, Any]) -> dict[str, Any]:
     "YYYY-MM-DDTHH:MM:SS" string is ambiguous to JS's `Date` parser (browsers
     treat it as local time), silently shifting every event's displayed and
     compared timestamp by the browser's UTC offset.
+
+    `event_id` comes back from clickhouse-connect as a `uuid.UUID` (the
+    column is natively `UUID`), while every other part of the codebase
+    (Postgres annotations, cursors, API responses) treats event ids as
+    `str`. Stringify it here so callers never have to remember to do it
+    themselves — e.g. export's annotation lookup keys its dict by `str`
+    annotation `event_id`s and would silently miss every match otherwise.
     """
     for key in ("timestamp", "ingest_time"):
         value = row.get(key)
         if isinstance(value, datetime):
             row[key] = ensure_utc_iso(value)
+    if "event_id" in row:
+        row["event_id"] = str(row["event_id"])
     return row
 
 
-# Columns selected in every event query (shared between paginated query and export).
-_EVENT_SELECT_COLUMNS = """
-    event_id,
-    case_id,
-    source_id,
-    source_file,
-    byte_offset,
-    line_number,
-    content_hash,
-    file_hash,
-    parser_name,
-    parser_version,
-    ingest_time,
-    message,
-    timestamp,
-    timestamp_desc,
-    artifact,
-    artifact_long,
-    display_name,
-    tags,
-    attributes,
-    embedding_model,
-    embedding_config_hash,
-    vector_id
-"""
+# SQL column list for every event query (shared between paginated query and
+# export), derived from the same column tuple anomaly_stats.py hydrates
+# representative events with — see _columns.EVENT_SELECT_COLUMNS.
+_EVENT_SELECT_COLUMNS = ",\n    ".join(EVENT_SELECT_COLUMNS)
 
 
 class _ParameterizedQueryBuilder:
@@ -270,9 +246,7 @@ class _ParameterizedQueryBuilder:
         ]
         clauses = [f"{c} ILIKE {{{name}:String}}" for c in columns]
         clauses.append(f"arrayExists(v -> v ILIKE {{{name}:String}}, tags)")
-        clauses.append(
-            f"arrayExists(v -> v ILIKE {{{name}:String}}, mapValues(attributes))"
-        )
+        clauses.append(f"arrayExists(v -> v ILIKE {{{name}:String}}, mapValues(attributes))")
         self.conditions.append("(" + " OR ".join(clauses) + ")")
 
     def add_cursor(self, op: str, ts: datetime, event_id: str) -> None:
@@ -281,24 +255,41 @@ class _ParameterizedQueryBuilder:
         ClickHouse supports native tuple comparison, so ties at equal
         timestamps are broken by ``event_id`` in a single comparison — exactly
         matching the table's ``ORDER BY (..., timestamp, event_id)`` sort key,
-        which is what makes this seek efficient (no OR-chain needed).
+        which is what makes this seek efficient (no OR-chain needed). Both
+        sides must compare on the native ``UUID`` type, not ``toString()`` —
+        ClickHouse's UUID ordering (its two internal UInt64 halves) does not
+        match string ordering, so a ``toString()`` predicate would duplicate
+        or skip rows sharing a timestamp across a page boundary. Native
+        comparison also lets this predicate use the table's
+        ``(case_id, source_id, timestamp, event_id)`` primary index, which
+        ``toString()`` would defeat.
+
+        ``timestamp`` is coalesced to :data:`_NULL_TIMESTAMP_SENTINEL` because
+        a NULL component makes the whole tuple comparison evaluate to NULL
+        (not true/false), which would silently drop every NULL-timestamp row
+        from keyset-paginated results. An empty ``event_id`` is the
+        jump-to-time synthetic bound (a target time with no anchor event) and
+        is mapped to :data:`_MIN_EVENT_ID`, the lowest possible UUID, so it
+        keeps sorting before every real event at that timestamp.
         """
         ts_name = self._param_name()
         id_name = self._param_name()
+        sentinel_name = self._param_name()
         self.conditions.append(
-            f"(timestamp, toString(event_id)) {op} "
-            f"({{{ts_name}:DateTime64(3)}}, {{{id_name}:String}})"
+            f"(coalesce(timestamp, {{{sentinel_name}:DateTime64(3)}}), event_id) {op} "
+            f"({{{ts_name}:DateTime64(3)}}, {{{id_name}:UUID}})"
         )
-        self.parameters[ts_name] = _format_clickhouse_datetime_precise(ts)
-        self.parameters[id_name] = event_id
+        self.parameters[ts_name] = to_clickhouse_utc(ts, precise=True)
+        self.parameters[id_name] = event_id or _MIN_EVENT_ID
+        self.parameters[sentinel_name] = to_clickhouse_utc(_NULL_TIMESTAMP_SENTINEL, precise=True)
 
     def _column_expr(self, key: str) -> str:
-        normalized = key.strip().lower()
-        if normalized in _TOP_LEVEL_FILTER_COLUMNS:
-            return normalized
+        column, attr_key = resolve_column_token(key)
+        if column is not None:
+            return column
         # Map lookup; parameterize the key as well to stay defensive.
         key_param = self._param_name()
-        self.parameters[key_param] = key
+        self.parameters[key_param] = attr_key
         return f"attributes[{{{key_param}:String}}]"
 
     def where_clause(self) -> str:
@@ -334,14 +325,21 @@ class EventQueryService:
             # search box behaves like a real "search everything" field.
             builder.add_broad_text_search(query.q)
 
-        if query.artifact:
-            builder.add_param("artifact = :name", query.artifact)
-
-        if query.artifacts:
-            if len(query.artifacts) == 1:
-                builder.add_param("artifact = :name", query.artifacts[0])
-            else:
-                builder.add_in_list("artifact", query.artifacts)
+        # `artifact` (singular) and `artifacts` (plural) are two independent
+        # optional filters on the same column. Applying both as separate ANDed
+        # predicates would require an event's `artifact` to equal two
+        # different values at once — unsatisfiable outside the rare case
+        # where `artifact` also appears in `artifacts`, which then makes the
+        # `artifacts` list redundant. Merge into one effective list instead
+        # so a caller setting both intersects sanely rather than getting
+        # silently-empty results.
+        effective_artifacts = list(query.artifacts or [])
+        if query.artifact and query.artifact not in effective_artifacts:
+            effective_artifacts.append(query.artifact)
+        if len(effective_artifacts) == 1:
+            builder.add_param("artifact = :name", effective_artifacts[0])
+        elif effective_artifacts:
+            builder.add_in_list("artifact", effective_artifacts)
 
         if query.tag:
             builder.add_param("has(tags, :name)", query.tag)
@@ -352,13 +350,13 @@ class EventQueryService:
         if query.start is not None:
             builder.add_param(
                 "timestamp >= :name",
-                _format_clickhouse_datetime(query.start),
+                to_clickhouse_utc(query.start),
             )
 
         if query.end is not None:
             builder.add_param(
                 "timestamp <= :name",
-                _format_clickhouse_datetime(query.end),
+                to_clickhouse_utc(query.end),
             )
 
         if query.event_ids is not None:
@@ -455,18 +453,22 @@ class EventQueryService:
             # there's no cursor-side limit+1 trick to lean on here.
             has_more_after = (query.offset + len(rows)) < total
 
-        events = [
-            _normalize_event_datetimes(dict(zip(columns, row, strict=False)))
-            for row in rows
-        ]
+        events = [_normalize_event_row(dict(zip(columns, row, strict=False))) for row in rows]
         if query.before is not None:
             events.reverse()
 
         next_cursor = None
         prev_cursor = None
         if events:
-            prev_cursor = (events[0]["timestamp"], str(events[0]["event_id"]))
-            next_cursor = (events[-1]["timestamp"], str(events[-1]["event_id"]))
+            # A NULL timestamp must never reach the cursor as `None` — it
+            # would serialize to JSON `null`, and `[null, id]` is not a
+            # parseable "<iso-ts>,<event_id>" cursor string on the way back
+            # in. Use the same sentinel the keyset predicate coalesces NULLs
+            # to, so round-tripping this cursor lands back on the NULL rows.
+            prev_ts = events[0]["timestamp"] or _NULL_TIMESTAMP_SENTINEL_ISO
+            next_ts = events[-1]["timestamp"] or _NULL_TIMESTAMP_SENTINEL_ISO
+            prev_cursor = (prev_ts, events[0]["event_id"])
+            next_cursor = (next_ts, events[-1]["event_id"])
 
         return EventPage(
             total=total,
@@ -479,9 +481,7 @@ class EventQueryService:
             prev_cursor=prev_cursor,
         )
 
-    def iter_events(
-        self, query: EventQuery, batch_size: int = 1000
-    ) -> Iterator[dict[str, Any]]:
+    def iter_events(self, query: EventQuery, batch_size: int = 1000) -> Iterator[dict[str, Any]]:
         """Yield every event matching *query*, paging through ClickHouse in batches.
 
         This is used for streaming export where the full result set should not
@@ -510,14 +510,12 @@ class EventQueryService:
             columns = result.column_names
             rows = result.result_rows
             for row in rows:
-                yield _normalize_event_datetimes(dict(zip(columns, row, strict=False)))
+                yield _normalize_event_row(dict(zip(columns, row, strict=False)))
             if len(rows) < batch_size:
                 break
             offset += batch_size
 
-    def query_event_refs(
-        self, query: EventQuery, cap: int = 100_000
-    ) -> list[tuple[str, str]]:
+    def query_event_refs(self, query: EventQuery, cap: int = 100_000) -> list[tuple[str, str]]:
         """Return (event_id, source_id) pairs for all events matching *query*.
 
         Like :py:meth:`query` but only fetches the two identifier columns,
@@ -535,9 +533,7 @@ class EventQueryService:
         )
         return [(row[0], row[1]) for row in result.result_rows]
 
-    def list_fields(
-        self, case_id: str, source_ids: list[str]
-    ) -> dict[str, list[str]]:
+    def list_fields(self, case_id: str, source_ids: list[str]) -> dict[str, list[str]]:
         """Return the displayable field names for a timeline.
 
         ``top_level`` contains the fixed columns common to every event.
@@ -584,9 +580,7 @@ class EventQueryService:
         )
         return [row[0] for row in result.result_rows]
 
-    def list_distinct_parser_tags(
-        self, case_id: str, source_ids: list[str]
-    ) -> list[str]:
+    def list_distinct_parser_tags(self, case_id: str, source_ids: list[str]) -> list[str]:
         """Return distinct values from the parser-derived ``tags`` array column.
 
         Distinct from user annotation tags (stored in Postgres) — these come
@@ -683,8 +677,7 @@ class EventQueryService:
             parameters=params,
         )
         inventory = {
-            (row[0] or ""): (row[1], sorted(row[2]) if row[2] else [])
-            for row in inv.result_rows
+            (row[0] or ""): (row[1], sorted(row[2]) if row[2] else []) for row in inv.result_rows
         }
 
         # 2. Randomised value sample per artifact **and source** so that
@@ -740,14 +733,10 @@ class EventQueryService:
                 # Build field_samples_by_source: source_id → token → values.
                 # Seed every candidate token for every source so absent fields
                 # still get verdicts with present_in_sources=0.
-                all_tokens = list(self._EMBEDDABLE_TOP_LEVEL) + [
-                    f"attr:{k}" for k in attr_keys
-                ]
+                all_tokens = list(self._EMBEDDABLE_TOP_LEVEL) + [f"attr:{k}" for k in attr_keys]
                 src_samples: dict[str, dict[str, list[Any]]] = {
                     src_id: {
-                        token: samples_by_src.get(artifact_name, {})
-                        .get(src_id, {})
-                        .get(token, [])
+                        token: samples_by_src.get(artifact_name, {}).get(src_id, {}).get(token, [])
                         for token in all_tokens
                     }
                     for src_id in source_ids
@@ -851,9 +840,7 @@ class EventQueryService:
             },
         }
 
-    def histogram(
-        self, query: EventQuery, buckets: int = 60
-    ) -> dict[str, Any]:
+    def histogram(self, query: EventQuery, buckets: int = 60) -> dict[str, Any]:
         """Return a bucketed event-count histogram honoring all query filters.
 
         If the query has no explicit time range the min/max timestamps are
@@ -866,25 +853,15 @@ class EventQueryService:
 
         # Resolve time range.
         if query.start is not None and query.end is not None:
-            min_ts: datetime | None = query.start
-            max_ts: datetime | None = query.end
+            min_ts: datetime | None = ensure_utc(query.start)
+            max_ts: datetime | None = ensure_utc(query.end)
         else:
-            range_result = self.store.client.query(
-                f"SELECT min(timestamp), max(timestamp) FROM {database}.events WHERE {where}",
-                parameters=parameters,
-            )
-            row = range_result.result_rows[0] if range_result.result_rows else (None, None)
-            min_ts, max_ts = row[0], row[1]
+            min_ts, max_ts = query_timestamp_range(self.store.client, database, where, parameters)
 
         if min_ts is None or max_ts is None:
             return {"interval_seconds": 0, "min": None, "max": None, "buckets": []}
 
-        # Ensure timezone-aware for arithmetic.
-        min_ts = ensure_utc(min_ts)
-        max_ts = ensure_utc(max_ts)
-
-        duration = (max_ts - min_ts).total_seconds()
-        interval = max(1, int(duration / buckets))
+        interval = bucket_interval_seconds(min_ts, max_ts, buckets)
 
         bucket_result = self.store.client.query(
             f"""
@@ -899,8 +876,7 @@ class EventQueryService:
         )
 
         bucket_list = [
-            {"start": ensure_utc_iso(row[0]), "count": row[1]}
-            for row in bucket_result.result_rows
+            {"start": ensure_utc_iso(row[0]), "count": row[1]} for row in bucket_result.result_rows
         ]
         return {
             "interval_seconds": interval,

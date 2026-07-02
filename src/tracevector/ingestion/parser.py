@@ -380,9 +380,7 @@ def get_parser(
             case_id, source_id, config, file_hash=file_hash, source_name=source_name
         )
     if name in {"jsonl", "json"}:
-        return JsonlParser(
-            case_id, source_id, config, file_hash=file_hash, source_name=source_name
-        )
+        return JsonlParser(case_id, source_id, config, file_hash=file_hash, source_name=source_name)
     raise ValueError(f"Unsupported parser format: {format_name}")
 
 
