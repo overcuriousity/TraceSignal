@@ -50,8 +50,15 @@ def _get_field_encoder() -> Any:
         try:
             from tracevector.models.embeddings import EmbeddingModel
 
-            _embedding_model = EmbeddingModel()
-            _embedding_model.load()
+            model = EmbeddingModel()
+            # encode() lazy-loads locally or routes to the remote endpoint on
+            # its own; calling load() unconditionally here would raise in
+            # remote mode (load() is local-model-only) and get swallowed by
+            # the except below, silently disabling field pairing whenever
+            # remote embeddings are configured.
+            if not model.is_remote:
+                model.load()
+            _embedding_model = model
         except Exception:  # noqa: BLE001
             return None
     return _embedding_model.encode
@@ -175,6 +182,19 @@ async def _resolve_tags_event_ids(
     matches if *either* system has *any* of these exact values, so the analyst
     doesn't need to know or care which system a given tag value came from.
     Shared by both the include and exclude resolvers below.
+
+    For a tag matching a very large number of events, ``parser_ids`` fully
+    materializes a ClickHouse-native ``hasAny(tags, ...)`` match into Python
+    only to re-inject it into the caller's *next* ClickHouse query as an
+    array parameter — a real extra round trip that could instead be a
+    ``hasAny(tags, ...)`` predicate pushed directly into that query's WHERE
+    clause. Doing that correctly needs its own AND'd-with-everything-else,
+    OR'd-between-systems predicate (``hasAny(tags, :values) OR has(:pg_ids,
+    toString(event_id))``) that can't be expressed through the generic
+    ``event_ids`` intersection path all four callers currently share (see
+    ``_resolve_event_id_filters``) without also changing that shared
+    contract — deferred rather than done as a narrow, easy-to-regress patch
+    alongside it.
     """
     if not tag_values:
         return None
@@ -204,15 +224,8 @@ def _intersect_optional(*id_lists: list[str] | None) -> list[str] | None:
     return list(result)
 
 
-def _parse_id_list(value: str | None) -> list[str] | None:
-    """Parse a comma-separated event_id allowlist query param."""
-    if not value:
-        return None
-    return [v.strip() for v in value.split(",") if v.strip()]
-
-
 def _parse_str_list(value: str | None) -> list[str] | None:
-    """Parse a comma-separated string-list query param (e.g. ``artifacts``)."""
+    """Parse a comma-separated list query param (e.g. ``artifacts``, ``ids``)."""
     if not value:
         return None
     return [v.strip() for v in value.split(",") if v.strip()]
@@ -237,6 +250,15 @@ async def _resolve_annotated_event_ids(
     can't see them from annotations alone — when "anomaly" is requested,
     these are unioned in too, so the filter matches detected-but-unconfirmed
     findings as well as tagged/persisted ones.
+
+    Known limitation: this ships the client's full unpersisted finding-ID set
+    on every request (GET query string or POST body) — at ``limit=500`` findings
+    that's tens of KB of UUIDs, past some proxies' URL-length limits for the
+    GET endpoints specifically. A structural fix (persisting detector runs
+    server-side under a run ID that the client references by ID instead of
+    resending, or filtering live findings purely client-side after the fact)
+    is a bigger design change than fits opportunistically alongside other
+    cleanup — deferred, not overlooked.
     """
     if not annotated:
         return None
@@ -258,6 +280,39 @@ async def _resolve_annotated_event_ids(
     return list(event_ids)
 
 
+async def _resolve_event_id_filters(
+    case_id: str,
+    source_ids: list[str],
+    *,
+    annotated: str | None,
+    annotation_tag_value: str | None,
+    live_event_ids: str | None,
+    tags_include: str | None,
+    tags_exclude: str | None,
+    ids: str | None,
+) -> tuple[list[str] | None, list[str] | None]:
+    """Resolve the annotated/tags_include/tags_exclude/ids filter combo shared
+    by list_events, bulk_annotate_by_filter, get_histogram, and export_events.
+
+    Returns ``(event_ids, exclude_event_ids)`` ready to pass straight into
+    :class:`EventQuery`. Each of the four endpoints previously re-implemented
+    this same resolve-and-intersect sequence with ~10 identical query params;
+    a filter added to one and not the others silently made the grid,
+    histogram, bulk-tag, and export disagree on which events match.
+    """
+    annotated_ids = await _resolve_annotated_event_ids(
+        case_id, source_ids, annotated, annotation_tag_value, live_event_ids
+    )
+    tags_include_ids = await _resolve_tags_event_ids(
+        case_id, source_ids, _parse_str_list(tags_include)
+    )
+    tags_exclude_ids = await _resolve_tags_event_ids(
+        case_id, source_ids, _parse_str_list(tags_exclude)
+    )
+    event_ids = _intersect_optional(annotated_ids, tags_include_ids, _parse_str_list(ids))
+    return event_ids, tags_exclude_ids
+
+
 @router.get("/{case_id}/timelines/{timeline_id}/events")
 async def list_events(
     case_id: str,
@@ -270,8 +325,12 @@ async def list_events(
         default=None, description="Comma-separated artifact values (OR'd)"
     ),
     source_id: str | None = Query(default=None),
-    tag: str | None = Query(default=None),
-    exclude_tag: str | None = Query(default=None),
+    tag: str | None = Query(
+        default=None, description="Deprecated single-value form — prefer tags_include."
+    ),
+    exclude_tag: str | None = Query(
+        default=None, description="Deprecated single-value form — prefer tags_exclude."
+    ),
     tags_include: str | None = Query(
         default=None,
         description=(
@@ -345,24 +404,29 @@ async def list_events(
     after_cursor = _parse_cursor(after, param_name="after")
     before_cursor = _parse_cursor(before, param_name="before")
     if after_cursor is not None and before_cursor is not None:
-        raise HTTPException(
-            status_code=400, detail="Cannot set both 'after' and 'before' cursors"
-        )
+        raise HTTPException(status_code=400, detail="Cannot set both 'after' and 'before' cursors")
 
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
     if event_id:
+        # A specific event_id short-circuits the annotated/tags_include/ids
+        # resolution entirely — those filters are irrelevant once the caller
+        # already knows the exact event, and skipping them avoids wasted
+        # annotation/tag lookups on this hot single-event-lookup path.
         event_ids: list[str] | None = [event_id]
+        tags_exclude_ids = await _resolve_tags_event_ids(
+            case_id, source_ids, _parse_str_list(tags_exclude)
+        )
     else:
-        annotated_ids = await _resolve_annotated_event_ids(
-            case_id, source_ids, annotated, annotation_tag_value, live_event_ids
+        event_ids, tags_exclude_ids = await _resolve_event_id_filters(
+            case_id,
+            source_ids,
+            annotated=annotated,
+            annotation_tag_value=annotation_tag_value,
+            live_event_ids=live_event_ids,
+            tags_include=tags_include,
+            tags_exclude=tags_exclude,
+            ids=ids,
         )
-        tags_include_ids = await _resolve_tags_event_ids(
-            case_id, source_ids, _parse_str_list(tags_include)
-        )
-        event_ids = _intersect_optional(annotated_ids, tags_include_ids, _parse_id_list(ids))
-    tags_exclude_ids = await _resolve_tags_event_ids(
-        case_id, source_ids, _parse_str_list(tags_exclude)
-    )
 
     service = _get_query_service()
     page = service.query(
@@ -401,9 +465,7 @@ async def list_events(
 
 
 class BulkAnnotateByFilterRequest(BaseModel):
-    annotation_type: str = Field(
-        ..., description="Annotation type: 'tag', 'comment', or 'normal'."
-    )
+    annotation_type: str = Field(..., description="Annotation type: 'tag', 'comment', or 'normal'.")
     content: str = Field(..., min_length=1, max_length=4096)
     q: str | None = None
     artifact: str | None = None
@@ -462,17 +524,15 @@ async def bulk_annotate_by_filter(
         )
 
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
-    annotated_ids = await _resolve_annotated_event_ids(
-        case_id, source_ids, body.annotated, body.annotation_tag_value, body.live_event_ids
-    )
-    tags_include_ids = await _resolve_tags_event_ids(
-        case_id, source_ids, _parse_str_list(body.tags_include)
-    )
-    tags_exclude_ids = await _resolve_tags_event_ids(
-        case_id, source_ids, _parse_str_list(body.tags_exclude)
-    )
-    event_ids = _intersect_optional(
-        annotated_ids, tags_include_ids, _parse_id_list(body.ids)
+    event_ids, tags_exclude_ids = await _resolve_event_id_filters(
+        case_id,
+        source_ids,
+        annotated=body.annotated,
+        annotation_tag_value=body.annotation_tag_value,
+        live_event_ids=body.live_event_ids,
+        tags_include=body.tags_include,
+        tags_exclude=body.tags_exclude,
+        ids=body.ids,
     )
 
     service = _get_query_service()
@@ -575,9 +635,7 @@ async def list_embedding_fields(
     """
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
     service = _get_query_service()
-    return service.list_fields_by_artifact(
-        case_id, source_ids, encode=_get_field_encoder()
-    )
+    return service.list_fields_by_artifact(case_id, source_ids, encode=_get_field_encoder())
 
 
 @router.get("/{case_id}/sources/{source_id}/embedding-fields")
@@ -592,9 +650,7 @@ async def list_source_embedding_fields(
     recommender; field pairing degrades to heuristic-only if the model can't load.
     """
     service = _get_query_service()
-    return service.list_fields_by_artifact(
-        case_id, [source_id], encode=_get_field_encoder()
-    )
+    return service.list_fields_by_artifact(case_id, [source_id], encode=_get_field_encoder())
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/histogram")
@@ -605,8 +661,12 @@ async def get_histogram(
     artifact: str | None = Query(default=None),
     artifacts: str | None = Query(default=None),
     source_id: str | None = Query(default=None),
-    tag: str | None = Query(default=None),
-    exclude_tag: str | None = Query(default=None),
+    tag: str | None = Query(
+        default=None, description="Deprecated single-value form — prefer tags_include."
+    ),
+    exclude_tag: str | None = Query(
+        default=None, description="Deprecated single-value form — prefer tags_exclude."
+    ),
     tags_include: str | None = Query(default=None),
     tags_exclude: str | None = Query(default=None),
     ids: str | None = Query(default=None),
@@ -627,16 +687,16 @@ async def get_histogram(
     ``max(1, duration / buckets)`` seconds.
     """
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
-    annotated_ids = await _resolve_annotated_event_ids(
-        case_id, source_ids, annotated, annotation_tag_value, live_event_ids
+    event_ids, tags_exclude_ids = await _resolve_event_id_filters(
+        case_id,
+        source_ids,
+        annotated=annotated,
+        annotation_tag_value=annotation_tag_value,
+        live_event_ids=live_event_ids,
+        tags_include=tags_include,
+        tags_exclude=tags_exclude,
+        ids=ids,
     )
-    tags_include_ids = await _resolve_tags_event_ids(
-        case_id, source_ids, _parse_str_list(tags_include)
-    )
-    tags_exclude_ids = await _resolve_tags_event_ids(
-        case_id, source_ids, _parse_str_list(tags_exclude)
-    )
-    event_ids = _intersect_optional(annotated_ids, tags_include_ids, _parse_id_list(ids))
     service = _get_query_service()
     return service.histogram(
         EventQuery(
@@ -728,9 +788,7 @@ def _stream_jsonl(query: EventQuery, annotations_by_event: dict[str, list[Any]])
     service = EventQueryService()
     for event in service.iter_events(query):
         row = dict(event)
-        row["annotations"] = [
-            a.to_dict() for a in annotations_by_event.get(row["event_id"], [])
-        ]
+        row["annotations"] = [a.to_dict() for a in annotations_by_event.get(row["event_id"], [])]
         yield json.dumps(row, default=str) + "\n"
 
 
@@ -791,21 +849,15 @@ async def export_events(
     tagging a finding is what makes it show up here.
     """
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
-    annotated_ids = await _resolve_annotated_event_ids(
+    event_ids, tags_exclude_ids = await _resolve_event_id_filters(
         case_id,
         source_ids,
-        body.filter.annotated,
-        body.filter.annotation_tag_value,
-        body.filter.live_event_ids,
-    )
-    tags_include_ids = await _resolve_tags_event_ids(
-        case_id, source_ids, _parse_str_list(body.filter.tags_include)
-    )
-    tags_exclude_ids = await _resolve_tags_event_ids(
-        case_id, source_ids, _parse_str_list(body.filter.tags_exclude)
-    )
-    event_ids = _intersect_optional(
-        annotated_ids, tags_include_ids, _parse_id_list(body.filter.ids)
+        annotated=body.filter.annotated,
+        annotation_tag_value=body.filter.annotation_tag_value,
+        live_event_ids=body.filter.live_event_ids,
+        tags_include=body.filter.tags_include,
+        tags_exclude=body.filter.tags_exclude,
+        ids=body.filter.ids,
     )
 
     store = get_store()
@@ -869,9 +921,67 @@ def _get_stat_anomaly_service() -> StatisticalAnomalyService:
     return _stat_anomaly_service
 
 
-async def _resolve_similarity_source_ids(
-    case_id: str, timeline_id: str | None
-) -> list[str]:
+async def _run_stat_detector(
+    case_id: str,
+    source_ids: list[str],
+    *,
+    detector: str,
+    fields: str | None,
+    series_field: str,
+    z_threshold: float | None,
+    baseline_end: datetime | None,
+    temporal: bool,
+    limit: int,
+) -> Any:
+    """Resolve the temporal split point and normal-annotation suppression
+    list, then dispatch to the requested detector.
+
+    Shared by ``list_anomalies`` (preview) and ``tag_anomalies`` (persist),
+    which previously duplicated this ~25-line pipeline verbatim — a drift
+    risk, since "Tag N anomalies" must persist the same set of findings the
+    preview showed the analyst.
+    """
+    cfg = get_settings()
+    store = get_store()
+    svc = _get_stat_anomaly_service()
+
+    effective_baseline_end = baseline_end
+    if temporal and effective_baseline_end is None:
+        effective_baseline_end = await run_in_threadpool(
+            svc.get_timeline_midpoint, case_id, source_ids
+        )
+
+    # Fetch events marked "normal" by the analyst for suppression.
+    normal_ids = await store.list_event_ids_by_annotation_type(case_id, source_ids, "normal")
+    exclude_ids: set[str] | None = set(normal_ids) if normal_ids else None
+
+    if detector == "frequency":
+        return await run_in_threadpool(
+            svc.find_frequency_anomalies,
+            case_id=case_id,
+            source_ids=source_ids,
+            series_field=series_field,
+            limit=limit,
+            bucket_count=cfg.stat_frequency_buckets,
+            z_threshold=z_threshold if z_threshold is not None else cfg.stat_z_threshold,
+            baseline_end=effective_baseline_end,
+            exclude_event_ids=exclude_ids,
+        )
+    parsed_fields = _parse_novelty_fields(fields)
+    return await run_in_threadpool(
+        svc.find_value_novelty,
+        case_id=case_id,
+        source_ids=source_ids,
+        fields=parsed_fields,
+        limit=limit,
+        rarity_floor=cfg.stat_rarity_floor,
+        baseline_end=effective_baseline_end,
+        per_field_limit=cfg.stat_per_field_limit,
+        exclude_event_ids=exclude_ids,
+    )
+
+
+async def _resolve_similarity_source_ids(case_id: str, timeline_id: str | None) -> list[str]:
     """Return the source IDs to search: a timeline's sources, or the whole case's.
 
     Similarity search is not timeline-specific at the storage layer (Qdrant
@@ -901,12 +1011,11 @@ async def find_similar_events(
     """
     source_ids = await _resolve_similarity_source_ids(case_id, timeline_id)
     svc = _get_similarity_service()
-    result = svc.find_similar(case_id, source_ids, event_id, limit=limit)
+    result = await run_in_threadpool(svc.find_similar, case_id, source_ids, event_id, limit=limit)
     return {
         "status": result.status,
         "results": [
-            {"event_id": r.event_id, "score": r.score, "event": r.event}
-            for r in result.results
+            {"event_id": r.event_id, "score": r.score, "event": r.event} for r in result.results
         ],
     }
 
@@ -926,12 +1035,11 @@ async def semantic_search_events(
     """
     source_ids = await _resolve_similarity_source_ids(case_id, timeline_id)
     svc = _get_similarity_service()
-    result = svc.find_similar_by_text(case_id, source_ids, q, limit=limit)
+    result = await run_in_threadpool(svc.find_similar_by_text, case_id, source_ids, q, limit=limit)
     return {
         "status": result.status,
         "results": [
-            {"event_id": r.event_id, "score": r.score, "event": r.event}
-            for r in result.results
+            {"event_id": r.event_id, "score": r.score, "event": r.event} for r in result.results
         ],
     }
 
@@ -1025,14 +1133,14 @@ async def list_anomalies(
         gt=0,
         description="|z| cutoff for the frequency detector. Omit to use the server default.",
     ),
-    baseline_start: datetime | None = Query(  # noqa: B008
+    baseline_end: datetime | None = Query(  # noqa: B008
         default=None,
         description="Explicit temporal baseline end timestamp (detect window = after this).",
     ),
     temporal: bool = Query(
         default=False,
         description=(
-            "Enable temporal mode.  When no baseline_start is given the timeline "
+            "Enable temporal mode.  When no baseline_end is given the timeline "
             "midpoint is used as the baseline/detect split."
         ),
     ),
@@ -1048,49 +1156,18 @@ async def list_anomalies(
     **frequency**: flags time windows with anomalous event-count z-scores per
     field-value series.
     """
-    cfg = get_settings()
-    store = get_store()
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
-    svc = _get_stat_anomaly_service()
-
-    # Resolve temporal split point.
-    effective_baseline_end = baseline_start
-    if temporal and effective_baseline_end is None:
-        effective_baseline_end = await run_in_threadpool(
-            svc.get_timeline_midpoint, case_id, source_ids
-        )
-
-    # Fetch events marked "normal" by the analyst for suppression.
-    normal_ids = await store.list_event_ids_by_annotation_type(
-        case_id, source_ids, "normal"
+    result = await _run_stat_detector(
+        case_id,
+        source_ids,
+        detector=detector,
+        fields=fields,
+        series_field=series_field,
+        z_threshold=z_threshold,
+        baseline_end=baseline_end,
+        temporal=temporal,
+        limit=limit,
     )
-    exclude_ids: set[str] | None = set(normal_ids) if normal_ids else None
-
-    if detector == "frequency":
-        result = await run_in_threadpool(
-            svc.find_frequency_anomalies,
-            case_id=case_id,
-            source_ids=source_ids,
-            series_field=series_field,
-            limit=limit,
-            bucket_count=cfg.stat_frequency_buckets,
-            z_threshold=z_threshold if z_threshold is not None else cfg.stat_z_threshold,
-            baseline_end=effective_baseline_end,
-            exclude_event_ids=exclude_ids,
-        )
-    else:
-        parsed_fields = _parse_novelty_fields(fields)
-        result = await run_in_threadpool(
-            svc.find_value_novelty,
-            case_id=case_id,
-            source_ids=source_ids,
-            fields=parsed_fields,
-            limit=limit,
-            rarity_floor=cfg.stat_rarity_floor,
-            baseline_end=effective_baseline_end,
-            per_field_limit=cfg.stat_per_field_limit,
-            exclude_event_ids=exclude_ids,
-        )
 
     return {
         "status": result.status,
@@ -1122,14 +1199,14 @@ class TagAnomaliesRequest(BaseModel):
         gt=0,
         description="|z| cutoff for the frequency detector. Omit to use the server default.",
     )
-    baseline_start: datetime | None = Field(
+    baseline_end: datetime | None = Field(
         default=None,
         description="Explicit temporal baseline end timestamp.",
     )
     temporal: bool = Field(
         default=False,
         description=(
-            "Enable temporal mode.  When no baseline_start is given the timeline "
+            "Enable temporal mode.  When no baseline_end is given the timeline "
             "midpoint is used as the baseline/detect split."
         ),
     )
@@ -1154,49 +1231,19 @@ async def tag_anomalies(
 
     Returns the same shape as ``GET /anomalies`` plus a ``tagged`` count.
     """
-    cfg = get_settings()
     store = get_store()
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
-    svc = _get_stat_anomaly_service()
-
-    # Resolve temporal split point.
-    effective_baseline_end = body.baseline_start
-    if body.temporal and effective_baseline_end is None:
-        effective_baseline_end = await run_in_threadpool(
-            svc.get_timeline_midpoint, case_id, source_ids
-        )
-
-    # Fetch events marked "normal" by the analyst for suppression.
-    normal_ids = await store.list_event_ids_by_annotation_type(
-        case_id, source_ids, "normal"
+    result = await _run_stat_detector(
+        case_id,
+        source_ids,
+        detector=body.detector,
+        fields=body.fields,
+        series_field=body.series_field,
+        z_threshold=body.z_threshold,
+        baseline_end=body.baseline_end,
+        temporal=body.temporal,
+        limit=body.limit,
     )
-    exclude_ids: set[str] | None = set(normal_ids) if normal_ids else None
-
-    if body.detector == "frequency":
-        result = await run_in_threadpool(
-            svc.find_frequency_anomalies,
-            case_id=case_id,
-            source_ids=source_ids,
-            series_field=body.series_field,
-            limit=body.limit,
-            bucket_count=cfg.stat_frequency_buckets,
-            z_threshold=body.z_threshold if body.z_threshold is not None else cfg.stat_z_threshold,
-            baseline_end=effective_baseline_end,
-            exclude_event_ids=exclude_ids,
-        )
-    else:
-        parsed_fields = _parse_novelty_fields(body.fields)
-        result = await run_in_threadpool(
-            svc.find_value_novelty,
-            case_id=case_id,
-            source_ids=source_ids,
-            fields=parsed_fields,
-            limit=body.limit,
-            rarity_floor=cfg.stat_rarity_floor,
-            baseline_end=effective_baseline_end,
-            per_field_limit=cfg.stat_per_field_limit,
-            exclude_event_ids=exclude_ids,
-        )
 
     if result.status != "ok":
         return {

@@ -26,6 +26,7 @@ import { similarityApi } from "@/api/similarity";
 import { viewsApi } from "@/api/views";
 import { timelinesApi } from "@/api/timelines";
 import { useUiStore, DEFAULT_COLUMNS } from "@/stores/ui";
+import { useScrollPositionStore } from "@/stores/scrollPosition";
 import { paramsToFilters, filtersToParams } from "@/lib/queryParams";
 
 import { FilterRail } from "@/components/explorer/FilterRail";
@@ -228,7 +229,10 @@ export function ExplorerPage() {
   const [selection, setSelection] = useState<SelectionState>({ mode: "ids", ids: new Set() });
   const [similarAnchor, setSimilarAnchor] = useState<Event | null>(null);
   const [anomalyMarkers, setAnomalyMarkers] = useState<AnomalyMarker[]>([]);
-  const [scrollPositionTs, setScrollPositionTs] = useState<string | null>(null);
+  // Scroll position feeds TimelineHistogram only, via a store subscribed
+  // solely by that component (C15) — not page state, so scrolling doesn't
+  // re-render EventGrid/FilterRail/AnalysisPanel on every row crossed.
+  const setCurrentPositionTs = useScrollPositionStore((s) => s.setCurrentPositionTs);
   const [saveViewOpen, setSaveViewOpen] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const gridRef = useRef<EventGridHandle>(null);
@@ -237,7 +241,12 @@ export function ExplorerPage() {
   // visual (a Frequency finding's anomalous window), never a URL filter.
   const [preJumpFilters, setPreJumpFilters] = useState<EventFilters | null>(null);
   const [rangeHighlight, setRangeHighlight] = useState<{ start: string; end: string } | null>(null);
-  const pendingJumpRef = useRef<{ ts: string; eventId?: string } | null>(null);
+  const pendingJumpRef = useRef<{ ts: string; eventId?: string; seq: number } | null>(null);
+  // Bumped on every jump; the pending-jump effect only trusts `events` once
+  // `seededSeqRef` catches up, so a stray automatic fetch landing mid-jump
+  // (or a second jump superseding the first) can't be mistaken for "ready".
+  const jumpSeqRef = useRef(0);
+  const seededSeqRef = useRef(0);
   const tlKey = `${caseId}/${timelineId}`;
   const visibleColumns = useUiStore((s) => s.visibleColumnsByTimeline[tlKey] ?? DEFAULT_COLUMNS);
   const histogramOpen = useUiStore((s) => s.histogramOpen);
@@ -337,10 +346,23 @@ export function ExplorerPage() {
         pageParam,
       ),
     initialPageParam: {} as EventsPageParam,
-    getNextPageParam: (lastPage) =>
-      lastPage.has_more_after && lastPage.next_cursor
-        ? { after: cursorParam(lastPage.next_cursor) }
-        : undefined,
+    getNextPageParam: (lastPage, _allPages, lastPageParam) => {
+      if (lastPage.has_more_after && lastPage.next_cursor) {
+        return { after: cursorParam(lastPage.next_cursor) };
+      }
+      // A jump-to-time anchor with no target event is seeded from a
+      // `before`-mode fetch (see handleJumpToTime), and before-mode only
+      // ever computes `has_more_before` — `has_more_after` is always false
+      // regardless of whether more events actually follow. Synthesize the
+      // forward cursor from this page's own last row instead of reporting
+      // "no more" when we simply don't know; the resulting `after` fetch is
+      // a normal cursor fetch that correctly reports its own has_more_after,
+      // so this synthesis is only needed for the seeded page itself.
+      if (lastPageParam?.before && lastPage.next_cursor) {
+        return { after: cursorParam(lastPage.next_cursor) };
+      }
+      return undefined;
+    },
     getPreviousPageParam: (firstPage) =>
       firstPage.has_more_before && firstPage.prev_cursor
         ? { before: cursorParam(firstPage.prev_cursor) }
@@ -497,8 +519,18 @@ export function ExplorerPage() {
       if (!caseId || !timelineId) return;
       setPreJumpFilters((prev) => prev ?? filters);
       setRangeHighlight(windowEnd ? { start: ts, end: windowEnd } : null);
-      pendingJumpRef.current = { ts, eventId };
+      const seq = ++jumpSeqRef.current;
+      pendingJumpRef.current = { ts, eventId, seq };
       setFilters({});
+
+      // `filters` is about to become `{}` (above), so the live query key is
+      // about to become this — not the current-render `eventsQueryKey`
+      // closure, which still reflects the pre-jump filters. Cancel whatever
+      // the automatic refetch triggered by that key change is doing before
+      // seeding the cache, or it can resolve after `setQueryData` below and
+      // silently overwrite the anchor page with the un-jumped top-of-list page.
+      const targetKey = ["events", caseId, timelineId, {}, sortDir];
+      await queryClient.cancelQueries({ queryKey: targetKey });
 
       let anchorPage: EventPage;
       if (eventId) {
@@ -547,10 +579,24 @@ export function ExplorerPage() {
           { before: `${ts},` },
         );
       }
-      queryClient.setQueryData(["events", caseId, timelineId, {}, sortDir], {
+
+      // A newer jump started while this one was in flight — let it win.
+      if (jumpSeqRef.current !== seq) return;
+
+      // The no-eventId branch fetches in `before` mode, and before-mode
+      // pagination only ever computes `has_more_before` on the backend —
+      // `has_more_after` comes back false even when more events follow.
+      // Recording `before` in this page's own pageParam lets
+      // `getNextPageParam` know its `has_more_after` can't be trusted and
+      // synthesize the forward cursor instead of reporting "all loaded".
+      const anchorPageParam: EventsPageParam = eventId
+        ? {}
+        : { before: cursorParam(anchorPage.prev_cursor) };
+      queryClient.setQueryData(targetKey, {
         pages: [anchorPage],
-        pageParams: [{} as EventsPageParam],
+        pageParams: [anchorPageParam],
       });
+      seededSeqRef.current = seq;
     },
     [caseId, timelineId, filters, setFilters, sortDir, queryClient],
   );
@@ -614,6 +660,11 @@ export function ExplorerPage() {
   useEffect(() => {
     const pending = pendingJumpRef.current;
     if (!pending) return;
+    // `events` can change for reasons unrelated to this jump — e.g. a
+    // still-in-flight automatic fetch resolving, or annotation refetches —
+    // so only treat it as "ready" once we know it reflects the page we
+    // ourselves seeded for this specific jump.
+    if (seededSeqRef.current !== pending.seq) return;
     const foundEvent = pending.eventId
       ? events.find((e) => e.event_id === pending.eventId)
       : undefined;
@@ -724,7 +775,6 @@ export function ExplorerPage() {
             filters={effectiveFilters}
             onRangeSelect={handleHistogramRange}
             markers={analysisPanelOpen ? anomalyMarkers : []}
-            currentPositionTs={scrollPositionTs}
             highlightRange={rangeHighlight}
           />
         )}
@@ -796,7 +846,7 @@ export function ExplorerPage() {
                   sortDir={sortDir}
                   onSortToggle={() => setSortDir(sortDir === "desc" ? "asc" : "desc")}
                   liveAnomalies={liveAnomaliesByEvent}
-                  onVisibleTimestampChange={setScrollPositionTs}
+                  onVisibleTimestampChange={setCurrentPositionTs}
                   highlightRange={rangeHighlight}
                 />
 

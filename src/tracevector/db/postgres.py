@@ -70,9 +70,7 @@ class Source(Base):
     """
 
     __tablename__ = "sources"
-    __table_args__ = (
-        Index("ix_sources_case_id_file_hash", "case_id", "file_hash", unique=True),
-    )
+    __table_args__ = (Index("ix_sources_case_id_file_hash", "case_id", "file_hash", unique=True),)
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
@@ -166,9 +164,7 @@ class Timeline(Base):
     embedding_config_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # Snapshot of source_ids at embed time; used to derive staleness.
     embedded_source_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
-    embedded_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    embedded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     sources: Mapped[list[Source]] = relationship(
         "Source", secondary="timeline_sources", back_populates="timelines"
@@ -285,7 +281,9 @@ class Annotation(Base):
     # annotations wholesale (see delete_system_annotations) — pinned rows are
     # excluded from that clear so a manually-confirmed finding survives a
     # later re-scan that no longer surfaces it.
-    pinned: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    pinned: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
@@ -339,11 +337,20 @@ class PostgresStore:
                 }
             )
             for column, ddl in (
-                ("pinned", "ALTER TABLE annotations ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT false"),
+                (
+                    "pinned",
+                    "ALTER TABLE annotations ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT false",
+                ),
                 ("detector", "ALTER TABLE annotations ADD COLUMN detector VARCHAR(32)"),
             ):
                 if column not in existing_columns:
                     await conn.execute(text(ddl))
+            # No migration for the earlier `annotation_type="outlier"` rows
+            # (renamed to "anomaly" when the statistical anomaly engine
+            # landed): no releases exist yet and pre-this-branch databases
+            # are already documented as deprecated, so a stale-value UPDATE
+            # isn't worth carrying. Revisit if in-place upgrades from a
+            # pre-anomaly-engine database ever need to be supported.
 
     async def get_case(self, case_id: str) -> Case | None:
         """Return a case by ID, or None if not found."""
@@ -411,9 +418,7 @@ class PostgresStore:
 
         async with self.session_factory() as session:
             result = await session.execute(
-                select(Source)
-                .where(Source.case_id == case_id)
-                .order_by(Source.created_at.desc())
+                select(Source).where(Source.case_id == case_id).order_by(Source.created_at.desc())
             )
             return list(result.scalars().all())
 
@@ -481,29 +486,6 @@ class PostgresStore:
                     .where(Source.id == source_id, Source.case_id == case_id)
                     .values(**values)
                 )
-            await session.commit()
-
-    async def update_source_embedding_config(
-        self,
-        case_id: str,
-        source_id: str,
-        embedding_model: str | None = None,
-        embedding_config: dict | None = None,
-    ) -> None:
-        """Persist the analyst's per-source field selection on the source."""
-        async with self.session_factory() as session:
-            values: dict = {"updated_at": datetime.now(UTC)}
-            if embedding_model is not None:
-                values["embedding_model"] = embedding_model
-            if embedding_config is not None:
-                values["embedding_config"] = embedding_config
-            result = await session.execute(
-                update(Source)
-                .where(Source.case_id == case_id, Source.id == source_id)
-                .values(**values)
-            )
-            if result.rowcount == 0:
-                return
             await session.commit()
 
     async def delete_source(self, case_id: str, source_id: str) -> bool:
@@ -1028,10 +1010,12 @@ class PostgresStore:
             conditions.append(Annotation.detector == detector)
         async with self.session_factory() as session:
             result = await session.execute(
-                select(Annotation.event_id).where(
+                select(Annotation.event_id)
+                .where(
                     *conditions,
                     Annotation.pinned.is_(True),
-                ).distinct()
+                )
+                .distinct()
             )
             return [row[0] for row in result.all()]
 

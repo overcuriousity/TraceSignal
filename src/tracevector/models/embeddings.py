@@ -72,9 +72,7 @@ class EmbeddingModel:
     def _get_client(self) -> httpx.Client:
         if self._client is None:
             headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
-            self._client = httpx.Client(
-                base_url=self._api_base_url, headers=headers, timeout=60.0
-            )
+            self._client = httpx.Client(base_url=self._api_base_url, headers=headers, timeout=60.0)
         return self._client
 
     def vector_dimension(self) -> int:

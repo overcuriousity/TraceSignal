@@ -224,9 +224,7 @@ class QdrantStore:
 
         return best[1] if best is not None else None
 
-    def find_collection_for_sources(
-        self, case_id: str, source_ids: list[str]
-    ) -> str | None:
+    def find_collection_for_sources(self, case_id: str, source_ids: list[str]) -> str | None:
         """Return the Qdrant collection name that holds vectors for these sources.
 
         Returns the collection with the most points matching any of the given
@@ -298,9 +296,7 @@ class QdrantStore:
             with_payload=True,
         ).points
 
-    def retrieve_vector(
-        self, collection_name: str, event_id: str
-    ) -> list[float] | None:
+    def retrieve_vector(self, collection_name: str, event_id: str) -> list[float] | None:
         """Retrieve the stored vector for a single point by its event_id.
 
         Returns ``None`` if the point does not exist in the collection.

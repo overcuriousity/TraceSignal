@@ -1,5 +1,6 @@
 import { get } from "./client";
 import type { EmbeddingFieldsResponse, Event, EventCursor, EventFilters, EventPage, FieldsResponse, HistogramResponse } from "./types";
+import { serializeEventFilterFields } from "@/lib/queryParams";
 
 export const eventsApi = {
   list: (
@@ -11,45 +12,18 @@ export const eventsApi = {
   ): Promise<EventPage> => {
     const params: Record<string, string | number | boolean | undefined | null> =
       {
-        q: filters.q,
-        artifact: filters.artifact,
-        source_id: filters.sourceId,
-        tag: filters.tag,
-        exclude_tag: filters.excludeTag,
-        start: filters.start,
-        end: filters.end,
+        ...serializeEventFilterFields(filters),
         limit: filters.limit ?? 100,
         offset: filters.offset ?? 0,
         order: filters.order ?? "desc",
         after: cursor?.after,
         before: cursor?.before,
       };
-    if (filters.artifacts && filters.artifacts.length > 0) {
-      params.artifacts = filters.artifacts.join(",");
-    }
-    if (filters.tagsInclude && filters.tagsInclude.length > 0) {
-      params.tags_include = filters.tagsInclude.join(",");
-    }
-    if (filters.tagsExclude && filters.tagsExclude.length > 0) {
-      params.tags_exclude = filters.tagsExclude.join(",");
-    }
     if (filters.filters && Object.keys(filters.filters).length > 0) {
       params.filters = JSON.stringify(filters.filters);
     }
     if (filters.exclusions && Object.keys(filters.exclusions).length > 0) {
       params.exclusions = JSON.stringify(filters.exclusions);
-    }
-    if (filters.annotated && filters.annotated.length > 0) {
-      params.annotated = filters.annotated.join(",");
-    }
-    if (filters.annotationTagValue) {
-      params.annotation_tag_value = filters.annotationTagValue;
-    }
-    if (filters.liveAnomalyEventIds && filters.liveAnomalyEventIds.length > 0) {
-      params.live_event_ids = filters.liveAnomalyEventIds.join(",");
-    }
-    if (filters.ids && filters.ids.length > 0) {
-      params.ids = filters.ids.join(",");
     }
     return get<EventPage>(
       `/cases/${caseId}/timelines/${timelineId}/events`,
@@ -91,41 +65,14 @@ export const eventsApi = {
     buckets = 60,
   ): Promise<HistogramResponse> => {
     const params: Record<string, string | number | undefined | null> = {
-      q: filters.q,
-      artifact: filters.artifact,
-      source_id: filters.sourceId,
-      tag: filters.tag,
-      exclude_tag: filters.excludeTag,
-      start: filters.start,
-      end: filters.end,
+      ...serializeEventFilterFields(filters),
       buckets,
     };
-    if (filters.artifacts && filters.artifacts.length > 0) {
-      params.artifacts = filters.artifacts.join(",");
-    }
-    if (filters.tagsInclude && filters.tagsInclude.length > 0) {
-      params.tags_include = filters.tagsInclude.join(",");
-    }
-    if (filters.tagsExclude && filters.tagsExclude.length > 0) {
-      params.tags_exclude = filters.tagsExclude.join(",");
-    }
     if (filters.filters && Object.keys(filters.filters).length > 0) {
       params.filters = JSON.stringify(filters.filters);
     }
     if (filters.exclusions && Object.keys(filters.exclusions).length > 0) {
       params.exclusions = JSON.stringify(filters.exclusions);
-    }
-    if (filters.annotated && filters.annotated.length > 0) {
-      params.annotated = filters.annotated.join(",");
-    }
-    if (filters.annotationTagValue) {
-      params.annotation_tag_value = filters.annotationTagValue;
-    }
-    if (filters.liveAnomalyEventIds && filters.liveAnomalyEventIds.length > 0) {
-      params.live_event_ids = filters.liveAnomalyEventIds.join(",");
-    }
-    if (filters.ids && filters.ids.length > 0) {
-      params.ids = filters.ids.join(",");
     }
     return get<HistogramResponse>(
       `/cases/${caseId}/timelines/${timelineId}/histogram`,

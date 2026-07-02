@@ -1,12 +1,11 @@
 /**
- * FrequencyView — time-series bar chart with anomalous windows highlighted.
+ * FrequencyView — ranked list of frequency-anomaly findings (z-score spikes
+ * or silences in a per-series event count).
  *
- * Calls the frequency detector endpoint.  Anomalous buckets are rendered in a
- * different color; clicking one fires onRangeSelect so the event explorer
- * zooms to that window (same brush contract as TimelineHistogram).
- *
- * No chart dependency — hand-rolled div bars (airgap-safe), same idiom as
- * TimelineHistogram.tsx.
+ * Calls the frequency detector endpoint and renders each finding as a row:
+ * series field/value, observed vs. expected count, z-score, and a window
+ * time range. Clicking a row (onDrillField/onJumpToTime) narrows the event
+ * explorer to that series value and scrolls/highlights the anomalous window.
  */
 import { useEffect, useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -20,10 +19,13 @@ import {
   Clock,
 } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import type { AnomalyMarker, FrequencyFinding } from "@/api/types";
 import { cn } from "@/lib/cn";
+import { tagResultLabel } from "@/lib/format";
+import { fmtTimestampCompactUtc as fmtTs } from "@/lib/time";
 
 interface Props {
   caseId: string;
@@ -46,20 +48,6 @@ const STATIC_SERIES_FIELD_OPTIONS = [
   { value: "parser_name", label: "Parser", group: "standard" },
   { value: "source_file", label: "Source file", group: "standard" },
 ];
-
-function fmtTs(iso: string): string {
-  try {
-    return new Date(iso).toLocaleString(undefined, {
-      month: "short",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
-    });
-  } catch {
-    return iso;
-  }
-}
 
 interface FreqFindingRowProps {
   finding: FrequencyFinding;
@@ -175,9 +163,13 @@ export function FrequencyView({ caseId, timelineId, onDrillField, onFindingsChan
   const [zThresholdInput, setZThresholdInput] = useState("2.5");
   const qc = useQueryClient();
 
+  // Debounce so a full detector scan doesn't fire on every keystroke
+  // (including transient invalid states like a bare "-" or "").
+  const debouncedZThresholdInput = useDebouncedValue(zThresholdInput, 400);
+
   // Only send a well-formed positive number; otherwise omit the param and let
   // the backend use its own default (also reflected back in `data.z_threshold`).
-  const parsedZThreshold = Number(zThresholdInput);
+  const parsedZThreshold = Number(debouncedZThresholdInput);
   const zThresholdParam =
     Number.isFinite(parsedZThreshold) && parsedZThreshold > 0 ? parsedZThreshold : undefined;
 
@@ -385,16 +377,7 @@ export function FrequencyView({ caseId, timelineId, onDrillField, onFindingsChan
           </Button>
           {tagMutation.isSuccess && (
             <span className="text-xs text-[var(--color-success)]">
-              ✓ {(tagMutation.data as { tagged?: number } | undefined)?.tagged ?? 0} tagged
-              {!!(tagMutation.data as { skipped_unresolved?: number } | undefined)
-                ?.skipped_unresolved && (
-                <>
-                  {" "}
-                  (
-                  {(tagMutation.data as { skipped_unresolved?: number }).skipped_unresolved}{" "}
-                  skipped — event no longer exists)
-                </>
-              )}
+              {tagResultLabel(tagMutation.data)}
             </span>
           )}
           {tagMutation.isError && (

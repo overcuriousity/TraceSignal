@@ -172,7 +172,7 @@ def test_cross_source_cohesion_identical_fields_returns_one():
 def test_cross_source_cohesion_orthogonal_fields_returns_zero():
     """Sources with completely different content domains → cohesion ≈ 0."""
     values_by_source = {
-        "src_a": ["ip 10.0.0.1", "ip 10.0.0.2"],   # → +x
+        "src_a": ["ip 10.0.0.1", "ip 10.0.0.2"],  # → +x
         "src_b": ["login event", "logon attempt"],  # → +y
     }
     c = cross_source_cohesion(values_by_source, encode=_fake_encode_factory())
@@ -242,11 +242,11 @@ def test_divergent_field_not_recommended():
     field_samples_by_source = {
         "src_a": {
             "message": ["user login"],
-            "attr:note": ["ip 10.0.0.1", "addr 10.0.0.2"],      # IP-topic
+            "attr:note": ["ip 10.0.0.1", "addr 10.0.0.2"],  # IP-topic
         },
         "src_b": {
             "message": ["logon attempt"],
-            "attr:note": ["login event", "logon audit"],           # login-topic
+            "attr:note": ["login event", "logon audit"],  # login-topic
         },
     }
     rec = recommend_fields_across_sources(
@@ -282,9 +282,7 @@ def test_source_specific_field_not_recommended():
         source_count=2,
         encode=_fake_encode_factory(),
     )
-    proc_verdict = next(
-        (v for v in rec.verdicts if v.token == "attr:proc_name"), None
-    )
+    proc_verdict = next((v for v in rec.verdicts if v.token == "attr:proc_name"), None)
     assert proc_verdict is not None
     assert not proc_verdict.recommended
     assert proc_verdict.kind == "source-specific"
@@ -319,6 +317,7 @@ def test_single_source_fallback_no_cohesion_penalty():
 
 def test_cohesion_summary_strong():
     from tracevector.db.field_recommend import TimelineFieldVerdict
+
     verdicts = [
         TimelineFieldVerdict("message", True, "text", "primary", 2, 0.9),
         TimelineFieldVerdict("attr:src_ip", True, "shared-cohesive", "", 2, 0.85),
@@ -330,6 +329,7 @@ def test_cohesion_summary_strong():
 
 def test_cohesion_summary_weak():
     from tracevector.db.field_recommend import TimelineFieldVerdict
+
     verdicts = [
         TimelineFieldVerdict("message", True, "text", "primary", 2, 0.3),
     ]
@@ -440,12 +440,8 @@ def test_universal_cohesion_disjoint_artifacts_gives_honest_banner():
     # src_a: WEBHIST artifact; src_b: EVTX artifact.
     # Both have logon-flavoured messages that embed to the same y-axis direction.
     samples_by_source = {
-        "src_a": {
-            "message": ["user login from browser", "logon session", "logon completed"]
-        },
-        "src_b": {
-            "message": ["login event recorded", "user logon", "session logon"]
-        },
+        "src_a": {"message": ["user login from browser", "logon session", "logon completed"]},
+        "src_b": {"message": ["login event recorded", "user logon", "session logon"]},
     }
     verdicts = timeline_universal_cohesion(
         samples_by_source,
@@ -453,9 +449,7 @@ def test_universal_cohesion_disjoint_artifacts_gives_honest_banner():
         tokens=["message", "display_name", "tags", "timestamp_desc"],
         cohesion_threshold=0.6,
     )
-    summary = timeline_cohesion_summary(
-        verdicts, source_count=2, encode_available=True
-    )
+    summary = timeline_cohesion_summary(verdicts, source_count=2, encode_available=True)
     # Must NOT produce the "no shared fields" weak verdict anymore.
     assert summary.level in ("moderate", "strong"), (
         f"Expected moderate/strong, got {summary.level}: {summary.message}"

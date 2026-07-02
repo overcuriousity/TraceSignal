@@ -16,6 +16,7 @@ import { eventsApi } from "@/api/events";
 import { Spinner } from "@/components/ui/Spinner";
 import type { AnomalyMarker, EventFilters, HistogramBucket } from "@/api/types";
 import { cn } from "@/lib/cn";
+import { useScrollPositionStore } from "@/stores/scrollPosition";
 
 interface Props {
   caseId: string;
@@ -24,8 +25,6 @@ interface Props {
   onRangeSelect: (start: string, end: string) => void;
   /** Anomaly finding timestamps overlaid as vertical lines on the chart. */
   markers?: AnomalyMarker[];
-  /** Timestamp of the row currently scrolled into view in the event grid. */
-  currentPositionTs?: string | null;
   /** Persistent time-window overlay (e.g. a Frequency finding's anomalous window). */
   highlightRange?: { start: string; end: string } | null;
 }
@@ -105,9 +104,9 @@ export function TimelineHistogram({
   filters,
   onRangeSelect,
   markers,
-  currentPositionTs,
   highlightRange,
 }: Props) {
+  const currentPositionTs = useScrollPositionStore((s) => s.currentPositionTs);
   const { data, isLoading, isFetching } = useQuery({
     queryKey: ["histogram", caseId, timelineId, filters],
     queryFn: () => eventsApi.histogram(caseId, timelineId, filters),

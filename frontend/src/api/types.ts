@@ -311,7 +311,6 @@ export interface UploadResult {
   events_inserted: number;
   parser: string;
   duplicate?: boolean;
-  embed_job_id?: string | null;
 }
 
 export interface HealthResponse {

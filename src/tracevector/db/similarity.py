@@ -9,7 +9,7 @@ requiring embeddings.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -38,11 +38,7 @@ class SimilaritySearchResult:
     """Return value of :py:meth:`SimilarityService.find_similar`."""
 
     status: str  # "ok" | "not_embedded" | "vector_not_found"
-    results: list[SimilarResult]
-
-    def __init__(self, status: str, results: list[SimilarResult] | None = None) -> None:
-        self.status = status
-        self.results = results if results is not None else []
+    results: list[SimilarResult] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +151,6 @@ class SimilarityService:
     def _get_embedding_model(self) -> EmbeddingModel:
         if self._embedding_model is None:
             self._embedding_model = EmbeddingModel()
-            self._embedding_model.load()
         return self._embedding_model
 
     def find_similar(

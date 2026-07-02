@@ -40,6 +40,7 @@ def _normalize_event_datetimes(row: dict[str, Any]) -> dict[str, Any]:
         row[key] = value.isoformat()
     return row
 
+
 _EVENT_COLUMNS = [
     "event_id",
     "case_id",
