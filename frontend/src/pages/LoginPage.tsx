@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useLocation, useNavigate } from "react-router-dom";
 import { ShieldAlert } from "lucide-react";
 import { authApi } from "@/api/auth";
@@ -7,13 +7,12 @@ import { ApiError } from "@/api/client";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { useAuthStore } from "@/stores/auth";
-import { useInvalidateCurrentUser } from "@/hooks/useCurrentUser";
 
 export function LoginPage() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const setUser = useAuthStore((s) => s.setUser);
-  const invalidate = useInvalidateCurrentUser();
+  const queryClient = useQueryClient();
   const navigate = useNavigate();
   const location = useLocation();
   const from = (location.state as { from?: Location })?.from?.pathname ?? "/";
@@ -24,7 +23,10 @@ export function LoginPage() {
     mutationFn: () => authApi.login(username, password),
     onSuccess: (user) => {
       setUser(user);
-      invalidate();
+      // Seed the cache with the fresh user rather than invalidating: a stale
+      // cached 401 would otherwise survive until the refetch settles and sign
+      // us right back out (see useCurrentUser).
+      queryClient.setQueryData(["auth", "me"], user);
       navigate(from, { replace: true });
     },
   });
