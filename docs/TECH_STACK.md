@@ -121,6 +121,13 @@ For a lone analyst on one machine, Qdrant can run in **local mode** through the 
 - Model weights can be pre-bundled for fully offline deployment.
 - Docker images can also be pre-bundled, but Docker is not required for airgapped use.
 - Telemetry and cloud APIs are disabled by default and not required.
+- `allow_online`/`TV_ALLOW_ONLINE` is not yet checked at any network call site.
+- Exception: optional OIDC SSO (`TV_OIDC_ENABLED`) is intentionally independent of
+  `TV_ALLOW_ONLINE`. It is operator-opted-in (off by default) and talks to an
+  operator-configured IdP the analyst chose to trust — commonly reachable on the same LAN as
+  an otherwise airgapped deployment — rather than an unconditional external call. An operator
+  relying on `TV_ALLOW_ONLINE=false` as the single offline switch should be aware OIDC egress
+  is a separate toggle (`TV_OIDC_ENABLED`).
 
 ## 7. Out of Scope for This Stack
 
@@ -133,7 +140,9 @@ For a lone analyst on one machine, Qdrant can run in **local mode** through the 
 1. ✅ Exact default embedding model and vector dimension — default is `all-MiniLM-L6-v2` (384-dim), swappable via config.
 2. ✅ ClickHouse table schema — implemented; `events` table uses `tokenbf_v1` for full-text and is partitioned by `(case_id, source_id)`.
 3. ✅ Frontend tech stack — React 19 + Vite, served as a static build directly from Uvicorn (no Nginx sidecar).
-4. ⬜ Authentication backend: local users vs. OIDC.
+4. ✅ Authentication backend — session-cookie auth for local users, plus optional OIDC SSO;
+   implemented alongside case-RBAC, teams, an append-only audit trail, and an SSE
+   live-collaboration stream (see §6 for the OIDC/airgap interaction).
 
 ## 9. Completed Steps
 
@@ -144,10 +153,14 @@ For a lone analyst on one machine, Qdrant can run in **local mode** through the 
 - ✅ Frontend built (React 19 + Vite + TypeScript) and wired to the full API surface.
 - ✅ Statistical anomaly engine (`value_novelty` + `frequency` detectors) added, replacing
   the original embedding-distance-only anomaly panel described in §5.
+- ✅ Authentication, RBAC, teams, audit trail, and live collaboration implemented
+  (session-cookie auth + optional OIDC, case-RBAC dependency layer, append-only audit-log
+  middleware, SSE invalidation stream) and hardened against a full security review — see
+  `docs/archive/PR7_REVIEW_FINDINGS.md`.
 
 ## 10. Next Steps
 
-1. ⬜ Implement authentication (local or OIDC) — nothing built yet.
-2. ⬜ Implement strict offline-mode enforcement — `allow_online` flag exists
-   (`core/config.py`) but is not checked at any network call site yet.
-3. ⬜ GPU acceleration (ROCm/CUDA) — still aspirational; no GPU-specific code exists.
+1. ⬜ Implement strict offline-mode enforcement — `allow_online` flag exists
+   (`core/config.py`) but is not checked at any network call site yet (OIDC is a deliberate,
+   documented exception — see §6).
+2. ⬜ GPU acceleration (ROCm/CUDA) — still aspirational; no GPU-specific code exists.

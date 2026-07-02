@@ -28,6 +28,7 @@ import { timelinesApi } from "@/api/timelines";
 import { useUiStore, DEFAULT_COLUMNS } from "@/stores/ui";
 import { useScrollPositionStore } from "@/stores/scrollPosition";
 import { paramsToFilters, filtersToParams } from "@/lib/queryParams";
+import { useCaseStream } from "@/hooks/useCaseStream";
 
 import { FilterRail } from "@/components/explorer/FilterRail";
 import { FilterChips } from "@/components/explorer/FilterChips";
@@ -73,6 +74,10 @@ export function ExplorerPage() {
     timelineId: string;
   }>();
   const [searchParams, setSearchParams] = useSearchParams();
+
+  // Live collaboration: another analyst's tag/annotation shows up here
+  // within about a second, no manual refresh needed.
+  useCaseStream(caseId);
 
   // ── Filter state (URL-driven) ──────────────────────────────────────────
   const filters = useMemo(() => paramsToFilters(searchParams), [searchParams]);

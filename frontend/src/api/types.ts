@@ -4,8 +4,72 @@ export interface Case {
   id: string;
   name: string;
   description: string | null;
+  /** Creator's user id. */
+  owner_id: string | null;
+  /** Investigation team this case belongs to, or null for a personal case. */
+  team_id: string | null;
   created_at: string;
   updated_at: string;
+}
+
+// ---------------------------------------------------------------------------
+// Auth / users / teams / audit
+// ---------------------------------------------------------------------------
+
+export type AuthProvider = "local" | "oidc";
+
+export interface TeamMembershipSummary {
+  id: string;
+  name: string;
+  role: "member" | "manager";
+}
+
+export interface User {
+  id: string;
+  username: string;
+  display_name: string | null;
+  email: string | null;
+  is_admin: boolean;
+  is_active: boolean;
+  must_change_password: boolean;
+  auth_provider: AuthProvider;
+  created_at: string;
+  updated_at: string;
+  last_login_at: string | null;
+  /** Only present on /auth/me and /auth/me/password responses. */
+  teams?: TeamMembershipSummary[];
+}
+
+export interface Team {
+  id: string;
+  name: string;
+  description: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type TeamRole = "member" | "manager";
+
+export interface TeamMember extends User {
+  role: TeamRole;
+}
+
+export interface AuditEntry {
+  id: string;
+  timestamp: string;
+  user_id: string | null;
+  username: string | null;
+  action: string;
+  method: string | null;
+  path: string | null;
+  route: string | null;
+  case_id: string | null;
+  target_type: string | null;
+  target_id: string | null;
+  status_code: number | null;
+  ip: string | null;
+  user_agent: string | null;
+  detail: Record<string, unknown> | null;
 }
 
 /**
@@ -323,6 +387,7 @@ export interface UploadResult {
 export interface HealthResponse {
   status: "ok";
   version: string;
+  oidc_enabled: boolean;
 }
 
 /** Filter params for the events query */

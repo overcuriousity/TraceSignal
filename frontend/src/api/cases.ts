@@ -7,8 +7,10 @@ export const casesApi = {
   get: (caseId: string) =>
     get<{ case: Case }>(`/cases/${caseId}`).then((r) => r.case),
 
-  create: (name: string, description?: string) =>
-    post<{ case: Case }>("/cases/", { name, description }).then((r) => r.case),
+  create: (name: string, description?: string, teamId?: string) =>
+    post<{ case: Case }>("/cases/", { name, description, team_id: teamId }).then(
+      (r) => r.case,
+    ),
 
   delete: (caseId: string) => del<{ deleted: boolean }>(`/cases/${caseId}`),
 };

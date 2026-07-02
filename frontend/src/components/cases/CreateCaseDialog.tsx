@@ -4,21 +4,35 @@ import { casesApi } from "@/api/cases";
 import { Dialog, DialogContent, DialogTrigger, DialogClose } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/Select";
 import { Plus } from "lucide-react";
+import { manageableTeams } from "@/lib/caseAccess";
+import { useAuthStore } from "@/stores/auth";
+
+const PERSONAL = "__personal__";
 
 export function CreateCaseDialog() {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
   const [desc, setDesc] = useState("");
+  const [teamId, setTeamId] = useState<string>(PERSONAL);
   const qc = useQueryClient();
+  const user = useAuthStore((s) => s.user);
+  const teams = manageableTeams(user);
 
   const { mutate, isPending, error } = useMutation({
-    mutationFn: () => casesApi.create(name.trim(), desc.trim() || undefined),
+    mutationFn: () =>
+      casesApi.create(
+        name.trim(),
+        desc.trim() || undefined,
+        teamId === PERSONAL ? undefined : teamId,
+      ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["cases"] });
       setOpen(false);
       setName("");
       setDesc("");
+      setTeamId(PERSONAL);
     },
   });
 
@@ -59,6 +73,30 @@ export function CreateCaseDialog() {
               className="w-full resize-none rounded border border-[var(--color-border-strong)] bg-[var(--color-bg-elevated)] px-3 py-2 text-sm text-[var(--color-fg-primary)] placeholder:text-[var(--color-fg-muted)] focus:border-[var(--color-accent)] focus:outline-none"
             />
           </div>
+          {teams.length > 0 && (
+            <div>
+              <label className="mb-1 block text-xs text-[var(--color-fg-muted)]">
+                Team (optional)
+              </label>
+              <Select value={teamId} onValueChange={setTeamId}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={PERSONAL}>Personal (only me)</SelectItem>
+                  {teams.map((t) => (
+                    <SelectItem key={t.id} value={t.id}>
+                      {t.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
+                A team case is visible to every team member; a personal case is visible only to
+                you and admins.
+              </p>
+            </div>
+          )}
           {error && (
             <p className="text-xs text-[var(--color-danger)]">{(error as Error).message}</p>
           )}

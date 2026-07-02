@@ -38,6 +38,8 @@ dependencies = [
     "httpx>=0.28.0",
     "python-multipart>=0.0.20",
     "jinja2>=3.1.0",
+    "argon2-cffi>=23.1.0",
+    "authlib>=1.3.2",
 ]
 
 [project.scripts]
@@ -128,6 +130,23 @@ ignore = ["E501"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency-injection pattern calls Depends()/Query()/etc. in
+# argument defaults by design; these calls are evaluated once at route
+# registration, not per-request, so B008's "don't call functions in
+# defaults" concern doesn't apply here.
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Query",
+    "fastapi.Path",
+    "fastapi.Body",
+    "fastapi.Header",
+    "fastapi.Cookie",
+    "fastapi.File",
+    "fastapi.Form",
+    "fastapi.Security",
+]
 
 [tool.ruff.format]
 quote-style = "double"
