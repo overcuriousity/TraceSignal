@@ -57,6 +57,7 @@ export function NumericHistogram({
               <AxisLeft scale={y} innerWidth={innerWidth} tickFormat={(v) => fmtCount(v)} />
               <AxisBottom
                 scale={x}
+                innerWidth={innerWidth}
                 innerHeight={innerHeight}
                 tickFormat={(v) => fmtValue(v as number)}
               />

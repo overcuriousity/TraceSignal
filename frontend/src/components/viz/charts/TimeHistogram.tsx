@@ -46,7 +46,14 @@ export function TimeHistogram({
     );
   }
 
-  const dates = buckets.map((b) => new Date(b.start));
+  // Domain spans whichever series covers more time — `contextBuckets` (the
+  // unscoped total) usually does, since a focused value may not occur across
+  // the entire filtered range. Callers should fetch both series with the
+  // same explicit start/end/bucket-count so bar widths line up (see
+  // `FieldHistogramModal`); this is just a defensive fallback.
+  const widerSeries =
+    (contextBuckets?.length ?? 0) > buckets.length ? contextBuckets! : buckets;
+  const dates = widerSeries.map((b) => new Date(b.start));
   const domainMax = dates.length > 1 ? dates[dates.length - 1] : dates[0];
   const contextMax = d3max(contextBuckets ?? [], (b) => b.count) ?? 0;
   const maxCount = Math.max(1, d3max(buckets, (b) => b.count) ?? 0, contextMax);
@@ -57,13 +64,14 @@ export function TimeHistogram({
         {({ innerWidth, innerHeight, margin }) => {
           const x = scaleTime().domain([dates[0], domainMax]).range([0, innerWidth]);
           const y = scaleLinear().domain([0, maxCount]).nice().range([innerHeight, 0]);
-          const barWidth = Math.max(1, innerWidth / buckets.length - 1);
+          const barWidth = Math.max(1, innerWidth / widerSeries.length - 1);
 
           return (
             <>
               <AxisLeft scale={y} innerWidth={innerWidth} tickFormat={(v) => fmtCount(v)} />
               <AxisBottom
                 scale={x}
+                innerWidth={innerWidth}
                 innerHeight={innerHeight}
                 tickFormat={(v) => fmtTick(v as Date)}
               />

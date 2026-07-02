@@ -61,7 +61,12 @@ export function LineChart({ data, svgRef, height = 260 }: LineChartProps) {
           return (
             <>
               <AxisLeft scale={y} innerWidth={innerWidth} tickFormat={(v) => fmtCount(v)} />
-              <AxisBottom scale={x} innerHeight={innerHeight} tickFormat={(v) => fmtTick(v as Date)} />
+              <AxisBottom
+                scale={x}
+                innerWidth={innerWidth}
+                innerHeight={innerHeight}
+                tickFormat={(v) => fmtTick(v as Date)}
+              />
               {data.series.map((s) => (
                 <path
                   key={s.value}
