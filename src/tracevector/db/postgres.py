@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -25,6 +26,8 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship,
 
 from tracevector.core.config import get_settings
 
+logger = logging.getLogger(__name__)
+
 
 class Base(DeclarativeBase):
     """SQLAlchemy declarative base for TraceVector metadata."""
@@ -38,6 +41,12 @@ class Case(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(String(4096), nullable=True)
+    # Owning user (creator). Nullable only for pre-auth rows on a dev DB that
+    # predates this feature; every case created through the API now gets one.
+    owner_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # Investigation team this case belongs to, or None for a personal case
+    # (visible only to its owner and admins).
+    team_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
@@ -56,6 +65,8 @@ class Case(Base):
             "id": self.id,
             "name": self.name,
             "description": self.description,
+            "owner_id": self.owner_id,
+            "team_id": self.team_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -352,6 +363,214 @@ class Annotation(Base):
         }
 
 
+class User(Base):
+    """An analyst or administrator account.
+
+    ``password_hash`` is null for OIDC-only accounts that have never set a
+    local password. ``auth_provider`` records how the account was created;
+    an OIDC-provisioned account can still gain a local password later if an
+    admin sets one. ``must_change_password`` forces a password rotation
+    before any other mutating action succeeds — used for the seeded admin
+    bootstrap credential (see ``core.config.Settings.admin_password``), which
+    is invalidated the moment it's changed.
+    """
+
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    username: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    display_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    must_change_password: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # "local" (username+password) or "oidc" (provisioned via an external IdP).
+    auth_provider: Mapped[str] = mapped_column(String(16), nullable=False, default="local")
+    oidc_subject: Mapped[str | None] = mapped_column(String(255), nullable=True, unique=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary. Never includes ``password_hash``."""
+        return {
+            "id": self.id,
+            "username": self.username,
+            "display_name": self.display_name,
+            "email": self.email,
+            "is_admin": self.is_admin,
+            "is_active": self.is_active,
+            "must_change_password": self.must_change_password,
+            "auth_provider": self.auth_provider,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "last_login_at": self.last_login_at.isoformat() if self.last_login_at else None,
+        }
+
+
+class Session(Base):
+    """A server-side login session, referenced by an opaque httpOnly cookie value.
+
+    Storing sessions in Postgres (rather than a signed stateless token) makes
+    them instantly revocable — deleting/deactivating a user or rotating a
+    password can invalidate every outstanding session immediately, which
+    matters for a forensic tool where "who was logged in when" must be
+    reconstructable and access must be cut off the moment it's revoked.
+    """
+
+    __tablename__ = "sessions"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    revoked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+class Team(Base):
+    """An investigation team. Cases optionally belong to a team."""
+
+    __tablename__ = "teams"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    description: Mapped[str | None] = mapped_column(String(4096), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class TeamMembership(Base):
+    """A user's membership in a team, carrying their role within it.
+
+    ``manager`` members may create/delete cases for the team; ``member``
+    users may only access existing team cases (add sources, create
+    timelines, annotate).
+    """
+
+    __tablename__ = "team_memberships"
+
+    team_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("teams.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    role: Mapped[str] = mapped_column(String(16), nullable=False, default="member")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary."""
+        return {
+            "team_id": self.team_id,
+            "user_id": self.user_id,
+            "role": self.role,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class AuditLog(Base):
+    """An append-only forensic record of a user action.
+
+    Written for every authenticated (and failed-auth) request by the audit
+    middleware in ``api.main``, plus enriched rows for security-relevant
+    events (login, admin CRUD, password rotation) via
+    :py:meth:`PostgresStore.record_audit`. Rows are never mutated or deleted
+    by application code. ``username_snapshot`` preserves the actor's name
+    even after the ``User`` row is deleted, so the trail stays legible.
+    Request/response bodies are never captured, so credentials never appear
+    here.
+    """
+
+    __tablename__ = "audit_log"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+        index=True,
+    )
+    user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    username_snapshot: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    action: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    method: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    route: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    case_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    target_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    target_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    status_code: Mapped[int | None] = mapped_column(nullable=True)
+    ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    detail: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary."""
+        return {
+            "id": self.id,
+            "timestamp": self.timestamp.isoformat() if self.timestamp else None,
+            "user_id": self.user_id,
+            "username": self.username_snapshot,
+            "action": self.action,
+            "method": self.method,
+            "path": self.path,
+            "route": self.route,
+            "case_id": self.case_id,
+            "target_type": self.target_type,
+            "target_id": self.target_id,
+            "status_code": self.status_code,
+            "ip": self.ip,
+            "user_agent": self.user_agent,
+            "detail": self.detail,
+        }
+
+
 class PostgresStore:
     """Async PostgreSQL store for metadata."""
 
@@ -402,9 +621,18 @@ class PostgresStore:
         async with self.session_factory() as session:
             return await session.get(Case, case_id)
 
-    async def create_case(self, case_id: str, name: str, description: str | None = None) -> Case:
+    async def create_case(
+        self,
+        case_id: str,
+        name: str,
+        description: str | None = None,
+        owner_id: str | None = None,
+        team_id: str | None = None,
+    ) -> Case:
         """Create a new case and its default timeline."""
-        case = Case(id=case_id, name=name, description=description)
+        case = Case(
+            id=case_id, name=name, description=description, owner_id=owner_id, team_id=team_id
+        )
         default_timeline = Timeline(
             id=generate_id("all-sources"),
             case_id=case_id,
@@ -420,11 +648,29 @@ class PostgresStore:
             return case
 
     async def list_cases(self) -> list[Case]:
-        """Return all cases ordered by creation time."""
+        """Return all cases ordered by creation time. Unscoped — admin/CLI use only."""
         from sqlalchemy import select
 
         async with self.session_factory() as session:
             result = await session.execute(select(Case).order_by(Case.created_at.desc()))
+            return list(result.scalars().all())
+
+    async def list_cases_for_user(self, user_id: str, team_ids: list[str]) -> list[Case]:
+        """Return cases visible to a non-admin user: their own, plus their teams'."""
+        from sqlalchemy import and_, or_, select
+
+        # Owner match only applies to personal (team-less) cases — a team
+        # case is governed entirely by current membership (see
+        # deps.resolve_case_access), so an owner removed from the team must
+        # stop seeing it here too, or the case card lists but every click
+        # dead-ends in a 403.
+        conditions = [and_(Case.owner_id == user_id, Case.team_id.is_(None))]
+        if team_ids:
+            conditions.append(Case.team_id.in_(team_ids))
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Case).where(or_(*conditions)).order_by(Case.created_at.desc())
+            )
             return list(result.scalars().all())
 
     # ------------------------------------------------------------------
@@ -1200,6 +1446,422 @@ class PostgresStore:
                 select(Annotation.event_id).where(*conditions).distinct()
             )
             return [row[0] for row in result.all()]
+
+    # ------------------------------------------------------------------
+    # Users
+    # ------------------------------------------------------------------
+
+    async def create_user(
+        self,
+        user_id: str,
+        username: str,
+        password_hash: str | None = None,
+        is_admin: bool = False,
+        must_change_password: bool = False,
+        auth_provider: str = "local",
+        oidc_subject: str | None = None,
+        display_name: str | None = None,
+        email: str | None = None,
+    ) -> User:
+        """Create a new user account and return it."""
+        user = User(
+            id=user_id,
+            username=username,
+            password_hash=password_hash,
+            is_admin=is_admin,
+            must_change_password=must_change_password,
+            auth_provider=auth_provider,
+            oidc_subject=oidc_subject,
+            display_name=display_name,
+            email=email,
+        )
+        async with self.session_factory() as session:
+            session.add(user)
+            await session.commit()
+            await session.refresh(user)
+            return user
+
+    async def get_user(self, user_id: str) -> User | None:
+        """Return a user by ID, or None if not found."""
+        async with self.session_factory() as session:
+            return await session.get(User, user_id)
+
+    async def get_user_by_username(self, username: str) -> User | None:
+        """Return a user by (case-sensitive) username, or None if not found."""
+        async with self.session_factory() as session:
+            result = await session.execute(select(User).where(User.username == username))
+            return result.scalar_one_or_none()
+
+    async def get_user_by_oidc_subject(self, oidc_subject: str) -> User | None:
+        """Return a user by their OIDC subject claim, or None if not provisioned yet."""
+        async with self.session_factory() as session:
+            result = await session.execute(select(User).where(User.oidc_subject == oidc_subject))
+            return result.scalar_one_or_none()
+
+    async def list_users(self) -> list[User]:
+        """Return all users ordered by creation time."""
+        async with self.session_factory() as session:
+            result = await session.execute(select(User).order_by(User.created_at.asc()))
+            return list(result.scalars().all())
+
+    async def update_user(
+        self,
+        user_id: str,
+        *,
+        username: str | None = None,
+        display_name: str | None = None,
+        is_admin: bool | None = None,
+        is_active: bool | None = None,
+        must_change_password: bool | None = None,
+    ) -> User | None:
+        """Patch mutable fields on a user. Returns the updated row, or None if missing."""
+        values: dict[str, Any] = {"updated_at": datetime.now(UTC)}
+        if username is not None:
+            values["username"] = username
+        if display_name is not None:
+            values["display_name"] = display_name
+        if is_admin is not None:
+            values["is_admin"] = is_admin
+        if is_active is not None:
+            values["is_active"] = is_active
+        if must_change_password is not None:
+            values["must_change_password"] = must_change_password
+        async with self.session_factory() as session:
+            result = await session.execute(
+                update(User).where(User.id == user_id).values(**values).returning(User)
+            )
+            user = result.scalar_one_or_none()
+            await session.commit()
+            return user
+
+    async def set_password(
+        self, user_id: str, password_hash: str, must_change_password: bool = False
+    ) -> None:
+        """Set a user's password hash, e.g. self-service change or admin rotation."""
+        async with self.session_factory() as session:
+            await session.execute(
+                update(User)
+                .where(User.id == user_id)
+                .values(
+                    password_hash=password_hash,
+                    must_change_password=must_change_password,
+                    updated_at=datetime.now(UTC),
+                )
+            )
+            await session.commit()
+
+    async def touch_last_login(self, user_id: str) -> None:
+        """Record the current time as the user's last successful login."""
+        async with self.session_factory() as session:
+            await session.execute(
+                update(User).where(User.id == user_id).values(last_login_at=datetime.now(UTC))
+            )
+            await session.commit()
+
+    async def delete_user(self, user_id: str, reassign_cases_to: str | None = None) -> bool:
+        """Delete a user, cascading their sessions and team memberships.
+
+        Personal cases the user owns are reassigned to ``reassign_cases_to``
+        (typically the acting admin) rather than orphaned. Sessions and
+        memberships cascade via FK ``ON DELETE CASCADE``. Returns True if the
+        user existed and was removed.
+        """
+        async with self.session_factory() as session:
+            user = await session.get(User, user_id)
+            if user is None:
+                return False
+            if reassign_cases_to is not None:
+                await session.execute(
+                    update(Case).where(Case.owner_id == user_id).values(owner_id=reassign_cases_to)
+                )
+            await session.delete(user)
+            await session.commit()
+            return True
+
+    async def owned_case_count(self, user_id: str) -> int:
+        """Return how many cases this user owns (used to gate deletion without reassignment)."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(func.count()).select_from(Case).where(Case.owner_id == user_id)
+            )
+            return int(result.scalar_one())
+
+    # ------------------------------------------------------------------
+    # Sessions
+    # ------------------------------------------------------------------
+
+    async def create_session(
+        self,
+        session_id: str,
+        user_id: str,
+        expires_at: datetime,
+        ip: str | None = None,
+        user_agent: str | None = None,
+    ) -> Session:
+        """Create a new login session."""
+        row = Session(
+            id=session_id, user_id=user_id, expires_at=expires_at, ip=ip, user_agent=user_agent
+        )
+        async with self.session_factory() as session:
+            session.add(row)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def get_session(self, session_id: str) -> Session | None:
+        """Return a session by ID, or None if not found."""
+        async with self.session_factory() as session:
+            return await session.get(Session, session_id)
+
+    async def touch_session(self, session_id: str) -> None:
+        """Update a session's last-seen timestamp."""
+        async with self.session_factory() as session:
+            await session.execute(
+                update(Session)
+                .where(Session.id == session_id)
+                .values(last_seen_at=datetime.now(UTC))
+            )
+            await session.commit()
+
+    async def revoke_session(self, session_id: str) -> bool:
+        """Mark a single session as revoked (used by logout). Returns True if it existed."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                update(Session).where(Session.id == session_id).values(revoked=True)
+            )
+            await session.commit()
+            return result.rowcount > 0
+
+    async def revoke_user_sessions(self, user_id: str) -> int:
+        """Revoke all of a user's sessions (used on password change/rotation)."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                update(Session).where(Session.user_id == user_id).values(revoked=True)
+            )
+            await session.commit()
+            return result.rowcount
+
+    async def purge_expired_sessions(self) -> int:
+        """Delete sessions past their expiry. Safe to call periodically or at login time."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                delete(Session).where(Session.expires_at < datetime.now(UTC))
+            )
+            await session.commit()
+            return result.rowcount
+
+    # ------------------------------------------------------------------
+    # Teams & memberships
+    # ------------------------------------------------------------------
+
+    async def create_team(self, team_id: str, name: str, description: str | None = None) -> Team:
+        """Create a new investigation team."""
+        team = Team(id=team_id, name=name, description=description)
+        async with self.session_factory() as session:
+            session.add(team)
+            await session.commit()
+            await session.refresh(team)
+            return team
+
+    async def get_team(self, team_id: str) -> Team | None:
+        """Return a team by ID, or None if not found."""
+        async with self.session_factory() as session:
+            return await session.get(Team, team_id)
+
+    async def get_team_by_name(self, name: str) -> Team | None:
+        """Return a team by its (unique) name, or None if not found."""
+        async with self.session_factory() as session:
+            result = await session.execute(select(Team).where(Team.name == name))
+            return result.scalar_one_or_none()
+
+    async def list_teams(self) -> list[Team]:
+        """Return all teams ordered by name."""
+        async with self.session_factory() as session:
+            result = await session.execute(select(Team).order_by(Team.name.asc()))
+            return list(result.scalars().all())
+
+    async def delete_team(self, team_id: str) -> bool:
+        """Delete a team; its memberships cascade and its cases become personal.
+
+        Returns True if the team existed and was removed.
+        """
+        async with self.session_factory() as session:
+            team = await session.get(Team, team_id)
+            if team is None:
+                return False
+            await session.execute(update(Case).where(Case.team_id == team_id).values(team_id=None))
+            await session.delete(team)
+            await session.commit()
+            return True
+
+    async def add_membership(
+        self, team_id: str, user_id: str, role: str = "member"
+    ) -> TeamMembership:
+        """Add a user to a team with the given role."""
+        membership = TeamMembership(team_id=team_id, user_id=user_id, role=role)
+        async with self.session_factory() as session:
+            session.add(membership)
+            await session.commit()
+            await session.refresh(membership)
+            return membership
+
+    async def remove_membership(self, team_id: str, user_id: str) -> bool:
+        """Remove a user from a team. Returns True if the membership existed."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                delete(TeamMembership).where(
+                    TeamMembership.team_id == team_id, TeamMembership.user_id == user_id
+                )
+            )
+            await session.commit()
+            return result.rowcount > 0
+
+    async def set_membership_role(self, team_id: str, user_id: str, role: str) -> bool:
+        """Change a member's role within a team. Returns True if the membership existed."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                update(TeamMembership)
+                .where(TeamMembership.team_id == team_id, TeamMembership.user_id == user_id)
+                .values(role=role)
+            )
+            await session.commit()
+            return result.rowcount > 0
+
+    async def get_membership(self, team_id: str, user_id: str) -> TeamMembership | None:
+        """Return a single membership row, or None if the user isn't on the team."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(TeamMembership).where(
+                    TeamMembership.team_id == team_id, TeamMembership.user_id == user_id
+                )
+            )
+            return result.scalar_one_or_none()
+
+    async def list_memberships(self, team_id: str) -> list[TeamMembership]:
+        """Return all memberships for a team."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(TeamMembership).where(TeamMembership.team_id == team_id)
+            )
+            return list(result.scalars().all())
+
+    async def list_user_memberships(self, user_id: str) -> list[TeamMembership]:
+        """Return all team memberships for a user."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(TeamMembership).where(TeamMembership.user_id == user_id)
+            )
+            return list(result.scalars().all())
+
+    async def list_teams_for_user(self, user_id: str) -> list[tuple[Team, str]]:
+        """Return (team, role) for every team the user belongs to, one query."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Team, TeamMembership.role)
+                .join(TeamMembership, TeamMembership.team_id == Team.id)
+                .where(TeamMembership.user_id == user_id)
+            )
+            return list(result.all())
+
+    async def list_members_with_users(self, team_id: str) -> list[tuple[User, str]]:
+        """Return (user, role) for every member of a team, one query."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(User, TeamMembership.role)
+                .join(TeamMembership, TeamMembership.user_id == User.id)
+                .where(TeamMembership.team_id == team_id)
+            )
+            return list(result.all())
+
+    async def list_unassigned_users(self) -> list[User]:
+        """Return users with no team membership at all, one query."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(User)
+                .outerjoin(TeamMembership, TeamMembership.user_id == User.id)
+                .where(TeamMembership.user_id.is_(None))
+                .order_by(User.username.asc())
+            )
+            return list(result.scalars().all())
+
+    # ------------------------------------------------------------------
+    # Audit log
+    # ------------------------------------------------------------------
+
+    async def record_audit(
+        self,
+        action: str,
+        user_id: str | None = None,
+        username_snapshot: str | None = None,
+        actor: User | None = None,
+        method: str | None = None,
+        path: str | None = None,
+        route: str | None = None,
+        case_id: str | None = None,
+        target_type: str | None = None,
+        target_id: str | None = None,
+        status_code: int | None = None,
+        ip: str | None = None,
+        user_agent: str | None = None,
+        detail: dict | None = None,
+    ) -> None:
+        """Append one audit-log row. Never raises on log-only failures upstream —
+        callers should treat this as best-effort so a logging hiccup never blocks
+        the underlying request.
+
+        Pass ``actor`` (the ``User`` who performed the action) instead of
+        ``user_id``/``username_snapshot`` separately — it derives both,
+        removing the risk of a call site setting one but forgetting the
+        other. ``user_id``/``username_snapshot`` remain for the anonymous
+        cases (failed login, unauthenticated request) where there's no
+        ``User`` to pass.
+        """
+        if actor is not None:
+            user_id = actor.id
+            username_snapshot = actor.username
+        row = AuditLog(
+            id=generate_id(f"audit_{action}"),
+            user_id=user_id,
+            username_snapshot=username_snapshot,
+            action=action,
+            method=method,
+            path=path,
+            route=route,
+            case_id=case_id,
+            target_type=target_type,
+            target_id=target_id,
+            status_code=status_code,
+            ip=ip,
+            user_agent=user_agent,
+            detail=detail,
+        )
+        try:
+            async with self.session_factory() as session:
+                session.add(row)
+                await session.commit()
+        except Exception:
+            logger.exception("Failed to record audit row (action=%s)", action)
+
+    async def query_audit(
+        self,
+        user_id: str | None = None,
+        case_id: str | None = None,
+        action: str | None = None,
+        limit: int = 500,
+    ) -> list[AuditLog]:
+        """Return audit rows matching the given filters, newest first."""
+        conditions = []
+        if user_id is not None:
+            conditions.append(AuditLog.user_id == user_id)
+        if case_id is not None:
+            conditions.append(AuditLog.case_id == case_id)
+        if action is not None:
+            conditions.append(AuditLog.action == action)
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(AuditLog).where(*conditions).order_by(AuditLog.timestamp.desc()).limit(limit)
+            )
+            return list(result.scalars().all())
 
 
 def generate_id(base: str) -> str:

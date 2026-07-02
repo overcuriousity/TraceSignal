@@ -7,7 +7,10 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from fastapi import HTTPException
 
+from tests.conftest import _fake_user
+from tracevector.api import deps
 from tracevector.api.routers import cases
 from tracevector.api.routers.cases import upload_source
 from tracevector.db.postgres import PostgresStore
@@ -58,7 +61,8 @@ async def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PostgresStor
     url = f"sqlite+aiosqlite:///{db_path}"
     s = PostgresStore(url=url)
     await s.init_schema()
-    monkeypatch.setattr(cases, "_store", s)
+    # get_store() is shared across every router via api.deps now.
+    monkeypatch.setattr(deps, "_store", s)
     monkeypatch.setattr(cases, "IngestionPipeline", FakeIngestionPipeline)
     yield s
     await s.engine.dispose()
@@ -78,11 +82,13 @@ async def test_duplicate_upload_is_idempotent(
     content = b'{"message":"login","timestamp":"2024-01-01T00:00:00+00:00"}\n'
     upload_file = _UploadFile("events.jsonl", content)
     expected_hash = hash_file(BytesIO(content))
+    case_obj = await store.get_case(case)
 
     first = await upload_source(
-        case_id=case,
         file=upload_file,
         parser=None,
+        case=case_obj,
+        user=_fake_user(),
     )
     assert first.events_inserted == 1
     assert first.duplicate is False
@@ -94,9 +100,10 @@ async def test_duplicate_upload_is_idempotent(
 
     # Second upload of the same bytes must be a no-op.
     second = await upload_source(
-        case_id=case,
         file=_UploadFile("events.jsonl", content),
         parser=None,
+        case=case_obj,
+        user=_fake_user(),
     )
     assert second.events_inserted == 0
     assert second.duplicate is True
@@ -112,18 +119,21 @@ async def test_uploading_different_file_adds_events(
 ) -> None:
     first_content = b'{"message":"login","timestamp":"2024-01-01T00:00:00+00:00"}\n'
     second_content = b'{"message":"logout","timestamp":"2024-01-01T00:01:00+00:00"}\n'
+    case_obj = await store.get_case(case)
 
     first = await upload_source(
-        case_id=case,
         file=_UploadFile("first.jsonl", first_content),
         parser=None,
+        case=case_obj,
+        user=_fake_user(),
     )
     assert first.events_inserted == 1
 
     second = await upload_source(
-        case_id=case,
         file=_UploadFile("second.jsonl", second_content),
         parser=None,
+        case=case_obj,
+        user=_fake_user(),
     )
     assert second.events_inserted == 1
     assert second.duplicate is False
@@ -134,16 +144,13 @@ async def test_uploading_different_file_adds_events(
 
 
 @pytest.mark.asyncio
-async def test_upload_to_missing_case_returns_404(
-    store: PostgresStore,
-) -> None:
-    with pytest.raises(Exception) as exc_info:  # noqa: PT011
-        await upload_source(
-            case_id="missing",
-            file=_UploadFile("events.jsonl", b'{"message":"x"}\n'),
-            parser=None,
-        )
-    assert exc_info.value.status_code == 404  # type: ignore[attr-defined]
+async def test_upload_to_missing_case_returns_404(store: PostgresStore) -> None:
+    """Case existence/access is now enforced by the `require_case_contribute`
+    dependency before the handler body runs, rather than inside the handler
+    itself — exercise that dependency directly the way FastAPI would."""
+    with pytest.raises(HTTPException) as exc_info:
+        await deps.require_case_contribute(case_id="missing", user=_fake_user())
+    assert exc_info.value.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -151,10 +158,12 @@ async def test_source_added_to_default_timeline(
     store: PostgresStore,
     case: str,
 ) -> None:
+    case_obj = await store.get_case(case)
     await upload_source(
-        case_id=case,
         file=_UploadFile("events.jsonl", b'{"message":"x"}\n'),
         parser=None,
+        case=case_obj,
+        user=_fake_user(),
     )
     default_timeline = await store.get_default_timeline(case)
     assert default_timeline is not None

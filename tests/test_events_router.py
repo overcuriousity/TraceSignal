@@ -14,8 +14,10 @@ import pytest
 import pytest_asyncio
 from fastapi import HTTPException
 
+from tests.conftest import _fake_user
+from tracevector.api import deps
 from tracevector.api.routers import events
-from tracevector.db.postgres import PostgresStore
+from tracevector.db.postgres import Case, PostgresStore
 
 
 @pytest_asyncio.fixture()
@@ -31,8 +33,8 @@ async def store(tmp_path):
 
 @pytest_asyncio.fixture()
 async def patched_store(store, monkeypatch):
-    """Point events.get_store() at the in-memory test store."""
-    monkeypatch.setattr(events, "_store", store)
+    """Point deps.get_store() (shared by every router) at the in-memory test store."""
+    monkeypatch.setattr(deps, "_store", store)
     return store
 
 
@@ -319,7 +321,9 @@ async def test_bulk_annotate_by_filter_honors_annotated_restriction(patched_stor
         content="reviewed",
         annotated="anomaly",
     )
-    result = await events.bulk_annotate_by_filter("c1", "t1", body)
+    result = await events.bulk_annotate_by_filter(
+        "c1", "t1", body, case=Case(id="c1"), user=_fake_user()
+    )
 
     assert result == {"tagged": 1}
     assert fake_service.last_query.event_ids == ["flagged-evt"]
@@ -644,6 +648,7 @@ def _call_list_anomalies(persist: bool = True):
         temporal=False,
         limit=50,
         persist=persist,
+        case=Case(id="c1"),
     )
 
 
@@ -686,7 +691,7 @@ async def test_tag_anomalies_always_persists_a_run(timeline_setup, monkeypatch):
     monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
 
     body = events.TagAnomaliesRequest(detector="value_novelty")
-    response = await events.tag_anomalies("c1", "t1", body)
+    response = await events.tag_anomalies("c1", "t1", body, case=Case(id="c1"), user=_fake_user())
 
     assert response["run_id"] is not None
     run = await timeline_setup.get_detector_run("c1", response["run_id"])
@@ -699,7 +704,7 @@ async def test_get_detector_run_endpoint_returns_persisted_run(timeline_setup, m
     monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
 
     scan = await _call_list_anomalies()
-    fetched = await events.get_detector_run("c1", scan["run_id"])
+    fetched = await events.get_detector_run("c1", scan["run_id"], case=Case(id="c1"))
 
     assert fetched["detector"] == "value_novelty"
     assert fetched["result"]["results"][0]["event_id"] == "evt-1"
@@ -708,5 +713,5 @@ async def test_get_detector_run_endpoint_returns_persisted_run(timeline_setup, m
 @pytest.mark.asyncio
 async def test_get_detector_run_endpoint_404s_for_unknown_id(timeline_setup):
     with pytest.raises(HTTPException) as exc_info:
-        await events.get_detector_run("c1", "no-such-run")
+        await events.get_detector_run("c1", "no-such-run", case=Case(id="c1"))
     assert exc_info.value.status_code == 404

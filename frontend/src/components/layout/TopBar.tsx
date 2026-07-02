@@ -1,10 +1,32 @@
-import { Link, useLocation } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
-import { Wifi, WifiOff, Activity, Sun, Moon, Rows2, Rows3 } from "lucide-react";
+import { Link, useLocation, useNavigate } from "react-router-dom";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  Wifi,
+  WifiOff,
+  Activity,
+  Sun,
+  Moon,
+  Rows2,
+  Rows3,
+  UserCircle,
+  Settings as SettingsIcon,
+  ShieldCheck,
+  LogOut,
+} from "lucide-react";
 import { healthApi } from "@/api/health";
+import { authApi } from "@/api/auth";
 import { JobTray } from "./JobTray";
 import { Tooltip } from "@/components/ui/Tooltip";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/DropdownMenu";
 import { cn } from "@/lib/cn";
+import { useAuthStore } from "@/stores/auth";
 import { useThemeStore } from "@/stores/theme";
 import { useUiStore } from "@/stores/ui";
 
@@ -73,6 +95,54 @@ function HealthIndicator() {
   );
 }
 
+function UserMenu() {
+  const user = useAuthStore((s) => s.user);
+  const clear = useAuthStore((s) => s.clear);
+  const navigate = useNavigate();
+  const qc = useQueryClient();
+
+  const { mutate: logout } = useMutation({
+    mutationFn: authApi.logout,
+    onSuccess: () => {
+      clear();
+      qc.setQueryData(["auth", "me"], null);
+      navigate("/login");
+    },
+  });
+
+  if (!user) return null;
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          className="flex items-center gap-1.5 rounded px-2 py-1 text-xs text-[var(--color-fg-secondary)] hover:bg-[var(--color-bg-hover)] hover:text-[var(--color-fg-primary)] transition-base"
+        >
+          <UserCircle size={16} />
+          <span className="hidden sm:inline">{user.display_name || user.username}</span>
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent>
+        <DropdownMenuLabel>{user.username}</DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => navigate("/settings")}>
+          <SettingsIcon size={14} /> Settings
+        </DropdownMenuItem>
+        {user.is_admin && (
+          <DropdownMenuItem onSelect={() => navigate("/admin")}>
+            <ShieldCheck size={14} /> Admin
+          </DropdownMenuItem>
+        )}
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => logout()}>
+          <LogOut size={14} /> Log out
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
 export function TopBar() {
   const location = useLocation();
 
@@ -134,6 +204,7 @@ export function TopBar() {
         <HealthIndicator />
         <DensityToggle />
         <ThemeToggle />
+        <UserMenu />
       </div>
     </header>
   );
