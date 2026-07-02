@@ -8,7 +8,7 @@
  * - Typed error surface
  */
 
-const BASE = (import.meta.env.VITE_API_BASE ?? "") + "/api";
+export const BASE = (import.meta.env.VITE_API_BASE ?? "") + "/api";
 
 export class ApiError extends Error {
   status: number;
@@ -53,6 +53,25 @@ export function setUnauthorizedHandler(handler: (() => void) | null): void {
   onUnauthorized = handler;
 }
 
+/** Shared 401-handling + error-surfacing for every fetch helper below.
+ * Excludes `/auth/login` from `onUnauthorized` — a 401 there is just a
+ * rejected login attempt, not a session that needs to redirect to itself. */
+async function checkResponse(res: Response, path: string): Promise<void> {
+  if (res.status === 401 && path !== "/auth/login") {
+    onUnauthorized?.();
+  }
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      const j = await res.json();
+      detail = extractErrorDetail(j, detail);
+    } catch {
+      // ignore
+    }
+    throw new ApiError(res.status, detail);
+  }
+}
+
 async function request<T>(
   method: string,
   path: string,
@@ -89,20 +108,7 @@ async function request<T>(
     credentials: "include",
   });
 
-  if (res.status === 401 && path !== "/auth/login") {
-    onUnauthorized?.();
-  }
-
-  if (!res.ok) {
-    let detail = res.statusText;
-    try {
-      const j = await res.json();
-      detail = extractErrorDetail(j, detail);
-    } catch {
-      // ignore
-    }
-    throw new ApiError(res.status, detail);
-  }
+  await checkResponse(res, path);
 
   return res.json() as Promise<T>;
 }
@@ -127,17 +133,7 @@ export const del = <T>(path: string, params?: Record<string, string | number | b
 export async function postForm<T>(path: string, form: FormData): Promise<T> {
   const url = BASE + path;
   const res = await fetch(url, { method: "POST", body: form, credentials: "include" });
-  if (res.status === 401) onUnauthorized?.();
-  if (!res.ok) {
-    let detail = res.statusText;
-    try {
-      const j = await res.json();
-      detail = extractErrorDetail(j, detail);
-    } catch {
-      // ignore
-    }
-    throw new ApiError(res.status, detail);
-  }
+  await checkResponse(res, path);
   return res.json() as Promise<T>;
 }
 
@@ -149,17 +145,7 @@ export async function fetchBlob(path: string, body: unknown): Promise<Blob> {
     body: JSON.stringify(body),
     credentials: "include",
   });
-  if (res.status === 401) onUnauthorized?.();
-  if (!res.ok) {
-    let detail = res.statusText;
-    try {
-      const j = await res.json();
-      detail = extractErrorDetail(j, detail);
-    } catch {
-      // ignore
-    }
-    throw new ApiError(res.status, detail);
-  }
+  await checkResponse(res, path);
   return res.blob();
 }
 
@@ -175,16 +161,6 @@ export async function fetchBlobGet(
     }
   }
   const res = await fetch(url.toString(), { credentials: "include" });
-  if (res.status === 401) onUnauthorized?.();
-  if (!res.ok) {
-    let detail = res.statusText;
-    try {
-      const j = await res.json();
-      detail = extractErrorDetail(j, detail);
-    } catch {
-      // ignore
-    }
-    throw new ApiError(res.status, detail);
-  }
+  await checkResponse(res, path);
   return res.blob();
 }

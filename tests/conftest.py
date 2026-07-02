@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 from tracevector.api import deps
 from tracevector.api.main import create_app
 from tracevector.core.config import get_settings
-from tracevector.db.postgres import PostgresStore
+from tracevector.db.postgres import PostgresStore, User
 
 
 @pytest_asyncio.fixture()
@@ -57,6 +57,11 @@ def login(client: TestClient, username: str, password: str) -> dict:
     resp = client.post("/api/auth/login", json={"username": username, "password": password})
     assert resp.status_code == 200, resp.text
     return resp.json()
+
+
+def _fake_user(user_id: str = "u1") -> User:
+    """A non-persisted User for calling route handlers directly (bypassing FastAPI DI)."""
+    return User(id=user_id, username="tester", is_admin=True, is_active=True)
 
 
 def as_admin(client: TestClient, admin_bootstrap: dict) -> dict:

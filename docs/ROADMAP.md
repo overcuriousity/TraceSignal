@@ -114,19 +114,30 @@ Qdrant-backed similarity/semantic search:
 - ✅ **Remote embedding option** — OpenAI-compatible remote embedding endpoint as an
   alternative to local sentence-transformers inference.
 
+### 8. Authentication, RBAC, teams, audit trail, live collaboration ✅
+
+- ✅ **Session-cookie auth** for local users, with a seeded one-time bootstrap admin
+  (`TV_ADMIN_PASSWORD`) whose forced password rotation is enforced centrally in
+  `AuthAuditMiddleware` for every mutating `/api/*` request.
+- ✅ **Optional OIDC SSO** (`TV_OIDC_ENABLED`), gated at runtime via `/api/health`'s
+  `oidc_enabled` flag rather than a build-time frontend env var.
+- ✅ **Teams** with member/manager roles; **case-RBAC** dependency layer
+  (`api/deps.py::resolve_case_access`) wired into every case-scoped endpoint.
+- ✅ **Append-only audit trail** — ASGI middleware records mutating `/api/*` requests plus
+  semantic per-action rows from auth/admin handlers; self-service (`/me/audit`) and
+  admin-global (`/admin/audit`) query endpoints, CSV/JSON export.
+- ✅ **SSE live-collaboration stream** — per-case invalidation events, re-validated against
+  session/access on every keepalive tick (not just at connect).
+- Full security review completed and all findings resolved — see
+  `docs/archive/PR7_REVIEW_FINDINGS.md`.
+
 ## Remaining work before MVP is closed
 
-These are the only two items with zero implementation — everything else in the original scope
-is done:
-
-- **Authentication** — no `User` model, login endpoint, or session/JWT middleware exists
-  anywhere in the codebase. `created_by` fields are unpopulated placeholders. Needed for real
-  multi-analyst attribution of annotations and views.
 - **Offline-mode enforcement** — `allow_online` (`core/config.py`) is a config flag that is
   defined but never checked at any call site. Airgapped-by-default is a stated hard
   requirement (`CLAUDE.md` §"Working conventions") that the code does not yet honor — a
   network call to HuggingFace or a remote embedding endpoint currently succeeds regardless of
-  the flag.
+  the flag. (OIDC SSO is a deliberate, documented exception to this — see `TECH_STACK.md` §6.)
 
 ## Explicitly deferred (not blocking MVP)
 

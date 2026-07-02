@@ -137,6 +137,42 @@ def test_deleting_team_reverts_its_cases_to_personal(client, admin_bootstrap, st
     assert resp.json()["case"]["owner_id"] == manager["id"]
 
 
+def test_duplicate_team_name_rejected(client, admin_bootstrap, store):
+    as_admin(client, admin_bootstrap)
+    resp = client.post("/api/admin/teams", json={"name": "Ops"})
+    assert resp.status_code == 200
+    resp = client.post("/api/admin/teams", json={"name": "Ops"})
+    assert resp.status_code == 409
+
+
+def test_rotate_password_rejected_for_oidc_account(client, admin_bootstrap, store):
+    as_admin(client, admin_bootstrap)
+    user = client.post(
+        "/api/admin/users", json={"username": "localuser", "password": "abcdefgh12"}
+    ).json()["user"]
+
+    # Flip the freshly-created local user to an OIDC-provisioned one at the
+    # store level — there's no API surface to do this, since OIDC accounts
+    # are only ever created via the OIDC callback.
+    import asyncio
+
+    from tracevector.db.postgres import User as UserModel
+
+    async def _make_oidc() -> None:
+        async with store.session_factory() as session:
+            row = await session.get(UserModel, user["id"])
+            row.auth_provider = "oidc"
+            row.oidc_subject = "sub-123"
+            await session.commit()
+
+    asyncio.run(_make_oidc())
+
+    resp = client.post(
+        f"/api/admin/users/{user['id']}/password", json={"new_password": "newone1234"}
+    )
+    assert resp.status_code == 409
+
+
 def test_default_pool_listing(client, admin_bootstrap, store):
     as_admin(client, admin_bootstrap)
     team = client.post("/api/admin/teams", json={"name": "HasTeam"}).json()["team"]

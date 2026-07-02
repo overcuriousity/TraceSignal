@@ -25,6 +25,6 @@ async def get_job(job_id: str, user: User = Depends(get_current_user)) -> dict[s
     job = store.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    if not user.is_admin and job.created_by is not None and job.created_by != user.id:
+    if not user.is_admin and (job.created_by is None or job.created_by != user.id):
         raise HTTPException(status_code=404, detail="Job not found")
     return {"job": job.to_dict()}

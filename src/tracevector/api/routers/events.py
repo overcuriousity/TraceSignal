@@ -21,7 +21,7 @@ from tracevector.api.deps import (
     require_password_current,
 )
 from tracevector.core.config import get_settings
-from tracevector.core.events_bus import get_event_bus
+from tracevector.core.events_bus import publish_annotation_change
 from tracevector.db.anomaly_stats import (
     FreqFinding,
     NoveltyFieldInfo,
@@ -581,16 +581,7 @@ async def bulk_annotate_by_filter(
     ]
     tagged = await store.bulk_create_annotations(rows)
     if tagged:
-        get_event_bus().publish(
-            case_id,
-            {
-                "type": "annotation.changed",
-                "case_id": case_id,
-                "timeline_id": timeline_id,
-                "event_id": None,
-                "actor": user.username,
-            },
-        )
+        publish_annotation_change(case_id, timeline_id, None, user)
     return {"tagged": tagged}
 
 
@@ -1448,16 +1439,7 @@ async def tag_anomalies(
 
     tagged = await store.bulk_create_annotations(annotation_rows) if annotation_rows else 0
     if tagged:
-        get_event_bus().publish(
-            case_id,
-            {
-                "type": "annotation.changed",
-                "case_id": case_id,
-                "timeline_id": timeline_id,
-                "event_id": None,
-                "actor": user.username,
-            },
-        )
+        publish_annotation_change(case_id, timeline_id, None, user)
 
     payload = _serialize_stat_result(result)
     run_id = await _persist_detector_run(
@@ -1536,14 +1518,5 @@ async def persist_anomaly_finding(
         pinned=True,
         detector=body.detector,
     )
-    get_event_bus().publish(
-        case_id,
-        {
-            "type": "annotation.changed",
-            "case_id": case_id,
-            "timeline_id": None,
-            "event_id": event_id,
-            "actor": user.username,
-        },
-    )
+    publish_annotation_change(case_id, None, event_id, user)
     return {"annotation": annotation.to_dict()}

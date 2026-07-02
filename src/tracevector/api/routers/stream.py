@@ -16,7 +16,12 @@ from collections.abc import AsyncGenerator
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 
-from tracevector.api.deps import require_case_read
+from tracevector.api.deps import (
+    AccessLevel,
+    require_case_read,
+    resolve_case_access,
+    resolve_user_optional,
+)
 from tracevector.core.events_bus import get_event_bus
 from tracevector.db.postgres import Case
 
@@ -25,9 +30,9 @@ router = APIRouter(prefix="/api/cases", tags=["stream"])
 _KEEPALIVE_SECONDS = 20
 
 
-async def _event_stream(request: Request, case_id: str) -> AsyncGenerator[str]:
+async def _event_stream(request: Request, case: Case) -> AsyncGenerator[str]:
     bus = get_event_bus()
-    queue = bus.subscribe(case_id)
+    queue = bus.subscribe(case.id)
     try:
         yield "retry: 3000\n\n"
         while True:
@@ -37,9 +42,17 @@ async def _event_stream(request: Request, case_id: str) -> AsyncGenerator[str]:
                 event = await asyncio.wait_for(queue.get(), timeout=_KEEPALIVE_SECONDS)
                 yield f"data: {json.dumps(event)}\n\n"
             except TimeoutError:
+                # Auth/case-access was only checked once, at connect time, via
+                # the route dependency below. Re-validate here on every
+                # keepalive tick so a revoked session, deactivation, or team
+                # removal actually stops the stream instead of leaking
+                # activity metadata to a subscriber who's lost access.
+                user = await resolve_user_optional(request)
+                if user is None or await resolve_case_access(user, case) < AccessLevel.READ:
+                    break
                 yield ": keepalive\n\n"
     finally:
-        bus.unsubscribe(case_id, queue)
+        bus.unsubscribe(case.id, queue)
 
 
 @router.get("/{case_id}/stream")
@@ -49,7 +62,7 @@ async def stream_case_events(
 ) -> StreamingResponse:
     """Subscribe to live change events (annotations/tags) for a case."""
     return StreamingResponse(
-        _event_stream(request, case.id),
+        _event_stream(request, case),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

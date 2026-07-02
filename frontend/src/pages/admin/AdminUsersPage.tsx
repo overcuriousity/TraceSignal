@@ -95,7 +95,7 @@ export function AdminUsersPage() {
               </TableCell>
               <TableCell>
                 <div className="flex justify-end gap-1">
-                  <RotatePasswordDialog user={u} />
+                  {u.auth_provider === "local" && <RotatePasswordDialog user={u} />}
                   {u.id !== me?.id && <DeleteUserDialog user={u} />}
                 </div>
               </TableCell>
@@ -257,7 +257,7 @@ function DeleteUserDialog({ user }: { user: User }) {
   const me = useAuthStore((s) => s.user);
 
   const { mutate, isPending, error } = useMutation({
-    mutationFn: () => adminApi.deleteUser(user.id, reassignTo),
+    mutationFn: (reassignTo?: string) => adminApi.deleteUser(user.id, reassignTo),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["admin", "users"] });
       setOpen(false);
@@ -305,13 +305,18 @@ function DeleteUserDialog({ user }: { user: User }) {
                 disabled={isPending}
                 onClick={() => {
                   setReassignTo(me?.id);
-                  mutate();
+                  mutate(me?.id);
                 }}
               >
                 Reassign to me &amp; delete
               </Button>
             ) : (
-              <Button variant="danger" size="sm" disabled={isPending} onClick={() => mutate()}>
+              <Button
+                variant="danger"
+                size="sm"
+                disabled={isPending}
+                onClick={() => mutate(reassignTo)}
+              >
                 {isPending ? "Deleting..." : "Delete"}
               </Button>
             )}

@@ -21,7 +21,7 @@ from tracevector.api.deps import (
     require_password_current,
 )
 from tracevector.core.config import get_settings
-from tracevector.core.events_bus import get_event_bus
+from tracevector.core.events_bus import publish_annotation_change
 from tracevector.core.jobs import JobStore, get_job_store
 from tracevector.db.clickhouse import ClickHouseStore
 from tracevector.db.postgres import Case, PostgresStore, User, generate_id
@@ -89,31 +89,6 @@ def _retention_path(file_hash: str) -> Path:
     return _retention_dir() / file_hash[:2] / file_hash
 
 
-def _publish_annotation_change(
-    case_id: str,
-    timeline_id: str | None,
-    event_id: str,
-    actor: User,
-    kind: str = "annotation.changed",
-) -> None:
-    """Notify live subscribers of this case that annotations/tags changed.
-
-    Advisory only: payload carries IDs and the acting user, never event
-    content, so a subscriber never learns anything they couldn't already
-    fetch themselves under their own case-access grant.
-    """
-    get_event_bus().publish(
-        case_id,
-        {
-            "type": kind,
-            "case_id": case_id,
-            "timeline_id": timeline_id,
-            "event_id": event_id,
-            "actor": actor.username,
-        },
-    )
-
-
 # ═════════════════════════════════════════════════════════════════════════════
 # Cases
 # ═════════════════════════════════════════════════════════════════════════════
@@ -166,8 +141,7 @@ async def create_case(
     )
     await store.record_audit(
         action="case.create",
-        user_id=user.id,
-        username_snapshot=user.username,
+        actor=user,
         case_id=case_id,
         target_type="case",
         target_id=case_id,
@@ -202,8 +176,7 @@ async def delete_case(
 
     await store.record_audit(
         action="case.delete",
-        user_id=user.id,
-        username_snapshot=user.username,
+        actor=user,
         case_id=case_id,
         target_type="case",
         target_id=case_id,
@@ -323,8 +296,7 @@ async def upload_source(
 
         await store.record_audit(
             action="source.upload",
-            user_id=user.id,
-            username_snapshot=user.username,
+            actor=user,
             case_id=case_id,
             target_type="source",
             target_id=source_id,
@@ -387,8 +359,7 @@ async def delete_source(
 
     await store.record_audit(
         action="source.delete",
-        user_id=user.id,
-        username_snapshot=user.username,
+        actor=user,
         case_id=case_id,
         target_type="source",
         target_id=source_id,
@@ -437,8 +408,7 @@ async def create_timeline(
     )
     await store.record_audit(
         action="timeline.create",
-        user_id=user.id,
-        username_snapshot=user.username,
+        actor=user,
         case_id=case.id,
         target_type="timeline",
         target_id=timeline_id,
@@ -463,8 +433,7 @@ async def delete_timeline(
         raise HTTPException(status_code=404, detail="Timeline not found")
     await store.record_audit(
         action="timeline.delete",
-        user_id=user.id,
-        username_snapshot=user.username,
+        actor=user,
         case_id=case.id,
         target_type="timeline",
         target_id=timeline_id,
@@ -643,7 +612,7 @@ async def create_event_annotation(
         content=payload.content,
         created_by=user.id,
     )
-    _publish_annotation_change(case.id, None, event_id, user)
+    publish_annotation_change(case.id, None, event_id, user)
     return {"annotation": annotation.to_dict()}
 
 
@@ -663,7 +632,7 @@ async def delete_event_annotation(
     deleted = await store.delete_annotation(case.id, event_id, annotation_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Annotation not found")
-    _publish_annotation_change(case.id, None, event_id, user)
+    publish_annotation_change(case.id, None, event_id, user)
     return {"deleted": True, "annotation_id": annotation_id}
 
 

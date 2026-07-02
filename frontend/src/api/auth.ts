@@ -1,4 +1,4 @@
-import { fetchBlobGet, get, patch, post } from "./client";
+import { BASE, fetchBlobGet, get, patch, post } from "./client";
 import type { User } from "./types";
 
 export const authApi = {
@@ -21,5 +21,5 @@ export const authApi = {
   downloadMyAudit: (format: "csv" | "json" = "csv") =>
     fetchBlobGet("/auth/me/audit", { format }),
 
-  oidcLoginUrl: () => `${(import.meta.env.VITE_API_BASE ?? "") + "/api"}/auth/oidc/login`,
+  oidcLoginUrl: () => `${BASE}/auth/oidc/login`,
 };

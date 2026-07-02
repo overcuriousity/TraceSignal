@@ -13,7 +13,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from tracevector.db.postgres import User
 
 _MAX_QUEUE = 100
 
@@ -61,3 +64,32 @@ def get_event_bus() -> CaseEventBus:
     if _bus is None:
         _bus = CaseEventBus()
     return _bus
+
+
+def publish_annotation_change(
+    case_id: str,
+    timeline_id: str | None,
+    event_id: str | None,
+    actor: User,
+    kind: str = "annotation.changed",
+) -> None:
+    """Notify live subscribers of this case that annotations/tags changed.
+
+    Shared by every annotation write path (cases.py, events.py) so the
+    payload shape lives in one place instead of being re-declared per
+    call site and silently drifting.
+
+    Advisory only: payload carries IDs and the acting user, never event
+    content, so a subscriber never learns anything they couldn't already
+    fetch themselves under their own case-access grant.
+    """
+    get_event_bus().publish(
+        case_id,
+        {
+            "type": kind,
+            "case_id": case_id,
+            "timeline_id": timeline_id,
+            "event_id": event_id,
+            "actor": actor.username,
+        },
+    )

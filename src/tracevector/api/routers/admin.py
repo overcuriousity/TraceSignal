@@ -7,6 +7,7 @@ teams and memberships.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -74,14 +75,7 @@ class MembershipRoleUpdate(BaseModel):
 async def list_users(unassigned: bool = Query(default=False)) -> dict[str, Any]:
     """List all users, optionally filtered to the team-less default pool."""
     store = get_store()
-    users = await store.list_users()
-    if unassigned:
-        result = []
-        for u in users:
-            memberships = await store.list_user_memberships(u.id)
-            if not memberships:
-                result.append(u)
-        users = result
+    users = await store.list_unassigned_users() if unassigned else await store.list_users()
     return {"users": [u.to_dict() for u in users]}
 
 
@@ -91,18 +85,18 @@ async def create_user(payload: UserCreate, admin: User = Depends(require_admin))
     store = get_store()
     if await store.get_user_by_username(payload.username) is not None:
         raise HTTPException(status_code=409, detail="Username already taken")
+    password_hash = await asyncio.to_thread(hash_password, payload.password)
     user = await store.create_user(
         user_id=generate_id("user"),
         username=payload.username,
-        password_hash=hash_password(payload.password),
+        password_hash=password_hash,
         is_admin=payload.is_admin,
         display_name=payload.display_name,
         email=payload.email,
     )
     await store.record_audit(
         action="admin.create_user",
-        user_id=admin.id,
-        username_snapshot=admin.username,
+        actor=admin,
         target_type="user",
         target_id=user.id,
         detail={"created_username": user.username},
@@ -134,8 +128,7 @@ async def update_user(
     )
     await store.record_audit(
         action="admin.update_user",
-        user_id=admin.id,
-        username_snapshot=admin.username,
+        actor=admin,
         target_type="user",
         target_id=user_id,
         detail=payload.model_dump(exclude_none=True),
@@ -152,14 +145,17 @@ async def rotate_password(
     target = await store.get_user(user_id)
     if target is None:
         raise HTTPException(status_code=404, detail="User not found")
-    await store.set_password(
-        user_id, hash_password(payload.new_password), must_change_password=payload.force_change
-    )
+    if target.auth_provider != "local":
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot set a local password for an OIDC-linked account",
+        )
+    new_hash = await asyncio.to_thread(hash_password, payload.new_password)
+    await store.set_password(user_id, new_hash, must_change_password=payload.force_change)
     await store.revoke_user_sessions(user_id)
     await store.record_audit(
         action="admin.rotate_password",
-        user_id=admin.id,
-        username_snapshot=admin.username,
+        actor=admin,
         target_type="user",
         target_id=user_id,
     )
@@ -196,8 +192,7 @@ async def delete_user(
     await store.delete_user(user_id, reassign_cases_to=reassign_to)
     await store.record_audit(
         action="admin.delete_user",
-        user_id=admin.id,
-        username_snapshot=admin.username,
+        actor=admin,
         target_type="user",
         target_id=user_id,
         detail={"deleted_username": target.username, "reassigned_to": reassign_to},
@@ -221,13 +216,14 @@ async def list_teams() -> dict[str, Any]:
 async def create_team(payload: TeamCreate, admin: User = Depends(require_admin)) -> dict[str, Any]:
     """Create a new investigation team."""
     store = get_store()
+    if await store.get_team_by_name(payload.name) is not None:
+        raise HTTPException(status_code=409, detail="Team name already taken")
     team = await store.create_team(
         team_id=generate_id(payload.name), name=payload.name, description=payload.description
     )
     await store.record_audit(
         action="admin.create_team",
-        user_id=admin.id,
-        username_snapshot=admin.username,
+        actor=admin,
         target_type="team",
         target_id=team.id,
     )
@@ -243,8 +239,7 @@ async def delete_team(team_id: str, admin: User = Depends(require_admin)) -> dic
         raise HTTPException(status_code=404, detail="Team not found")
     await store.record_audit(
         action="admin.delete_team",
-        user_id=admin.id,
-        username_snapshot=admin.username,
+        actor=admin,
         target_type="team",
         target_id=team_id,
     )
@@ -257,12 +252,10 @@ async def list_team_members(team_id: str) -> dict[str, Any]:
     store = get_store()
     if await store.get_team(team_id) is None:
         raise HTTPException(status_code=404, detail="Team not found")
-    memberships = await store.list_memberships(team_id)
-    members = []
-    for m in memberships:
-        user = await store.get_user(m.user_id)
-        if user is not None:
-            members.append({**user.to_dict(), "role": m.role})
+    members = [
+        {**user.to_dict(), "role": role}
+        for user, role in await store.list_members_with_users(team_id)
+    ]
     return {"members": members}
 
 
@@ -281,8 +274,7 @@ async def add_team_member(
     membership = await store.add_membership(team_id, payload.user_id, role=payload.role)
     await store.record_audit(
         action="admin.add_team_member",
-        user_id=admin.id,
-        username_snapshot=admin.username,
+        actor=admin,
         target_type="team",
         target_id=team_id,
         detail={"member_user_id": payload.user_id, "role": payload.role},
@@ -304,8 +296,7 @@ async def set_team_member_role(
         raise HTTPException(status_code=404, detail="Membership not found")
     await store.record_audit(
         action="admin.update_team_member",
-        user_id=admin.id,
-        username_snapshot=admin.username,
+        actor=admin,
         target_type="team",
         target_id=team_id,
         detail={"member_user_id": member_user_id, "role": payload.role},
@@ -324,8 +315,7 @@ async def remove_team_member(
         raise HTTPException(status_code=404, detail="Membership not found")
     await store.record_audit(
         action="admin.remove_team_member",
-        user_id=admin.id,
-        username_snapshot=admin.username,
+        actor=admin,
         target_type="team",
         target_id=team_id,
         detail={"member_user_id": member_user_id},

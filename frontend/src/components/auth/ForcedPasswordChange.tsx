@@ -1,33 +1,24 @@
-import { useState } from "react";
-import { useMutation } from "@tanstack/react-query";
 import { ShieldAlert } from "lucide-react";
-import { authApi } from "@/api/auth";
 import { ApiError } from "@/api/client";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
-import { useAuthStore } from "@/stores/auth";
-import { useInvalidateCurrentUser } from "@/hooks/useCurrentUser";
+import { usePasswordChangeForm } from "@/hooks/usePasswordChangeForm";
 
 /** Blocking full-screen gate shown when the account (typically the seeded
  * admin bootstrap credential) must rotate its password before continuing. */
 export function ForcedPasswordChange() {
-  const [currentPassword, setCurrentPassword] = useState("");
-  const [newPassword, setNewPassword] = useState("");
-  const [confirm, setConfirm] = useState("");
-  const setUser = useAuthStore((s) => s.setUser);
-  const invalidate = useInvalidateCurrentUser();
-
-  const { mutate, isPending, error } = useMutation({
-    mutationFn: () => authApi.changePassword(newPassword, currentPassword),
-    onSuccess: (user) => {
-      setUser(user);
-      invalidate();
-    },
-  });
-
-  const mismatch = confirm.length > 0 && newPassword !== confirm;
-  const tooShort = newPassword.length > 0 && newPassword.length < 8;
-  const canSubmit = currentPassword && newPassword.length >= 8 && !mismatch;
+  const {
+    currentPassword,
+    setCurrentPassword,
+    newPassword,
+    setNewPassword,
+    confirmPassword,
+    setConfirmPassword,
+    mismatch,
+    tooShort,
+    canSubmit,
+    mutation: { mutate, isPending, error },
+  } = usePasswordChangeForm();
 
   return (
     <div className="flex h-svh items-center justify-center bg-[var(--color-bg-base)] px-4">
@@ -71,8 +62,8 @@ export function ForcedPasswordChange() {
             Confirm new password
             <Input
               type="password"
-              value={confirm}
-              onChange={(e) => setConfirm(e.target.value)}
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
               autoComplete="new-password"
             />
           </label>

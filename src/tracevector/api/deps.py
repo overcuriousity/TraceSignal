@@ -9,27 +9,14 @@ that every case-scoped endpoint now goes through.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import IntEnum
 
 from fastapi import Depends, HTTPException, Request
 
 from tracevector.core.config import get_settings
+from tracevector.db._dt import ensure_utc
 from tracevector.db.postgres import Case, PostgresStore, User
-
-
-def _aware(dt: datetime) -> datetime:
-    """Coerce a possibly-naive datetime to UTC-aware.
-
-    SQLite (used in tests and for local/offline setups) doesn't preserve
-    timezone info on round-trip even for a ``DateTime(timezone=True))``
-    column — it comes back naive. Postgres (the primary target) doesn't have
-    this problem, but comparing a naive value against ``datetime.now(UTC)``
-    would raise ``TypeError`` on SQLite, so every stored value is treated as
-    UTC if it lacks tzinfo.
-    """
-    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
-
 
 _store: PostgresStore | None = None
 
@@ -51,6 +38,13 @@ class AccessLevel(IntEnum):
     MANAGE = 3
 
 
+# Every /api/* hit re-validates the session, so an unconditional touch_session
+# UPDATE+commit on each request is one Postgres write per request just to
+# refresh a "last seen" timestamp. Debouncing to once/minute keeps session
+# activity current enough for admin visibility without the per-request write.
+_SESSION_TOUCH_INTERVAL = timedelta(seconds=60)
+
+
 async def resolve_user_optional(request: Request) -> User | None:
     """Resolve the session cookie to a user, or return None if unauthenticated.
 
@@ -67,14 +61,15 @@ async def resolve_user_optional(request: Request) -> User | None:
 
     store = get_store()
     session = await store.get_session(session_id)
-    if session is None or session.revoked or _aware(session.expires_at) < datetime.now(UTC):
+    if session is None or session.revoked or ensure_utc(session.expires_at) < datetime.now(UTC):
         return None
 
     user = await store.get_user(session.user_id)
     if user is None or not user.is_active:
         return None
 
-    await store.touch_session(session_id)
+    if datetime.now(UTC) - ensure_utc(session.last_seen_at) > _SESSION_TOUCH_INTERVAL:
+        await store.touch_session(session_id)
     request.state.user = user
     request.state.session_id = session_id
     return user
@@ -106,9 +101,15 @@ async def require_admin(user: User = Depends(get_current_user)) -> User:
 async def require_password_current(user: User = Depends(get_current_user)) -> User:
     """Block mutating actions until a forced password rotation is complete.
 
-    Applied to every mutating case/admin endpoint. The change-password
-    endpoint itself depends on ``get_current_user`` directly, not this, so a
-    user stuck in the forced-rotation state can still reach it.
+    Kept as an explicit, in-route dependency on the ``cases.py``/``events.py``
+    endpoints that already used it (defense in depth, and a clear 403 in the
+    OpenAPI schema for those routes). The actual enforcement boundary is
+    ``AuthAuditMiddleware`` in ``main.py``, which blocks every mutating
+    ``/api/*`` request (including admin endpoints, which never opted in to
+    this dependency — see PR #7 review finding #1) except ``/api/auth/*``
+    self-service routes (login, logout, profile update, and the
+    change-password endpoint itself, so a user stuck in forced rotation can
+    still reach it).
     """
     if user.must_change_password:
         raise HTTPException(

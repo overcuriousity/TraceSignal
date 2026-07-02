@@ -1,7 +1,6 @@
 import { useEffect } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-
-const API_BASE = (import.meta.env.VITE_API_BASE ?? "") + "/api";
+import { BASE } from "@/api/client";
 
 /** Query key prefixes that reflect annotation/tag state and should be
  * refetched the moment any team member changes them. Kept in one place so
@@ -24,7 +23,7 @@ export function useCaseStream(caseId: string | undefined) {
   useEffect(() => {
     if (!caseId) return;
 
-    const source = new EventSource(`${API_BASE}/cases/${caseId}/stream`, {
+    const source = new EventSource(`${BASE}/cases/${caseId}/stream`, {
       withCredentials: true,
     });
 

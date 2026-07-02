@@ -5,6 +5,7 @@ import { authApi } from "@/api/auth";
 import { ApiError } from "@/api/client";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
+import { usePasswordChangeForm } from "@/hooks/usePasswordChangeForm";
 import { useAuthStore } from "@/stores/auth";
 import { useInvalidateCurrentUser } from "@/hooks/useCurrentUser";
 
@@ -15,9 +16,17 @@ export function SettingsPage() {
 
   const [username, setUsername] = useState(user?.username ?? "");
   const [displayName, setDisplayName] = useState(user?.display_name ?? "");
-  const [currentPassword, setCurrentPassword] = useState("");
-  const [newPassword, setNewPassword] = useState("");
-  const [confirmPassword, setConfirmPassword] = useState("");
+  const {
+    currentPassword,
+    setCurrentPassword,
+    newPassword,
+    setNewPassword,
+    confirmPassword,
+    setConfirmPassword,
+    mismatch: passwordMismatch,
+    canSubmit: canSubmitPassword,
+    mutation: password,
+  } = usePasswordChangeForm();
 
   const profile = useMutation({
     mutationFn: () => authApi.updateProfile({ username: username.trim(), display_name: displayName.trim() }),
@@ -26,19 +35,6 @@ export function SettingsPage() {
       invalidate();
     },
   });
-
-  const password = useMutation({
-    mutationFn: () => authApi.changePassword(newPassword, currentPassword || undefined),
-    onSuccess: (u) => {
-      setUser(u);
-      invalidate();
-      setCurrentPassword("");
-      setNewPassword("");
-      setConfirmPassword("");
-    },
-  });
-
-  const passwordMismatch = confirmPassword.length > 0 && newPassword !== confirmPassword;
 
   if (!user) return null;
 
@@ -151,9 +147,7 @@ export function SettingsPage() {
                 <Button
                   variant="accent"
                   size="sm"
-                  disabled={
-                    !currentPassword || newPassword.length < 8 || passwordMismatch || password.isPending
-                  }
+                  disabled={!canSubmitPassword || password.isPending}
                   onClick={() => password.mutate()}
                 >
                   {password.isPending ? "Changing..." : "Change password"}
