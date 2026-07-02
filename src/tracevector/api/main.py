@@ -1,16 +1,158 @@
 """FastAPI application factory and API routers."""
 
+import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from tracevector import __version__
-from tracevector.api.routers import cases, events, jobs
+from tracevector.api.deps import get_store, resolve_user_optional
+from tracevector.api.routers import admin, auth, cases, events, jobs, stream
+from tracevector.core.config import get_settings
+from tracevector.core.security import hash_password
+from tracevector.db.postgres import generate_id
+
+logger = logging.getLogger(__name__)
 
 _FRONTEND_DIST = Path(__file__).resolve().parents[3] / "frontend" / "dist"
+
+# API paths reachable without an authenticated session. Everything else under
+# /api/* requires a valid session cookie (enforced by the middleware below);
+# the SPA catch-all route serves static files only, so it stays exempt too.
+_AUTH_EXEMPT_PREFIXES = (
+    "/api/health",
+    "/api/auth/login",
+    "/api/auth/oidc/",
+    "/api/docs",
+    "/api/openapi.json",
+)
+
+
+def _is_exempt(path: str) -> bool:
+    return any(path == p or path.startswith(p) for p in _AUTH_EXEMPT_PREFIXES)
+
+
+async def _seed_admin() -> None:
+    """Seed the first administrator on startup if no users exist yet.
+
+    The seeded password is one-time: ``must_change_password=True`` forces a
+    rotation on first login, which invalidates ``TV_ADMIN_PASSWORD`` the
+    moment it's changed (see ``auth.change_my_password``).
+    """
+    settings = get_settings()
+    store = get_store()
+    if await store.list_users():
+        return
+    if not settings.admin_password:
+        logger.error(
+            "No users exist yet and TV_ADMIN_PASSWORD is not set. Set it and "
+            "restart to bootstrap the first administrator account."
+        )
+        return
+    await store.create_user(
+        user_id=generate_id("user"),
+        username=settings.admin_username,
+        password_hash=hash_password(settings.admin_password),
+        is_admin=True,
+        must_change_password=True,
+    )
+    logger.info(
+        "Seeded administrator account %r (password must be changed on first login).",
+        settings.admin_username,
+    )
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    store = get_store()
+    await store.init_schema()
+    await _seed_admin()
+    yield
+
+
+class AuthAuditMiddleware:
+    """Gate unauthenticated access to /api/* and append one audit row per request.
+
+    Deliberately a plain ASGI middleware, **not** ``@app.middleware("http")``
+    (Starlette's ``BaseHTTPMiddleware``) — that wrapper buffers/re-frames the
+    response through an in-memory stream, which breaks disconnect detection
+    and effectively hangs long-lived ``StreamingResponse``s (this app's SSE
+    live-collaboration endpoint being exactly that case). A pure ASGI
+    middleware passes ``receive``/``send`` straight through, so streaming and
+    client-disconnect propagation both work correctly.
+
+    Authorization (which case/admin actions a given user may take) still
+    happens in the route dependencies (``deps.get_current_user``,
+    ``deps.require_case``); this middleware only establishes *who* is calling
+    (if anyone) and enforces that a session exists at all for non-exempt API
+    paths. Resolving the user here means route handlers reuse the cached
+    value via ``request.state.user`` instead of re-querying the session store.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope, receive=receive)
+        path = request.url.path
+        settings = get_settings()
+
+        user = None
+        if path.startswith("/api/"):
+            user = await resolve_user_optional(request)
+            if user is None and not _is_exempt(path):
+                response = JSONResponse(status_code=401, content={"detail": "Not authenticated"})
+                await response(scope, receive, send)
+                return
+
+        status_holder: dict[str, int] = {}
+
+        async def _send(message: dict) -> None:
+            if message["type"] == "http.response.start":
+                status_holder["status_code"] = message["status"]
+            await send(message)
+
+        await self.app(scope, receive, _send)
+
+        should_audit = (
+            settings.audit_enabled
+            and path.startswith("/api/")
+            and not path.startswith("/api/auth/")
+        )
+        if should_audit:
+            # /api/auth/* actions (login, logout, password change, OIDC) write
+            # their own enriched audit rows with a semantic action label;
+            # logging them again here would duplicate with less detail.
+            user = user or getattr(request.state, "user", None)
+            route = scope.get("route")
+            route_path = getattr(route, "path", path)
+            case_id = (scope.get("path_params") or {}).get("case_id")
+            try:
+                await get_store().record_audit(
+                    action="api.request",
+                    user_id=user.id if user else None,
+                    username_snapshot=user.username if user else None,
+                    method=request.method,
+                    path=path,
+                    route=route_path,
+                    case_id=case_id,
+                    status_code=status_holder.get("status_code"),
+                    ip=request.client.host if request.client else None,
+                    user_agent=request.headers.get("user-agent"),
+                )
+            except Exception:
+                # Audit logging must never take down the actual request.
+                logger.exception("Failed to write audit log row for %s %s", request.method, path)
 
 
 def create_app() -> FastAPI:
@@ -21,6 +163,7 @@ def create_app() -> FastAPI:
         version=__version__,
         docs_url="/api/docs",
         openapi_url="/api/openapi.json",
+        lifespan=_lifespan,
     )
 
     app.add_middleware(
@@ -30,14 +173,18 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.add_middleware(AuthAuditMiddleware)
 
     @app.get("/api/health", response_class=JSONResponse)
     async def health() -> dict:
         return {"status": "ok", "version": __version__}
 
+    app.include_router(auth.router)
+    app.include_router(admin.router)
     app.include_router(cases.router)
     app.include_router(events.router)
     app.include_router(jobs.router)
+    app.include_router(stream.router)
 
     # Serve the built frontend when frontend/dist exists.
     # Run `npm run build` inside frontend/ once; tv-web then serves everything.
