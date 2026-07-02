@@ -41,6 +41,18 @@ function extractErrorDetail(json: unknown, fallback: string): string {
   return fallback;
 }
 
+/**
+ * Called whenever a request comes back 401 (no/expired/revoked session).
+ * Wired up by `stores/auth.ts` to clear the cached user and redirect to
+ * `/login`, without creating an import cycle between the API layer and the
+ * auth store.
+ */
+let onUnauthorized: (() => void) | null = null;
+
+export function setUnauthorizedHandler(handler: (() => void) | null): void {
+  onUnauthorized = handler;
+}
+
 async function request<T>(
   method: string,
   path: string,
@@ -71,7 +83,15 @@ async function request<T>(
     headers,
     body: reqBody,
     signal: opts?.signal,
+    // Sessions are an httpOnly cookie — this is required for it to be sent
+    // (and accepted) both same-origin (tv-web on :8080) and cross-origin
+    // during dev (Vite on :5173 proxying to :8080).
+    credentials: "include",
   });
+
+  if (res.status === 401 && path !== "/auth/login") {
+    onUnauthorized?.();
+  }
 
   if (!res.ok) {
     let detail = res.statusText;
@@ -97,12 +117,17 @@ export const get = <T>(
 export const post = <T>(path: string, body?: unknown) =>
   request<T>("POST", path, { body });
 
-export const del = <T>(path: string) => request<T>("DELETE", path);
+export const patch = <T>(path: string, body?: unknown) =>
+  request<T>("PATCH", path, { body });
+
+export const del = <T>(path: string, params?: Record<string, string | number | boolean | undefined | null>) =>
+  request<T>("DELETE", path, { params });
 
 /** POST with multipart form data (for file upload). */
 export async function postForm<T>(path: string, form: FormData): Promise<T> {
   const url = BASE + path;
-  const res = await fetch(url, { method: "POST", body: form });
+  const res = await fetch(url, { method: "POST", body: form, credentials: "include" });
+  if (res.status === 401) onUnauthorized?.();
   if (!res.ok) {
     let detail = res.statusText;
     try {
@@ -116,13 +141,41 @@ export async function postForm<T>(path: string, form: FormData): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-/** Trigger a streaming download. Returns a Blob. */
+/** Trigger a streaming download (JSON POST body). Returns a Blob. */
 export async function fetchBlob(path: string, body: unknown): Promise<Blob> {
   const res = await fetch(BASE + path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    credentials: "include",
   });
+  if (res.status === 401) onUnauthorized?.();
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      const j = await res.json();
+      detail = extractErrorDetail(j, detail);
+    } catch {
+      // ignore
+    }
+    throw new ApiError(res.status, detail);
+  }
+  return res.blob();
+}
+
+/** GET a resource as a Blob (e.g. a CSV/JSONL download via query params). */
+export async function fetchBlobGet(
+  path: string,
+  params?: Record<string, string | number | boolean | undefined | null>,
+): Promise<Blob> {
+  const url = new URL(BASE + path, window.location.href);
+  if (params) {
+    for (const [k, v] of Object.entries(params)) {
+      if (v != null && v !== "") url.searchParams.set(k, String(v));
+    }
+  }
+  const res = await fetch(url.toString(), { credentials: "include" });
+  if (res.status === 401) onUnauthorized?.();
   if (!res.ok) {
     let detail = res.statusText;
     try {

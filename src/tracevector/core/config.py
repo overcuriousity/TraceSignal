@@ -58,6 +58,32 @@ class Settings(BaseSettings):
     # Source file retention
     source_retention_path: str = "data/sources"
 
+    # Authentication: local admin bootstrap
+    # Seeds the first administrator on startup if no users exist yet. The
+    # seeded password is one-time: the admin is forced to rotate it on first
+    # login (User.must_change_password), which invalidates this env value.
+    admin_username: str = "admin"
+    admin_password: str | None = None
+
+    # Authentication: sessions
+    session_ttl_hours: int = 168
+    auth_cookie_name: str = "tv_session"
+    auth_cookie_secure: bool = False
+    auth_cookie_samesite: str = "lax"
+
+    # Authentication: audit log
+    audit_enabled: bool = True
+
+    # Authentication: optional OIDC (e.g. Authentik, Nextcloud). Independent
+    # of `allow_online` — this talks to an operator-configured IdP the analyst
+    # chose to trust, not an unconditional external call.
+    oidc_enabled: bool = False
+    oidc_issuer: str | None = None
+    oidc_client_id: str | None = None
+    oidc_client_secret: str | None = None
+    oidc_scopes: str = "openid email profile"
+    oidc_redirect_url: str | None = None
+
 
 @lru_cache
 def get_settings() -> Settings:

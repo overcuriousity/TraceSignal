@@ -9,19 +9,26 @@ from collections.abc import Generator
 from datetime import datetime
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from tracevector.api.deps import (
+    get_store,
+    require_case_contribute,
+    require_case_read,
+    require_password_current,
+)
 from tracevector.core.config import get_settings
+from tracevector.core.events_bus import get_event_bus
 from tracevector.db.anomaly_stats import (
     FreqFinding,
     NoveltyFieldInfo,
     StatisticalAnomalyService,
     ValueFinding,
 )
-from tracevector.db.postgres import PostgresStore, generate_id
+from tracevector.db.postgres import Case, User, generate_id
 from tracevector.db.queries import EventQuery, EventQueryService, TagFilter
 from tracevector.db.similarity import SimilarityService
 
@@ -65,16 +72,6 @@ def _get_field_encoder() -> Any:
 
 
 router = APIRouter(prefix="/api/cases", tags=["events"])
-
-_store: PostgresStore | None = None
-
-
-def get_store() -> PostgresStore:
-    """Return a cached PostgresStore instance."""
-    global _store  # noqa: PLW0603
-    if _store is None:
-        _store = PostgresStore()
-    return _store
 
 
 def _parse_json_object(value: str | None) -> dict[str, str]:
@@ -400,6 +397,7 @@ async def list_events(
     limit: int = Query(default=50, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     order: str = Query(default="desc", description="Sort order: asc or desc"),
+    case: Case = Depends(require_case_read),
 ) -> dict[str, Any]:
     """List events for a timeline with optional filters."""
     if order not in ("asc", "desc"):
@@ -515,6 +513,8 @@ async def bulk_annotate_by_filter(
     case_id: str,
     timeline_id: str,
     body: BulkAnnotateByFilterRequest,
+    case: Case = Depends(require_case_contribute),
+    user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
     """Create an annotation on every event matching the given filter.
 
@@ -575,10 +575,22 @@ async def bulk_annotate_by_filter(
             "annotation_type": body.annotation_type,
             "content": body.content.strip(),
             "origin": "user",
+            "created_by": user.id,
         }
         for event_id, src_id in refs
     ]
     tagged = await store.bulk_create_annotations(rows)
+    if tagged:
+        get_event_bus().publish(
+            case_id,
+            {
+                "type": "annotation.changed",
+                "case_id": case_id,
+                "timeline_id": timeline_id,
+                "event_id": None,
+                "actor": user.username,
+            },
+        )
     return {"tagged": tagged}
 
 
@@ -586,6 +598,7 @@ async def bulk_annotate_by_filter(
 async def list_fields(
     case_id: str,
     timeline_id: str,
+    case: Case = Depends(require_case_read),
 ) -> dict[str, Any]:
     """Return the displayable field names for a timeline.
 
@@ -600,7 +613,9 @@ async def list_fields(
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/artifacts")
-async def list_artifacts(case_id: str, timeline_id: str) -> dict[str, Any]:
+async def list_artifacts(
+    case_id: str, timeline_id: str, case: Case = Depends(require_case_read)
+) -> dict[str, Any]:
     """Return distinct ``artifact`` values present in the timeline.
 
     Powers the artifact filter's autocomplete/multi-select in the UI.
@@ -611,7 +626,9 @@ async def list_artifacts(case_id: str, timeline_id: str) -> dict[str, Any]:
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/tags/merged")
-async def list_merged_tags(case_id: str, timeline_id: str) -> dict[str, Any]:
+async def list_merged_tags(
+    case_id: str, timeline_id: str, case: Case = Depends(require_case_read)
+) -> dict[str, Any]:
     """Return the union of distinct user annotation tags and parser-derived tags.
 
     Powers the unified "Tags" filter panel, which matches a value against
@@ -632,6 +649,7 @@ async def list_merged_tags(case_id: str, timeline_id: str) -> dict[str, Any]:
 async def list_embedding_fields(
     case_id: str,
     timeline_id: str,
+    case: Case = Depends(require_case_read),
 ) -> dict[str, Any]:
     """Return per-artifact field information for the embedding wizard.
 
@@ -649,6 +667,7 @@ async def list_embedding_fields(
 async def list_source_embedding_fields(
     case_id: str,
     source_id: str,
+    case: Case = Depends(require_case_read),
 ) -> dict[str, Any]:
     """Per-artifact field recommendations for a single source's embedding wizard.
 
@@ -685,6 +704,7 @@ async def get_histogram(
     annotation_tag_value: str | None = Query(default=None),
     run_id: str | None = Query(default=None),
     buckets: int = Query(default=60, ge=10, le=200),
+    case: Case = Depends(require_case_read),
 ) -> dict[str, Any]:
     """Return a bucketed event-count histogram for a timeline.
 
@@ -849,6 +869,7 @@ async def export_events(
     case_id: str,
     timeline_id: str,
     body: ExportRequest,
+    case: Case = Depends(require_case_read),
 ) -> StreamingResponse:
     """Stream all events matching the given filters as CSV or JSONL.
 
@@ -1010,6 +1031,7 @@ async def find_similar_events(
     event_id: str,
     limit: int = Query(default=10, ge=1, le=100),
     timeline_id: str | None = Query(default=None),
+    case: Case = Depends(require_case_read),
 ) -> dict[str, Any]:
     """Return events semantically similar to ``event_id`` using vector search.
 
@@ -1035,6 +1057,7 @@ async def semantic_search_events(
     q: str = Query(..., min_length=1),
     limit: int = Query(default=10, ge=1, le=100),
     timeline_id: str | None = Query(default=None),
+    case: Case = Depends(require_case_read),
 ) -> dict[str, Any]:
     """Return events semantically similar to a free-text query.
 
@@ -1088,6 +1111,7 @@ def _serialize_finding(r: ValueFinding | FreqFinding) -> dict[str, Any]:
 async def list_anomaly_fields(
     case_id: str,
     timeline_id: str,
+    case: Case = Depends(require_case_read),
 ) -> dict[str, Any]:
     """Return candidate fields for anomaly detection, annotated with cardinality.
 
@@ -1162,7 +1186,9 @@ async def _persist_detector_run(
 
 
 @router.get("/{case_id}/detector-runs/{run_id}")
-async def get_detector_run(case_id: str, run_id: str) -> dict[str, Any]:
+async def get_detector_run(
+    case_id: str, run_id: str, case: Case = Depends(require_case_read)
+) -> dict[str, Any]:
     """Return a persisted detector run's params and findings.
 
     Lets the client (or an analyst debugging a filter) inspect what a
@@ -1222,6 +1248,7 @@ async def list_anomalies(
             "grid to 'anomaly') instead of re-uploading event IDs."
         ),
     ),
+    case: Case = Depends(require_case_read),
 ) -> dict[str, Any]:
     """Run a statistical anomaly detector on the timeline and return findings.
 
@@ -1304,6 +1331,8 @@ async def tag_anomalies(
     case_id: str,
     timeline_id: str,
     body: TagAnomaliesRequest,
+    case: Case = Depends(require_case_contribute),
+    user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
     """Re-run the statistical anomaly detector and persist findings as annotations.
 
@@ -1418,6 +1447,17 @@ async def tag_anomalies(
         )
 
     tagged = await store.bulk_create_annotations(annotation_rows) if annotation_rows else 0
+    if tagged:
+        get_event_bus().publish(
+            case_id,
+            {
+                "type": "annotation.changed",
+                "case_id": case_id,
+                "timeline_id": timeline_id,
+                "event_id": None,
+                "actor": user.username,
+            },
+        )
 
     payload = _serialize_stat_result(result)
     run_id = await _persist_detector_run(
@@ -1467,6 +1507,8 @@ async def persist_anomaly_finding(
     source_id: str,
     event_id: str,
     body: PersistAnomalyFindingRequest,
+    case: Case = Depends(require_case_contribute),
+    user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
     """Persist a single live anomaly finding as a system annotation.
 
@@ -1481,7 +1523,6 @@ async def persist_anomaly_finding(
     this manually-confirmed finding, even if the re-scan no longer surfaces it.
     """
     store = get_store()
-    await store.init_schema()
     annotation_id = generate_id(f"{event_id}_anomaly_{body.detector}")
     annotation = await store.create_annotation(
         case_id=case_id,
@@ -1494,5 +1535,15 @@ async def persist_anomaly_finding(
         details=body.details,
         pinned=True,
         detector=body.detector,
+    )
+    get_event_bus().publish(
+        case_id,
+        {
+            "type": "annotation.changed",
+            "case_id": case_id,
+            "timeline_id": None,
+            "event_id": event_id,
+            "actor": user.username,
+        },
     )
     return {"annotation": annotation.to_dict()}

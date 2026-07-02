@@ -17,6 +17,10 @@ class Job:
     progress: dict[str, Any] = field(default_factory=dict)
     result: dict[str, Any] | None = None
     error: str | None = None
+    # ID of the user who started this job, or None for jobs created before
+    # auth existed. Used to scope job-status reads so one analyst can't poll
+    # another's job by guessing its ID.
+    created_by: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a serializable representation."""
@@ -40,10 +44,12 @@ class JobStore:
     def __init__(self) -> None:
         self._jobs: dict[str, Job] = {}
 
-    def create(self, kind: str, progress: dict[str, Any] | None = None) -> Job:
+    def create(
+        self, kind: str, progress: dict[str, Any] | None = None, created_by: str | None = None
+    ) -> Job:
         """Create a new job and return it."""
         job_id = uuid.uuid4().hex[:16]
-        job = Job(id=job_id, kind=kind, progress=progress or {})
+        job = Job(id=job_id, kind=kind, progress=progress or {}, created_by=created_by)
         self._jobs[job_id] = job
         return job
 
