@@ -347,10 +347,12 @@ async def _trigger_automatic_enrichments(
     from tracesignal.enrichers.jobs import run_enrichment_job
     from tracesignal.enrichers.registry import get_cached_availability, get_enricher
 
-    configs = await store.list_automatic_enrichers_for_source(source_id)
-    for config in configs:
-        enricher = get_enricher(config.enricher_key)
-        availability = get_cached_availability(config.enricher_key)
+    global_configs = await store.list_enricher_global_configs()
+    default_auto_keys = {c.enricher_key for c in global_configs if c.auto_run_default}
+    pairs = await store.list_automatic_enrichers_for_source(source_id, default_auto_keys)
+    for timeline_id, enricher_key in pairs:
+        enricher = get_enricher(enricher_key)
+        availability = get_cached_availability(enricher_key)
         if enricher is None or availability is None or not availability.available:
             continue
         job = job_store.create(
@@ -360,8 +362,8 @@ async def _trigger_automatic_enrichments(
             run_enrichment_job(
                 job_id=job.id,
                 case_id=case_id,
-                timeline_id=config.timeline_id,
-                enricher_key=config.enricher_key,
+                timeline_id=timeline_id,
+                enricher_key=enricher_key,
                 source_ids=[source_id],
                 job_store=job_store,
                 store=store,
@@ -1296,6 +1298,9 @@ async def list_timeline_enrichers(
     sources = await store.list_timeline_sources(case_id, timeline_id)
     ready_source_ids = [s.id for s in sources if s.is_ready]
     configs = {c.enricher_key: c for c in await store.list_timeline_enrichers(timeline_id)}
+    global_defaults = {
+        c.enricher_key: c.auto_run_default for c in await store.list_enricher_global_configs()
+    }
 
     clickhouse = ClickHouseStore()
     result = []
@@ -1307,6 +1312,9 @@ async def list_timeline_enrichers(
             enricher.check_eligibility, clickhouse, case_id, ready_source_ids
         )
         config = configs.get(enricher.key)
+        # Without an explicit per-timeline row, the admin-set instance
+        # default decides whether this enricher auto-runs here.
+        default_enabled = global_defaults.get(enricher.key, False)
         result.append(
             {
                 "key": enricher.key,
@@ -1316,7 +1324,7 @@ async def list_timeline_enrichers(
                 "sample_checked": eligibility.sample_checked,
                 "sample_matched": eligibility.sample_matched,
                 "mode": config.mode if config else "automatic",
-                "enabled": config.enabled if config else False,
+                "enabled": config.enabled if config else default_enabled,
             }
         )
     return {"enrichers": result}

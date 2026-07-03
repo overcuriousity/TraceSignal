@@ -349,6 +349,64 @@ async def query_audit(
 # ═════════════════════════════════════════════════════════════════════════════
 
 
+class EnricherGlobalConfigUpdate(BaseModel):
+    """Payload to set an enricher's instance-wide defaults."""
+
+    auto_run_default: bool
+
+
+@router.get("/enrichers/config")
+async def list_enricher_global_configs(admin: User = Depends(require_admin)) -> dict[str, Any]:
+    """Return every registered enricher with its instance-wide config."""
+    from tracesignal.enrichers.registry import all_enrichers, get_cached_availability
+
+    store = get_store()
+    configs = {c.enricher_key: c for c in await store.list_enricher_global_configs()}
+    result = []
+    for enricher in all_enrichers():
+        availability = get_cached_availability(enricher.key)
+        config = configs.get(enricher.key)
+        result.append(
+            {
+                "key": enricher.key,
+                "display_name": enricher.display_name,
+                "description": enricher.description,
+                "available": availability.available if availability else False,
+                "reason": availability.reason if availability else None,
+                "auto_run_default": config.auto_run_default if config else False,
+            }
+        )
+    return {"enrichers": result}
+
+
+@router.put("/enrichers/{enricher_key}/config")
+async def set_enricher_global_config(
+    enricher_key: str,
+    body: EnricherGlobalConfigUpdate,
+    admin: User = Depends(require_admin),
+) -> dict[str, Any]:
+    """Set instance-wide defaults for one enricher (currently: auto-run on ingest)."""
+    from tracesignal.enrichers.registry import get_enricher
+
+    if get_enricher(enricher_key) is None:
+        raise HTTPException(status_code=404, detail="Unknown enricher")
+
+    store = get_store()
+    config = await store.upsert_enricher_global_config(
+        enricher_key=enricher_key,
+        auto_run_default=body.auto_run_default,
+        updated_by=admin.id,
+    )
+    await store.record_audit(
+        action="admin.enricher_global_config",
+        actor=admin,
+        target_type="enricher",
+        target_id=enricher_key,
+        detail={"auto_run_default": body.auto_run_default},
+    )
+    return {"config": config.to_dict()}
+
+
 @router.get("/enrichers/geoip/database")
 async def get_geoip_database_status(admin: User = Depends(require_admin)) -> dict[str, Any]:
     """Return whether a GeoLite2 database is currently uploaded and its availability."""

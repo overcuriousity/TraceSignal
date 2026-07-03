@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -285,6 +286,38 @@ class TimelineEnricher(Base):
             "enricher_key": self.enricher_key,
             "mode": self.mode,
             "enabled": self.enabled,
+            "updated_by": self.updated_by,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class EnricherGlobalConfig(Base):
+    """Instance-wide enricher defaults, set by admins.
+
+    ``auto_run_default`` makes an enricher run automatically after ingestion
+    for every timeline that has *no explicit* ``timeline_enrichers`` row for
+    it — an explicit per-timeline config always overrides this default. This
+    lets an admin turn on e.g. GeoIP for the whole instance without touching
+    each timeline.
+    """
+
+    __tablename__ = "enricher_global_configs"
+
+    enricher_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    auto_run_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    updated_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary."""
+        return {
+            "enricher_key": self.enricher_key,
+            "auto_run_default": self.auto_run_default,
             "updated_by": self.updated_by,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -1094,23 +1127,69 @@ class PostgresStore:
             await session.refresh(row)
             return row
 
-    async def list_automatic_enrichers_for_source(self, source_id: str) -> list[TimelineEnricher]:
-        """Return enabled, automatic-mode enricher configs for every timeline this source belongs to.
+    async def list_automatic_enrichers_for_source(
+        self, source_id: str, default_auto_keys: Iterable[str] = ()
+    ) -> list[tuple[str, str]]:
+        """Return ``(timeline_id, enricher_key)`` pairs to auto-run after this source ingests.
 
-        Used by the post-ingestion hook to decide which enrichment jobs to
-        fire automatically once a source finishes ingesting.
+        A pair is included when the timeline has an explicit config row with
+        ``mode="automatic", enabled=True`` — or, for enrichers in
+        ``default_auto_keys`` (the admin-set instance-wide defaults), when the
+        timeline has *no* explicit row for that enricher at all. An explicit
+        row always overrides the instance default, in either direction.
         """
+        default_keys = set(default_auto_keys)
         async with self.session_factory() as session:
-            result = await session.execute(
-                select(TimelineEnricher)
-                .join(TimelineSource, TimelineSource.timeline_id == TimelineEnricher.timeline_id)
-                .where(
-                    TimelineSource.source_id == source_id,
-                    TimelineEnricher.mode == "automatic",
-                    TimelineEnricher.enabled.is_(True),
-                )
+            timeline_result = await session.execute(
+                select(TimelineSource.timeline_id).where(TimelineSource.source_id == source_id)
             )
+            timeline_ids = [row[0] for row in timeline_result.all()]
+            if not timeline_ids:
+                return []
+            config_result = await session.execute(
+                select(TimelineEnricher).where(TimelineEnricher.timeline_id.in_(timeline_ids))
+            )
+            configs = list(config_result.scalars().all())
+
+        pairs: list[tuple[str, str]] = [
+            (c.timeline_id, c.enricher_key) for c in configs if c.mode == "automatic" and c.enabled
+        ]
+        if default_keys:
+            explicit = {(c.timeline_id, c.enricher_key) for c in configs}
+            pairs.extend(
+                (timeline_id, key)
+                for timeline_id in timeline_ids
+                for key in sorted(default_keys)
+                if (timeline_id, key) not in explicit
+            )
+        return pairs
+
+    async def list_enricher_global_configs(self) -> list[EnricherGlobalConfig]:
+        """Return every instance-wide enricher config row."""
+        async with self.session_factory() as session:
+            result = await session.execute(select(EnricherGlobalConfig))
             return list(result.scalars().all())
+
+    async def upsert_enricher_global_config(
+        self, enricher_key: str, auto_run_default: bool, updated_by: str | None
+    ) -> EnricherGlobalConfig:
+        """Create or update the instance-wide config for one enricher."""
+        async with self.session_factory() as session:
+            row = await session.get(EnricherGlobalConfig, enricher_key)
+            if row is None:
+                row = EnricherGlobalConfig(
+                    enricher_key=enricher_key,
+                    auto_run_default=auto_run_default,
+                    updated_by=updated_by,
+                )
+                session.add(row)
+            else:
+                row.auto_run_default = auto_run_default
+                row.updated_by = updated_by
+                row.updated_at = datetime.now(UTC)
+            await session.commit()
+            await session.refresh(row)
+            return row
 
     async def stage_enrichment_results(self, rows: list[dict[str, Any]]) -> None:
         """Bulk-insert enrichment result rows into the crash-safe staging table."""

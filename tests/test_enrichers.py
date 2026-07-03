@@ -138,8 +138,52 @@ async def test_list_automatic_enrichers_for_source_filters_mode_and_enabled(stor
         updated_by=None,
     )
 
-    configs = await store.list_automatic_enrichers_for_source(source.id)
-    assert [c.enricher_key for c in configs] == ["geoip"]
+    pairs = await store.list_automatic_enrichers_for_source(source.id)
+    assert pairs == [(timeline.id, "geoip")]
+
+
+@pytest.mark.asyncio
+async def test_list_automatic_enrichers_global_default_and_override(store):
+    await store.create_case("c1", "Case One")
+    timeline_a = await store.create_timeline("c1", "t1", "Timeline A")
+    timeline_b = await store.create_timeline("c1", "t2", "Timeline B")
+    source = await store.create_source("c1", "s1", "source-one", file_hash="a" * 64, size_bytes=10)
+    await store.add_source_to_timeline("c1", timeline_a.id, source.id)
+    await store.add_source_to_timeline("c1", timeline_b.id, source.id)
+
+    # Timeline A explicitly opts out; timeline B has no row and should
+    # inherit the instance-wide default.
+    await store.upsert_timeline_enricher(
+        timeline_id=timeline_a.id,
+        enricher_key="geoip",
+        mode="automatic",
+        enabled=False,
+        updated_by=None,
+    )
+
+    pairs = await store.list_automatic_enrichers_for_source(source.id, {"geoip"})
+    assert pairs == [(timeline_b.id, "geoip")]
+
+    # Without the default, nothing fires.
+    pairs = await store.list_automatic_enrichers_for_source(source.id)
+    assert pairs == []
+
+
+@pytest.mark.asyncio
+async def test_upsert_enricher_global_config_creates_then_updates(store):
+    created = await store.upsert_enricher_global_config(
+        enricher_key="geoip", auto_run_default=True, updated_by="u1"
+    )
+    assert created.auto_run_default is True
+
+    updated = await store.upsert_enricher_global_config(
+        enricher_key="geoip", auto_run_default=False, updated_by="u2"
+    )
+    assert updated.auto_run_default is False
+
+    rows = await store.list_enricher_global_configs()
+    assert len(rows) == 1
+    assert rows[0].enricher_key == "geoip"
 
 
 # ---------------------------------------------------------------------------

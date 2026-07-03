@@ -20,6 +20,15 @@ export interface TimelineEnricherInfo {
   enabled: boolean;
 }
 
+export interface AdminEnricherConfig {
+  key: string;
+  display_name: string;
+  description: string;
+  available: boolean;
+  reason: string | null;
+  auto_run_default: boolean;
+}
+
 export interface GeoipDatabaseStatus {
   uploaded: boolean;
   size_bytes: number | null;
@@ -49,6 +58,14 @@ export const enrichersApi = {
       `/cases/${caseId}/timelines/${timelineId}/enrichers/${key}/run`,
       {},
     ),
+
+  adminConfigs: () =>
+    get<{ enrichers: AdminEnricherConfig[] }>("/admin/enrichers/config").then(
+      (r) => r.enrichers,
+    ),
+
+  setAdminConfig: (key: string, body: { auto_run_default: boolean }) =>
+    put(`/admin/enrichers/${key}/config`, body),
 
   geoipStatus: () => get<GeoipDatabaseStatus>("/admin/enrichers/geoip/database"),
 

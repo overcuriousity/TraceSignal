@@ -39,7 +39,7 @@ class GeoIPEnricher(Enricher):
         "locally uploaded MaxMind GeoLite2 City database."
     )
     eligibility_regex = IPV4_REGEX
-    output_fields = ("geoip_country", "geoip_city")
+    output_fields = ("geoip_country", "geoip_city", "geoip_country_code")
 
     def __init__(self, db_path: Path | None = None) -> None:
         self._db_path = db_path or geoip_database_path()
@@ -73,6 +73,11 @@ class GeoIPEnricher(Enricher):
             return None
         country = response.country.name or ""
         city = response.city.name or ""
+        country_code = response.country.iso_code or ""
         if not country and not city:
             return None
-        return {"geoip_country": country, "geoip_city": city}
+        return {
+            "geoip_country": country,
+            "geoip_city": city,
+            "geoip_country_code": country_code,
+        }

@@ -5,6 +5,7 @@ import { enrichersApi } from "@/api/enrichers";
 import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
 import { Spinner } from "@/components/ui/Spinner";
+import { Switch } from "@/components/ui/Switch";
 
 function fmtBytes(bytes: number | null): string {
   if (bytes == null) return "—";
@@ -19,6 +20,20 @@ export function AdminEnrichersPage() {
   const { data: status, isLoading } = useQuery({
     queryKey: ["admin", "enrichers", "geoip", "status"],
     queryFn: () => enrichersApi.geoipStatus(),
+  });
+
+  const { data: configs } = useQuery({
+    queryKey: ["admin", "enrichers", "config"],
+    queryFn: () => enrichersApi.adminConfigs(),
+  });
+  const geoipConfig = configs?.find((c) => c.key === "geoip");
+
+  const autoRunMutation = useMutation({
+    mutationFn: (autoRunDefault: boolean) =>
+      enrichersApi.setAdminConfig("geoip", { auto_run_default: autoRunDefault }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["admin", "enrichers", "config"] });
+    },
   });
 
   const uploadMutation = useMutation({
@@ -59,6 +74,23 @@ export function AdminEnrichersPage() {
 
         <div className="flex items-center gap-3 text-xs text-[var(--color-fg-muted)]">
           <span>{status?.uploaded ? `Database uploaded (${fmtBytes(status.size_bytes)})` : "No database uploaded"}</span>
+        </div>
+
+        <div className="flex items-center justify-between gap-3 rounded border border-[var(--color-border-subtle)] px-3 py-2">
+          <div>
+            <p className="text-xs font-medium text-[var(--color-fg-primary)]">
+              Run automatically on new ingests
+            </p>
+            <p className="text-xs text-[var(--color-fg-muted)]">
+              Instance-wide default. Applies to every timeline without its own enricher
+              configuration; per-timeline settings override this.
+            </p>
+          </div>
+          <Switch
+            checked={geoipConfig?.auto_run_default ?? false}
+            disabled={autoRunMutation.isPending || !geoipConfig}
+            onCheckedChange={(v) => autoRunMutation.mutate(v)}
+          />
         </div>
 
         <div>

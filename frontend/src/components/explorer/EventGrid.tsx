@@ -32,6 +32,7 @@ import { useAnnotationMutations } from "@/hooks/useAnnotationMutations";
 import { RETIRED_COLUMN_IDS, useUiStore } from "@/stores/ui";
 import { cn } from "@/lib/cn";
 import { isIpAddress, isPrivateIp } from "@/lib/privateIp";
+import { geoipFlagForAttribute } from "@/lib/countryFlag";
 
 // Keep in sync with --grid-row-height in index.css.
 const ROW_HEIGHT_BY_DENSITY = { comfortable: 42, compact: 34 } as const;
@@ -565,9 +566,17 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
           cell: ({ row }) => {
             const value = row.original.attributes[colId];
             const showIpBadge = value != null && isIpAddress(value);
+            const geo = showIpBadge
+              ? geoipFlagForAttribute(row.original.attributes, colId)
+              : null;
             return (
               <span className="flex items-center gap-1.5 font-mono text-sm leading-snug truncate text-[var(--color-fg-secondary)]">
                 <span className="truncate">{value ?? "—"}</span>
+                {geo && (
+                  <span className="shrink-0" title={geo.label}>
+                    {geo.flag}
+                  </span>
+                )}
                 {showIpBadge && (
                   <span
                     className="shrink-0"
