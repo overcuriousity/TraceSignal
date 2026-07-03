@@ -10,7 +10,7 @@ RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
-FROM python:3.13-slim AS app
+FROM python:3.14-slim AS app
 WORKDIR /app
 
 RUN pip install --no-cache-dir uv
