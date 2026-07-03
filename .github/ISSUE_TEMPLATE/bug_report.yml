@@ -1,0 +1,58 @@
+name: Bug report
+description: Something in TraceSignal is broken or behaves unexpectedly.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: What did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Ingest ...
+        2. Open ...
+        3. Click ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / stack trace
+      render: shell
+
+  - type: input
+    id: version
+    attributes:
+      label: TraceSignal version / commit
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      multiple: true
+      options:
+        - Ingestion / parsers
+        - Explorer (event grid, filters, histogram)
+        - Statistical anomaly detectors (value_novelty, frequency)
+        - Semantic similarity / embeddings
+        - Auth / RBAC / audit
+        - Frontend (other)
+        - Backend API (other)
+        - Deployment / Docker
+
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: OS, deployment mode (native uv / container), Postgres/ClickHouse/Qdrant versions.
+    validations:
+      required: true
