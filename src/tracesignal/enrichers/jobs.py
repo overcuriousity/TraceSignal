@@ -128,10 +128,11 @@ async def run_enrichment_job(
     job_store.update(job_id, status="running", progress={"processed": 0, "total": 0})
 
     try:
-        total = sum(
-            await asyncio.to_thread(ch_store.count_events, case_id=case_id, source_id=source_id)
-            for source_id in source_ids
-        )
+        total = 0
+        for source_id in source_ids:
+            total += await asyncio.to_thread(
+                ch_store.count_events, case_id=case_id, source_id=source_id
+            )
         job_store.update(job_id, progress={"processed": 0, "total": total})
 
         processed = 0

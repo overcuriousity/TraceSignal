@@ -40,7 +40,12 @@ def test_geoip_status_reports_unavailable_before_upload(client, admin_bootstrap,
     from tracesignal.enrichers import registry
     from tracesignal.enrichers.geoip import GeoIPEnricher
 
-    registry.register(GeoIPEnricher(db_path=tmp_path / "missing.mmdb"))
+    missing_path = tmp_path / "missing.mmdb"
+    # The status endpoint resolves the path via geoip_database_path()
+    # directly (not through the registry), so both must point at the same
+    # (non-existent, test-isolated) location.
+    monkeypatch.setattr("tracesignal.enrichers.geoip.geoip_database_path", lambda: missing_path)
+    registry.register(GeoIPEnricher(db_path=missing_path))
     registry.refresh_availability()
 
     as_admin(client, admin_bootstrap)
