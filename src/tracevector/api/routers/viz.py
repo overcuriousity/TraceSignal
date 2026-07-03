@@ -20,6 +20,7 @@ from fastapi.concurrency import run_in_threadpool
 from tracevector.api.deps import require_case_read
 from tracevector.api.routers.events import (
     _get_query_service,
+    _get_stat_anomaly_service,
     _parse_exclusions_object,
     _parse_json_object,
     _parse_str_list,
@@ -277,3 +278,36 @@ async def get_field_value_timeseries(
     return await run_in_threadpool(
         service.field_value_timeseries, query, field, buckets, series_limit
     )
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/viz/fields")
+async def list_viz_fields(
+    case_id: str,
+    timeline_id: str,
+    case: Case = Depends(require_case_read),
+) -> dict[str, Any]:
+    """Return every chartable field for the Visualization page's field picker.
+
+    Unlike ``GET .../anomalies/fields`` this applies **no** novelty-detection
+    heuristics — charting a constant or identifier-like field is a legitimate
+    analyst choice, and coupling the picker to anomaly tuning would let
+    detector changes silently reshape this list. Each entry carries:
+
+    - ``token``    — field token to pass to the viz endpoints' ``field`` param.
+    - ``distinct`` — number of distinct non-empty values.
+    - ``coverage`` — fraction of events with a non-empty value (0-1).
+
+    Sorted by coverage descending, then token — the first entry is the
+    frontend's default field pick.
+    """
+    source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
+    svc = _get_stat_anomaly_service()
+    inventory, total = await run_in_threadpool(svc.field_inventory, case_id, source_ids)
+    if total == 0:
+        return {"fields": []}
+    fields = [
+        {"token": token, "distinct": distinct, "coverage": round(cov_count / total, 4)}
+        for token, distinct, cov_count in inventory
+    ]
+    fields.sort(key=lambda f: (-f["coverage"], f["token"]))
+    return {"fields": fields}
