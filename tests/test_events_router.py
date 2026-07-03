@@ -409,6 +409,61 @@ def test_parse_cursor_rejects_bad_timestamp():
 
 
 # ---------------------------------------------------------------------------
+# _validate_regex / _run_regex_guarded (q_regex search)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_regex_accepts_valid_pattern():
+    events._validate_regex(r"^Login (failed|succeeded)$", True)
+
+
+def test_validate_regex_noop_when_flag_off_or_no_query():
+    events._validate_regex("([", False)  # invalid pattern, but literal mode
+    events._validate_regex(None, True)
+
+
+def test_validate_regex_rejects_invalid_pattern_with_400():
+    with pytest.raises(HTTPException) as exc_info:
+        events._validate_regex("([", True)
+    assert exc_info.value.status_code == 400
+    assert "invalid regular expression" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_run_regex_guarded_maps_re2_failure_to_400():
+    from clickhouse_connect.driver.exceptions import DatabaseError
+
+    def scan():
+        raise DatabaseError("Code: 427. DB::Exception: OK, but cannot compile re2: (?<=x)")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await events._run_regex_guarded(True, scan)
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_run_regex_guarded_reraises_non_regex_errors():
+    from clickhouse_connect.driver.exceptions import DatabaseError
+
+    def scan():
+        raise DatabaseError("Code: 241. DB::Exception: Memory limit exceeded")
+
+    with pytest.raises(DatabaseError):
+        await events._run_regex_guarded(True, scan)
+
+
+@pytest.mark.asyncio
+async def test_run_regex_guarded_reraises_when_flag_off():
+    from clickhouse_connect.driver.exceptions import DatabaseError
+
+    def scan():
+        raise DatabaseError("Code: 427. DB::Exception: cannot compile re2")
+
+    with pytest.raises(DatabaseError):
+        await events._run_regex_guarded(False, scan)
+
+
+# ---------------------------------------------------------------------------
 # _get_field_encoder (embedding-assisted field pairing)
 # ---------------------------------------------------------------------------
 

@@ -1,14 +1,37 @@
-import { useState } from "react";
-import { Search, Clock, PlusCircle, MinusCircle, BookmarkCheck, PanelLeftClose, X, Tag, ShieldAlert, FileText, Database } from "lucide-react";
+import { useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { Search, Clock, PlusCircle, MinusCircle, BookmarkCheck, PanelLeftClose, X, Tag, ShieldAlert, FileText, Database, Regex } from "lucide-react";
 import { Input } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { Spinner } from "@/components/ui/Spinner";
 import { TagInput } from "@/components/explorer/TagInput";
 import { TagFacetPanel } from "@/components/explorer/TagFacetPanel";
+import { vizApi } from "@/api/viz";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import { cn } from "@/lib/cn";
 import type { EventFilters, View } from "@/api/types";
 import { datetimeLocalToUtcIso, fmtRelative, isoToDatetimeLocalUtc } from "@/lib/time";
 import { viewPayloadToFilters } from "@/lib/queryParams";
+
+/** Debounced top-N distinct values of `fieldKey`, for value autocomplete.
+ * Deliberately unfiltered (empty EventFilters): suggestions describe the
+ * whole timeline, not the currently narrowed view, and don't refetch on
+ * every filter change. */
+function useFieldValueSuggestions(
+  caseId: string,
+  timelineId: string,
+  fieldKey: string,
+): string[] {
+  const debouncedKey = useDebouncedValue(fieldKey.trim(), 300);
+  const { data } = useQuery({
+    queryKey: ["field-value-suggest", caseId, timelineId, debouncedKey],
+    queryFn: () => vizApi.fieldTerms(caseId, timelineId, debouncedKey, {}, 50),
+    enabled: !!(caseId && timelineId && debouncedKey),
+    staleTime: 60_000,
+  });
+  return useMemo(() => (data?.values ?? []).map((v) => v.value).filter(Boolean), [data]);
+}
 
 interface Props {
   filters: EventFilters;
@@ -21,6 +44,14 @@ interface Props {
   mergedTagSuggestions?: string[];
   /** Distinct artifact values in this timeline, for the Artifact filter. */
   artifactSuggestions?: string[];
+  /** Field names (top-level + attribute keys) across this timeline's sources,
+   * for the Field=Value / Field≠Value key autocomplete. */
+  fieldSuggestions?: string[];
+  /** Whether any source in this timeline has embeddings — gates the Semantic
+   * search mode. */
+  hasVectors?: boolean;
+  caseId: string;
+  timelineId: string;
   /**
    * Submits the search box's free text. The caller decides whether it's an
    * event_id lookup (jump directly) or a keyword/semantic query (narrows the
@@ -41,6 +72,10 @@ export function FilterRail({
   onClose,
   mergedTagSuggestions = [],
   artifactSuggestions = [],
+  fieldSuggestions = [],
+  hasVectors = false,
+  caseId,
+  timelineId,
   onSearchSubmit,
   searchStatus,
   searchPending,
@@ -52,23 +87,58 @@ export function FilterRail({
   const [excludeKey, setExcludeKey] = useState("");
   const [excludeVal, setExcludeVal] = useState("");
 
-  const addFilter = () => {
-    if (!fieldKey.trim() || !fieldVal.trim()) return;
+  const fieldValueSuggestions = useFieldValueSuggestions(caseId, timelineId, fieldKey);
+  const excludeValueSuggestions = useFieldValueSuggestions(caseId, timelineId, excludeKey);
+
+  const semanticMode = filters.qMode === "semantic";
+  const setSearchMode = (mode: "keyword" | "semantic") => {
+    if ((mode === "semantic") === semanticMode) return;
+    const f = { ...filters };
+    if (mode === "semantic") {
+      f.qMode = "semantic";
+      delete f.qRegex; // regex only applies to the server-side keyword search
+    } else {
+      delete f.qMode;
+    }
+    onChange(f);
+  };
+  const toggleRegex = () => {
+    const f = { ...filters };
+    if (f.qRegex) delete f.qRegex;
+    else f.qRegex = true;
+    onChange(f);
+  };
+  // Non-authoritative early hint: JS RegExp and ClickHouse RE2 dialects
+  // differ, so the server-side 400 stays the source of truth.
+  const regexHint = useMemo(() => {
+    if (semanticMode || !filters.qRegex || !searchInput.trim()) return undefined;
+    try {
+      new RegExp(searchInput);
+      return undefined;
+    } catch (e) {
+      return e instanceof Error ? e.message : "invalid regular expression";
+    }
+  }, [semanticMode, filters.qRegex, searchInput]);
+
+  const addFilter = (value?: string) => {
+    const v = (value ?? fieldVal).trim();
+    if (!fieldKey.trim() || !v) return;
     onChange({
       ...filters,
-      filters: { ...(filters.filters ?? {}), [fieldKey.trim()]: fieldVal.trim() },
+      filters: { ...(filters.filters ?? {}), [fieldKey.trim()]: v },
     });
     setFieldKey("");
     setFieldVal("");
   };
 
-  const addExclusion = () => {
-    if (!excludeKey.trim() || !excludeVal.trim()) return;
+  const addExclusion = (value?: string) => {
+    const v = (value ?? excludeVal).trim();
+    if (!excludeKey.trim() || !v) return;
     onChange({
       ...filters,
       exclusions: {
         ...(filters.exclusions ?? {}) as Record<string, string[]>,
-        [excludeKey.trim()]: [...(filters.exclusions?.[excludeKey.trim()] ?? []), excludeVal.trim()],
+        [excludeKey.trim()]: [...(filters.exclusions?.[excludeKey.trim()] ?? []), v],
       },
     });
     setExcludeKey("");
@@ -167,7 +237,13 @@ export function FilterRail({
             }}
           >
             <Input
-              placeholder="keyword, phrase, or event id…"
+              placeholder={
+                semanticMode
+                  ? "describe events to find…"
+                  : filters.qRegex
+                    ? "RE2 pattern — (?i) for case-insensitive"
+                    : "keyword, phrase, or event id…"
+              }
               value={searchInput}
               onChange={(e) => setSearchInput(e.target.value)}
             />
@@ -185,6 +261,65 @@ export function FilterRail({
               </Button>
             )}
           </form>
+          {/* Search-mode control: keyword (default) vs semantic is a deliberate
+              analyst choice — never auto-switched. */}
+          <div className="mt-1.5 flex items-center gap-1">
+            <div className="flex overflow-hidden rounded border border-[var(--color-border-strong)] text-xs">
+              <button
+                type="button"
+                onClick={() => setSearchMode("keyword")}
+                className={cn(
+                  "px-2 py-1 transition-base",
+                  !semanticMode
+                    ? "bg-[var(--color-accent)] text-white"
+                    : "bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)] hover:text-[var(--color-fg-primary)]",
+                )}
+              >
+                Keyword
+              </button>
+              <Tooltip
+                content={
+                  hasVectors
+                    ? "Embedding-based similarity search"
+                    : "No embeddings for this timeline yet"
+                }
+              >
+                <button
+                  type="button"
+                  disabled={!hasVectors}
+                  onClick={() => setSearchMode("semantic")}
+                  className={cn(
+                    "px-2 py-1 transition-base",
+                    semanticMode
+                      ? "bg-[var(--color-accent)] text-white"
+                      : "bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)] hover:text-[var(--color-fg-primary)] disabled:opacity-40 disabled:hover:text-[var(--color-fg-muted)]",
+                  )}
+                >
+                  Semantic
+                </button>
+              </Tooltip>
+            </div>
+            {!semanticMode && (
+              <Tooltip content="Treat search as RE2 regular expression">
+                <button
+                  type="button"
+                  aria-label="Treat search as RE2 regular expression"
+                  onClick={toggleRegex}
+                  className={cn(
+                    "rounded border px-1.5 py-1 transition-base",
+                    filters.qRegex
+                      ? "border-[var(--color-accent)] bg-[var(--color-accent)]/15 text-[var(--color-accent)]"
+                      : "border-[var(--color-border-strong)] bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)] hover:text-[var(--color-fg-primary)]",
+                  )}
+                >
+                  <Regex size={13} />
+                </button>
+              </Tooltip>
+            )}
+          </div>
+          {regexHint && (
+            <div className="mt-1 text-xs text-[var(--color-danger)]">{regexHint}</div>
+          )}
           {(searchPending || searchStatus) && (
             <div className="mt-1 flex items-center gap-1 text-xs text-[var(--color-fg-muted)]">
               {searchPending && <Spinner size={10} />}
@@ -330,20 +465,27 @@ export function FilterRail({
             <PlusCircle size={13} /> Field = Value
           </label>
           <div className="flex gap-1">
-            <Input
+            <TagInput
               placeholder="field"
+              openOnFocus
               value={fieldKey}
-              onChange={(e) => setFieldKey(e.target.value)}
+              onChange={setFieldKey}
+              onSubmit={setFieldKey}
+              onCancel={() => setFieldKey("")}
+              suggestions={fieldSuggestions}
               className="w-24"
             />
-            <Input
+            <TagInput
               placeholder="value"
+              openOnFocus
               value={fieldVal}
-              onChange={(e) => setFieldVal(e.target.value)}
+              onChange={setFieldVal}
+              onSubmit={addFilter}
+              onCancel={() => setFieldVal("")}
+              suggestions={fieldValueSuggestions}
               className="flex-1"
-              onKeyDown={(e) => e.key === "Enter" && addFilter()}
             />
-            <Button size="icon" variant="outline" onClick={addFilter}>
+            <Button size="icon" variant="outline" onClick={() => addFilter()}>
               <PlusCircle size={13} />
             </Button>
           </div>
@@ -355,20 +497,27 @@ export function FilterRail({
             <MinusCircle size={13} /> Field ≠ Value
           </label>
           <div className="flex gap-1">
-            <Input
+            <TagInput
               placeholder="field"
+              openOnFocus
               value={excludeKey}
-              onChange={(e) => setExcludeKey(e.target.value)}
+              onChange={setExcludeKey}
+              onSubmit={setExcludeKey}
+              onCancel={() => setExcludeKey("")}
+              suggestions={fieldSuggestions}
               className="w-24"
             />
-            <Input
+            <TagInput
               placeholder="value"
+              openOnFocus
               value={excludeVal}
-              onChange={(e) => setExcludeVal(e.target.value)}
+              onChange={setExcludeVal}
+              onSubmit={addExclusion}
+              onCancel={() => setExcludeVal("")}
+              suggestions={excludeValueSuggestions}
               className="flex-1"
-              onKeyDown={(e) => e.key === "Enter" && addExclusion()}
             />
-            <Button size="icon" variant="outline" onClick={addExclusion}>
+            <Button size="icon" variant="outline" onClick={() => addExclusion()}>
               <MinusCircle size={13} />
             </Button>
           </div>

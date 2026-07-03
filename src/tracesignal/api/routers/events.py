@@ -5,10 +5,12 @@ from __future__ import annotations
 import csv
 import io
 import json
+import re
 from collections.abc import Generator
 from datetime import datetime
 from typing import Any, Literal
 
+from clickhouse_connect.driver.exceptions import DatabaseError
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
@@ -72,6 +74,42 @@ def _get_field_encoder() -> Any:
 
 
 router = APIRouter(prefix="/api/cases", tags=["events"])
+
+
+def _validate_regex(q: str | None, q_regex: bool) -> None:
+    """Reject an obviously invalid regex search pattern with a 400.
+
+    ``re.compile`` is a cheap pre-check that catches plain syntax errors
+    before a ClickHouse round trip. It is not authoritative — ClickHouse
+    matches with RE2, which rejects some Python-valid constructs (e.g.
+    lookbehind) — so callers running a regex query must also route the scan
+    through :func:`_run_regex_guarded`.
+    """
+    if q_regex and q:
+        try:
+            re.compile(q)
+        except re.error as exc:
+            raise HTTPException(
+                status_code=400, detail=f"invalid regular expression: {exc}"
+            ) from exc
+
+
+async def _run_regex_guarded(q_regex: bool, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+    """Run a blocking query in the threadpool, mapping RE2 failures to 400.
+
+    RE2 rejects some patterns Python's ``re`` accepts, so a pattern can pass
+    :func:`_validate_regex` and still fail to compile inside ClickHouse —
+    without this, that surfaces as a 500 instead of a client error.
+    """
+    try:
+        return await run_in_threadpool(fn, *args, **kwargs)
+    except DatabaseError as exc:
+        message = str(exc)
+        if q_regex and re.search(r"re2|regex", message, re.IGNORECASE):
+            raise HTTPException(
+                status_code=400, detail="invalid regular expression (rejected by RE2)"
+            ) from exc
+        raise
 
 
 def _parse_json_object(value: str | None) -> dict[str, str]:
@@ -342,6 +380,13 @@ async def list_events(
     q: str | None = Query(
         default=None, description="Free-text search, broadened across all fields"
     ),
+    q_regex: bool = Query(
+        default=False,
+        description=(
+            "Treat q as an RE2 regular expression (case-sensitive; "
+            "prefix (?i) for case-insensitive)."
+        ),
+    ),
     artifact: str | None = Query(default=None),
     artifacts: str | None = Query(
         default=None, description="Comma-separated artifact values (OR'd)"
@@ -423,6 +468,7 @@ async def list_events(
     """List events for a timeline with optional filters."""
     if order not in ("asc", "desc"):
         order = "desc"
+    _validate_regex(q, q_regex)
 
     after_cursor = _parse_cursor(after, param_name="after")
     before_cursor = _parse_cursor(before, param_name="before")
@@ -457,12 +503,14 @@ async def list_events(
     # the threadpool so a slow scan doesn't stall the event loop for every
     # other request (the ClickHouse client is built for concurrent threadpool
     # use, see ClickHouseStore's autogenerate_session_id note).
-    page = await run_in_threadpool(
+    page = await _run_regex_guarded(
+        q_regex,
         service.query,
         EventQuery(
             case_id=case_id,
             source_ids=source_ids,
             q=q,
+            q_regex=q_regex,
             artifact=artifact,
             artifacts=_parse_str_list(artifacts),
             source_id=source_id,
@@ -499,6 +547,7 @@ class BulkAnnotateByFilterRequest(BaseModel):
     annotation_type: str = Field(..., description="Annotation type: 'tag', 'comment', or 'normal'.")
     content: str = Field(..., min_length=1, max_length=4096)
     q: str | None = None
+    q_regex: bool = False
     artifact: str | None = None
     artifacts: str | None = None
     source_id: str | None = None
@@ -555,6 +604,7 @@ async def bulk_annotate_by_filter(
             status_code=422,
             detail=f"annotation_type must be one of {sorted(allowed_types)}",
         )
+    _validate_regex(body.q, body.q_regex)
 
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
     event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
@@ -570,12 +620,14 @@ async def bulk_annotate_by_filter(
 
     service = _get_query_service()
     # Blocking ClickHouse scan — threadpool, same as list_events.
-    refs = await run_in_threadpool(
+    refs = await _run_regex_guarded(
+        body.q_regex,
         service.query_event_refs,
         EventQuery(
             case_id=case_id,
             source_ids=source_ids,
             q=body.q,
+            q_regex=body.q_regex,
             artifact=body.artifact,
             artifacts=_parse_str_list(body.artifacts),
             source_id=body.source_id,
@@ -710,6 +762,7 @@ async def get_histogram(
     case_id: str,
     timeline_id: str,
     q: str | None = Query(default=None),
+    q_regex: bool = Query(default=False, description="Treat q as an RE2 regular expression."),
     artifact: str | None = Query(default=None),
     artifacts: str | None = Query(default=None),
     source_id: str | None = Query(default=None),
@@ -739,6 +792,7 @@ async def get_histogram(
     target number of time buckets (10–200, default 60); the actual interval is
     ``max(1, duration / buckets)`` seconds.
     """
+    _validate_regex(q, q_regex)
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
     event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
         case_id,
@@ -752,12 +806,14 @@ async def get_histogram(
     )
     service = _get_query_service()
     # Blocking ClickHouse scan — threadpool, same as list_events.
-    return await run_in_threadpool(
+    return await _run_regex_guarded(
+        q_regex,
         service.histogram,
         EventQuery(
             case_id=case_id,
             source_ids=source_ids,
             q=q,
+            q_regex=q_regex,
             artifact=artifact,
             artifacts=_parse_str_list(artifacts),
             source_id=source_id,
@@ -783,6 +839,7 @@ class ExportFilter(BaseModel):
     """Filter parameters for event export."""
 
     q: str | None = None
+    q_regex: bool = False
     artifact: str | None = None
     artifacts: str | None = None
     source_id: str | None = None
@@ -906,6 +963,10 @@ async def export_events(
     persisted anomaly findings) so the export is a self-contained record —
     tagging a finding is what makes it show up here.
     """
+    # Pre-check only: the scan runs lazily inside the streaming response, so
+    # an RE2-only compile failure can still break the stream mid-flight —
+    # re.compile catches the common syntax errors up front with a clean 400.
+    _validate_regex(body.filter.q, body.filter.q_regex)
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
     event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
         case_id,
@@ -927,6 +988,7 @@ async def export_events(
         case_id=case_id,
         source_ids=source_ids,
         q=body.filter.q,
+        q_regex=body.filter.q_regex,
         artifact=body.filter.artifact,
         artifacts=_parse_str_list(body.filter.artifacts),
         source_id=body.filter.source_id,

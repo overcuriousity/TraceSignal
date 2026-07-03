@@ -418,6 +418,15 @@ export interface HealthResponse {
 /** Filter params for the events query */
 export interface EventFilters {
   q?: string;
+  /**
+   * Search mode for `q`. Absent = keyword (the default). "semantic" runs the
+   * embedding-based search client-side and replaces `q` with result ids —
+   * an explicit analyst choice, never inferred (forensic reproducibility:
+   * a shared URL or saved view must reproduce the exact search semantics).
+   */
+  qMode?: "semantic";
+  /** Treat `q` as an RE2 regex server-side (keyword mode only). */
+  qRegex?: boolean;
   artifact?: string;
   /** Multi-select artifact filter (OR'd); distinct from the single-value `artifact`. */
   artifacts?: string[];
@@ -633,6 +642,7 @@ export interface ExportRequest {
   format: "csv" | "jsonl";
   filter: {
     q?: string;
+    q_regex?: boolean;
     artifact?: string;
     artifacts?: string;
     source_id?: string;

@@ -78,6 +78,10 @@ class EventQuery:
     case_id: str
     source_ids: list[str] | None = None
     q: str | None = None
+    # Interpret `q` as an RE2 regular expression (ClickHouse `match()`)
+    # instead of a literal ILIKE substring. Case-sensitive; analysts prefix
+    # `(?i)` for case-insensitive matching.
+    q_regex: bool = False
     artifact: str | None = None
     artifacts: list[str] | None = None
     source_id: str | None = None
@@ -354,6 +358,32 @@ class _ParameterizedQueryBuilder:
         clauses.append(f"arrayExists(v -> v ILIKE {{{name}:String}}, mapValues(attributes))")
         self.conditions.append("(" + " OR ".join(clauses) + ")")
 
+    def add_broad_text_regex(self, value: str) -> None:
+        """OR-match *value* as an RE2 regex across the same fields as
+        :py:meth:`add_broad_text_search`.
+
+        The pattern is bound raw — no LIKE escaping, no ``%`` wrapping —
+        because the analyst is writing regex syntax deliberately.
+        ``match()`` is case-sensitive (unlike ILIKE); ``(?i)`` opts in to
+        case-insensitivity. Regex matching cannot use the tokenbf_v1 index,
+        so this is a full-scan predicate — an accepted tradeoff for an
+        explicit, analyst-chosen regex search.
+        """
+        name = self._param_name()
+        self.parameters[name] = value
+        columns = [
+            "message",
+            "display_name",
+            "artifact",
+            "artifact_long",
+            "timestamp_desc",
+            "source_file",
+        ]
+        clauses = [f"match({c}, {{{name}:String}})" for c in columns]
+        clauses.append(f"arrayExists(v -> match(v, {{{name}:String}}), tags)")
+        clauses.append(f"arrayExists(v -> match(v, {{{name}:String}}), mapValues(attributes))")
+        self.conditions.append("(" + " OR ".join(clauses) + ")")
+
     def add_cursor(self, op: str, ts: datetime, event_id: str) -> None:
         """Add a keyset predicate ``(timestamp, event_id) {op} (ts, event_id)``.
 
@@ -435,11 +465,14 @@ class EventQueryService:
             builder.add_param("source_id = :name", query.source_id)
 
         if query.q:
-            # ClickHouse tokenbf_v1 index supports hasToken and multiSearchAny.
-            # We use ILIKE for substring search as a simple baseline, broadened
-            # across every field (not just message) so the analyst's free-text
-            # search box behaves like a real "search everything" field.
-            builder.add_broad_text_search(query.q)
+            if query.q_regex:
+                builder.add_broad_text_regex(query.q)
+            else:
+                # ClickHouse tokenbf_v1 index supports hasToken and multiSearchAny.
+                # We use ILIKE for substring search as a simple baseline, broadened
+                # across every field (not just message) so the analyst's free-text
+                # search box behaves like a real "search everything" field.
+                builder.add_broad_text_search(query.q)
 
         # `artifact` (singular) and `artifacts` (plural) are two independent
         # optional filters on the same column. Applying both as separate ANDed

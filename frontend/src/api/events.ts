@@ -58,7 +58,7 @@ export const eventsApi = {
     filters: EventFilters = {},
     buckets = 60,
   ): Promise<HistogramResponse> => {
-    const params: Record<string, string | number | undefined | null> = {
+    const params: Record<string, string | number | boolean | undefined | null> = {
       ...serializeEventFilterParams(filters),
       buckets,
     };

@@ -127,6 +127,33 @@ def test_text_search_uses_parameterized_like(service: EventQueryService) -> None
     assert params.get("p1") == "%login%"
 
 
+def test_regex_search_uses_match_not_ilike(service: EventQueryService) -> None:
+    service.query(EventQuery(case_id="case-1", q="^Login (failed|succeeded)$", q_regex=True))
+    query, params = _last_query(service)
+    assert "match(message, {p1:String})" in query
+    assert "arrayExists(v -> match(v, {p1:String}), tags)" in query
+    assert "arrayExists(v -> match(v, {p1:String}), mapValues(attributes))" in query
+    assert "ILIKE" not in query
+    # Pattern is bound raw: no % wrapping, no LIKE-metacharacter escaping.
+    assert params.get("p1") == "^Login (failed|succeeded)$"
+
+
+def test_regex_search_does_not_like_escape_pattern(service: EventQueryService) -> None:
+    """Regex metacharacters that overlap LIKE syntax (% _ \\) must reach
+    ClickHouse untouched — LIKE-escaping them would corrupt the pattern."""
+    service.query(EventQuery(case_id="case-1", q=r"\d+%_", q_regex=True))
+    _, params = _last_query(service)
+    assert params.get("p1") == r"\d+%_"
+
+
+def test_keyword_search_unaffected_by_regex_flag_default(service: EventQueryService) -> None:
+    service.query(EventQuery(case_id="case-1", q="100%_done"))
+    query, params = _last_query(service)
+    assert "message ILIKE {p1:String}" in query
+    assert "match(" not in query
+    assert params.get("p1") == "%100\\%\\_done%"
+
+
 def test_artifact_and_tag_filters_are_parameterized(
     service: EventQueryService,
 ) -> None:

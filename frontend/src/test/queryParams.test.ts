@@ -62,6 +62,20 @@ describe("filtersToParams / paramsToFilters round-trip", () => {
     expect(p.has("artifact")).toBe(false);
     expect(p.has("tag")).toBe(false);
     expect(p.has("filters")).toBe(false);
+    expect(p.has("qMode")).toBe(false);
+    expect(p.has("qRegex")).toBe(false);
+  });
+
+  it("round-trips search mode and regex flag", () => {
+    const f: EventFilters = { q: "^Login fail", qMode: "semantic", qRegex: true };
+    const out = paramsToFilters(filtersToParams(f));
+    expect(out.qMode).toBe("semantic");
+    expect(out.qRegex).toBe(true);
+  });
+
+  it("ignores unknown qMode values from the URL", () => {
+    const p = new URLSearchParams({ q: "x", qMode: "bogus" });
+    expect(paramsToFilters(p).qMode).toBeUndefined();
   });
 });
 
@@ -83,11 +97,37 @@ describe("filtersToViewPayload / viewPayloadToFilters round-trip", () => {
     const out = viewPayloadToFilters({});
     expect(out).toEqual({});
   });
+
+  it("round-trips qMode/qRegex so a saved view reproduces search semantics", () => {
+    const f: EventFilters = { q: "lateral movement", qMode: "semantic" };
+    expect(viewPayloadToFilters(filtersToViewPayload(f)).qMode).toBe("semantic");
+    const g: EventFilters = { q: "^4624$", qRegex: true };
+    const out = viewPayloadToFilters(filtersToViewPayload(g));
+    expect(out.qRegex).toBe(true);
+    expect(out.qMode).toBeUndefined();
+  });
+
+  it("treats legacy payloads without qMode/qRegex as keyword, non-regex", () => {
+    const out = viewPayloadToFilters({ q: "old view" });
+    expect(out.qMode).toBeUndefined();
+    expect(out.qRegex).toBeUndefined();
+  });
 });
 
 describe("serializeEventFilterFields (C17 — shared by list/histogram/bulk-annotate/export)", () => {
   it("returns an empty object for no filters", () => {
     expect(serializeEventFilterFields({})).toEqual({});
+  });
+
+  it("emits q_regex only for a regex keyword search", () => {
+    expect(serializeEventFilterFields({ q: "^x", qRegex: true }).q_regex).toBe(true);
+    // No query text — nothing for the flag to apply to.
+    expect(serializeEventFilterFields({ qRegex: true }).q_regex).toBeUndefined();
+    // Semantic mode replaces q with ids client-side; regex is meaningless.
+    expect(
+      serializeEventFilterFields({ q: "^x", qRegex: true, qMode: "semantic" }).q_regex,
+    ).toBeUndefined();
+    expect(serializeEventFilterFields({ q: "plain" }).q_regex).toBeUndefined();
   });
 
   it("joins array fields with commas and maps to snake_case API names", () => {
