@@ -277,6 +277,9 @@ async def _run_ingestion_job(
             source_id=source_id,
             event_count=result.events_inserted,
         )
+        # Only now does the source become visible to timeline queries,
+        # detectors, and embedding (see events._resolve_timeline_scope).
+        await store.set_source_status(case_id, source_id, "ready")
         await store.record_audit(
             action="source.upload",
             actor=user,
@@ -408,6 +411,9 @@ async def upload_source(
                 parser=fmt,
                 event_count=0,
                 created_by=user.id,
+                # Excluded from timeline queries/detectors/embedding until
+                # the background job flips it to "ready".
+                status="ingesting",
             )
             source_created = True
         except IntegrityError:
@@ -545,10 +551,21 @@ async def get_timeline(timeline_id: str, case: Case = Depends(require_case_read)
 async def _check_field_mappings(
     case_id: str, source_ids: list[str], mappings: dict[str, list[str]]
 ) -> None:
-    """Validate mappings against the sources' actual attribute keys; 422 on problems."""
-    service = EventQueryService()
-    inventory = await run_in_threadpool(service.list_fields, case_id, source_ids)
-    problems = validate_field_mappings(mappings, set(inventory["attributes"]))
+    """Validate mappings against the sources' actual attribute keys; 422 on problems.
+
+    ``source_ids`` should contain only *ready* sources — a half-ingested
+    source's attribute inventory is incomplete and would reject mappings that
+    are valid once ingestion finishes. With zero ready sources the structural
+    rules still apply but the inventory-dependent checks are skipped (see
+    ``validate_field_mappings``).
+    """
+    if source_ids:
+        service = EventQueryService()
+        inventory = await run_in_threadpool(service.list_fields, case_id, source_ids)
+        keys: set[str] | None = set(inventory["attributes"])
+    else:
+        keys = None
+    problems = validate_field_mappings(mappings, keys)
     if problems:
         raise HTTPException(status_code=422, detail="; ".join(problems))
 
@@ -567,7 +584,13 @@ async def create_timeline(
     """
     store = get_store()
     if payload.field_mappings:
-        await _check_field_mappings(case.id, payload.source_ids, payload.field_mappings)
+        # Ingesting sources can still be timeline *members* — they're only
+        # excluded from the inventory validation (and from queries) until
+        # ready.
+        sources = await store.list_sources(case.id)
+        ready_ids = {s.id for s in sources if s.status == "ready"}
+        validate_ids = [sid for sid in payload.source_ids if sid in ready_ids]
+        await _check_field_mappings(case.id, validate_ids, payload.field_mappings)
     timeline_id = generate_id(payload.name)
     timeline = await store.create_timeline(
         case_id=case.id,
@@ -608,7 +631,8 @@ async def update_timeline_field_mappings(
     sources = await store.list_timeline_sources(case.id, timeline_id)
     new_mappings = payload.field_mappings or None
     if new_mappings:
-        await _check_field_mappings(case.id, [s.id for s in sources], new_mappings)
+        ready_ids = [s.id for s in sources if s.status == "ready"]
+        await _check_field_mappings(case.id, ready_ids, new_mappings)
     previous = timeline.field_mappings
     updated = await store.update_timeline_field_mappings(case.id, timeline_id, new_mappings)
     if updated is None:
@@ -1047,6 +1071,20 @@ async def start_timeline_embedding(
         raise HTTPException(
             status_code=422,
             detail="Timeline has no sources — add at least one source before embedding.",
+        )
+    ingesting = [s.name for s in sources if s.status != "ready"]
+    if ingesting:
+        # Embedding a half-ingested source would persist vectors over an
+        # incomplete event set — refuse outright rather than silently
+        # embedding a partial timeline (the run is expensive and its
+        # source-set snapshot would immediately go stale anyway).
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Source(s) still ingesting: "
+                + ", ".join(ingesting)
+                + ". Wait for ingestion to finish before embedding."
+            ),
         )
     source_ids = [s.id for s in sources]
 

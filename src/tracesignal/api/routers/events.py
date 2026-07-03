@@ -144,19 +144,26 @@ def _parse_exclusions_object(value: str | None) -> dict[str, list[str]]:
 async def _resolve_timeline_scope(
     case_id: str, timeline_id: str
 ) -> tuple[list[str], dict[str, list[str]] | None]:
-    """Return a timeline's source IDs plus its field mappings (issue #10).
+    """Return a timeline's *ready* source IDs plus its field mappings (issue #10).
 
     Every endpoint whose parameters carry field tokens (filters, group-bys,
     detector fields, exports) must resolve through this so canonical mapped
     fields work uniformly; endpoints that never see a field token can keep
     using :func:`_resolve_timeline_source_ids`.
+
+    Sources still being ingested (``status != "ready"``) are excluded here —
+    this is the single choke point that keeps half-ingested files out of the
+    explorer, histogram, export, detectors, and the field/embedding wizards,
+    where partial data would silently produce wrong counts and wrong
+    statistical baselines. The sources API still lists them (with their
+    status) so the UI can show ingest progress.
     """
     store = get_store()
     timeline = await store.get_timeline(case_id, timeline_id)
     if timeline is None:
         raise HTTPException(status_code=404, detail="Timeline not found")
     sources = await store.list_timeline_sources(case_id, timeline_id)
-    return [s.id for s in sources], timeline.field_mappings or None
+    return [s.id for s in sources if s.status == "ready"], timeline.field_mappings or None
 
 
 async def _resolve_timeline_source_ids(case_id: str, timeline_id: str) -> list[str]:
@@ -1048,7 +1055,9 @@ async def _resolve_similarity_source_ids(case_id: str, timeline_id: str | None) 
         return await _resolve_timeline_source_ids(case_id, timeline_id)
     store = get_store()
     sources = await store.list_sources(case_id)
-    return [s.id for s in sources]
+    # Same readiness rule as _resolve_timeline_scope: never search
+    # half-ingested sources.
+    return [s.id for s in sources if s.status == "ready"]
 
 
 @router.get("/{case_id}/events/{event_id}/similar")
