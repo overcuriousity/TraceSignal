@@ -932,10 +932,9 @@ def _viz_service(responses: list[tuple[str, FakeQueryResult]]) -> EventQueryServ
 def test_field_terms_returns_top_values_and_other_count() -> None:
     svc = _viz_service(
         [
-            ("uniqExact(", FakeQueryResult(result_rows=[[100, 5]])),
             (
                 "GROUP BY val",
-                FakeQueryResult(result_rows=[["GET", 60], ["POST", 30]]),
+                FakeQueryResult(result_rows=[["GET", 60, 100, 5], ["POST", 30, 100, 5]]),
             ),
         ]
     )
@@ -952,8 +951,7 @@ def test_field_terms_on_timestamp_column_casts_to_string() -> None:
     raises a type error on `col != ''`."""
     svc = _viz_service(
         [
-            ("uniqExact(", FakeQueryResult(result_rows=[[10, 10]])),
-            ("GROUP BY val", FakeQueryResult(result_rows=[["2024-01-01 00:00:00.000", 1]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["2024-01-01 00:00:00.000", 1, 10, 10]])),
         ]
     )
     result = svc.field_terms(EventQuery(case_id="c1", source_ids=["s1"]), "timestamp")
@@ -963,8 +961,8 @@ def test_field_terms_on_timestamp_column_casts_to_string() -> None:
     assert not any("AND timestamp != ''" in q for q in queries)
 
 
-def test_field_terms_empty_dataset_skips_terms_query() -> None:
-    svc = _viz_service([("uniqExact(", FakeQueryResult(result_rows=[[0, 0]]))])
+def test_field_terms_empty_dataset_returns_zero_totals() -> None:
+    svc = _viz_service([("GROUP BY val", FakeQueryResult(result_rows=[]))])
     result = svc.field_terms(EventQuery(case_id="c1", source_ids=["s1"]), "artifact")
     assert result == {
         "field": "artifact",
@@ -973,28 +971,26 @@ def test_field_terms_empty_dataset_skips_terms_query() -> None:
         "values": [],
         "other_count": 0,
     }
-    # No GROUP BY terms query should have been attempted since total is 0.
-    assert not any("GROUP BY val" in q for q, _ in svc.store.client.queries)  # type: ignore[union-attr]
+    # Fused single-scan design: an empty dataset still costs exactly one query.
+    assert len(svc.store.client.queries) == 1  # type: ignore[union-attr]
 
 
 def test_field_terms_top_level_column_uses_bare_column() -> None:
     svc = _viz_service(
         [
-            ("uniqExact(", FakeQueryResult(result_rows=[[1, 1]])),
-            ("GROUP BY val", FakeQueryResult(result_rows=[["auth", 1]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["auth", 1, 1, 1]])),
         ]
     )
     svc.field_terms(EventQuery(case_id="c1", source_ids=["s1"]), "artifact")
     query, _ = svc.store.client.queries[0]  # type: ignore[union-attr]
-    assert "uniqExact(artifact)" in query
+    assert "artifact AS val" in query
     assert "attributes[" not in query
 
 
 def test_field_terms_attribute_field_uses_map_lookup() -> None:
     svc = _viz_service(
         [
-            ("uniqExact(", FakeQueryResult(result_rows=[[1, 1]])),
-            ("GROUP BY val", FakeQueryResult(result_rows=[["200", 1]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["200", 1, 1, 1]])),
         ]
     )
     svc.field_terms(EventQuery(case_id="c1", source_ids=["s1"]), "attr:status_code")
@@ -1008,8 +1004,7 @@ def test_field_terms_honors_field_filters() -> None:
     """field_terms must reuse _build_where so it respects the same filters as the grid."""
     svc = _viz_service(
         [
-            ("uniqExact(", FakeQueryResult(result_rows=[[1, 1]])),
-            ("GROUP BY val", FakeQueryResult(result_rows=[["ok", 1]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["ok", 1, 1, 1]])),
         ]
     )
     svc.field_terms(
@@ -1103,8 +1098,7 @@ def test_field_value_timeseries_pivots_series_with_zero_fill() -> None:
     svc = _viz_service(
         [
             ("min(timestamp)", FakeQueryResult(result_rows=[[min_ts, max_ts]])),
-            ("uniqExact(", FakeQueryResult(result_rows=[[3, 2]])),
-            ("GROUP BY val", FakeQueryResult(result_rows=[["a", 2], ["b", 1]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["a", 2, 3, 2], ["b", 1, 3, 2]])),
             (
                 "toStartOfInterval",
                 FakeQueryResult(
@@ -1139,8 +1133,7 @@ def test_field_value_timeseries_zero_fills_buckets_with_no_top_value_events() ->
     svc = _viz_service(
         [
             ("min(timestamp)", FakeQueryResult(result_rows=[[min_ts, max_ts]])),
-            ("uniqExact(", FakeQueryResult(result_rows=[[2, 1]])),
-            ("GROUP BY val", FakeQueryResult(result_rows=[["a", 2]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["a", 2, 2, 1]])),
             (
                 "toStartOfInterval",
                 # Only bucket1 and bucket4 have rows — bucket2 (06:00) and
@@ -1176,7 +1169,7 @@ def test_field_value_timeseries_no_values_returns_empty_series_without_bucket_qu
     svc = _viz_service(
         [
             ("min(timestamp)", FakeQueryResult(result_rows=[[min_ts, max_ts]])),
-            ("uniqExact(", FakeQueryResult(result_rows=[[0, 0]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[])),
         ]
     )
     result = svc.field_value_timeseries(
