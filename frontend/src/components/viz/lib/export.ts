@@ -14,6 +14,8 @@
  * inlined to its live computed value before serialization.
  */
 
+import { triggerDownload } from "@/lib/download";
+
 const SVG_NS = "http://www.w3.org/2000/svg";
 
 function resolveElementSize(svg: SVGSVGElement): { width: number; height: number } {
@@ -95,17 +97,6 @@ function inlineCssVars(svgString: string): string {
 function serialize(svg: SVGSVGElement): string {
   const raw = new XMLSerializer().serializeToString(svg);
   return inlineCssVars(raw);
-}
-
-function triggerDownload(blob: Blob, filename: string): void {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
 }
 
 function withExt(filename: string, ext: string): string {

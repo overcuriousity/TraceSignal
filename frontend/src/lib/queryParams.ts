@@ -68,6 +68,28 @@ export function serializeEventFilterFields(
   return out;
 }
 
+/**
+ * Query-param transport shape of `EventFilters`: the shared scalar fields
+ * plus the object-shaped `filters`/`exclusions` maps JSON-stringified, as
+ * every GET-style request (events list, histogram, the viz aggregations)
+ * sends them. Callers with a structured JSON body (export) keep using
+ * `serializeEventFilterFields` and attach the maps as raw objects.
+ */
+export function serializeEventFilterParams(
+  filters: EventFilters,
+): SerializedEventFilterFields & { filters?: string; exclusions?: string } {
+  const out: SerializedEventFilterFields & { filters?: string; exclusions?: string } = {
+    ...serializeEventFilterFields(filters),
+  };
+  if (filters.filters && Object.keys(filters.filters).length > 0) {
+    out.filters = JSON.stringify(filters.filters);
+  }
+  if (filters.exclusions && Object.keys(filters.exclusions).length > 0) {
+    out.exclusions = JSON.stringify(filters.exclusions);
+  }
+  return out;
+}
+
 export function filtersToParams(filters: EventFilters): URLSearchParams {
   const p = new URLSearchParams();
   if (filters.q) p.set("q", filters.q);

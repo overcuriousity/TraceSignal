@@ -1,5 +1,5 @@
 import { get } from "./client";
-import { serializeEventFilterFields } from "@/lib/queryParams";
+import { serializeEventFilterParams } from "@/lib/queryParams";
 import type {
   EventFilters,
   FieldNumericResponse,
@@ -21,23 +21,12 @@ export const vizApi = {
     field: string,
     filters: EventFilters = {},
     limit = 50,
-  ): Promise<FieldTermsResponse> => {
-    const params: Record<string, string | number | undefined | null> = {
-      ...serializeEventFilterFields(filters),
+  ): Promise<FieldTermsResponse> =>
+    get<FieldTermsResponse>(`/cases/${caseId}/timelines/${timelineId}/viz/field-terms`, {
+      ...serializeEventFilterParams(filters),
       field,
       limit,
-    };
-    if (filters.filters && Object.keys(filters.filters).length > 0) {
-      params.filters = JSON.stringify(filters.filters);
-    }
-    if (filters.exclusions && Object.keys(filters.exclusions).length > 0) {
-      params.exclusions = JSON.stringify(filters.exclusions);
-    }
-    return get<FieldTermsResponse>(
-      `/cases/${caseId}/timelines/${timelineId}/viz/field-terms`,
-      params,
-    );
-  },
+    }),
 
   /** Summary statistics + fixed-width histogram for a numeric field. */
   fieldNumeric: (
@@ -46,23 +35,12 @@ export const vizApi = {
     field: string,
     filters: EventFilters = {},
     bins = 30,
-  ): Promise<FieldNumericResponse> => {
-    const params: Record<string, string | number | undefined | null> = {
-      ...serializeEventFilterFields(filters),
+  ): Promise<FieldNumericResponse> =>
+    get<FieldNumericResponse>(`/cases/${caseId}/timelines/${timelineId}/viz/field-numeric`, {
+      ...serializeEventFilterParams(filters),
       field,
       bins,
-    };
-    if (filters.filters && Object.keys(filters.filters).length > 0) {
-      params.filters = JSON.stringify(filters.filters);
-    }
-    if (filters.exclusions && Object.keys(filters.exclusions).length > 0) {
-      params.exclusions = JSON.stringify(filters.exclusions);
-    }
-    return get<FieldNumericResponse>(
-      `/cases/${caseId}/timelines/${timelineId}/viz/field-numeric`,
-      params,
-    );
-  },
+    }),
 
   /** Per-value event counts bucketed over time (top values only). */
   fieldTimeseries: (
@@ -72,22 +50,11 @@ export const vizApi = {
     filters: EventFilters = {},
     buckets = 60,
     seriesLimit = 12,
-  ): Promise<FieldTimeseriesResponse> => {
-    const params: Record<string, string | number | undefined | null> = {
-      ...serializeEventFilterFields(filters),
+  ): Promise<FieldTimeseriesResponse> =>
+    get<FieldTimeseriesResponse>(`/cases/${caseId}/timelines/${timelineId}/viz/field-timeseries`, {
+      ...serializeEventFilterParams(filters),
       field,
       buckets,
       series_limit: seriesLimit,
-    };
-    if (filters.filters && Object.keys(filters.filters).length > 0) {
-      params.filters = JSON.stringify(filters.filters);
-    }
-    if (filters.exclusions && Object.keys(filters.exclusions).length > 0) {
-      params.exclusions = JSON.stringify(filters.exclusions);
-    }
-    return get<FieldTimeseriesResponse>(
-      `/cases/${caseId}/timelines/${timelineId}/viz/field-timeseries`,
-      params,
-    );
-  },
+    }),
 };

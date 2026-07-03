@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import { scaleLinear, scaleTime } from "d3-scale";
 import { max as d3max } from "d3-array";
-import { timeFormat } from "d3-time-format";
+import { utcFormat } from "d3-time-format";
 import { format as formatNum } from "d3-format";
 import { AxisBottom, AxisLeft } from "@/components/viz/primitives/Axis";
 import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
@@ -9,8 +9,10 @@ import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
 import type { HistogramBucket } from "@/api/types";
 
 const fmtCount = formatNum(",d");
-const fmtTick = timeFormat("%b %d %H:%M");
-const fmtFull = timeFormat("%Y-%m-%d %H:%M:%S UTC");
+// utcFormat, not timeFormat — bucket starts are UTC instants and the tooltip
+// says "UTC"; timeFormat would silently render them in the browser's zone.
+const fmtTick = utcFormat("%b %d %H:%M");
+const fmtFull = utcFormat("%Y-%m-%d %H:%M:%S UTC");
 
 interface TimeHistogramProps {
   buckets: HistogramBucket[];

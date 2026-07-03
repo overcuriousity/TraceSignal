@@ -55,37 +55,55 @@ export function AxisBottom({
   );
 }
 
-/** Bottom axis for a band (categorical) scale — labels rotated when dense. */
+/** Minimum horizontal pixels between labelled bands. Rotated labels project
+ * mostly vertically, so they tolerate much tighter horizontal packing than
+ * upright ones. */
+const MIN_BAND_LABEL_SPACING_ROTATED = 20;
+const MIN_BAND_LABEL_SPACING_UPRIGHT = 70;
+
+/** Bottom axis for a band (categorical) scale — labels rotated when dense.
+ * When bands are narrower than a label needs, only every Nth band is
+ * labelled (every band keeps its tick mark) instead of overlapping.
+ * `maxLabelChars` caps label length before ellipsis; charts whose labels are
+ * uniform-width strings (e.g. Heatmap timestamps) should raise it, since a
+ * shared prefix + ellipsis makes every label identical and useless. */
 export function AxisBottomBand({
   scale,
   innerHeight,
   rotate = false,
   labelFormat,
+  maxLabelChars = 14,
 }: {
   scale: ScaleBand<string>;
   innerHeight: number;
   rotate?: boolean;
   labelFormat?: (value: string) => string;
+  maxLabelChars?: number;
 }) {
   const domain = scale.domain();
+  const minSpacing = rotate ? MIN_BAND_LABEL_SPACING_ROTATED : MIN_BAND_LABEL_SPACING_UPRIGHT;
+  const labelStep = Math.max(1, Math.ceil(minSpacing / Math.max(scale.step(), 1)));
   return (
     <g transform={`translate(0,${innerHeight})`}>
       <line x1={0} x2={scale.range()[1]} stroke="var(--viz-axis)" strokeWidth={1} />
-      {domain.map((v) => {
+      {domain.map((v, i) => {
         const x = (scale(v) ?? 0) + scale.bandwidth() / 2;
         const label = labelFormat ? labelFormat(v) : v;
+        const showLabel = i % labelStep === 0;
         return (
           <g key={v} transform={`translate(${x},0)`}>
             <line y1={0} y2={TICK_LEN} stroke="var(--viz-axis)" strokeWidth={1} />
-            <text
-              y={TICK_LEN + (rotate ? 10 : 12)}
-              textAnchor={rotate ? "end" : "middle"}
-              fontSize={10}
-              fill="var(--viz-ink-muted)"
-              transform={rotate ? `translate(0,${TICK_LEN + 4}) rotate(-40)` : undefined}
-            >
-              {label.length > 14 ? label.slice(0, 13) + "…" : label}
-            </text>
+            {showLabel && (
+              <text
+                y={TICK_LEN + (rotate ? 10 : 12)}
+                textAnchor={rotate ? "end" : "middle"}
+                fontSize={10}
+                fill="var(--viz-ink-muted)"
+                transform={rotate ? `translate(0,${TICK_LEN + 4}) rotate(-40)` : undefined}
+              >
+                {label.length > maxLabelChars ? label.slice(0, maxLabelChars - 1) + "…" : label}
+              </text>
+            )}
           </g>
         );
       })}

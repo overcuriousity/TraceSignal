@@ -2,7 +2,7 @@ import { useRef, useState } from "react";
 import { scaleLinear, scaleTime } from "d3-scale";
 import { line as d3line, curveMonotoneX } from "d3-shape";
 import { max as d3max, bisector } from "d3-array";
-import { timeFormat } from "d3-time-format";
+import { utcFormat } from "d3-time-format";
 import { format as formatNum } from "d3-format";
 import { AxisBottom, AxisLeft } from "@/components/viz/primitives/Axis";
 import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
@@ -12,8 +12,10 @@ import { buildSeriesColorMap } from "@/components/viz/lib/colors";
 import type { FieldTimeseriesResponse } from "@/api/types";
 
 const fmtCount = formatNum(",d");
-const fmtTick = timeFormat("%b %d %H:%M");
-const fmtFull = timeFormat("%Y-%m-%d %H:%M:%S UTC");
+// utcFormat, not timeFormat — bucket starts are UTC instants and the tooltip
+// says "UTC"; timeFormat would silently render them in the browser's zone.
+const fmtTick = utcFormat("%b %d %H:%M");
+const fmtFull = utcFormat("%Y-%m-%d %H:%M:%S UTC");
 const bisectDate = bisector((d: Date) => d).left;
 
 interface LineChartProps {

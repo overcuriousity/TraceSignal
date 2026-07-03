@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 import { scaleBand } from "d3-scale";
-import { timeFormat } from "d3-time-format";
+import { utcFormat } from "d3-time-format";
 import { format as formatNum } from "d3-format";
 import { AxisBottomBand } from "@/components/viz/primitives/Axis";
 import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
@@ -9,8 +9,29 @@ import { sequentialColor } from "@/components/viz/lib/colors";
 import type { FieldTimeseriesResponse } from "@/api/types";
 
 const fmtCount = formatNum(",d");
-const fmtFull = timeFormat("%Y-%m-%d %H:%M UTC");
+// utcFormat, not timeFormat — bucket starts are UTC instants and the label
+// says "UTC"; timeFormat would silently render them in the browser's zone.
+const fmtFull = utcFormat("%Y-%m-%d %H:%M UTC");
+const fmtTickTime = utcFormat("%H:%M");
+const fmtTickDay = utcFormat("%m-%d %H:%M");
+const fmtTickYear = utcFormat("%y-%m-%d %H:%M");
 const ROW_HEIGHT = 24;
+
+/** Pick the shortest tick format that still disambiguates the bucket range:
+ * time-only within one UTC day, month-day within one year, full date
+ * otherwise. Keeps axis labels short enough to read instead of truncating
+ * full timestamps to an identical shared prefix. */
+function tickFormatter(starts: string[]): (v: string) => string {
+  const first = new Date(starts[0]);
+  const last = new Date(starts[starts.length - 1]);
+  const sameDay =
+    first.getUTCFullYear() === last.getUTCFullYear() &&
+    first.getUTCMonth() === last.getUTCMonth() &&
+    first.getUTCDate() === last.getUTCDate();
+  const sameYear = first.getUTCFullYear() === last.getUTCFullYear();
+  const fmt = sameDay ? fmtTickTime : sameYear ? fmtTickDay : fmtTickYear;
+  return (v) => fmt(new Date(v));
+}
 
 interface HeatmapProps {
   data: FieldTimeseriesResponse;
@@ -53,7 +74,9 @@ export function Heatmap({ data, svgRef, height }: HeatmapProps) {
       <ChartFrame
         height={resolvedHeight}
         svgRef={ref}
-        margin={{ top: 8, right: 8, bottom: 44, left: labelCol }}
+        // Bottom margin fits the longest rotated tick label ("%y-%m-%d %H:%M",
+        // ~84px long at -40° ≈ 54px of vertical extent + offsets) unclipped.
+        margin={{ top: 8, right: 8, bottom: 72, left: labelCol }}
       >
         {({ innerWidth, innerHeight, margin }) => {
           const xBand = scaleBand().domain(bucketStarts).range([0, innerWidth]).padding(0.04);
@@ -68,7 +91,8 @@ export function Heatmap({ data, svgRef, height }: HeatmapProps) {
                 scale={xBand}
                 innerHeight={innerHeight}
                 rotate
-                labelFormat={(v) => fmtFull(new Date(v))}
+                labelFormat={tickFormatter(bucketStarts)}
+                maxLabelChars={17}
               />
               {data.series.map((s) => {
                 const ry = yBand(s.value) ?? 0;

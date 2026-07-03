@@ -86,7 +86,9 @@ export function VisualizePage() {
   const [chartType, setChartType] = useState<ChartType>("bar");
   const [topN, setTopN] = useState(10);
   const [bins, setBins] = useState(30);
-  const lastAutoField = useRef<string | null>(null);
+  // Last field the numeric probe auto-suggested a scale for — state (not a
+  // ref) because it also gates whether the probe query needs to run at all.
+  const [autoProbedField, setAutoProbedField] = useState<string | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
 
   const timelineQuery = useQuery({
@@ -109,28 +111,29 @@ export function VisualizePage() {
     }
   }, [field, fieldsQuery.data]);
 
-  // Always probe numeric-ness for the selected field — cheap (one query,
-  // server-side quantiles+bins) and needed both to auto-suggest a scale on
-  // field change and, if the analyst picks a ratio/interval chart, as its
-  // data source.
+  const dataKind = CHART_META[chartType].dataKind;
+
+  // Probe numeric-ness only when actually needed: once per field change (to
+  // auto-suggest a scale) and while a numeric chart type is displayed (as its
+  // data source) — not on every bins change while looking at a terms chart.
   const numericQuery = useQuery({
     queryKey: ["viz-field-numeric", caseId, timelineId, field, filters, bins],
     queryFn: () => vizApi.fieldNumeric(caseId!, timelineId!, field!, filters, bins),
-    enabled: !!(caseId && timelineId && field),
+    enabled:
+      !!(caseId && timelineId && field) && (dataKind === "numeric" || field !== autoProbedField),
   });
 
   // Auto-suggest a scale once per field change; the analyst can still
   // override it manually afterward without being reset until the field
   // changes again.
   useEffect(() => {
-    if (!field || field === lastAutoField.current) return;
+    if (!field || field === autoProbedField) return;
     if (numericQuery.data == null) return;
-    lastAutoField.current = field;
+    setAutoProbedField(field);
     const isNumeric = numericQuery.data.count > 0;
-    const suggested: Scale = isNumeric ? "ratio" : "nominal";
-    setScale(suggested);
-    setChartType(CHART_META[isNumeric ? "histogram" : "bar"].scales.includes(suggested) ? (isNumeric ? "histogram" : "bar") : "bar");
-  }, [field, numericQuery.data]);
+    setScale(isNumeric ? "ratio" : "nominal");
+    setChartType(isNumeric ? "histogram" : "bar");
+  }, [field, autoProbedField, numericQuery.data]);
 
   // Keep chartType valid whenever scale changes.
   useEffect(() => {
@@ -143,17 +146,21 @@ export function VisualizePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scale]);
 
-  const dataKind = CHART_META[chartType].dataKind;
+  // The slider's valid range differs by data kind (terms charts allow up to
+  // 50 values, timeseries up to 20 series); clamp the shared state on
+  // chart-type switch so the request always matches what the slider shows.
+  const maxTopN = dataKind === "timeseries" ? 20 : 50;
+  const effectiveTopN = Math.min(topN, maxTopN);
 
   const termsQuery = useQuery({
-    queryKey: ["viz-field-terms", caseId, timelineId, field, filters, topN],
-    queryFn: () => vizApi.fieldTerms(caseId!, timelineId!, field!, filters, topN),
+    queryKey: ["viz-field-terms", caseId, timelineId, field, filters, effectiveTopN],
+    queryFn: () => vizApi.fieldTerms(caseId!, timelineId!, field!, filters, effectiveTopN),
     enabled: !!(caseId && timelineId && field) && dataKind === "terms",
   });
 
   const timeseriesQuery = useQuery({
-    queryKey: ["viz-field-timeseries", caseId, timelineId, field, filters, topN],
-    queryFn: () => vizApi.fieldTimeseries(caseId!, timelineId!, field!, filters, 60, topN),
+    queryKey: ["viz-field-timeseries", caseId, timelineId, field, filters, effectiveTopN],
+    queryFn: () => vizApi.fieldTimeseries(caseId!, timelineId!, field!, filters, 60, effectiveTopN),
     enabled: !!(caseId && timelineId && field) && dataKind === "timeseries",
   });
 
@@ -281,14 +288,14 @@ export function VisualizePage() {
         {(dataKind === "terms" || dataKind === "timeseries") && (
           <div>
             <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-              Top values: {topN}
+              Top values: {effectiveTopN}
             </label>
             <input
               type="range"
               min={3}
-              max={dataKind === "timeseries" ? 20 : 50}
+              max={maxTopN}
               step={1}
-              value={topN}
+              value={effectiveTopN}
               onChange={(e) => setTopN(Number(e.target.value))}
               className="w-full accent-[var(--color-accent)]"
             />
