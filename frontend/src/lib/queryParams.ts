@@ -9,6 +9,7 @@ import type { EventFilters } from "@/api/types";
  * bodies that mirror the same param names (bulk-annotate, export). */
 export interface SerializedEventFilterFields {
   q?: string;
+  q_regex?: boolean;
   artifact?: string;
   artifacts?: string;
   source_id?: string;
@@ -42,6 +43,9 @@ export function serializeEventFilterFields(
 ): SerializedEventFilterFields {
   const out: SerializedEventFilterFields = {};
   if (filters.q) out.q = filters.q;
+  // q_regex only applies to the server-side keyword search — in semantic
+  // mode `q` is replaced by result ids client-side before any request.
+  if (filters.q && filters.qRegex && filters.qMode !== "semantic") out.q_regex = true;
   if (filters.artifact) out.artifact = filters.artifact;
   if (filters.artifacts && filters.artifacts.length > 0) {
     out.artifacts = filters.artifacts.join(",");
@@ -93,6 +97,8 @@ export function serializeEventFilterParams(
 export function filtersToParams(filters: EventFilters): URLSearchParams {
   const p = new URLSearchParams();
   if (filters.q) p.set("q", filters.q);
+  if (filters.qMode) p.set("qMode", filters.qMode);
+  if (filters.qRegex) p.set("qRegex", "1");
   if (filters.artifact) p.set("artifact", filters.artifact);
   if (filters.artifacts && filters.artifacts.length > 0) {
     p.set("artifacts", filters.artifacts.join(","));
@@ -141,6 +147,8 @@ export function paramsToFilters(params: URLSearchParams): EventFilters {
   const annotationTagValue = params.get("annotationTagValue");
 
   if (q) filters.q = q;
+  if (params.get("qMode") === "semantic") filters.qMode = "semantic";
+  if (params.get("qRegex") === "1" && filters.qMode !== "semantic") filters.qRegex = true;
   if (artifact) filters.artifact = artifact;
   if (artifacts) {
     filters.artifacts = artifacts.split(",").map((a) => a.trim()).filter(Boolean);
@@ -180,12 +188,18 @@ export function paramsToFilters(params: URLSearchParams): EventFilters {
   return filters;
 }
 
-/** Serialize filters into a plain Record suitable for storing in a View. */
+/** Serialize filters into a plain Record suitable for storing in a View.
+ *
+ * `qMode`/`qRegex` are part of the payload so a saved view reproduces the
+ * exact search semantics (keyword vs semantic, literal vs regex) — a
+ * forensic-reproducibility requirement, not a convenience. */
 export function filtersToViewPayload(
   filters: EventFilters,
 ): Record<string, unknown> {
   return {
     q: filters.q ?? null,
+    qMode: filters.qMode ?? null,
+    qRegex: filters.qRegex ?? false,
     artifact: filters.artifact ?? null,
     artifacts: filters.artifacts ?? [],
     sourceId: filters.sourceId ?? null,
@@ -208,6 +222,9 @@ export function viewPayloadToFilters(
 ): EventFilters {
   const f: EventFilters = {};
   if (typeof payload.q === "string" && payload.q) f.q = payload.q;
+  // Legacy payloads predate these keys — absent means keyword, non-regex.
+  if (payload.qMode === "semantic") f.qMode = "semantic";
+  if (payload.qRegex === true && f.qMode !== "semantic") f.qRegex = true;
   if (typeof payload.artifact === "string" && payload.artifact)
     f.artifact = payload.artifact;
   if (Array.isArray(payload.artifacts) && payload.artifacts.length > 0) {

@@ -24,6 +24,8 @@ interface Props {
   autoFocus?: boolean;
   /** Render the suggestion dropdown above the input instead of below. */
   dropUp?: boolean;
+  /** Show the full suggestion list on focus even before any text is typed. */
+  openOnFocus?: boolean;
 }
 
 export function TagInput({
@@ -37,17 +39,22 @@ export function TagInput({
   className,
   autoFocus,
   dropUp = false,
+  openOnFocus = false,
 }: Props) {
   const [highlightIdx, setHighlightIdx] = useState(-1);
   const [open, setOpen] = useState(false);
+  const [focused, setFocused] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // Filter suggestions by substring match
+  // Filter suggestions by substring match; with openOnFocus, an empty input
+  // offers the full list while focused (e.g. browse available field names).
   const filtered = value.trim()
     ? suggestions.filter((s) =>
         s.toLowerCase().includes(value.toLowerCase()),
       )
-    : [];
+    : openOnFocus && focused
+      ? suggestions
+      : [];
 
   // Reset highlight when filtered list changes
   useEffect(() => {
@@ -97,11 +104,13 @@ export function TagInput({
         onChange={(e) => onChange(e.target.value)}
         onKeyDown={handleKeyDown}
         onBlur={() => {
+          setFocused(false);
           // Small delay so click on suggestion is registered first
           setTimeout(() => setOpen(false), 150);
         }}
         onFocus={() => {
-          if (filtered.length > 0) setOpen(true);
+          setFocused(true);
+          if (filtered.length > 0 || (openOnFocus && suggestions.length > 0)) setOpen(true);
         }}
       />
       {open && (

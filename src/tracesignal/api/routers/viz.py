@@ -34,6 +34,8 @@ from tracesignal.api.routers.events import (
     _resolve_event_id_filters,
     _resolve_timeline_scope,
     _resolve_timeline_source_ids,
+    _run_regex_guarded,
+    _validate_regex,
 )
 from tracesignal.db.postgres import Case, User, generate_id
 from tracesignal.db.queries import EventQuery
@@ -46,6 +48,7 @@ async def _resolve_event_query(
     timeline_id: str,
     *,
     q: str | None,
+    q_regex: bool,
     artifact: str | None,
     artifacts: str | None,
     source_id: str | None,
@@ -70,6 +73,7 @@ async def _resolve_event_query(
     builds an identical ``EventQuery`` from identical inputs — one place to
     keep in sync with ``list_events``/``get_histogram`` instead of three.
     """
+    _validate_regex(q, q_regex)
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
     event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
         case_id,
@@ -85,6 +89,7 @@ async def _resolve_event_query(
         case_id=case_id,
         source_ids=source_ids,
         q=q,
+        q_regex=q_regex,
         artifact=artifact,
         artifacts=_parse_str_list(artifacts),
         source_id=source_id,
@@ -106,6 +111,7 @@ async def _resolve_event_query(
 # but the *values* immediately flow into `_resolve_event_query` above so the
 # resolution logic itself is written once.
 _Q = Query(default=None, description="Free-text search, broadened across all fields")
+_Q_REGEX = Query(default=False, description="Treat q as an RE2 regular expression.")
 _ARTIFACT = Query(default=None)
 _ARTIFACTS = Query(default=None, description="Comma-separated artifact values (OR'd)")
 _SOURCE_ID = Query(default=None)
@@ -132,6 +138,7 @@ async def get_field_terms(
     field: str = Query(..., description="Field token, e.g. 'artifact' or 'attr:status_code'"),
     limit: int = Query(default=50, ge=1, le=500),
     q: str | None = _Q,
+    q_regex: bool = _Q_REGEX,
     artifact: str | None = _ARTIFACT,
     artifacts: str | None = _ARTIFACTS,
     source_id: str | None = _SOURCE_ID,
@@ -158,6 +165,7 @@ async def get_field_terms(
         case_id,
         timeline_id,
         q=q,
+        q_regex=q_regex,
         artifact=artifact,
         artifacts=artifacts,
         source_id=source_id,
@@ -175,7 +183,7 @@ async def get_field_terms(
         run_id=run_id,
     )
     service = _get_query_service()
-    return await run_in_threadpool(service.field_terms, query, field, limit)
+    return await _run_regex_guarded(query.q_regex, service.field_terms, query, field, limit)
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/viz/field-numeric")
@@ -185,6 +193,7 @@ async def get_field_numeric_stats(
     field: str = Query(..., description="Field token, e.g. 'attr:bytes_sent'"),
     bins: int = Query(default=30, ge=1, le=200),
     q: str | None = _Q,
+    q_regex: bool = _Q_REGEX,
     artifact: str | None = _ARTIFACT,
     artifacts: str | None = _ARTIFACTS,
     source_id: str | None = _SOURCE_ID,
@@ -212,6 +221,7 @@ async def get_field_numeric_stats(
         case_id,
         timeline_id,
         q=q,
+        q_regex=q_regex,
         artifact=artifact,
         artifacts=artifacts,
         source_id=source_id,
@@ -229,7 +239,7 @@ async def get_field_numeric_stats(
         run_id=run_id,
     )
     service = _get_query_service()
-    return await run_in_threadpool(service.field_numeric_stats, query, field, bins)
+    return await _run_regex_guarded(query.q_regex, service.field_numeric_stats, query, field, bins)
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/viz/field-timeseries")
@@ -240,6 +250,7 @@ async def get_field_value_timeseries(
     buckets: int = Query(default=60, ge=10, le=200),
     series_limit: int = Query(default=12, ge=1, le=50),
     q: str | None = _Q,
+    q_regex: bool = _Q_REGEX,
     artifact: str | None = _ARTIFACT,
     artifacts: str | None = _ARTIFACTS,
     source_id: str | None = _SOURCE_ID,
@@ -267,6 +278,7 @@ async def get_field_value_timeseries(
         case_id,
         timeline_id,
         q=q,
+        q_regex=q_regex,
         artifact=artifact,
         artifacts=artifacts,
         source_id=source_id,
@@ -284,8 +296,8 @@ async def get_field_value_timeseries(
         run_id=run_id,
     )
     service = _get_query_service()
-    return await run_in_threadpool(
-        service.field_value_timeseries, query, field, buckets, series_limit
+    return await _run_regex_guarded(
+        query.q_regex, service.field_value_timeseries, query, field, buckets, series_limit
     )
 
 
@@ -297,6 +309,7 @@ class CompareFilters(BaseModel):
     """
 
     q: str | None = None
+    q_regex: bool = False
     artifact: str | None = None
     artifacts: str | None = None
     source_id: str | None = None
@@ -338,6 +351,7 @@ async def _resolve_body_query(case_id: str, timeline_id: str, body: CompareFilte
         case_id,
         timeline_id,
         q=body.q,
+        q_regex=body.q_regex,
         artifact=body.artifact,
         artifacts=body.artifacts,
         source_id=body.source_id,
@@ -389,6 +403,7 @@ async def compare_layers(
             case_id,
             timeline_id,
             q=None,
+            q_regex=False,
             artifact=None,
             artifacts=None,
             source_id=None,
@@ -414,16 +429,17 @@ async def compare_layers(
         comparison = replace(comparison, start=primary.start, end=primary.end)
 
     service = _get_query_service()
+    q_regex = primary.q_regex or comparison.q_regex
     if body.kind == "time":
-        return await run_in_threadpool(
-            service.compare_time_histogram, primary, comparison, body.buckets
+        return await _run_regex_guarded(
+            q_regex, service.compare_time_histogram, primary, comparison, body.buckets
         )
     if body.kind == "terms":
-        return await run_in_threadpool(
-            service.compare_field_terms, primary, comparison, body.field, body.limit
+        return await _run_regex_guarded(
+            q_regex, service.compare_field_terms, primary, comparison, body.field, body.limit
         )
-    return await run_in_threadpool(
-        service.compare_field_numeric, primary, comparison, body.field, body.bins
+    return await _run_regex_guarded(
+        q_regex, service.compare_field_numeric, primary, comparison, body.field, body.bins
     )
 
 

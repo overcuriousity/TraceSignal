@@ -299,21 +299,23 @@ export function ExplorerPage() {
   // never mistaken for complete ones.
   const ingestingSources = timelineSources?.filter((s) => s.status !== "ready") ?? [];
 
-  // The filter rail's search box runs semantic search in the background once
-  // embeddings exist for this timeline, so a free-text query narrows the grid
-  // to conceptually related events even when they don't literally contain the
-  // typed words. `filters.q` itself stays URL-shareable and drives the
-  // broadened keyword search server-side as a fallback while this is loading
-  // or when there are no embeddings to search.
+  // Semantic search only runs when the analyst deliberately picked Semantic
+  // mode in the filter rail — keyword (the default) never silently becomes
+  // semantic, so search semantics are always explicit and reproducible from
+  // the URL. `filters.q` stays URL-shareable and drives the broadened keyword
+  // search server-side while semantic results are loading or unavailable.
+  const semanticMode = filters.qMode === "semantic";
   const { data: semanticSearchData, isFetching: semanticSearchPending } = useQuery({
     queryKey: ["search-filter", caseId, timelineId, filters.q],
     queryFn: () => similarityApi.semanticSearch(caseId!, filters.q!, 200, timelineId),
-    enabled: !!(caseId && timelineId && hasVectors && filters.q),
+    enabled: !!(caseId && timelineId && hasVectors && filters.q && semanticMode),
   });
   const semanticSearchIds = useMemo(() => {
-    if (!filters.q || !hasVectors || semanticSearchData?.status !== "ok") return null;
+    if (!filters.q || !semanticMode || !hasVectors || semanticSearchData?.status !== "ok") {
+      return null;
+    }
     return semanticSearchData.results.map((r) => r.event_id);
-  }, [filters.q, hasVectors, semanticSearchData]);
+  }, [filters.q, semanticMode, hasVectors, semanticSearchData]);
 
   // The filter object actually sent to the events/histogram/export queries.
   // `filters` itself stays URL-serializable/shareable — this augments it
@@ -355,6 +357,7 @@ export function ExplorerPage() {
     isLoading: eventsLoading,
     isFetching,
     isError: eventsError,
+    error: eventsQueryError,
     refetch,
     fetchNextPage,
     hasNextPage,
@@ -426,6 +429,18 @@ export function ExplorerPage() {
     queryFn: () => eventsApi.artifacts(caseId!, timelineId!),
     enabled: !!(caseId && timelineId),
   });
+
+  // Field names across all of this timeline's sources, for the filter rail's
+  // Field=Value / Field≠Value key autocomplete (same cache as ColumnPicker).
+  const { data: fieldsData } = useQuery({
+    queryKey: ["fields", caseId, timelineId],
+    queryFn: () => eventsApi.fields(caseId!, timelineId!),
+    enabled: !!(caseId && timelineId),
+  });
+  const fieldSuggestions = useMemo(
+    () => [...(fieldsData?.top_level ?? []), ...(fieldsData?.attributes ?? [])],
+    [fieldsData],
+  );
 
   // ── Derived ────────────────────────────────────────────────────────────
   const annotationMap = useMemo<Map<string, Annotation[]>>(() => {
@@ -635,10 +650,10 @@ export function ExplorerPage() {
   /**
    * Wired to the filter rail's unified search box. Dispatches on the shape of
    * the input: an exact event_id (UUID) jumps straight to that event via the
-   * existing jump-to-time machinery; anything else becomes `filters.q`, which
-   * drives a broadened all-fields keyword search server-side and — once
-   * embeddings exist for this timeline — is also narrowed by a background
-   * semantic search (see the `semanticSearchIds` effective-filter override).
+   * existing jump-to-time machinery; anything else becomes `filters.q`. The
+   * rail's mode control decides how `q` is interpreted: keyword (broadened
+   * all-fields server-side search, optionally regex) or semantic (embedding
+   * search narrowing the grid via the `semanticSearchIds` override).
    */
   const handleSearchSubmit = useCallback(
     async (raw: string) => {
@@ -665,16 +680,34 @@ export function ExplorerPage() {
   const searchStatus = useMemo(() => {
     if (searchError) return searchError;
     if (!filters.q) return undefined;
-    if (!hasVectors) return "keyword search — no embeddings for this timeline";
+    if (!semanticMode) {
+      // Surface a server-side regex rejection (400) right under the box.
+      if (filters.qRegex && eventsError && eventsQueryError instanceof Error
+          && eventsQueryError.message.includes("invalid regular expression")) {
+        return eventsQueryError.message;
+      }
+      return filters.qRegex ? "regex search" : undefined;
+    }
     if (semanticSearchPending) return undefined; // spinner already shown
     if (semanticSearchData?.status === "ok") {
       return `${semanticSearchData.results.length} semantic match${semanticSearchData.results.length === 1 ? "" : "es"}`;
     }
     if (semanticSearchData?.status === "not_embedded") {
-      return "not embedded — keyword fallback";
+      return "not embedded — showing keyword matches instead";
     }
+    if (!hasVectors) return "no embeddings — showing keyword matches instead";
     return undefined;
-  }, [searchError, filters.q, hasVectors, semanticSearchPending, semanticSearchData]);
+  }, [
+    searchError,
+    filters.q,
+    filters.qRegex,
+    semanticMode,
+    hasVectors,
+    semanticSearchPending,
+    semanticSearchData,
+    eventsError,
+    eventsQueryError,
+  ]);
 
   // Once the jump target's anchor page has landed in `events`, scroll the
   // grid to it, open its detail panel (so the target is unmistakable — the
@@ -718,9 +751,13 @@ export function ExplorerPage() {
           onClose={() => setFilterRailOpen(false)}
           mergedTagSuggestions={mergedTagSuggestions}
           artifactSuggestions={artifactSuggestions}
+          fieldSuggestions={fieldSuggestions}
+          hasVectors={hasVectors}
+          caseId={caseId!}
+          timelineId={timelineId!}
           onSearchSubmit={handleSearchSubmit}
           searchStatus={searchStatus}
-          searchPending={hasVectors && !!filters.q && semanticSearchPending}
+          searchPending={semanticMode && !!filters.q && semanticSearchPending}
         />
       )}
 
