@@ -232,10 +232,18 @@ export function viewPayloadToFilters(
   }
   if (typeof payload.start === "string" && payload.start) f.start = payload.start;
   if (typeof payload.end === "string" && payload.end) f.end = payload.end;
-  if (payload.filters && typeof payload.filters === "object") {
+  if (
+    payload.filters &&
+    typeof payload.filters === "object" &&
+    Object.keys(payload.filters).length > 0
+  ) {
     f.filters = payload.filters as Record<string, string>;
   }
-  if (payload.exclusions && typeof payload.exclusions === "object") {
+  if (
+    payload.exclusions &&
+    typeof payload.exclusions === "object" &&
+    Object.keys(payload.exclusions).length > 0
+  ) {
     f.exclusions = payload.exclusions as Record<string, string[]>;
   }
   if (Array.isArray(payload.annotated) && payload.annotated.length > 0) {
