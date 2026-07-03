@@ -55,7 +55,7 @@ jobs:
         ports:
           - 6333:6333
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Wait for qdrant
         run: timeout 30 sh -c 'until curl -sf http://localhost:6333/healthz; do sleep 1; done'
@@ -87,7 +87,7 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Node
         uses: actions/setup-node@v4
