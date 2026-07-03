@@ -796,15 +796,26 @@ def _run_embedding_job(
         )
         result = pipeline.run()
 
-        # Use a fresh PostgresStore inside the worker thread.
+        # Use a fresh PostgresStore inside the worker thread, and run all of
+        # its awaits in a single asyncio.run() loop: pooled asyncpg
+        # connections are bound to the loop they were created on, so a second
+        # asyncio.run() against the same store would check out a connection
+        # whose futures belong to a closed loop ("attached to a different
+        # loop"). Dispose the engine before the loop closes so no pooled
+        # connection outlives it.
         store = PostgresStore()
-        asyncio.run(
-            store.update_source_counts(
-                case_id=case_id,
-                source_id=source_id,
-                vector_count=result.vectors_inserted,
-            )
-        )
+
+        async def _finalize() -> None:
+            try:
+                await store.update_source_counts(
+                    case_id=case_id,
+                    source_id=source_id,
+                    vector_count=result.vectors_inserted,
+                )
+            finally:
+                await store.engine.dispose()
+
+        asyncio.run(_finalize())
         job_store.update(
             job_id,
             status="completed",
@@ -842,31 +853,40 @@ def _run_timeline_embedding_job(
         )
         result = pipeline.run()
 
+        # One asyncio.run() for every await against this store — a pooled
+        # asyncpg connection is bound to the loop it was created on, so
+        # calling asyncio.run() per statement hands loop-A connections to
+        # loop B ("attached to a different loop"). Dispose the engine before
+        # the loop closes so no pooled connection outlives it.
         store = PostgresStore()
         embedding_model = get_settings().embedding_model
-        asyncio.run(
-            store.set_timeline_embedding(
-                case_id=case_id,
-                timeline_id=timeline_id,
-                model=embedding_model,
-                config=field_config or {},
-                config_hash=result.config_hash,
-                embedded_source_ids=source_ids,
-            )
-        )
-        # Update vector counts on each source.
-        # EmbeddingPipeline processes all sources in one collection so we set
-        # an approximate per-source count (total / n sources) as a best effort;
-        # the authoritative vector count is queryable from Qdrant directly.
-        per_source = result.vectors_inserted // max(len(source_ids), 1)
-        for sid in source_ids:
-            asyncio.run(
-                store.update_source_counts(
+
+        async def _finalize() -> None:
+            try:
+                await store.set_timeline_embedding(
                     case_id=case_id,
-                    source_id=sid,
-                    vector_count=per_source,
+                    timeline_id=timeline_id,
+                    model=embedding_model,
+                    config=field_config or {},
+                    config_hash=result.config_hash,
+                    embedded_source_ids=source_ids,
                 )
-            )
+                # Update vector counts on each source.
+                # EmbeddingPipeline processes all sources in one collection so
+                # we set an approximate per-source count (total / n sources)
+                # as a best effort; the authoritative vector count is
+                # queryable from Qdrant directly.
+                per_source = result.vectors_inserted // max(len(source_ids), 1)
+                for sid in source_ids:
+                    await store.update_source_counts(
+                        case_id=case_id,
+                        source_id=sid,
+                        vector_count=per_source,
+                    )
+            finally:
+                await store.engine.dispose()
+
+        asyncio.run(_finalize())
         job_store.update(
             job_id,
             status="completed",
