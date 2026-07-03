@@ -10,7 +10,7 @@
  * Brush state uses refs (not React state) so mouseup reliably reads the
  * current selection even when no re-render has occurred since mousedown.
  */
-import { useState, useRef, useCallback, useMemo } from "react";
+import { useState, useRef, useCallback, useLayoutEffect, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { eventsApi } from "@/api/events";
 import { Spinner } from "@/components/ui/Spinner";
@@ -129,6 +129,28 @@ export function TimelineHistogram({
     x: number;
     text: string;
   } | null>(null);
+  // Positioning anchor for bar hovers — `closest(".relative")` would match
+  // the hovered bar wrapper itself (it also carries `relative`), pinning
+  // every tooltip at the container's left edge.
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const tooltipRef = useRef<HTMLDivElement | null>(null);
+  // Clamp the centered tooltip so hovering the first/last bars edge-flushes
+  // it instead of clipping half of it outside the container.
+  const [tooltipLeft, setTooltipLeft] = useState<number | null>(null);
+  useLayoutEffect(() => {
+    if (!tooltip || !tooltipRef.current || !containerRef.current) {
+      setTooltipLeft(null);
+      return;
+    }
+    const half = tooltipRef.current.offsetWidth / 2;
+    const pad = 4;
+    setTooltipLeft(
+      Math.min(
+        Math.max(tooltip.x, half + pad),
+        containerRef.current.clientWidth - half - pad,
+      ),
+    );
+  }, [tooltip]);
 
   const buckets = useMemo(() => data?.buckets ?? [], [data]);
   const maxCount = Math.max(1, ...buckets.map((b: HistogramBucket) => b.count));
@@ -239,6 +261,7 @@ export function TimelineHistogram({
 
   return (
     <div
+      ref={containerRef}
       className="relative shrink-0 border-b border-[var(--color-border)] bg-[var(--color-bg-surface)] select-none"
       onMouseUp={handleMouseUp}
       onMouseLeave={handleContainerMouseLeave}
@@ -263,8 +286,8 @@ export function TimelineHistogram({
               style={{ height: "100%", display: "flex", alignItems: "flex-end" }}
               onMouseDown={() => handleMouseDown(idx)}
               onMouseEnter={(e) => {
-                const containerEl = e.currentTarget.closest<HTMLElement>(".relative");
-                const containerLeft = containerEl?.getBoundingClientRect().left ?? 0;
+                const containerLeft =
+                  containerRef.current?.getBoundingClientRect().left ?? 0;
                 const rect = e.currentTarget.getBoundingClientRect();
                 const xOffset = rect.left - containerLeft + rect.width / 2;
                 handleMouseEnter(idx, xOffset, bucket);
@@ -380,8 +403,9 @@ export function TimelineHistogram({
       {/* Tooltip */}
       {tooltip && (
         <div
+          ref={tooltipRef}
           className="pointer-events-none absolute bottom-full mb-1 -translate-x-1/2 rounded bg-[var(--color-bg-elevated)] border border-[var(--color-border)] px-2 py-1 text-xs text-[var(--color-fg-primary)] whitespace-nowrap shadow"
-          style={{ left: tooltip.x + 8 }}
+          style={{ left: tooltipLeft ?? tooltip.x }}
         >
           {tooltip.text}
         </div>
