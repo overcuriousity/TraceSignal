@@ -254,3 +254,108 @@ def test_copy_and_hash_matches_hash_file_and_caps(tmp_path: Path) -> None:
 
     with pytest.raises(UploadTooLargeError):
         copy_and_hash(BytesIO(content), BytesIO(), max_bytes=len(content) - 1)
+
+
+@pytest.mark.asyncio
+async def test_source_status_lifecycle(
+    store: PostgresStore,
+    case: str,
+) -> None:
+    """A source is created "ingesting" and flips to "ready" when the job
+    completes — only then does it become visible to timeline queries."""
+    case_obj = await store.get_case(case)
+
+    # Call upload_source without running the scheduled background job yet, so
+    # the mid-ingest state is observable.
+    background_tasks = BackgroundTasks()
+    response = await upload_source(
+        background_tasks=background_tasks,
+        file=_UploadFile("events.jsonl", b'{"message":"x"}\n'),
+        parser=None,
+        case=case_obj,
+        user=_fake_user(),
+    )
+    source = await store.get_source(case, response.source_id)
+    assert source.status == "ingesting"
+
+    await background_tasks()
+    source = await store.get_source(case, response.source_id)
+    assert source.status == "ready"
+
+
+@pytest.mark.asyncio
+async def test_ingesting_source_excluded_from_timeline_scope(
+    store: PostgresStore,
+    case: str,
+) -> None:
+    """_resolve_timeline_scope must never return a half-ingested source."""
+    from tracesignal.api.routers.events import _resolve_timeline_scope
+
+    await store.create_source(case, "s_ready", "ready one", file_hash="h1", size_bytes=1)
+    await store.create_source(
+        case, "s_pending", "pending one", file_hash="h2", size_bytes=1, status="ingesting"
+    )
+    default_timeline = await store.get_default_timeline(case)
+    await store.add_source_to_timeline(case, default_timeline.id, "s_ready")
+    await store.add_source_to_timeline(case, default_timeline.id, "s_pending")
+
+    source_ids, _ = await _resolve_timeline_scope(case, default_timeline.id)
+    assert source_ids == ["s_ready"]
+
+
+@pytest.mark.asyncio
+async def test_embed_refuses_ingesting_sources(
+    store: PostgresStore,
+    case: str,
+) -> None:
+    """Embedding persists vectors — it must refuse a timeline with a
+    half-ingested member instead of silently embedding partial data."""
+    from tracesignal.api.routers.cases import start_timeline_embedding
+
+    await store.create_source(
+        case, "s_pending", "pending one", file_hash="h2", size_bytes=1, status="ingesting"
+    )
+    default_timeline = await store.get_default_timeline(case)
+    await store.add_source_to_timeline(case, default_timeline.id, "s_pending")
+
+    case_obj = await store.get_case(case)
+    with pytest.raises(HTTPException) as exc_info:
+        await start_timeline_embedding(
+            timeline_id=default_timeline.id,
+            background_tasks=BackgroundTasks(),
+            body=None,
+            case=case_obj,
+            user=_fake_user(),
+        )
+    assert exc_info.value.status_code == 409
+    assert "still ingesting" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_startup_reconciliation_removes_orphaned_ingests(
+    store: PostgresStore,
+    case: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source stuck in "ingesting" on boot (in-memory job lost to a restart)
+    is cleaned up like a failed ingest, so the file can be re-uploaded."""
+    from tracesignal.api import main as api_main
+
+    await store.create_source(
+        case, "s_orphan", "orphan", file_hash="h9", size_bytes=1, status="ingesting"
+    )
+
+    deleted: list[tuple[str, str]] = []
+
+    class FakeClickHouse:
+        def delete_source_events(self, case_id: str, source_id: str) -> None:
+            deleted.append((case_id, source_id))
+
+    monkeypatch.setattr(api_main, "ClickHouseStore", FakeClickHouse, raising=False)
+    monkeypatch.setattr("tracesignal.db.clickhouse.ClickHouseStore", FakeClickHouse)
+
+    await api_main._reconcile_orphaned_ingests()
+
+    assert deleted == [(case, "s_orphan")]
+    assert await store.get_source(case, "s_orphan") is None
+    assert await store.list_ingesting_sources() == []

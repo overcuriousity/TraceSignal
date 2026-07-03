@@ -1,6 +1,19 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-03 (session 14 — full repository audit; fixed all Critical/High
+Last updated: 2026-07-03 (session 14, continued — source ingest-status lifecycle:
+`Source.status` (`ingesting`/`ready`, additive migration backfills `ready`); uploads create
+the row as `ingesting` and the background job flips it to `ready`; `_resolve_timeline_scope`
+(the single scope choke point) excludes non-ready sources so the explorer, histogram,
+export, detectors, and wizards never see half-ingested data; timeline embedding refuses
+409 while a member source is ingesting; field-mapping validation runs inventory checks only
+against ready sources (structural rules always apply — `validate_field_mappings` now takes
+`None` inventory to mean "unknown, skip inventory checks"); startup reconciliation removes
+sources orphaned mid-ingest by a restart (partial events + row, audited as
+`source.ingest_interrupted`) so re-upload isn't blocked by the file-hash duplicate check;
+frontend shows an "Ingesting" badge in the source list and an Explorer banner with
+poll-until-ready + auto-refetch when the source becomes visible)
+
+Previous (session 14 — full repository audit; fixed all Critical/High
 findings on `fix/audit-critical-high`: Dockerfile CMD now uses `--factory
 tracesignal.api.main:create_app` (the shipped image previously pointed at a nonexistent
 `app` attribute and could not start); CSV parser streams instead of `list(fh)`-ing the whole

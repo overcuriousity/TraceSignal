@@ -87,11 +87,54 @@ async def _seed_admin() -> None:
     )
 
 
+async def _reconcile_orphaned_ingests() -> None:
+    """Clean up sources stuck in "ingesting" from a mid-ingest restart.
+
+    Ingestion jobs live in the in-memory JobStore, so on a fresh boot any
+    source still marked "ingesting" has no job that will ever finish it.
+    Its partial ClickHouse events and its row are removed — the same cleanup
+    a failed ingest performs — so the file can simply be re-uploaded (the
+    duplicate check is keyed on file_hash and would otherwise reject the
+    retry forever). Each removal is recorded in the audit log.
+
+    Best-effort: ClickHouse being unreachable at startup must not prevent
+    the app from booting; the orphan stays "ingesting" (still invisible to
+    queries) and is retried on the next restart.
+    """
+    store = get_store()
+    orphans = await store.list_ingesting_sources()
+    if not orphans:
+        return
+    from tracesignal.db.clickhouse import ClickHouseStore
+
+    try:
+        clickhouse = ClickHouseStore()
+        for source in orphans:
+            await asyncio.to_thread(clickhouse.delete_source_events, source.case_id, source.id)
+            await store.delete_source(source.case_id, source.id)
+            await store.record_audit(
+                action="source.ingest_interrupted",
+                case_id=source.case_id,
+                target_type="source",
+                target_id=source.id,
+                detail={"filename": source.filename, "file_hash": source.file_hash},
+            )
+            logger.warning(
+                "Removed source %r (case %s): its ingestion was interrupted by a restart. "
+                "Re-upload the file to ingest it.",
+                source.name,
+                source.case_id,
+            )
+    except Exception:
+        logger.exception("Failed to reconcile %d orphaned ingesting source(s).", len(orphans))
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     store = get_store()
     await store.init_schema()
     await _seed_admin()
+    await _reconcile_orphaned_ingests()
     # No cron/scheduler in this single-process deployment (see JobStore),
     # so a startup-only sweep is the simple option — good enough to keep
     # `sessions` from growing unbounded across restarts without adding a

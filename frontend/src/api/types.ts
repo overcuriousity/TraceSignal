@@ -93,6 +93,8 @@ export interface Source {
   parser_version: string | null;
   event_count: number;
   vector_count: number;
+  /** Ingest lifecycle: "ingesting" sources are excluded from timeline queries until "ready". */
+  status: "ingesting" | "ready";
   embedding_model: string | null;
   /** Analyst-defined per-artifact field selection, null when not yet configured. */
   embedding_config: EmbeddingFieldConfig | null;
