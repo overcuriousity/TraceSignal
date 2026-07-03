@@ -47,9 +47,9 @@ tsig = "tracesignal.cli.main:app"
 tsig-web = "tracesignal.web.app:start"
 
 [project.urls]
-Homepage = "https://github.com/ScalarForensic/TraceSignal"
-Repository = "https://github.com/ScalarForensic/TraceSignal"
-Documentation = "https://github.com/ScalarForensic/TraceSignal/blob/main/docs/CONCEPT.md"
+Homepage = "https://github.com/overcuriousity/TraceSignal"
+Repository = "https://github.com/overcuriousity/TraceSignal"
+Documentation = "https://github.com/overcuriousity/TraceSignal/blob/main/docs/CONCEPT.md"
 
 [dependency-groups]
 dev = [
