@@ -50,6 +50,8 @@ import {
 } from "@/components/viz/lib/chartConfig";
 import { METRIC_INFO, type Metric } from "@/components/viz/lib/transforms";
 import { CHART_META, chartTypesFor, SCALES } from "@/components/viz/lib/chartMeta";
+import { buildCaptionLines, type CaptionFacts } from "@/components/viz/lib/caption";
+import { ChartCaption } from "@/components/viz/primitives/ChartCaption";
 import type {
   CompareNumericResponse,
   CompareTermsResponse,
@@ -262,34 +264,52 @@ export function VisualizePage() {
 
   const availableChartTypes = chartTypesFor(scale);
 
-  const compareSummary =
-    config.compare.mode === "baseline"
-      ? "baseline (all timeline events, same time range)"
-      : config.compare.mode === "custom"
-        ? `custom (${JSON.stringify(config.compare.filters)})`
-        : null;
+  // Data-derived caption facts for the active query — totals, grid width,
+  // and top-N capping feed the truthful caption/export lines.
+  const facts: CaptionFacts = {};
+  if (dataKind === "time" && timeQuery.data) {
+    facts.primaryTotal = timeQuery.data.primary_total;
+    if (compareOn) facts.comparisonTotal = timeQuery.data.comparison_total;
+    facts.intervalSeconds = timeQuery.data.interval_seconds;
+  } else if (dataKind === "terms") {
+    if (compareTermsOn && compareTermsQuery.data) {
+      facts.primaryTotal = compareTermsQuery.data.primary_total;
+      facts.comparisonTotal = compareTermsQuery.data.comparison_total;
+      facts.distinct = compareTermsQuery.data.distinct;
+      facts.shownValues = compareTermsQuery.data.values.length;
+      facts.otherCount = compareTermsQuery.data.primary_other;
+    } else if (termsQuery.data) {
+      facts.primaryTotal = termsQuery.data.total;
+      facts.distinct = termsQuery.data.distinct;
+      facts.shownValues = termsQuery.data.values.length;
+      facts.otherCount = termsQuery.data.other_count;
+    }
+  } else if (dataKind === "numeric") {
+    if (compareNumericOn && compareNumericQuery.data) {
+      facts.primaryTotal = compareNumericQuery.data.primary_total;
+      facts.comparisonTotal = compareNumericQuery.data.comparison_total;
+      facts.binCount = compareNumericQuery.data.bins.length;
+      facts.valueMin = compareNumericQuery.data.min;
+      facts.valueMax = compareNumericQuery.data.max;
+    } else if (numericQuery.data) {
+      facts.primaryTotal = numericQuery.data.count;
+      facts.binCount = numericQuery.data.bins.length;
+      facts.valueMin = numericQuery.data.min;
+      facts.valueMax = numericQuery.data.max;
+    }
+  } else if (dataKind === "timeseries" && timeseriesQuery.data) {
+    facts.shownValues = timeseriesQuery.data.series.length;
+    facts.intervalSeconds = timeseriesQuery.data.interval_seconds;
+  }
 
-  const captionLines = [
-    `TraceVector — visualization — case ${caseId} / timeline ${timelineId ?? ""}`,
-    dataKind === "time"
-      ? `event count over time — ${CHART_META[chartType].label}`
-      : field
-        ? `field: ${field} (${scale}) — ${CHART_META[chartType].label}`
-        : undefined,
-    filters.q ? `search: ${filters.q}` : undefined,
-    filters.start || filters.end
-      ? `range: ${filters.start ?? "…"} to ${filters.end ?? "…"}`
-      : undefined,
-    compareSummary ? `comparison layer: ${compareSummary}` : undefined,
-    dataKind === "time" && timeQuery.data
-      ? `primary: ${timeQuery.data.primary_total.toLocaleString()} events` +
-        (compareOn
-          ? ` · comparison: ${timeQuery.data.comparison_total.toLocaleString()} events`
-          : "") +
-        ` · ${timeQuery.data.interval_seconds}s buckets, UTC`
-      : undefined,
-    metric !== "count" ? `metric: ${METRIC_INFO[metric].label} = ${METRIC_INFO[metric].formula}` : undefined,
-  ].filter((l): l is string => !!l);
+  const captionLines = buildCaptionLines({
+    caseId,
+    timelineId,
+    chartLabel: CHART_META[chartType].label,
+    config,
+    filters,
+    facts,
+  });
 
   const loading =
     (dataKind === "time" && timeQuery.isLoading) ||
@@ -735,6 +755,7 @@ export function VisualizePage() {
             {chartType === "ecdf" && numericQuery.data && (
               <EcdfChart stats={numericQuery.data} svgRef={svgRef} />
             )}
+            <ChartCaption lines={captionLines} />
           </div>
         )}
       </div>
