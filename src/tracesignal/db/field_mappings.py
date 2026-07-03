@@ -77,9 +77,13 @@ def validate_field_mappings(
 
     Returns a list of human-readable problems (empty = valid). Enforced rules:
 
-    - canonical names must be non-empty, must not collide with core event
-      columns or with a raw attribute key present in the sources (that would
-      silently shadow real data), and must not use the ``attr:`` prefix;
+    - canonical names must be non-empty, must not have leading/trailing
+      whitespace (the dict key is the persisted, looked-up name — a
+      whitespace-padded key would validate here but never match at query
+      time, since resolution strips only the incoming field token), must not
+      collide with core event columns or with a raw attribute key present in
+      the sources (that would silently shadow real data), and must not use
+      the ``attr:`` prefix;
     - each raw key may appear in at most one mapping (and once per mapping);
     - every raw key must exist in at least one member source — mapping a
       nonexistent field is almost always a typo and would silently coalesce
@@ -96,6 +100,11 @@ def validate_field_mappings(
         if not name:
             problems.append("Canonical field names must not be empty.")
             continue
+        if name != canonical:
+            problems.append(
+                f"'{canonical}': canonical field names must not have leading or "
+                "trailing whitespace."
+            )
         if name.startswith("attr:"):
             problems.append(f"'{name}': canonical names must not use the 'attr:' prefix.")
         if name.lower() in core_lower:
