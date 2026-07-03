@@ -87,6 +87,16 @@ def test_empty_raw_list_and_empty_name_rejected():
     assert validate_field_mappings({"attr:ip": ["src_ip"]}, AVAILABLE)
 
 
+def test_padded_canonical_name_rejected():
+    # A canonical name is the dict key that gets persisted and later looked
+    # up verbatim by resolve_mapping (which only strips the incoming field
+    # token, not the stored key). Padding would pass "collides with a raw
+    # key"-style checks on the trimmed name yet never resolve at query time
+    # — so it must be rejected outright instead of silently accepted.
+    problems = validate_field_mappings({"ip_address ": ["src_ip"]}, AVAILABLE)
+    assert any("whitespace" in p for p in problems)
+
+
 # ── apply_mappings_to_attribute_keys ──────────────────────────────────────────
 
 
