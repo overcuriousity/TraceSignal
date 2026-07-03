@@ -50,7 +50,12 @@ import {
 } from "@/components/viz/lib/chartConfig";
 import { METRIC_INFO, type Metric } from "@/components/viz/lib/transforms";
 import { CHART_META, chartTypesFor, SCALES } from "@/components/viz/lib/chartMeta";
-import type { CompareTimeResponse, HistogramResponse } from "@/api/types";
+import type {
+  CompareNumericResponse,
+  CompareTermsResponse,
+  CompareTimeResponse,
+  HistogramResponse,
+} from "@/api/types";
 
 const SCALE_INFO: Record<Scale, { label: string; hint: string }> = {
   nominal: {
@@ -109,6 +114,10 @@ export function VisualizePage() {
   const { field, scale, chartType, metric } = config;
   const dataKind = CHART_META[chartType].dataKind;
   const compareOn = config.compare.mode !== "off";
+  // Chart types that can render a comparison layer — pie/box/violin/ecdf
+  // have no honest two-layer encoding, so the rail hides Compare for them.
+  const compareSupported =
+    chartType === "time" || chartType === "bar" || chartType === "histogram";
   const compareApiSpec: CompareMode | null =
     config.compare.mode === "baseline"
       ? { mode: "baseline" }
@@ -193,10 +202,38 @@ export function VisualizePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [metric, compareOn, dataKind]);
 
+  const compareTermsOn = compareOn && chartType === "bar" && compareApiSpec != null;
   const termsQuery = useQuery({
     queryKey: ["viz-field-terms", caseId, timelineId, field, filters, topN],
     queryFn: () => vizApi.fieldTerms(caseId!, timelineId!, field!, filters, topN),
-    enabled: !!(caseId && timelineId && field) && dataKind === "terms",
+    enabled: !!(caseId && timelineId && field) && dataKind === "terms" && !compareTermsOn,
+  });
+
+  const compareTermsQuery = useQuery({
+    queryKey: ["viz-compare-terms", caseId, timelineId, field, filters, config.compare, topN],
+    queryFn: async () =>
+      (await vizApi.compare(caseId!, timelineId!, {
+        kind: "terms",
+        field: field!,
+        primary: filters,
+        comparison: compareApiSpec!,
+        limit: topN,
+      })) as CompareTermsResponse,
+    enabled: !!(caseId && timelineId && field) && compareTermsOn,
+  });
+
+  const compareNumericOn = compareOn && chartType === "histogram" && compareApiSpec != null;
+  const compareNumericQuery = useQuery({
+    queryKey: ["viz-compare-numeric", caseId, timelineId, field, filters, config.compare, bins],
+    queryFn: async () =>
+      (await vizApi.compare(caseId!, timelineId!, {
+        kind: "numeric",
+        field: field!,
+        primary: filters,
+        comparison: compareApiSpec!,
+        bins,
+      })) as CompareNumericResponse,
+    enabled: !!(caseId && timelineId && field) && compareNumericOn,
   });
 
   const timeseriesQuery = useQuery({
@@ -256,8 +293,9 @@ export function VisualizePage() {
 
   const loading =
     (dataKind === "time" && timeQuery.isLoading) ||
-    (dataKind === "terms" && termsQuery.isLoading) ||
-    (dataKind === "numeric" && numericQuery.isLoading) ||
+    (dataKind === "terms" && (compareTermsOn ? compareTermsQuery.isLoading : termsQuery.isLoading)) ||
+    (dataKind === "numeric" &&
+      (compareNumericOn ? compareNumericQuery.isLoading : numericQuery.isLoading)) ||
     (dataKind === "timeseries" && timeseriesQuery.isLoading);
 
   return (
@@ -357,8 +395,8 @@ export function VisualizePage() {
           </Select>
         </div>
 
-        {/* Compare — supported for the time histogram (bar/numeric follow) */}
-        {dataKind === "time" && (
+        {/* Compare — time histogram, bar (grouped), numeric histogram (overlay) */}
+        {compareSupported && (
           <div>
             <label className="mb-1 flex items-center gap-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
               Compare
@@ -449,6 +487,145 @@ export function VisualizePage() {
           </div>
         )}
 
+        {/* Per-chart options */}
+        {(chartType === "bar" ||
+          chartType === "histogram" ||
+          chartType === "time" ||
+          chartType === "line") && (
+          <details className="rounded border border-[var(--color-border)]">
+            <summary className="cursor-pointer px-2 py-1.5 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+              Options
+            </summary>
+            <div className="space-y-3 px-2 pb-2 pt-1">
+              {chartType === "bar" && (
+                <>
+                  <div>
+                    <label className="mb-1 block text-xs text-[var(--color-fg-secondary)]">
+                      Orientation
+                    </label>
+                    <Select
+                      value={config.options.orientation ?? "horizontal"}
+                      onValueChange={(v) =>
+                        updateConfig({
+                          options: {
+                            ...config.options,
+                            orientation: v as "horizontal" | "vertical",
+                          },
+                        })
+                      }
+                    >
+                      <SelectTrigger className="h-7 text-xs">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="horizontal">Horizontal</SelectItem>
+                        <SelectItem value="vertical">Vertical</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-xs text-[var(--color-fg-secondary)]">
+                      Sort
+                    </label>
+                    <Select
+                      value={config.options.sort ?? "count"}
+                      onValueChange={(v) =>
+                        updateConfig({
+                          options: { ...config.options, sort: v as "count" | "value" },
+                        })
+                      }
+                    >
+                      <SelectTrigger className="h-7 text-xs">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="count">By count (descending)</SelectItem>
+                        <SelectItem value="value">By value (A→Z)</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </>
+              )}
+              {(chartType === "bar" || chartType === "histogram") && (
+                <label className="flex cursor-pointer items-center gap-2 text-xs text-[var(--color-fg-secondary)]">
+                  <input
+                    type="checkbox"
+                    checked={config.options.logScale ?? false}
+                    onChange={(e) =>
+                      updateConfig({
+                        options: { ...config.options, logScale: e.target.checked },
+                      })
+                    }
+                    className="accent-[var(--color-accent)]"
+                  />
+                  Log-scale count axis
+                </label>
+              )}
+              {chartType === "time" && (
+                <div>
+                  <label className="mb-1 block text-xs text-[var(--color-fg-secondary)]">
+                    Buckets: {buckets}
+                  </label>
+                  <input
+                    type="range"
+                    min={10}
+                    max={200}
+                    step={10}
+                    value={buckets}
+                    onChange={(e) =>
+                      updateConfig({
+                        options: { ...config.options, buckets: Number(e.target.value) },
+                      })
+                    }
+                    className="w-full accent-[var(--color-accent)]"
+                  />
+                </div>
+              )}
+              {chartType === "line" && (
+                <>
+                  <div>
+                    <label className="mb-1 block text-xs text-[var(--color-fg-secondary)]">
+                      Series mode
+                    </label>
+                    <Select
+                      value={config.options.seriesMode ?? "overlay"}
+                      onValueChange={(v) =>
+                        updateConfig({
+                          options: {
+                            ...config.options,
+                            seriesMode: v as "overlay" | "stacked",
+                          },
+                        })
+                      }
+                    >
+                      <SelectTrigger className="h-7 text-xs">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="overlay">Overlay (lines)</SelectItem>
+                        <SelectItem value="stacked">Stacked (areas)</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <label className="flex cursor-pointer items-center gap-2 text-xs text-[var(--color-fg-secondary)]">
+                    <input
+                      type="checkbox"
+                      checked={config.options.legend ?? true}
+                      onChange={(e) =>
+                        updateConfig({
+                          options: { ...config.options, legend: e.target.checked },
+                        })
+                      }
+                      className="accent-[var(--color-accent)]"
+                    />
+                    Show legend
+                  </label>
+                </>
+              )}
+            </div>
+          </details>
+        )}
+
         {/* Options */}
         {dataKind === "numeric" && (
           <div>
@@ -516,8 +693,15 @@ export function VisualizePage() {
                 svgRef={svgRef}
               />
             )}
-            {chartType === "bar" && termsQuery.data && (
-              <BarChart terms={termsQuery.data} svgRef={svgRef} />
+            {chartType === "bar" && (compareTermsOn ? compareTermsQuery.data : termsQuery.data) && (
+              <BarChart
+                terms={compareTermsOn ? undefined : termsQuery.data}
+                compare={compareTermsOn ? compareTermsQuery.data : undefined}
+                orientation={config.options.orientation ?? "horizontal"}
+                sort={config.options.sort ?? "count"}
+                logScale={config.options.logScale ?? false}
+                svgRef={svgRef}
+              />
             )}
             {chartType === "pie" && termsQuery.data && (
               <PieChart terms={termsQuery.data} svgRef={svgRef} />
@@ -526,11 +710,22 @@ export function VisualizePage() {
               <Heatmap data={timeseriesQuery.data} svgRef={svgRef} />
             )}
             {chartType === "line" && timeseriesQuery.data && (
-              <LineChart data={timeseriesQuery.data} svgRef={svgRef} />
+              <LineChart
+                data={timeseriesQuery.data}
+                seriesMode={config.options.seriesMode ?? "overlay"}
+                showLegend={config.options.legend ?? true}
+                svgRef={svgRef}
+              />
             )}
-            {chartType === "histogram" && numericQuery.data && (
-              <NumericHistogram stats={numericQuery.data} svgRef={svgRef} />
-            )}
+            {chartType === "histogram" &&
+              (compareNumericOn ? compareNumericQuery.data : numericQuery.data) && (
+                <NumericHistogram
+                  stats={compareNumericOn ? undefined : numericQuery.data}
+                  compare={compareNumericOn ? compareNumericQuery.data : undefined}
+                  logScale={config.options.logScale ?? false}
+                  svgRef={svgRef}
+                />
+              )}
             {chartType === "box" && numericQuery.data && (
               <BoxPlot stats={numericQuery.data} svgRef={svgRef} />
             )}
