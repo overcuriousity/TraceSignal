@@ -380,6 +380,7 @@ async def upload_geoip_database(
     atomically replaces any previous database and re-evaluates enricher
     availability so ``GET /api/enrichers`` reflects the change immediately.
     """
+    import shutil
     import tempfile
 
     import geoip2.database
@@ -408,7 +409,10 @@ async def upload_geoip_database(
             pass
         target = geoip_database_path()
         target.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path.replace(target)
+        # tmp_path is under the system temp dir, which may be a different
+        # filesystem than the target data dir — Path.replace() (os.rename)
+        # fails cross-device, so use shutil.move (copy+unlink fallback).
+        shutil.move(str(tmp_path), str(target))
 
     try:
         await asyncio.to_thread(_validate_and_install)
