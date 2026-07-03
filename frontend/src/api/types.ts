@@ -457,6 +457,20 @@ export interface HistogramResponse {
   buckets: HistogramBucket[];
 }
 
+/** One chartable field from `viz/fields` — no anomaly heuristics applied. */
+export interface VizFieldInfo {
+  token: string;
+  /** Number of distinct non-empty values. */
+  distinct: number;
+  /** Fraction of events with a non-empty value (0-1). */
+  coverage: number;
+}
+
+/** All chartable fields for the Visualization page's field picker, sorted by coverage descending. */
+export interface VizFieldsResponse {
+  fields: VizFieldInfo[];
+}
+
 /** One value's count from a `viz/field-terms` terms aggregation. */
 export interface FieldTermCount {
   value: string;

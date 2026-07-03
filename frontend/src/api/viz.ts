@@ -5,6 +5,7 @@ import type {
   FieldNumericResponse,
   FieldTermsResponse,
   FieldTimeseriesResponse,
+  VizFieldsResponse,
 } from "./types";
 
 /**
@@ -14,6 +15,11 @@ import type {
  * currently-filtered Explorer view.
  */
 export const vizApi = {
+  /** Every chartable field with distinct/coverage counts — unlike
+   * `anomaliesApi.fields`, no novelty-detection heuristics are applied. */
+  fields: (caseId: string, timelineId: string): Promise<VizFieldsResponse> =>
+    get<VizFieldsResponse>(`/cases/${caseId}/timelines/${timelineId}/viz/fields`),
+
   /** Top-N value/count terms aggregation for a field. */
   fieldTerms: (
     caseId: string,

@@ -13,7 +13,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowLeft, HelpCircle } from "lucide-react";
-import { anomaliesApi } from "@/api/anomalies";
 import { vizApi } from "@/api/viz";
 import { timelinesApi } from "@/api/timelines";
 import { paramsToFilters } from "@/lib/queryParams";
@@ -101,16 +100,16 @@ export function VisualizePage() {
   });
 
   const fieldsQuery = useQuery({
-    queryKey: ["anomaly-fields", caseId, timelineId],
-    queryFn: () => anomaliesApi.fields(caseId!, timelineId!),
+    queryKey: ["viz-fields", caseId, timelineId],
+    queryFn: () => vizApi.fields(caseId!, timelineId!),
     enabled: !!(caseId && timelineId),
   });
 
-  // Default to the first recommended field once the list loads.
+  // Default to the first field once the list loads — the backend sorts by
+  // coverage descending, so this is the highest-coverage field.
   useEffect(() => {
     if (field == null && fieldsQuery.data?.fields.length) {
-      const first = fieldsQuery.data.fields.find((f) => f.recommended) ?? fieldsQuery.data.fields[0];
-      setField(first.token);
+      setField(fieldsQuery.data.fields[0].token);
     }
   }, [field, fieldsQuery.data]);
 
