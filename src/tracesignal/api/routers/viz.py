@@ -34,6 +34,7 @@ from tracesignal.api.routers.events import (
     _resolve_event_id_filters,
     _resolve_timeline_scope,
     _resolve_timeline_source_ids,
+    _run_regex_guarded,
     _validate_regex,
 )
 from tracesignal.db.postgres import Case, User, generate_id
@@ -182,7 +183,7 @@ async def get_field_terms(
         run_id=run_id,
     )
     service = _get_query_service()
-    return await run_in_threadpool(service.field_terms, query, field, limit)
+    return await _run_regex_guarded(query.q_regex, service.field_terms, query, field, limit)
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/viz/field-numeric")
@@ -238,7 +239,9 @@ async def get_field_numeric_stats(
         run_id=run_id,
     )
     service = _get_query_service()
-    return await run_in_threadpool(service.field_numeric_stats, query, field, bins)
+    return await _run_regex_guarded(
+        query.q_regex, service.field_numeric_stats, query, field, bins
+    )
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/viz/field-timeseries")
@@ -295,8 +298,8 @@ async def get_field_value_timeseries(
         run_id=run_id,
     )
     service = _get_query_service()
-    return await run_in_threadpool(
-        service.field_value_timeseries, query, field, buckets, series_limit
+    return await _run_regex_guarded(
+        query.q_regex, service.field_value_timeseries, query, field, buckets, series_limit
     )
 
 
@@ -428,16 +431,17 @@ async def compare_layers(
         comparison = replace(comparison, start=primary.start, end=primary.end)
 
     service = _get_query_service()
+    q_regex = primary.q_regex or comparison.q_regex
     if body.kind == "time":
-        return await run_in_threadpool(
-            service.compare_time_histogram, primary, comparison, body.buckets
+        return await _run_regex_guarded(
+            q_regex, service.compare_time_histogram, primary, comparison, body.buckets
         )
     if body.kind == "terms":
-        return await run_in_threadpool(
-            service.compare_field_terms, primary, comparison, body.field, body.limit
+        return await _run_regex_guarded(
+            q_regex, service.compare_field_terms, primary, comparison, body.field, body.limit
         )
-    return await run_in_threadpool(
-        service.compare_field_numeric, primary, comparison, body.field, body.bins
+    return await _run_regex_guarded(
+        q_regex, service.compare_field_numeric, primary, comparison, body.field, body.bins
     )
 
 

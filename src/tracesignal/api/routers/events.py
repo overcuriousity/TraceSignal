@@ -7,6 +7,7 @@ import io
 import json
 import re
 from collections.abc import Generator
+from dataclasses import replace
 from datetime import datetime
 from typing import Any, Literal
 
@@ -963,9 +964,6 @@ async def export_events(
     persisted anomaly findings) so the export is a self-contained record —
     tagging a finding is what makes it show up here.
     """
-    # Pre-check only: the scan runs lazily inside the streaming response, so
-    # an RE2-only compile failure can still break the stream mid-flight —
-    # re.compile catches the common syntax errors up front with a clean 400.
     _validate_regex(body.filter.q, body.filter.q_regex)
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
     event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
@@ -1003,6 +1001,15 @@ async def export_events(
         tags_exclude=tags_exclude_filter,
         field_mappings=field_mappings,
     )
+
+    if eq.q_regex and eq.q:
+        # Force RE2 compilation on a cheap 1-row scan before streaming starts,
+        # so a pattern that passes _validate_regex's re.compile pre-check but
+        # is rejected by ClickHouse's RE2 driver still surfaces as a clean 400
+        # instead of breaking the response mid-stream.
+        await _run_regex_guarded(
+            True, _get_query_service().query, replace(eq, limit=1, offset=0)
+        )
 
     if body.format == "jsonl":
         media_type = "application/x-ndjson"

@@ -67,10 +67,17 @@ describe("filtersToParams / paramsToFilters round-trip", () => {
   });
 
   it("round-trips search mode and regex flag", () => {
-    const f: EventFilters = { q: "^Login fail", qMode: "semantic", qRegex: true };
+    const f: EventFilters = { q: "^Login fail", qRegex: true };
+    const out = paramsToFilters(filtersToParams(f));
+    expect(out.qMode).toBeUndefined();
+    expect(out.qRegex).toBe(true);
+  });
+
+  it("drops regex flag when search mode is semantic", () => {
+    const f: EventFilters = { q: "Login fail", qMode: "semantic", qRegex: true };
     const out = paramsToFilters(filtersToParams(f));
     expect(out.qMode).toBe("semantic");
-    expect(out.qRegex).toBe(true);
+    expect(out.qRegex).toBeUndefined();
   });
 
   it("ignores unknown qMode values from the URL", () => {

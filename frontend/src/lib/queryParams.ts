@@ -148,7 +148,7 @@ export function paramsToFilters(params: URLSearchParams): EventFilters {
 
   if (q) filters.q = q;
   if (params.get("qMode") === "semantic") filters.qMode = "semantic";
-  if (params.get("qRegex") === "1") filters.qRegex = true;
+  if (params.get("qRegex") === "1" && filters.qMode !== "semantic") filters.qRegex = true;
   if (artifact) filters.artifact = artifact;
   if (artifacts) {
     filters.artifacts = artifacts.split(",").map((a) => a.trim()).filter(Boolean);
@@ -224,7 +224,7 @@ export function viewPayloadToFilters(
   if (typeof payload.q === "string" && payload.q) f.q = payload.q;
   // Legacy payloads predate these keys — absent means keyword, non-regex.
   if (payload.qMode === "semantic") f.qMode = "semantic";
-  if (payload.qRegex === true) f.qRegex = true;
+  if (payload.qRegex === true && f.qMode !== "semantic") f.qRegex = true;
   if (typeof payload.artifact === "string" && payload.artifact)
     f.artifact = payload.artifact;
   if (Array.isArray(payload.artifacts) && payload.artifacts.length > 0) {
