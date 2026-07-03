@@ -30,7 +30,7 @@ from tracesignal.db.field_mappings import validate_field_mappings
 from tracesignal.db.postgres import Case, PostgresStore, User, generate_id
 from tracesignal.db.qdrant import QdrantStore
 from tracesignal.db.queries import EventQueryService
-from tracesignal.ingestion.files import hash_file
+from tracesignal.ingestion.files import UploadTooLargeError, copy_and_hash
 from tracesignal.ingestion.parser import detect_format
 from tracesignal.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
 
@@ -337,17 +337,31 @@ async def upload_source(
     store = get_store()
     case_id = case.id
 
-    file_hash = hash_file(file.file)
+    # Copy to a temp file and hash in one pass, in a worker thread so a
+    # multi-GB upload doesn't block the event loop, and capped by
+    # TS_MAX_UPLOAD_BYTES so a single request can't fill the disk. Hashing
+    # during the copy means the duplicate check now happens after the copy —
+    # a duplicate upload costs one temp write, but the common (new file) path
+    # reads the stream once instead of twice.
+    max_bytes = get_settings().max_upload_bytes or None
+    suffix = Path(file.filename or "upload").suffix or ".tmp"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)  # noqa: SIM115
+    tmp_path = Path(tmp.name)
     try:
-        file.file.seek(0)
-    except (OSError, AttributeError) as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded file stream is not seekable; cannot ingest",
-        ) from exc
+        with tmp:
+            file_hash, size_bytes = await asyncio.to_thread(
+                copy_and_hash, file.file, tmp, chunk_size=1024 * 1024, max_bytes=max_bytes
+            )
+    except UploadTooLargeError as exc:
+        tmp_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
     existing_source = await store.get_source_by_hash(case_id, file_hash)
     if existing_source is not None:
+        tmp_path.unlink(missing_ok=True)
         return SourceUploadResponse(
             source_id=existing_source.id,
             events_parsed=existing_source.event_count,
@@ -355,12 +369,6 @@ async def upload_source(
             parser=parser or existing_source.parser or "auto",
             duplicate=True,
         )
-
-    suffix = Path(file.filename or "upload").suffix or ".tmp"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        shutil.copyfileobj(file.file, tmp)
-        tmp_path = Path(tmp.name)
-        size_bytes = tmp_path.stat().st_size
 
     source_created = False
     try:

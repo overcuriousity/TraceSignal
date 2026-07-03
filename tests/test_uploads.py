@@ -14,9 +14,10 @@ from tests.conftest import _fake_user
 from tracesignal.api import deps
 from tracesignal.api.routers import cases
 from tracesignal.api.routers.cases import upload_source
+from tracesignal.core.config import get_settings
 from tracesignal.core.jobs import get_job_store
 from tracesignal.db.postgres import PostgresStore
-from tracesignal.ingestion.files import hash_file
+from tracesignal.ingestion.files import UploadTooLargeError, copy_and_hash, hash_file
 from tracesignal.ingestion.pipeline import IngestionResult
 
 
@@ -217,3 +218,39 @@ async def test_failed_ingestion_marks_job_failed_and_removes_source(
     retry = await _upload(case_obj, "bad.jsonl", content)
     assert retry.duplicate is False
     assert get_job_store().get(retry.job_id).status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_oversized_upload_rejected_with_413(
+    store: PostgresStore,
+    case: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An upload larger than TS_MAX_UPLOAD_BYTES is rejected mid-stream and
+    creates neither a source row nor a job."""
+    monkeypatch.setenv("TS_MAX_UPLOAD_BYTES", "8")
+    get_settings.cache_clear()
+    try:
+        case_obj = await store.get_case(case)
+        with pytest.raises(HTTPException) as exc_info:
+            await _upload(case_obj, "big.jsonl", b'{"message":"way too large"}\n')
+        assert exc_info.value.status_code == 413
+        assert await store.list_sources(case) == []
+    finally:
+        get_settings.cache_clear()
+
+
+def test_copy_and_hash_matches_hash_file_and_caps(tmp_path: Path) -> None:
+    """copy_and_hash produces the same digest as hash_file and enforces max_bytes."""
+    content = b"line one\nline two\n"
+    src_path = tmp_path / "src.log"
+    src_path.write_bytes(content)
+
+    dst = BytesIO()
+    digest, size = copy_and_hash(BytesIO(content), dst)
+    assert size == len(content)
+    assert dst.getvalue() == content
+    assert digest == hash_file(src_path)
+
+    with pytest.raises(UploadTooLargeError):
+        copy_and_hash(BytesIO(content), BytesIO(), max_bytes=len(content) - 1)
