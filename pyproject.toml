@@ -12,7 +12,7 @@ keywords = ["forensics", "timeline", "log-analysis", "vector-search", "anomaly-d
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Information Technology",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",

@@ -181,4 +181,4 @@ analysis system for a small, self-hosted team.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+GPL-3.0 — see [LICENSE](LICENSE).
