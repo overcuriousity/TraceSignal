@@ -13,10 +13,10 @@
  * `viz/lib/chartConfig.ts`) alongside the filter params — a Visualize URL is
  * a complete, shareable description of the chart.
  */
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowLeft, HelpCircle } from "lucide-react";
+import { ArrowLeft, HelpCircle, Lightbulb, X } from "lucide-react";
 import { vizApi, type CompareMode } from "@/api/viz";
 import { eventsApi } from "@/api/events";
 import { timelinesApi } from "@/api/timelines";
@@ -51,6 +51,7 @@ import {
 import { METRIC_INFO, type Metric } from "@/components/viz/lib/transforms";
 import { CHART_META, chartTypesFor, SCALES } from "@/components/viz/lib/chartMeta";
 import { buildCaptionLines, type CaptionFacts } from "@/components/viz/lib/caption";
+import { CHART_PRESETS } from "@/components/viz/lib/presets";
 import { ChartCaption } from "@/components/viz/primitives/ChartCaption";
 import type {
   CompareNumericResponse,
@@ -132,6 +133,14 @@ export function VisualizePage() {
   const buckets = config.options.buckets ?? 60;
 
   const svgRef = useRef<SVGSVGElement | null>(null);
+  // Preset strip: open by default on a fresh page (no chart state in the
+  // URL yet); a URL that already describes a chart skips the guidance.
+  const [presetsOpen, setPresetsOpen] = useState(() => !searchParams.has("c_type"));
+
+  const applyPreset = (preset: (typeof CHART_PRESETS)[number]) => {
+    updateConfig(preset.config);
+    setPresetsOpen(false);
+  };
 
   const timelineQuery = useQuery({
     queryKey: ["timeline", caseId, timelineId],
@@ -334,6 +343,12 @@ export function VisualizePage() {
           <h2 className="mt-1 text-sm font-semibold text-[var(--color-fg-primary)]">
             Visualize {timelineQuery.data ? `— ${timelineQuery.data.name}` : ""}
           </h2>
+          <button
+            onClick={() => setPresetsOpen((v) => !v)}
+            className="mt-1 flex items-center gap-1 text-xs text-[var(--color-fg-secondary)] hover:text-[var(--color-fg-primary)]"
+          >
+            <Lightbulb size={12} /> Presets
+          </button>
         </div>
 
         {/* Field picker */}
@@ -695,6 +710,36 @@ export function VisualizePage() {
 
       {/* Canvas */}
       <div className="flex-1 overflow-auto p-4">
+        {presetsOpen && (
+          <div className="mb-4 rounded border border-[var(--color-border)] bg-[var(--color-bg-surface)] p-3">
+            <div className="mb-2 flex items-center justify-between">
+              <span className="text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+                What do you want to find out?
+              </span>
+              <button
+                onClick={() => setPresetsOpen(false)}
+                className="text-[var(--color-fg-muted)] hover:text-[var(--color-fg-primary)]"
+                aria-label="Close presets"
+              >
+                <X size={14} />
+              </button>
+            </div>
+            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+              {CHART_PRESETS.map((p) => (
+                <button
+                  key={p.id}
+                  onClick={() => applyPreset(p)}
+                  className="rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] p-2.5 text-left hover:border-[var(--color-accent)]"
+                >
+                  <div className="text-sm font-medium text-[var(--color-fg-primary)]">
+                    {p.label}
+                  </div>
+                  <div className="mt-1 text-xs text-[var(--color-fg-muted)]">{p.question}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
         {dataKind !== "time" && !field ? (
           <div className="flex h-full items-center justify-center text-sm text-[var(--color-fg-muted)]">
             {fieldsQuery.isLoading ? <Spinner size={20} /> : "Choose a field to visualize."}
