@@ -382,6 +382,8 @@ export interface UploadResult {
   events_inserted: number;
   parser: string;
   duplicate?: boolean;
+  /** Background ingestion job to poll for progress; null for duplicates. */
+  job_id?: string | null;
 }
 
 export interface HealthResponse {

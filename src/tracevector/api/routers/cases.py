@@ -64,13 +64,21 @@ class AnnotationCreate(BaseModel):
 
 
 class SourceUploadResponse(BaseModel):
-    """Response shape for a source upload."""
+    """Response shape for a source upload.
+
+    For a new (non-duplicate) upload, ingestion runs as a background job:
+    ``job_id`` identifies it in ``GET /api/jobs/{job_id}`` and the event
+    counts are 0 until the job completes (the job result carries the final
+    counts). Duplicate uploads return the existing source's counts and no
+    job.
+    """
 
     source_id: str
     events_parsed: int
     events_inserted: int
     parser: str
     duplicate: bool
+    job_id: str | None = None
 
 
 router = APIRouter(prefix="/api/cases", tags=["cases"])
@@ -207,8 +215,87 @@ async def get_source(source_id: str, case: Case = Depends(require_case_read)) ->
     return {"source": source.to_dict()}
 
 
+async def _run_ingestion_job(
+    job_id: str,
+    case_id: str,
+    source_id: str,
+    tmp_path: Path,
+    fmt: str,
+    file_hash: str,
+    source_name: str,
+    filename: str | None,
+    size_bytes: int,
+    user: User,
+    job_store: JobStore,
+) -> None:
+    """Ingest an uploaded file in the background, updating the job store.
+
+    The source row already exists (with ``event_count=0``, created before the
+    job was scheduled so duplicate uploads are rejected immediately); this job
+    streams the events into ClickHouse, bumps the stored count, and records
+    the audit row. On failure it removes the partial events and the source
+    row again so a failed upload leaves no half-populated source behind.
+    """
+    store = get_store()
+
+    def progress_callback(total: int, processed: int) -> None:
+        job_store.update(
+            job_id,
+            status="running",
+            progress={"total": total, "processed": processed},
+        )
+
+    try:
+        pipeline = IngestionPipeline(
+            case_id=case_id,
+            source_id=source_id,
+            batch_size=get_settings().embedding_batch_size,
+            file_hash=file_hash,
+            source_name=source_name,
+            progress_callback=progress_callback,
+        )
+        # The pipeline is synchronous (parsing + ClickHouse inserts) — run it
+        # in a worker thread so a large ingest doesn't block the event loop.
+        result = await asyncio.to_thread(pipeline.run, tmp_path, fmt)
+
+        await store.update_source_counts(
+            case_id=case_id,
+            source_id=source_id,
+            event_count=result.events_inserted,
+        )
+        await store.record_audit(
+            action="source.upload",
+            actor=user,
+            case_id=case_id,
+            target_type="source",
+            target_id=source_id,
+            detail={"filename": filename, "events_inserted": result.events_inserted},
+        )
+        job_store.update(
+            job_id,
+            status="completed",
+            progress={"total": size_bytes, "processed": size_bytes},
+            result={
+                "source_id": source_id,
+                "events_parsed": result.events_parsed,
+                "events_inserted": result.events_inserted,
+                "parser": fmt,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        try:
+            await asyncio.to_thread(ClickHouseStore().delete_source_events, case_id, source_id)
+            await store.delete_source(case_id, source_id)
+        except Exception:  # noqa: BLE001, S110 — best-effort cleanup
+            pass
+        job_store.update(job_id, status="failed", error=str(exc))
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 @router.post("/{case_id}/sources")
 async def upload_source(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),  # noqa: B008
     parser: str | None = Form(default=None),
     name: str | None = Form(default=None),
@@ -219,6 +306,10 @@ async def upload_source(
 
     ``name`` is supplied as a form field, but the function may also be called
     directly from tests with a plain ``str`` or ``None`` value.
+
+    Ingestion runs as a background job (see ``SourceUploadResponse.job_id``)
+    so the UI can show live progress; the source row itself is created
+    immediately with ``event_count=0``.
 
     Embeddings are *not* generated here; use the timeline embed endpoint
     (``POST /{case_id}/timelines/{timeline_id}/embed``) for that.
@@ -259,7 +350,20 @@ async def upload_source(
 
     try:
         fmt = parser if parser and parser.lower() not in {"undefined", "null", "auto", ""} else None
-        fmt = fmt or detect_format(tmp_path)
+        if fmt is None:
+            try:
+                fmt = detect_format(tmp_path)
+            except ValueError as exc:
+                # Unknown extension is a client problem, not a server crash.
+                # detect_format's own message names the server-side temp file,
+                # which is useless (and mildly leaky) for the client.
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Cannot detect parser format for {file.filename!r}; "
+                        "pass an explicit parser (e.g. jsonl, timesketch_csv)."
+                    ),
+                ) from exc
         source_id = generate_id(f"{case_id}:{file_hash}")
         source_name = name or file.filename or tmp_path.name
 
@@ -268,15 +372,8 @@ async def upload_source(
         retention_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(tmp_path, retention_path)
 
-        pipeline = IngestionPipeline(
-            case_id=case_id,
-            source_id=source_id,
-            batch_size=get_settings().embedding_batch_size,
-            file_hash=file_hash,
-            source_name=file.filename or tmp_path.name,
-        )
-        result = pipeline.run(tmp_path, format_name=fmt)
-
+        # Create the source row up front (event_count=0) so a re-upload of
+        # the same bytes is rejected as a duplicate while ingestion runs.
         await store.create_source(
             case_id=case_id,
             source_id=source_id,
@@ -285,7 +382,7 @@ async def upload_source(
             size_bytes=size_bytes,
             filename=file.filename,
             parser=fmt,
-            event_count=result.events_inserted,
+            event_count=0,
             created_by=user.id,
         )
 
@@ -294,24 +391,38 @@ async def upload_source(
         if default_timeline is not None:
             await store.add_source_to_timeline(case_id, default_timeline.id, source_id)
 
-        await store.record_audit(
-            action="source.upload",
-            actor=user,
-            case_id=case_id,
-            target_type="source",
-            target_id=source_id,
-            detail={"filename": file.filename, "events_inserted": result.events_inserted},
+        job_store = get_job_store()
+        job = job_store.create(
+            kind="ingest",
+            progress={"total": size_bytes, "processed": 0},
+            created_by=user.id,
         )
-
-        return SourceUploadResponse(
-            source_id=source_id,
-            events_parsed=result.events_parsed,
-            events_inserted=result.events_inserted,
-            parser=fmt,
-            duplicate=False,
+        background_tasks.add_task(
+            _run_ingestion_job,
+            job.id,
+            case_id,
+            source_id,
+            tmp_path,
+            fmt,
+            file_hash,
+            file.filename or tmp_path.name,
+            file.filename,
+            size_bytes,
+            user,
+            job_store,
         )
-    finally:
+    except Exception:
         tmp_path.unlink(missing_ok=True)
+        raise
+
+    return SourceUploadResponse(
+        source_id=source_id,
+        events_parsed=0,
+        events_inserted=0,
+        parser=fmt,
+        duplicate=False,
+        job_id=job.id,
+    )
 
 
 @router.get("/{case_id}/sources/{source_id}/download")

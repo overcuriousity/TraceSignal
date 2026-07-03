@@ -12,8 +12,9 @@ existing behavior, tests, or CSS rules were removed, and no CLAUDE.md rule viola
 found. Verification did surface real correctness bugs, mostly at the edges of the new
 aggregation queries and the D3 scale/color logic, plus a set of cleanup opportunities.
 
-**Status: partially resolved.** 5 of 7 correctness bugs fixed (2026-07-02, same session);
-2 remain open. This file is a fix-it reference for whoever picks this up next.
+**Status: correctness bugs fully resolved.** 5 of 7 fixed 2026-07-02; bugs 6–7 plus design
+items 8/10/12/13 fixed 2026-07-03. Design items 9/11/14/15/16 remain open as deliberate
+lower-priority refactors. This file is a fix-it reference for whoever picks those up next.
 
 ## Resolution summary
 
@@ -24,12 +25,32 @@ aggregation queries and the D3 scale/color logic, plus a set of cleanup opportun
 | 3 | ✅ Fixed | Added `numericDomain(min, max)` to `lib/stats.ts` — pads a degenerate (`min === max`) domain by a small symmetric epsilon instead of leaving it zero-span. Applied to `NumericHistogram`, `EcdfChart` (previously unguarded), and also `BoxPlot`/`ViolinPlot` (their existing `.nice()` call turned out **not** to fix a zero-span domain either — confirmed by reading d3-array's `nice()` source, which early-returns `[start, stop]` unchanged when the tick step is 0 — so those two had the identical latent bug). Added `numericDomain` unit tests in `vizStats.test.ts`. |
 | 4 | ✅ Fixed | `buildSeriesColorMap` now folds any series past the 8-slot categorical palette into the neutral `OTHER_COLOR` instead of wrapping `% 8` and silently reusing an earlier series' hue. |
 | 5 | ✅ Fixed | Bucketed under the same code change as #4: `buildSeriesColorMap` now takes `(string \| {key, isOther})[]` and a reserved sentinel `OTHER_KEY` (a NUL-prefixed string no real ClickHouse value can produce) identifies the synthesized "outside top-N" row structurally, not by comparing display text to the literal string `"Other"`. `BarChart`/`PieChart` rows now carry a `key` distinct from `label`, used for the `scaleBand`/`pie` domain, React `key`, and color-map lookups — a real field value literally named `"Other"` no longer collides with the synthesized bucket. Extended `vizColors.test.ts` with folding and non-collision cases. |
-| 6 | ⬜ Not started | `AxisBottomBand` 13-char truncation vs. `Heatmap`'s ~20-char timestamp labels. |
-| 7 | ⬜ Not started | Export filenames (`FieldHistogramModal`/`lib/export.ts`) not sanitized against `/`/`:` from file-path-valued fields. |
+| 6 | ✅ Fixed | `AxisBottomBand` grew a `maxLabelChars` prop (default 14) plus density-aware label thinning (every band keeps its tick, only every Nth gets a label). `Heatmap` now feeds it an adaptive **UTC** tick formatter (time-only within one day, month-day within one year, full date otherwise) with `maxLabelChars={17}`. While here: `Heatmap`/`LineChart`/`TimeHistogram` all formatted ticks/tooltips with `timeFormat` (browser-local) while labeling them "UTC" — switched to `utcFormat`. |
+| 7 | ✅ Fixed | New shared `lib/download.ts` with `sanitizeFilename` (strips `/ \ : * ? " < > \|` + control chars, collapses runs, falls back to "download") applied inside `triggerDownload`, used by both chart exports and event exports. Covers design item 12 too — the duplicated blob-download helpers in `viz/lib/export.ts` and `api/export.ts` are now one implementation (with the DOM-attach Firefox/Safari fix). Tests in `download.test.ts`. |
+
+## Design-item resolution (2026-07-03)
+
+| # | Status | What happened |
+|---|--------|----------------|
+| 8 | ✅ Fixed | The numeric probe query is now gated: it runs once per field change (scale auto-suggestion, tracked via `autoProbedField` state) and while a numeric chart is displayed — no longer on every bins change on a terms chart. |
+| 9 | ⬜ Open | Backend double scans in `field_terms`/`field_numeric_stats`/`field_value_timeseries`. |
+| 10 | ✅ Fixed | `VisualizePage` clamps the shared `topN` via `effectiveTopN = min(topN, maxTopN)` per data kind — request, slider position, and label always agree after a chart-type switch. |
+| 11 | ⬜ Open | `_field_column_expr` duplication of `_ParameterizedQueryBuilder._column_expr`. |
+| 12 | ✅ Fixed | Folded into bug 7 (shared `lib/download.ts`). |
+| 13 | ✅ Fixed | New `serializeEventFilterParams` in `lib/queryParams.ts` (scalar fields + JSON-stringified `filters`/`exclusions`); `api/viz.ts` (3×) and `api/events.ts` (2×) now use it instead of hand-rolled stringify blocks. |
+| 14 | ⬜ Open | Shared chart hooks (`useChartRef`/`ChartEmptyState`/`useChartHover`). |
+| 15 | ⬜ Open | `chartType`/`scale` sync via two `useEffect`s. |
+| 16 | ⬜ Open | Field picker reuses `/anomalies/fields`. |
 
 Verified after each fix: backend `uv run pytest` (274 passed) and `uv run ruff check .` clean;
 frontend `npm run test` (59 passed), `npm run typecheck`, and `npm run lint` clean (lint's 3
 warnings are pre-existing, unrelated to this PR).
+
+2026-07-03 session: backend 276 passed, frontend 66 passed, ruff/tsc/oxlint clean. Bugs 6
+and the new ingestion progress bar were additionally verified end-to-end against the running
+app (real ClickHouse/Postgres/Qdrant, Playwright-driven UI): the heatmap axis now renders
+distinct, unclipped, thinned UTC tick labels, and a 300k-event upload shows live byte-based
+progress in the job tray, completing with the source list auto-refreshing to the final count.
 
 ## Correctness bugs (verified against the code)
 

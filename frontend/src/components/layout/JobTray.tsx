@@ -21,9 +21,10 @@ function JobRow({ job }: { job: TrackedJob }) {
     queryFn: async () => {
       const j = await jobsApi.get(job.id);
       updateJob(j);
-      if (j.status === "completed" && job.timelineKey) {
-        const [caseId, timelineId] = job.timelineKey.split("/");
-        qc.invalidateQueries({ queryKey: ["timeline", caseId, timelineId] });
+      if (j.status === "completed") {
+        for (const key of job.invalidate ?? []) {
+          qc.invalidateQueries({ queryKey: key });
+        }
       }
       return j;
     },
