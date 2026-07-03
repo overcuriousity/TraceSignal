@@ -35,6 +35,11 @@ from tracesignal.ingestion.files import UploadTooLargeError, copy_and_hash
 from tracesignal.ingestion.parser import detect_format
 from tracesignal.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
 
+# Strong references for fire-and-forget automatic enrichment tasks (see
+# _trigger_automatic_enrichments) so asyncio doesn't garbage-collect them
+# mid-run; entries are removed once each task finishes.
+_background_enrichment_tasks: set[asyncio.Task] = set()
+
 
 class CaseCreate(BaseModel):
     """Payload to create a case."""
@@ -323,6 +328,52 @@ async def _revalidate_stale_field_mappings(
             )
 
 
+async def _trigger_automatic_enrichments(
+    store: PostgresStore,
+    clickhouse: ClickHouseStore,
+    job_store: JobStore,
+    case_id: str,
+    source_id: str,
+) -> None:
+    """Fire background enrichment jobs for every timeline configured to auto-run on this source.
+
+    Called right after a source flips to "ready" — the same point
+    ``_revalidate_stale_field_mappings`` uses, since that's the single place
+    in the codebase that knows ingestion just succeeded. Skips any enricher
+    that is currently unavailable (e.g. its required database was never
+    uploaded); the config still exists and will fire again on the next
+    ingestion once availability is restored.
+    """
+    from tracesignal.enrichers.jobs import run_enrichment_job
+    from tracesignal.enrichers.registry import get_cached_availability, get_enricher
+
+    configs = await store.list_automatic_enrichers_for_source(source_id)
+    for config in configs:
+        enricher = get_enricher(config.enricher_key)
+        availability = get_cached_availability(config.enricher_key)
+        if enricher is None or availability is None or not availability.available:
+            continue
+        job = job_store.create(
+            kind="enrich", progress={"processed": 0, "total": 0}, created_by=None
+        )
+        task = asyncio.create_task(
+            run_enrichment_job(
+                job_id=job.id,
+                case_id=case_id,
+                timeline_id=config.timeline_id,
+                enricher_key=config.enricher_key,
+                source_ids=[source_id],
+                job_store=job_store,
+                store=store,
+                ch_store=clickhouse,
+            )
+        )
+        # Keep a strong reference so the task isn't garbage-collected
+        # mid-run (asyncio only holds a weak reference once scheduled).
+        _background_enrichment_tasks.add(task)
+        task.add_done_callback(_background_enrichment_tasks.discard)
+
+
 async def _run_ingestion_job(
     job_id: str,
     case_id: str,
@@ -377,6 +428,7 @@ async def _run_ingestion_job(
         # detectors, and embedding (see events._resolve_timeline_scope).
         await store.set_source_status(case_id, source_id, "ready")
         await _revalidate_stale_field_mappings(store, case_id, source_id)
+        await _trigger_automatic_enrichments(store, clickhouse, job_store, case_id, source_id)
         await store.record_audit(
             action="source.upload",
             actor=user,
@@ -1211,5 +1263,147 @@ async def start_timeline_embedding(
         source_ids,
         job_store,
         field_config,
+    )
+    return {"job_id": job.id, "status": job.status, "source_ids": source_ids}
+
+
+class TimelineEnricherConfigUpdate(BaseModel):
+    """Payload to enable/configure an enricher for a timeline."""
+
+    mode: str = Field(..., pattern="^(automatic|manual)$")
+    enabled: bool
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/enrichers")
+async def list_timeline_enrichers(
+    timeline_id: str,
+    case: Case = Depends(require_case_read),
+) -> dict[str, Any]:
+    """List every *available* enricher for this timeline, with eligibility and current config.
+
+    Enrichers that fail their availability check (e.g. GeoIP with no
+    uploaded database) are omitted entirely — they should not appear in the
+    GUI until an admin makes them available.
+    """
+    from tracesignal.enrichers.registry import all_enrichers, get_cached_availability
+
+    store = get_store()
+    case_id = case.id
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    sources = await store.list_timeline_sources(case_id, timeline_id)
+    ready_source_ids = [s.id for s in sources if s.is_ready]
+    configs = {c.enricher_key: c for c in await store.list_timeline_enrichers(timeline_id)}
+
+    clickhouse = ClickHouseStore()
+    result = []
+    for enricher in all_enrichers():
+        availability = get_cached_availability(enricher.key)
+        if availability is None or not availability.available:
+            continue
+        eligibility = await run_in_threadpool(
+            enricher.check_eligibility, clickhouse, case_id, ready_source_ids
+        )
+        config = configs.get(enricher.key)
+        result.append(
+            {
+                "key": enricher.key,
+                "display_name": enricher.display_name,
+                "description": enricher.description,
+                "eligible": eligibility.eligible,
+                "sample_checked": eligibility.sample_checked,
+                "sample_matched": eligibility.sample_matched,
+                "mode": config.mode if config else "automatic",
+                "enabled": config.enabled if config else False,
+            }
+        )
+    return {"enrichers": result}
+
+
+@router.put("/{case_id}/timelines/{timeline_id}/enrichers/{enricher_key}")
+async def set_timeline_enricher_config(
+    timeline_id: str,
+    enricher_key: str,
+    body: TimelineEnricherConfigUpdate,
+    case: Case = Depends(require_case_manage),
+    user: User = Depends(require_password_current),
+) -> dict[str, Any]:
+    """Enable/disable an enricher for a timeline and set its trigger mode."""
+    from tracesignal.enrichers.registry import get_enricher
+
+    if get_enricher(enricher_key) is None:
+        raise HTTPException(status_code=404, detail="Unknown enricher")
+
+    store = get_store()
+    case_id = case.id
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    config = await store.upsert_timeline_enricher(
+        timeline_id=timeline_id,
+        enricher_key=enricher_key,
+        mode=body.mode,
+        enabled=body.enabled,
+        updated_by=user.id,
+    )
+    await store.record_audit(
+        action="timeline.enricher_config",
+        actor=user,
+        case_id=case_id,
+        target_type="timeline",
+        target_id=timeline_id,
+        detail={"enricher_key": enricher_key, "mode": body.mode, "enabled": body.enabled},
+    )
+    return {"enricher": config.to_dict()}
+
+
+@router.post("/{case_id}/timelines/{timeline_id}/enrichers/{enricher_key}/run")
+async def run_timeline_enricher(
+    timeline_id: str,
+    enricher_key: str,
+    background_tasks: BackgroundTasks,
+    case: Case = Depends(require_case_contribute),
+    user: User = Depends(require_password_current),
+) -> dict[str, Any]:
+    """Manually trigger an enrichment run for a timeline's sources."""
+    from tracesignal.enrichers.jobs import run_enrichment_job
+    from tracesignal.enrichers.registry import get_cached_availability, get_enricher
+
+    if get_enricher(enricher_key) is None:
+        raise HTTPException(status_code=404, detail="Unknown enricher")
+    availability = get_cached_availability(enricher_key)
+    if availability is None or not availability.available:
+        raise HTTPException(status_code=409, detail="Enricher is not currently available")
+
+    store = get_store()
+    case_id = case.id
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    sources = await store.list_timeline_sources(case_id, timeline_id)
+    source_ids = [s.id for s in sources if s.is_ready]
+    if not source_ids:
+        raise HTTPException(status_code=422, detail="Timeline has no ready sources to enrich")
+
+    job_store = get_job_store()
+    job = job_store.create(
+        kind="enrich",
+        progress={"processed": 0, "total": 0},
+        created_by=user.id,
+    )
+    background_tasks.add_task(
+        run_enrichment_job,
+        job_id=job.id,
+        case_id=case_id,
+        timeline_id=timeline_id,
+        enricher_key=enricher_key,
+        source_ids=source_ids,
+        job_store=job_store,
+        store=store,
+        ch_store=ClickHouseStore(),
     )
     return {"job_id": job.id, "status": job.status, "source_ids": source_ids}

@@ -8,14 +8,17 @@ teams and memberships.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 
 from tracesignal.api.deps import get_store, require_admin
+from tracesignal.core.config import get_settings
 from tracesignal.core.security import hash_password
 from tracesignal.db.postgres import User, generate_id
+from tracesignal.ingestion.files import UploadTooLargeError, copy_and_hash
 
 router = APIRouter(prefix="/api/admin", tags=["admin"], dependencies=[Depends(require_admin)])
 
@@ -339,3 +342,90 @@ async def query_audit(
     store = get_store()
     rows = await store.query_audit(user_id=user_id, case_id=case_id, action=action, limit=limit)
     return {"audit": [r.to_dict() for r in rows]}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Enricher assets (GeoIP database upload)
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+@router.get("/enrichers/geoip/database")
+async def get_geoip_database_status(admin: User = Depends(require_admin)) -> dict[str, Any]:
+    """Return whether a GeoLite2 database is currently uploaded and its availability."""
+    from tracesignal.enrichers.geoip import geoip_database_path
+    from tracesignal.enrichers.registry import get_cached_availability, refresh_availability
+
+    path = geoip_database_path()
+    exists = await asyncio.to_thread(path.exists)
+    size_bytes = await asyncio.to_thread(lambda: path.stat().st_size) if exists else None
+    availability = get_cached_availability("geoip") or (
+        await asyncio.to_thread(refresh_availability)
+    ).get("geoip")
+    return {
+        "uploaded": exists,
+        "size_bytes": size_bytes,
+        "available": availability.available if availability else False,
+        "reason": availability.reason if availability else None,
+    }
+
+
+@router.post("/enrichers/geoip/database")
+async def upload_geoip_database(
+    file: UploadFile = File(...),  # noqa: B008
+    admin: User = Depends(require_admin),
+) -> dict[str, Any]:
+    """Upload (or replace) the MaxMind GeoLite2 database used by the GeoIP enricher.
+
+    Validates the file opens as a real ``.mmdb`` before committing it, then
+    atomically replaces any previous database and re-evaluates enricher
+    availability so ``GET /api/enrichers`` reflects the change immediately.
+    """
+    import tempfile
+
+    import geoip2.database
+
+    from tracesignal.enrichers.geoip import geoip_database_path
+    from tracesignal.enrichers.registry import refresh_availability
+
+    store = get_store()
+    max_bytes = get_settings().max_upload_bytes or None
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mmdb")  # noqa: SIM115
+    tmp_path = Path(tmp.name)
+    try:
+        with tmp:
+            await asyncio.to_thread(
+                copy_and_hash, file.file, tmp, chunk_size=1024 * 1024, max_bytes=max_bytes
+            )
+    except UploadTooLargeError as exc:
+        tmp_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+    def _validate_and_install() -> None:
+        with geoip2.database.Reader(str(tmp_path)):
+            pass
+        target = geoip_database_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path.replace(target)
+
+    try:
+        await asyncio.to_thread(_validate_and_install)
+    except Exception as exc:  # noqa: BLE001
+        tmp_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=f"Invalid GeoLite2 database: {exc}") from exc
+
+    availability_map = await asyncio.to_thread(refresh_availability)
+    await store.record_audit(
+        action="admin.geoip_database_upload",
+        actor=admin,
+        target_type="enricher",
+        target_id="geoip",
+        detail={"filename": file.filename},
+    )
+    availability = availability_map.get("geoip")
+    return {
+        "available": availability.available if availability else False,
+        "reason": availability.reason if availability else None,
+    }

@@ -16,6 +16,7 @@ from sqlalchemy import (
     String,
     delete,
     func,
+    insert,
     inspect,
     select,
     text,
@@ -244,6 +245,114 @@ class TimelineSource(Base):
     )
     source_id: Mapped[str] = mapped_column(
         String(64), ForeignKey("sources.id", ondelete="CASCADE"), primary_key=True
+    )
+
+
+class TimelineEnricher(Base):
+    """Per-timeline enricher configuration: which enrichers run, and how.
+
+    ``mode`` controls whether this enricher fires automatically after
+    ingestion succeeds for a source belonging to this timeline, or only when
+    an analyst manually triggers it. Mirrors the ``timeline_sources`` join
+    table in spirit, but carries config rather than being a pure M:N link.
+    """
+
+    __tablename__ = "timeline_enrichers"
+    __table_args__ = (
+        Index("ix_timeline_enrichers_unique", "timeline_id", "enricher_key", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    timeline_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("timelines.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    enricher_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False, default="automatic")
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    updated_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary."""
+        return {
+            "id": self.id,
+            "timeline_id": self.timeline_id,
+            "enricher_key": self.enricher_key,
+            "mode": self.mode,
+            "enabled": self.enabled,
+            "updated_by": self.updated_by,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class EnrichmentResultStaging(Base):
+    """Crash/resume-safe staging area for in-flight enrichment jobs.
+
+    Rows accumulate here as an enrichment job processes batches; on job
+    completion (or a periodic checkpoint) they are bulk-flushed to the
+    ClickHouse ``event_enrichments`` table and deleted. If the process dies
+    mid-run, rows survive here (Postgres is transactional) even though the
+    in-memory JobStore does not — see ``list_orphaned_enrichment_job_runs``,
+    which mirrors ``list_ingesting_sources`` for reconciliation on restart.
+    """
+
+    __tablename__ = "enrichment_results_staging"
+    __table_args__ = (
+        Index("ix_staging_job_id", "job_id"),
+        Index(
+            "ix_staging_unique_row",
+            "job_id",
+            "event_id",
+            "enricher_key",
+            "field_key",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    job_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    timeline_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    enricher_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    field_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    value: Mapped[str] = mapped_column(String(1024), nullable=False)
+    computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class EnrichmentJobRun(Base):
+    """Durable marker for an in-flight enrichment job.
+
+    The Postgres-side complement to the ephemeral JobStore (``core/jobs.py``):
+    written when a job starts, deleted only after its final ClickHouse flush
+    succeeds. A row still present at startup means the process died mid-run —
+    the same signal ``Source.status == "ingesting"`` gives
+    ``list_ingesting_sources`` for orphaned ingest jobs.
+    """
+
+    __tablename__ = "enrichment_job_runs"
+
+    job_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    timeline_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    enricher_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
     )
 
 
@@ -922,6 +1031,156 @@ class PostgresStore:
         """
         async with self.session_factory() as session:
             result = await session.execute(select(Source).where(Source.status == "ingesting"))
+            return list(result.scalars().all())
+
+    # ------------------------------------------------------------------
+    # Enrichers
+    # ------------------------------------------------------------------
+
+    async def list_timeline_enrichers(self, timeline_id: str) -> list[TimelineEnricher]:
+        """Return every enricher config row for a timeline."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(TimelineEnricher).where(TimelineEnricher.timeline_id == timeline_id)
+            )
+            return list(result.scalars().all())
+
+    async def get_timeline_enricher(
+        self, timeline_id: str, enricher_key: str
+    ) -> TimelineEnricher | None:
+        """Return one timeline's config for a specific enricher, if set."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(TimelineEnricher).where(
+                    TimelineEnricher.timeline_id == timeline_id,
+                    TimelineEnricher.enricher_key == enricher_key,
+                )
+            )
+            return result.scalar_one_or_none()
+
+    async def upsert_timeline_enricher(
+        self,
+        timeline_id: str,
+        enricher_key: str,
+        mode: str,
+        enabled: bool,
+        updated_by: str | None,
+    ) -> TimelineEnricher:
+        """Create or update a timeline's config for one enricher."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(TimelineEnricher).where(
+                    TimelineEnricher.timeline_id == timeline_id,
+                    TimelineEnricher.enricher_key == enricher_key,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                row = TimelineEnricher(
+                    id=generate_id(f"enricher_{enricher_key}"),
+                    timeline_id=timeline_id,
+                    enricher_key=enricher_key,
+                    mode=mode,
+                    enabled=enabled,
+                    updated_by=updated_by,
+                )
+                session.add(row)
+            else:
+                row.mode = mode
+                row.enabled = enabled
+                row.updated_by = updated_by
+                row.updated_at = datetime.now(UTC)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def list_automatic_enrichers_for_source(self, source_id: str) -> list[TimelineEnricher]:
+        """Return enabled, automatic-mode enricher configs for every timeline this source belongs to.
+
+        Used by the post-ingestion hook to decide which enrichment jobs to
+        fire automatically once a source finishes ingesting.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(TimelineEnricher)
+                .join(TimelineSource, TimelineSource.timeline_id == TimelineEnricher.timeline_id)
+                .where(
+                    TimelineSource.source_id == source_id,
+                    TimelineEnricher.mode == "automatic",
+                    TimelineEnricher.enabled.is_(True),
+                )
+            )
+            return list(result.scalars().all())
+
+    async def stage_enrichment_results(self, rows: list[dict[str, Any]]) -> None:
+        """Bulk-insert enrichment result rows into the crash-safe staging table."""
+        if not rows:
+            return
+        async with self.session_factory() as session:
+            await session.execute(insert(EnrichmentResultStaging), rows)
+            await session.commit()
+
+    async def pop_staged_rows_for_job(
+        self, job_id: str, limit: int
+    ) -> list[EnrichmentResultStaging]:
+        """Return up to ``limit`` staged rows for a job, oldest first (does not delete them)."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(EnrichmentResultStaging)
+                .where(EnrichmentResultStaging.job_id == job_id)
+                .order_by(EnrichmentResultStaging.id.asc())
+                .limit(limit)
+            )
+            return list(result.scalars().all())
+
+    async def delete_staged_rows(self, ids: list[int]) -> None:
+        """Delete staged rows by primary key, after they've been flushed to ClickHouse."""
+        if not ids:
+            return
+        async with self.session_factory() as session:
+            await session.execute(
+                delete(EnrichmentResultStaging).where(EnrichmentResultStaging.id.in_(ids))
+            )
+            await session.commit()
+
+    async def delete_staged_rows_for_job(self, job_id: str) -> None:
+        """Delete every staged row for a job — used to discard an orphaned/unflushed run."""
+        async with self.session_factory() as session:
+            await session.execute(
+                delete(EnrichmentResultStaging).where(EnrichmentResultStaging.job_id == job_id)
+            )
+            await session.commit()
+
+    async def start_enrichment_job_run(
+        self, job_id: str, timeline_id: str, case_id: str, enricher_key: str
+    ) -> None:
+        """Write the durable in-flight marker for an enrichment job, before any processing starts."""
+        async with self.session_factory() as session:
+            session.add(
+                EnrichmentJobRun(
+                    job_id=job_id,
+                    timeline_id=timeline_id,
+                    case_id=case_id,
+                    enricher_key=enricher_key,
+                )
+            )
+            await session.commit()
+
+    async def finish_enrichment_job_run(self, job_id: str) -> None:
+        """Delete the durable marker for an enrichment job — only call after its final flush succeeds."""
+        async with self.session_factory() as session:
+            await session.execute(delete(EnrichmentJobRun).where(EnrichmentJobRun.job_id == job_id))
+            await session.commit()
+
+    async def list_orphaned_enrichment_job_runs(self) -> list[EnrichmentJobRun]:
+        """Return every enrichment job marker still present at startup.
+
+        Mirrors ``list_ingesting_sources``: enrichment jobs live in the
+        in-memory JobStore, so any marker row found on a fresh boot was
+        orphaned by a mid-run restart and never reached its final flush.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(select(EnrichmentJobRun))
             return list(result.scalars().all())
 
     async def delete_source(self, case_id: str, source_id: str) -> bool:

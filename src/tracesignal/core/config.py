@@ -65,6 +65,15 @@ class Settings(BaseSettings):
     # temp file plus a retained content-addressed copy).
     max_upload_bytes: int = Field(default=10 * 1024**3, ge=0)
 
+    # Enrichers: where admin-uploaded enricher assets (e.g. the MaxMind
+    # GeoLite2 database) are stored.
+    enricher_data_path: str = "data/enrichers"
+
+    # Enrichment job checkpointing: how many event batches to process before
+    # flushing staged results from Postgres to ClickHouse's event_enrichments
+    # table. Keeps memory/staging-table size bounded on very large timelines.
+    enrichment_flush_batch_count: int = 20
+
     # Authentication: local admin bootstrap
     # Seeds the first administrator on startup if no users exist yet. The
     # seeded password is one-time: the admin is forced to rotate it on first

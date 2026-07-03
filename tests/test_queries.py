@@ -59,6 +59,8 @@ class FakeClickHouseClient:
         self.queries.append((query, parameters))
         if query.strip().startswith("SELECT count()"):
             return FakeQueryResult(result_rows=[[0]])
+        if "event_enrichments" in query:
+            return FakeQueryResult(result_rows=[])
         return FakeQueryResult(
             result_rows=self.event_rows,
             column_names=self.event_columns,
@@ -807,6 +809,8 @@ class _FieldsFakeClient:
         **_kwargs: Any,
     ) -> FakeQueryResult:
         self.queries.append((query, parameters))
+        if "event_enrichments" in query:
+            return FakeQueryResult(result_rows=[])
         return FakeQueryResult(result_rows=[[self._keys]], column_names=["keys"])
 
 

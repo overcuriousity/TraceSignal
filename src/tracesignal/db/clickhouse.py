@@ -12,6 +12,7 @@ member source IDs and use ``source_id IN (...)`` filtering.
 
 from __future__ import annotations
 
+import contextlib
 from datetime import UTC
 from typing import Any
 
@@ -99,6 +100,33 @@ PARTITION BY (case_id, source_id)
 SETTINGS index_granularity = 8192, allow_nullable_key = 1
 """.strip()
 
+_ENRICHMENT_COLUMNS = [
+    "event_id",
+    "case_id",
+    "source_id",
+    "enricher_key",
+    "field_key",
+    "value",
+    "computed_at",
+    "enricher_config_hash",
+]
+
+_EVENT_ENRICHMENTS_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS {database}.event_enrichments (
+    event_id UUID,
+    case_id LowCardinality(String),
+    source_id LowCardinality(String),
+    enricher_key LowCardinality(String),
+    field_key LowCardinality(String),
+    value String,
+    computed_at DateTime64(3),
+    enricher_config_hash String DEFAULT ''
+)
+ENGINE = MergeTree()
+ORDER BY (case_id, source_id, event_id, enricher_key, field_key)
+PARTITION BY (case_id, source_id)
+""".strip()
+
 
 class ClickHouseStore:
     """Sync ClickHouse client for event data."""
@@ -133,9 +161,10 @@ class ClickHouseStore:
         return int(parts[1]) if len(parts) > 1 else 8123
 
     def init_schema(self) -> None:
-        """Create the target database and events table if they do not exist."""
+        """Create the target database and events/event_enrichments tables if they do not exist."""
         self.client.command(f"CREATE DATABASE IF NOT EXISTS {self.database}")
         self.client.command(_EVENTS_TABLE_DDL.format(database=self.database))
+        self.client.command(_EVENT_ENRICHMENTS_TABLE_DDL.format(database=self.database))
 
     def insert_events(self, events: list[Event]) -> int:
         """Insert a batch of events into ClickHouse.
@@ -154,6 +183,25 @@ class ClickHouseStore:
             table=f"{self.database}.events",
             data=data,
             column_names=_EVENT_COLUMNS,
+            database=self.database,
+        )
+        return response.written_rows
+
+    def bulk_insert_enrichments(self, rows: list[dict[str, Any]]) -> int:
+        """Bulk-insert enrichment result rows into the append-only ``event_enrichments`` table.
+
+        Each row is one ``(event_id, enricher_key, field_key)`` -> value pair.
+        Never mutates the ``events`` table itself — enrichment output is
+        joined in at query time (see ``db/queries.py``).
+        """
+        if not rows:
+            return 0
+        rows = [{**row, "enricher_config_hash": row.get("enricher_config_hash", "")} for row in rows]
+        data = [[row[column] for column in _ENRICHMENT_COLUMNS] for row in rows]
+        response = self.client.insert(
+            table=f"{self.database}.event_enrichments",
+            data=data,
+            column_names=_ENRICHMENT_COLUMNS,
             database=self.database,
         )
         return response.written_rows
@@ -280,13 +328,15 @@ class ClickHouseStore:
         ``DROP PARTITION`` is instant and does not require a full-table scan.
         If the partition does not exist the call is a silent no-op.
         """
-        try:
-            partition_expr = f"tuple('{case_id}', '{source_id}')"
+        partition_expr = f"tuple('{case_id}', '{source_id}')"
+        with contextlib.suppress(Exception):
             self.client.command(
                 f"ALTER TABLE {self.database}.events DROP PARTITION {partition_expr}"
             )
-        except Exception:  # noqa: BLE001
-            pass
+        with contextlib.suppress(Exception):
+            self.client.command(
+                f"ALTER TABLE {self.database}.event_enrichments DROP PARTITION {partition_expr}"
+            )
 
     def delete_timeline_events(self, case_id: str, source_ids: list[str]) -> None:
         """Remove all events for a timeline by dropping partitions for its sources."""

@@ -538,6 +538,37 @@ class EventQueryService:
 
         return builder.where_clause(), builder.parameters
 
+    def _hydrate_enrichments(self, case_id: str, events: list[dict[str, Any]]) -> None:
+        """Merge enrichment output into each event's ``attributes`` dict, in place.
+
+        Enrichment results live in the append-only ``event_enrichments``
+        table (never as a mutation of ``events``) and are namespaced
+        ``enrich.<field_key>`` so they can't collide with real ingested
+        attribute keys. This lets the existing generic "dynamic field"
+        rendering in the Explorer (ColumnPicker/EventGrid) show enriched
+        columns with no frontend changes. Display-only in v1 — not wired
+        into ``field_filters``/FilterRail (see module docstring for
+        ``_build_where``'s scope).
+        """
+        event_ids = [e["event_id"] for e in events if "event_id" in e]
+        if not event_ids:
+            return
+        result = self.store.client.query(
+            f"""
+            SELECT event_id, field_key, value
+            FROM {self.store.database}.event_enrichments
+            WHERE case_id = {{case_id:String}} AND toString(event_id) IN {{event_ids:Array(String)}}
+            """,
+            parameters={"case_id": case_id, "event_ids": event_ids},
+        )
+        by_event: dict[str, dict[str, str]] = {}
+        for event_id, field_key, value in result.result_rows:
+            by_event.setdefault(str(event_id), {})[f"enrich.{field_key}"] = value
+        for event in events:
+            extra = by_event.get(event["event_id"])
+            if extra:
+                event.setdefault("attributes", {}).update(extra)
+
     def query(self, query: EventQuery) -> EventPage:
         """Execute an :py:class:`EventQuery` and return a paginated result.
 
@@ -611,6 +642,7 @@ class EventQueryService:
         events = [_normalize_event_row(dict(zip(columns, row, strict=False))) for row in rows]
         if query.before is not None:
             events.reverse()
+        self._hydrate_enrichments(query.case_id, events)
 
         next_cursor = None
         prev_cursor = None
@@ -720,7 +752,19 @@ class EventQueryService:
             parameters=params,
         )
         raw_keys: list[str] = result.result_rows[0][0] if result.result_rows else []
+
+        enrichment_result = self.store.client.query(
+            f"""
+            SELECT DISTINCT field_key
+            FROM {database}.event_enrichments
+            WHERE case_id = {{p0:String}} AND has({{src:Array(String)}}, source_id)
+            """,
+            parameters=params,
+        )
+        enrichment_keys = [f"enrich.{row[0]}" for row in enrichment_result.result_rows]
+
         keys, provenance = apply_mappings_to_attribute_keys(sorted(raw_keys), field_mappings)
+        keys = sorted({*keys, *enrichment_keys})
         return {
             "top_level": TOP_LEVEL_DISPLAY_COLUMNS,
             "attributes": keys,

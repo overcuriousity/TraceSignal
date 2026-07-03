@@ -206,6 +206,8 @@ def test_list_fields_rewrites_inventory_with_provenance():
     store.client.event_rows = []
 
     def fake_query(query, parameters=None, **_kw):
+        if "event_enrichments" in query:
+            return FakeQueryResult(result_rows=[])
         return FakeQueryResult(result_rows=[[["src_ip", "ip_addr", "status"]]])
 
     store.client.query = fake_query

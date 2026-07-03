@@ -14,7 +14,17 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from tracesignal import __version__
 from tracesignal.api.deps import get_store, resolve_user_optional
-from tracesignal.api.routers import admin, auth, cases, converters, events, jobs, stream, viz
+from tracesignal.api.routers import (
+    admin,
+    auth,
+    cases,
+    converters,
+    enrichers,
+    events,
+    jobs,
+    stream,
+    viz,
+)
 from tracesignal.core.config import get_settings
 from tracesignal.core.security import hash_password
 from tracesignal.db.postgres import generate_id
@@ -149,12 +159,28 @@ async def _reconcile_orphaned_ingests() -> None:
             )
 
 
+async def _reconcile_orphaned_enrichment_jobs() -> None:
+    """Discard enrichment jobs left running by a mid-run restart. See ``enrichers/jobs.py``."""
+    from tracesignal.enrichers.jobs import reconcile_orphaned_enrichment_jobs
+
+    store = get_store()
+    try:
+        await reconcile_orphaned_enrichment_jobs(store)
+    except Exception:
+        logger.exception("Failed to reconcile orphaned enrichment jobs; retrying on next restart.")
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     store = get_store()
     await store.init_schema()
     await _seed_admin()
     await _reconcile_orphaned_ingests()
+    await _reconcile_orphaned_enrichment_jobs()
+
+    from tracesignal.enrichers.registry import refresh_availability
+
+    await asyncio.to_thread(refresh_availability)
     # No cron/scheduler in this single-process deployment (see JobStore),
     # so a startup-only sweep is the simple option — good enough to keep
     # `sessions` from growing unbounded across restarts without adding a
@@ -317,6 +343,7 @@ def create_app() -> FastAPI:
 
     app.include_router(auth.router)
     app.include_router(admin.router)
+    app.include_router(enrichers.router)
     app.include_router(cases.router)
     app.include_router(events.router)
     app.include_router(viz.router)
