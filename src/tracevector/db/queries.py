@@ -964,31 +964,36 @@ class EventQueryService:
         database = self.store.database
         col_expr = _field_column_expr(field_token, parameters, "field_key")
 
-        totals_result = self.store.client.query(
+        # Single scan: the window aggregates run after GROUP BY but before
+        # ORDER BY/LIMIT, so every surviving row carries the pre-LIMIT event
+        # total and group count (= distinct non-empty values, since the
+        # grouping key is the value itself).
+        result = self.store.client.query(
             f"""
-            SELECT count() AS n, uniqExact({col_expr}) AS d
+            SELECT {col_expr} AS val,
+                   count() AS c,
+                   sum(count()) OVER () AS total,
+                   count() OVER () AS n_groups
             FROM {database}.events
             WHERE {where} AND {col_expr} != ''
+            GROUP BY val
+            ORDER BY c DESC, val ASC
+            LIMIT {int(limit)}
             """,
             parameters=parameters,
         )
-        total, distinct = totals_result.result_rows[0] if totals_result.result_rows else (0, 0)
+        rows = result.result_rows
+        if not rows:
+            return {
+                "field": field_token,
+                "total": 0,
+                "distinct": 0,
+                "values": [],
+                "other_count": 0,
+            }
 
-        values: list[dict[str, Any]] = []
-        if total:
-            terms_result = self.store.client.query(
-                f"""
-                SELECT {col_expr} AS val, count() AS c
-                FROM {database}.events
-                WHERE {where} AND {col_expr} != ''
-                GROUP BY val
-                ORDER BY c DESC, val ASC
-                LIMIT {int(limit)}
-                """,
-                parameters=parameters,
-            )
-            values = [{"value": row[0], "count": row[1]} for row in terms_result.result_rows]
-
+        total, distinct = rows[0][2], rows[0][3]
+        values = [{"value": row[0], "count": row[1]} for row in rows]
         other_count = total - sum(v["count"] for v in values)
         return {
             "field": field_token,
@@ -1019,6 +1024,12 @@ class EventQueryService:
         ClickHouse's adaptive ``histogram()`` function — reproducibility (the
         same filters always produce the same bin edges) matters more here
         than adaptive bin placement.
+
+        The two scans are deliberate: bin edges are a function of the first
+        scan's min/max, and the single-scan alternatives (adaptive
+        ``histogram()``, or frameless window ``min/max OVER ()`` forcing
+        ClickHouse to buffer every row) are worse than a second
+        aggregate-only pass.
         """
         self.store.init_schema()
         where, parameters = self._build_where(query)
