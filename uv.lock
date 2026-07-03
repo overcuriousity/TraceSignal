@@ -167,7 +167,7 @@ wheels = [
 
 [[package]]
 name = "clickhouse-connect"
-version = "1.3.0"
+version = "1.4.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "certifi" },
@@ -176,17 +176,17 @@ dependencies = [
     { name = "urllib3" },
     { name = "zstandard" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/40/b4/720c5f4cdfe4bf716001d3a8db24b9ba94e7ad709e626a067502ed457199/clickhouse_connect-1.3.0.tar.gz", hash = "sha256:32e780ff3de62dbff2ff21eaf0501582b5365fba6c42227e203664379312e33e", size = 164472, upload-time = "2026-06-11T14:50:18.159Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c6/ee/fd031393d65f9f25cfd3fb0f5a4c29221b2cbfb8cb39bf3ecb672409c8e5/clickhouse_connect-1.4.1.tar.gz", hash = "sha256:e1ba88202d8084b484fc331733c317b3b07399ed2e2c79a18c9a9ce168c8457b", size = 167418, upload-time = "2026-06-30T19:19:42.13Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/12/24/c18f4e78237b06baa74c0df3feffff0a48a0bc5c407215f6c9f6e8f82d70/clickhouse_connect-1.3.0-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:ac62f270da013a6bb224a135fbebb8cefbc7137371d9fca9c3a58b55daa7b023", size = 342363, upload-time = "2026-06-11T14:49:26.284Z" },
-    { url = "https://files.pythonhosted.org/packages/77/15/2589333eee4f9ce018a50828e5203a7e8a9889d36f7621509b8012eb46f8/clickhouse_connect-1.3.0-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:9164b2d021eb4f8474767a301e196ffdb045ee960e9b68fc00c53b975ea10e79", size = 331014, upload-time = "2026-06-11T14:49:27.802Z" },
-    { url = "https://files.pythonhosted.org/packages/d2/92/afea9053138c9991dcd8747e1b271427ca0f5271dfbebf853f1d5f5f840f/clickhouse_connect-1.3.0-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:2432a22aab181a483f3dc6b398c8f641099f2d71bb9289ec84de9643a3b96493", size = 1255688, upload-time = "2026-06-11T14:49:29.26Z" },
-    { url = "https://files.pythonhosted.org/packages/2b/e3/8c64e9530c64874760f3d013fe00a3c1463a5a5d758a7a943279d7e53a74/clickhouse_connect-1.3.0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:dee1b1d91258859260b7a2059fea87e1ee52f006e4a99a76ef21aa67a31face5", size = 1277867, upload-time = "2026-06-11T14:49:31.072Z" },
-    { url = "https://files.pythonhosted.org/packages/37/f9/243137b951523e78e48981739eabf3986bb4d82c4f9c07656781ab6b3794/clickhouse_connect-1.3.0-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:69c6f9b3f2fb766ff87fa0c432c27c67b5b7de643ace33f4c4635ce1722d86ad", size = 1232259, upload-time = "2026-06-11T14:49:32.807Z" },
-    { url = "https://files.pythonhosted.org/packages/ee/e0/4475f30fec4ae7d3c76d514f77ab630980ab95cbcfa82e743ddd5931ff5b/clickhouse_connect-1.3.0-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:9022aefacb10ab9cb56944e24322736a3917a40527e1b3853c33b9497ea06a7f", size = 1272927, upload-time = "2026-06-11T14:49:34.541Z" },
-    { url = "https://files.pythonhosted.org/packages/d5/ae/90fac00149ac0d09bb50a0acf2a2c2d7b3ba34298827a41ad99c641a4f1e/clickhouse_connect-1.3.0-cp313-cp313-win32.whl", hash = "sha256:900e4bd920b34a8ce3c21616dc55da869e4cfdae900e80fc00cfab2ae0f571e1", size = 309101, upload-time = "2026-06-11T14:49:35.865Z" },
-    { url = "https://files.pythonhosted.org/packages/f2/ff/4aead8da2136d9391c886773f597bb3e7057738bcd0f5dbc373396e986c1/clickhouse_connect-1.3.0-cp313-cp313-win_amd64.whl", hash = "sha256:5a294365cda07869ea30ef00ea07b542e50cc77ca7f329ebf3e1bcdce5b0afb8", size = 327890, upload-time = "2026-06-11T14:49:37.325Z" },
-    { url = "https://files.pythonhosted.org/packages/32/f9/642ab6d321c2808eb1f10f536d717294d54aa29effc50481db1c4a34ffd8/clickhouse_connect-1.3.0-cp313-cp313-win_arm64.whl", hash = "sha256:219230675f255626340674d8a393ac0abf68810c2269e9c73afb35673facea7e", size = 307340, upload-time = "2026-06-11T14:49:39.156Z" },
+    { url = "https://files.pythonhosted.org/packages/fe/f2/9791cc8442d51a66e897fc17b095d0624dd9e21b49aef93cd4c0a9bebdc8/clickhouse_connect-1.4.1-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:26d21d9c71aaaf987edd3c4e46074a4c737105f9dbfb3f3bbeaf1515d1af5b02", size = 347401, upload-time = "2026-06-30T19:18:54.232Z" },
+    { url = "https://files.pythonhosted.org/packages/1d/3a/9e06c225796bd2ae0a0f1d85a507d0dbd7551a7ac69bc4b61b45f59935e0/clickhouse_connect-1.4.1-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:496d2886e7a976f91697936fd64330a584a36abc927bb0f67b6e691d24b62810", size = 336115, upload-time = "2026-06-30T19:18:55.447Z" },
+    { url = "https://files.pythonhosted.org/packages/94/0d/80949cfe205667e441894d50c74b0254639b756c3b4a490d3fca237b1de4/clickhouse_connect-1.4.1-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:071ece06283699117fc7d6214b84727fb3b73640b22b38cdb46e644cdd970935", size = 1269923, upload-time = "2026-06-30T19:18:56.708Z" },
+    { url = "https://files.pythonhosted.org/packages/a0/97/0ca34f8ad1736b83626b2ecc14737e6030eb78ebed7208d49b3fe5532614/clickhouse_connect-1.4.1-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:4ea6be69c1aab994df6b8c47e94b24bde9466a6ab2f89cab4abe08c7899174f8", size = 1294231, upload-time = "2026-06-30T19:18:58.284Z" },
+    { url = "https://files.pythonhosted.org/packages/23/05/838569127d276327837ce40bbf4027973187e035778ae34c32d13b55fc99/clickhouse_connect-1.4.1-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:12e37100a5e15c465f078711984a3219d182e707b265ca84cbf4e405c6a179c8", size = 1246941, upload-time = "2026-06-30T19:18:59.688Z" },
+    { url = "https://files.pythonhosted.org/packages/e4/73/a14ec048e6451252a19758a9142a1165e950ab163e00c154821e61a1c13b/clickhouse_connect-1.4.1-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:c7b8930e727f47b416e4af316921ed8ae1a2690b9e7c29bd1fc2e85c044afaee", size = 1290226, upload-time = "2026-06-30T19:19:01.094Z" },
+    { url = "https://files.pythonhosted.org/packages/51/f2/4e9de83df069ed7adc5c947ed39cab88cdadd8e1f8e773b8037c21d18a63/clickhouse_connect-1.4.1-cp313-cp313-win32.whl", hash = "sha256:cd5e470e30554866736eee5c1dc05b7f84c27580231477a960e5d4c2e48d5511", size = 311604, upload-time = "2026-06-30T19:19:02.455Z" },
+    { url = "https://files.pythonhosted.org/packages/36/7b/3f91692f405f563d1f1456f07fc12883190db672ce62fbf7fb12485d59b1/clickhouse_connect-1.4.1-cp313-cp313-win_amd64.whl", hash = "sha256:5cd5eb681053ba1b0b876bd6be5e32a42362ff6c34d931e1ccb75ecd97cfaef4", size = 329866, upload-time = "2026-06-30T19:19:03.779Z" },
+    { url = "https://files.pythonhosted.org/packages/6b/17/1a7ef9a65ee273ee288d3af6c04863af8074c5fb0683ccd4b17ae4a1a4c3/clickhouse_connect-1.4.1-cp313-cp313-win_arm64.whl", hash = "sha256:bbef58a7e1a328e0c346c69b173a357590bec03a506be24c031f14df3af682d4", size = 311686, upload-time = "2026-06-30T19:19:05.041Z" },
 ]
 
 [[package]]
@@ -1208,13 +1208,13 @@ resolution-markers = [
     "sys_platform == 'darwin'",
 ]
 dependencies = [
-    { name = "filelock" },
-    { name = "fsspec" },
-    { name = "jinja2" },
-    { name = "networkx" },
-    { name = "setuptools" },
-    { name = "sympy" },
-    { name = "typing-extensions" },
+    { name = "filelock", marker = "sys_platform == 'darwin'" },
+    { name = "fsspec", marker = "sys_platform == 'darwin'" },
+    { name = "jinja2", marker = "sys_platform == 'darwin'" },
+    { name = "networkx", marker = "sys_platform == 'darwin'" },
+    { name = "setuptools", marker = "sys_platform == 'darwin'" },
+    { name = "sympy", marker = "sys_platform == 'darwin'" },
+    { name = "typing-extensions", marker = "sys_platform == 'darwin'" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.12.1-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:c75e93173c700bccd6bfcc4a9d19ce242ab6dacd1f1781483027a16239b9e650", upload-time = "2026-06-17T15:44:09Z" },
@@ -1228,13 +1228,13 @@ resolution-markers = [
     "sys_platform != 'darwin'",
 ]
 dependencies = [
-    { name = "filelock" },
-    { name = "fsspec" },
-    { name = "jinja2" },
-    { name = "networkx" },
-    { name = "setuptools" },
-    { name = "sympy" },
-    { name = "typing-extensions" },
+    { name = "filelock", marker = "sys_platform != 'darwin'" },
+    { name = "fsspec", marker = "sys_platform != 'darwin'" },
+    { name = "jinja2", marker = "sys_platform != 'darwin'" },
+    { name = "networkx", marker = "sys_platform != 'darwin'" },
+    { name = "setuptools", marker = "sys_platform != 'darwin'" },
+    { name = "sympy", marker = "sys_platform != 'darwin'" },
+    { name = "typing-extensions", marker = "sys_platform != 'darwin'" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.12.1%2Bcpu-cp313-cp313-linux_s390x.whl", hash = "sha256:4ca206a35f2aeba7da944a69ef857103358e8d4bc6b06b49b9e554dcfa57777d", upload-time = "2026-06-18T01:57:47Z" },
@@ -1251,9 +1251,9 @@ resolution-markers = [
     "sys_platform == 'darwin'",
 ]
 dependencies = [
-    { name = "numpy" },
-    { name = "pillow" },
-    { name = "torch", version = "2.12.1", source = { registry = "https://download.pytorch.org/whl/cpu" } },
+    { name = "numpy", marker = "sys_platform == 'darwin'" },
+    { name = "pillow", marker = "sys_platform == 'darwin'" },
+    { name = "torch", version = "2.12.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.27.1-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:d60311a6d08df905f9656a3a312f0a8f55f0d46321bc737bad30a8dec9644309", upload-time = "2026-06-17T15:44:32Z" },
@@ -1267,9 +1267,9 @@ resolution-markers = [
     "sys_platform != 'darwin'",
 ]
 dependencies = [
-    { name = "numpy" },
-    { name = "pillow" },
-    { name = "torch", version = "2.12.1+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" } },
+    { name = "numpy", marker = "sys_platform != 'darwin'" },
+    { name = "pillow", marker = "sys_platform != 'darwin'" },
+    { name = "torch", version = "2.12.1+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.27.1%2Bcpu-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:7d5d09a0e98441111d026ea924c202e3752d62425b84b0768d98c0bb074747ff", upload-time = "2026-06-17T15:44:31Z" },
@@ -1335,7 +1335,7 @@ requires-dist = [
     { name = "argon2-cffi", specifier = ">=23.1.0" },
     { name = "asyncpg", specifier = ">=0.30.0" },
     { name = "authlib", specifier = ">=1.3.2" },
-    { name = "clickhouse-connect", specifier = ">=0.8.0" },
+    { name = "clickhouse-connect", specifier = ">=1.4.1" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "httpx", specifier = ">=0.28.0" },
     { name = "jinja2", specifier = ">=3.1.0" },
