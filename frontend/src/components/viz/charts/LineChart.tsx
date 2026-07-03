@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { scaleLinear, scaleTime } from "d3-scale";
-import { line as d3line, curveMonotoneX } from "d3-shape";
+import { line as d3line, area as d3area, curveMonotoneX } from "d3-shape";
 import { max as d3max, bisector } from "d3-array";
 import { utcFormat } from "d3-time-format";
 import { format as formatNum } from "d3-format";
@@ -25,6 +25,10 @@ interface LineChartProps {
   data: FieldTimeseriesResponse;
   svgRef?: React.RefObject<SVGSVGElement | null>;
   height?: number;
+  /** "overlay" (default) draws independent lines; "stacked" draws cumulative
+   * areas — reads as composition of the total rather than per-series shape. */
+  seriesMode?: "overlay" | "stacked";
+  showLegend?: boolean;
 }
 
 /**
@@ -33,7 +37,13 @@ interface LineChartProps {
  * crosshair + tooltip shows every series' value at the hovered bucket, per
  * the dataviz skill's line-chart interaction default.
  */
-export function LineChart({ data, svgRef, height = 260 }: LineChartProps) {
+export function LineChart({
+  data,
+  svgRef,
+  height = 260,
+  seriesMode = "overlay",
+  showLegend = true,
+}: LineChartProps) {
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const ref = useChartRef(svgRef);
 
@@ -42,7 +52,25 @@ export function LineChart({ data, svgRef, height = 260 }: LineChartProps) {
   }
 
   const dates = data.series[0].buckets.map((b) => new Date(b.start));
-  const maxCount = Math.max(1, d3max(data.series, (s) => d3max(s.buckets, (b) => b.count) ?? 0) ?? 0);
+  const stacked = seriesMode === "stacked";
+  // Stacked offsets: series i's band sits on the sum of series 0..i-1 —
+  // same order as the legend so bands and labels read top-down consistently.
+  const stackBase: number[][] = [];
+  if (stacked) {
+    let running = dates.map(() => 0);
+    for (const s of data.series) {
+      stackBase.push(running);
+      running = running.map((v, i) => v + (s.buckets[i]?.count ?? 0));
+    }
+  }
+  const maxCount = stacked
+    ? Math.max(
+        1,
+        ...dates.map((_, i) =>
+          data.series.reduce((sum, s) => sum + (s.buckets[i]?.count ?? 0), 0),
+        ),
+      )
+    : Math.max(1, d3max(data.series, (s) => d3max(s.buckets, (b) => b.count) ?? 0) ?? 0);
   const colorMap = buildSeriesColorMap(data.series.map((s) => s.value));
 
   return (
@@ -57,6 +85,11 @@ export function LineChart({ data, svgRef, height = 260 }: LineChartProps) {
             .curve(curveMonotoneX)
             .x((d) => x(new Date(d.start)))
             .y((d) => y(d.count));
+          const areaGen = d3area<{ date: Date; y0: number; y1: number }>()
+            .curve(curveMonotoneX)
+            .x((d) => x(d.date))
+            .y0((d) => y(d.y0))
+            .y1((d) => y(d.y1));
 
           return (
             <>
@@ -67,15 +100,34 @@ export function LineChart({ data, svgRef, height = 260 }: LineChartProps) {
                 innerHeight={innerHeight}
                 tickFormat={(v) => fmtTick(v as Date)}
               />
-              {data.series.map((s) => (
-                <path
-                  key={s.value}
-                  d={lineGen(s.buckets) ?? undefined}
-                  fill="none"
-                  stroke={colorMap.get(s.value) ?? "var(--color-accent)"}
-                  strokeWidth={1.75}
-                />
-              ))}
+              {stacked
+                ? data.series.map((s, si) => (
+                    <path
+                      key={s.value}
+                      d={
+                        areaGen(
+                          s.buckets.map((b, i) => ({
+                            date: dates[i],
+                            y0: stackBase[si][i],
+                            y1: stackBase[si][i] + b.count,
+                          })),
+                        ) ?? undefined
+                      }
+                      fill={colorMap.get(s.value) ?? "var(--color-accent)"}
+                      fillOpacity={0.75}
+                      stroke={colorMap.get(s.value) ?? "var(--color-accent)"}
+                      strokeWidth={0.75}
+                    />
+                  ))
+                : data.series.map((s) => (
+                    <path
+                      key={s.value}
+                      d={lineGen(s.buckets) ?? undefined}
+                      fill="none"
+                      stroke={colorMap.get(s.value) ?? "var(--color-accent)"}
+                      strokeWidth={1.75}
+                    />
+                  ))}
               {hoverIdx != null && (
                 <line
                   x1={x(dates[hoverIdx])}
@@ -114,12 +166,14 @@ export function LineChart({ data, svgRef, height = 260 }: LineChartProps) {
           );
         }}
       </ChartFrame>
-      <Legend
-        entries={data.series.map((s) => ({
-          label: s.value,
-          color: colorMap.get(s.value) ?? "var(--color-accent)",
-        }))}
-      />
+      {showLegend && (
+        <Legend
+          entries={data.series.map((s) => ({
+            label: s.value,
+            color: colorMap.get(s.value) ?? "var(--color-accent)",
+          }))}
+        />
+      )}
       {hoverIdx != null && (
         <ChartTooltip
           x={80}
