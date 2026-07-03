@@ -1,12 +1,19 @@
-import { get } from "./client";
+import { get, post } from "./client";
 import { serializeEventFilterParams } from "@/lib/queryParams";
 import type {
+  CompareNumericResponse,
+  CompareTermsResponse,
+  CompareTimeResponse,
   EventFilters,
   FieldNumericResponse,
   FieldTermsResponse,
   FieldTimeseriesResponse,
   VizFieldsResponse,
 } from "./types";
+
+export type CompareMode =
+  | { mode: "baseline" }
+  | { mode: "custom"; filters: EventFilters };
 
 /**
  * Field-value aggregations for the per-value histogram modal and the
@@ -62,5 +69,36 @@ export const vizApi = {
       field,
       buckets,
       series_limit: seriesLimit,
+    }),
+
+  /**
+   * Two-layer comparison against one server-computed shared grid. The body's
+   * filter objects reuse the query-param field names (`serializeEventFilterParams`
+   * output maps 1:1), so a compare layer is exactly an Explorer filter set.
+   */
+  compare: (
+    caseId: string,
+    timelineId: string,
+    body: {
+      kind: "time" | "terms" | "numeric";
+      field?: string;
+      primary: EventFilters;
+      comparison: CompareMode;
+      buckets?: number;
+      bins?: number;
+      limit?: number;
+    },
+  ): Promise<CompareTimeResponse | CompareTermsResponse | CompareNumericResponse> =>
+    post(`/cases/${caseId}/timelines/${timelineId}/viz/compare`, {
+      kind: body.kind,
+      field: body.field,
+      primary: serializeEventFilterParams(body.primary),
+      comparison:
+        body.comparison.mode === "custom"
+          ? { mode: "custom", filters: serializeEventFilterParams(body.comparison.filters) }
+          : { mode: "baseline" },
+      buckets: body.buckets,
+      bins: body.bins,
+      limit: body.limit,
     }),
 };

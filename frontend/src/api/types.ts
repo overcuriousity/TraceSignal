@@ -531,6 +531,68 @@ export interface FieldTimeseriesResponse {
   series: FieldTimeseriesSeries[];
 }
 
+/** One shared-grid time bucket carrying both compare layers' raw counts. */
+export interface CompareTimeBucket {
+  start: string;
+  primary: number;
+  comparison: number;
+}
+
+/**
+ * Two-layer event-count histogram from `viz/compare` (kind=time). Both
+ * layers are evaluated against one shared bucket grid server-side, so the
+ * series are comparable by construction.
+ */
+export interface CompareTimeResponse {
+  kind: "time";
+  interval_seconds: number;
+  min: string | null;
+  max: string | null;
+  buckets: CompareTimeBucket[];
+  primary_total: number;
+  comparison_total: number;
+}
+
+/** One shared category carrying both compare layers' counts. */
+export interface CompareTermValue {
+  value: string;
+  primary: number;
+  comparison: number;
+}
+
+/** Two-layer terms aggregation from `viz/compare` (kind=terms) — the
+ * primary's top-N fixes the category list for both layers. */
+export interface CompareTermsResponse {
+  kind: "terms";
+  field: string;
+  values: CompareTermValue[];
+  distinct: number;
+  primary_total: number;
+  comparison_total: number;
+  primary_other: number;
+  comparison_other: number;
+}
+
+/** One shared-edge numeric bin carrying both compare layers' counts. */
+export interface CompareNumericBin {
+  x0: number;
+  x1: number;
+  primary: number;
+  comparison: number;
+}
+
+/** Two-layer numeric histogram from `viz/compare` (kind=numeric) — bin
+ * edges derive from the union min/max of both layers. */
+export interface CompareNumericResponse {
+  kind: "numeric";
+  field: string;
+  min: number | null;
+  max: number | null;
+  bins: CompareNumericBin[];
+  primary_total: number;
+  comparison_total: number;
+}
+
 /** Body for export endpoint */
 export interface ExportRequest {
   format: "csv" | "jsonl";
