@@ -3,7 +3,7 @@
 # (see README "Quick start"). This image exists for operators who prefer to run the
 # whole stack — backing services plus the app — via docker-compose.
 
-FROM node:22-alpine AS frontend-build
+FROM node:26-alpine AS frontend-build
 WORKDIR /frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
