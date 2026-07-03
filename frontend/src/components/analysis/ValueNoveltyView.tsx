@@ -402,7 +402,10 @@ export function ValueNoveltyView({
       <div className="flex items-start gap-1.5 text-xs text-[var(--color-fg-muted)] pt-1">
         <AlertTriangle size={10} className="mt-0.5 shrink-0" />
         <span>
-          Rare ≠ malicious. Rare values appear in &lt;= rarity floor events.
+          Rare ≠ malicious.{" "}
+          {mode === "temporal"
+            ? "Temporal mode ignores the rarity floor — it flags any value absent from the baseline window but present in the detect window."
+            : "Self-baseline mode flags values that appear ≤ rarity floor times in the whole corpus."}{" "}
           Score = −log(count/total); higher is rarer.
         </span>
       </div>

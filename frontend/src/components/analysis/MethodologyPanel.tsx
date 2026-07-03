@@ -90,8 +90,11 @@ export function MethodologyPanel({ caseId: _caseId, timelineId: _timelineId, sou
           </p>
           <div className="space-y-1.5 text-[var(--color-fg-muted)]">
             <Row label="Method">
-              Z-score against the series' own event-count distribution.
-              Optional temporal variant: baseline/detect split.
+              Z-score against the series' own event-count distribution, using
+              leave-one-out mean/std (each window is scored against the rest of
+              the series, excluding itself, so one spike can't inflate its own
+              baseline). Optional temporal variant: baseline/detect split, mean
+              and std computed from the baseline window only.
             </Row>
             <Row label="Signal">
               Time windows where the event count per (field, value) series

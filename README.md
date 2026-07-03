@@ -41,7 +41,9 @@ embeddings surface the needles in the haystack, without needing a cluster to run
 ### Anomaly detection
 - **Statistical engine**, inspired by
   [`ait-aecid/logdata-anomaly-miner`](https://github.com/ait-aecid/logdata-anomaly-miner)'s
-  value/frequency detector approach, run directly against ClickHouse — no embeddings required:
+  value/frequency detector approach, run directly against ClickHouse — no embeddings required.
+  See [Anomaly Detection](docs/ANOMALY_DETECTION.md) for a plain-language explanation of every
+  detector, its formula, and its default values:
   - `value_novelty` — rare or first-seen field values.
   - `frequency` — z-score spikes and silences over time buckets.
   - Both support a self-baseline mode and a temporal mode (split a case into a baseline window
@@ -171,6 +173,7 @@ analysis system for a small, self-hosted team.
 ## Documentation
 
 - [Concept](docs/CONCEPT.md)
+- [Anomaly Detection](docs/ANOMALY_DETECTION.md) — every statistical detector explained, plain language
 - [Tech Stack](docs/TECH_STACK.md)
 - [Model Refinement](docs/MODEL_REFINEMENT.md) — approved Case / Source / Timeline / Artifact redesign
 - [Roadmap](docs/ROADMAP.md)
