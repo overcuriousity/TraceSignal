@@ -1,10 +1,13 @@
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { scaleLinear } from "d3-scale";
 import { area as d3area, curveBasis } from "d3-shape";
 import { format as formatNum } from "d3-format";
 import { AxisLeft } from "@/components/viz/primitives/Axis";
+import { ChartEmptyState } from "@/components/viz/primitives/ChartEmptyState";
 import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
 import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
+import { useChartRef } from "@/components/viz/primitives/useChartRef";
+import { svgLocalPoint } from "@/components/viz/lib/pointer";
 import { kdeFromBins, numericDomain } from "@/components/viz/lib/stats";
 import type { FieldNumericResponse } from "@/api/types";
 
@@ -28,16 +31,11 @@ export function ViolinPlot({
   color = "var(--color-accent)",
 }: ViolinPlotProps) {
   const [hover, setHover] = useState<{ x: number; y: number; label: string } | null>(null);
-  const fallbackRef = useRef<SVGSVGElement | null>(null);
-  const ref = svgRef ?? fallbackRef;
+  const ref = useChartRef(svgRef);
 
   const density = kdeFromBins(stats.bins);
   if (stats.count === 0 || density.length === 0 || stats.min == null || stats.max == null) {
-    return (
-      <div className="flex h-[220px] items-center justify-center text-sm text-[var(--color-fg-muted)]">
-        No numeric values in the current filter range.
-      </div>
-    );
+    return <ChartEmptyState>No numeric values in the current filter range.</ChartEmptyState>;
   }
 
   const maxDensity = Math.max(1e-9, ...density.map((d) => d.density));
@@ -89,9 +87,9 @@ export function ViolinPlot({
                 height={innerHeight}
                 fill="transparent"
                 onMouseMove={(e) => {
-                  const rect = (e.target as SVGRectElement).ownerSVGElement?.getBoundingClientRect();
-                  if (!rect) return;
-                  const localY = e.clientY - rect.top - margin.top;
+                  const local = svgLocalPoint(e, margin);
+                  if (!local) return;
+                  const localY = local.y;
                   const value = y.invert(localY);
                   setHover({ x: cx + margin.left, y: localY + margin.top, label: fmtValue(value) });
                 }}

@@ -1,9 +1,11 @@
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { scaleLinear } from "d3-scale";
 import { format as formatNum } from "d3-format";
 import { AxisLeft } from "@/components/viz/primitives/Axis";
+import { ChartEmptyState } from "@/components/viz/primitives/ChartEmptyState";
 import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
 import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
+import { useChartRef } from "@/components/viz/primitives/useChartRef";
 import { boxPlotStats, numericDomain } from "@/components/viz/lib/stats";
 import type { FieldNumericResponse } from "@/api/types";
 
@@ -22,16 +24,11 @@ interface BoxPlotProps {
  * no raw values are shipped to the client. */
 export function BoxPlot({ stats, svgRef, height = 260, color = "var(--color-accent)" }: BoxPlotProps) {
   const [hover, setHover] = useState<{ x: number; y: number; label: string } | null>(null);
-  const fallbackRef = useRef<SVGSVGElement | null>(null);
-  const ref = svgRef ?? fallbackRef;
+  const ref = useChartRef(svgRef);
 
   const box = boxPlotStats(stats);
   if (!box) {
-    return (
-      <div className="flex h-[220px] items-center justify-center text-sm text-[var(--color-fg-muted)]">
-        No numeric values in the current filter range.
-      </div>
-    );
+    return <ChartEmptyState>No numeric values in the current filter range.</ChartEmptyState>;
   }
 
   return (

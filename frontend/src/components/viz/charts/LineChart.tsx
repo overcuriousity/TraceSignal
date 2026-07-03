@@ -1,14 +1,17 @@
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { scaleLinear, scaleTime } from "d3-scale";
 import { line as d3line, curveMonotoneX } from "d3-shape";
 import { max as d3max, bisector } from "d3-array";
 import { utcFormat } from "d3-time-format";
 import { format as formatNum } from "d3-format";
 import { AxisBottom, AxisLeft } from "@/components/viz/primitives/Axis";
+import { ChartEmptyState } from "@/components/viz/primitives/ChartEmptyState";
 import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
 import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
 import { Legend } from "@/components/viz/primitives/Legend";
+import { useChartRef } from "@/components/viz/primitives/useChartRef";
 import { buildSeriesColorMap } from "@/components/viz/lib/colors";
+import { svgLocalPoint } from "@/components/viz/lib/pointer";
 import type { FieldTimeseriesResponse } from "@/api/types";
 
 const fmtCount = formatNum(",d");
@@ -32,15 +35,10 @@ interface LineChartProps {
  */
 export function LineChart({ data, svgRef, height = 260 }: LineChartProps) {
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
-  const fallbackRef = useRef<SVGSVGElement | null>(null);
-  const ref = svgRef ?? fallbackRef;
+  const ref = useChartRef(svgRef);
 
   if (data.series.length === 0 || data.series[0].buckets.length === 0) {
-    return (
-      <div className="flex h-[220px] items-center justify-center text-sm text-[var(--color-fg-muted)]">
-        No data in the current filter range.
-      </div>
-    );
+    return <ChartEmptyState>No data in the current filter range.</ChartEmptyState>;
   }
 
   const dates = data.series[0].buckets.map((b) => new Date(b.start));
@@ -97,10 +95,9 @@ export function LineChart({ data, svgRef, height = 260 }: LineChartProps) {
                 height={innerHeight}
                 fill="transparent"
                 onMouseMove={(e) => {
-                  const rect = (e.target as SVGRectElement).ownerSVGElement?.getBoundingClientRect();
-                  if (!rect) return;
-                  const localX = e.clientX - rect.left - margin.left;
-                  const target = x.invert(localX);
+                  const local = svgLocalPoint(e, margin);
+                  if (!local) return;
+                  const target = x.invert(local.x);
                   let idx = bisectDate(dates, target, 1);
                   idx = Math.min(dates.length - 1, Math.max(0, idx));
                   if (

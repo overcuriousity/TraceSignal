@@ -1,11 +1,13 @@
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { scaleLinear, scaleTime } from "d3-scale";
 import { max as d3max } from "d3-array";
 import { utcFormat } from "d3-time-format";
 import { format as formatNum } from "d3-format";
 import { AxisBottom, AxisLeft } from "@/components/viz/primitives/Axis";
+import { ChartEmptyState } from "@/components/viz/primitives/ChartEmptyState";
 import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
 import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
+import { useChartRef } from "@/components/viz/primitives/useChartRef";
 import type { HistogramBucket } from "@/api/types";
 
 const fmtCount = formatNum(",d");
@@ -37,15 +39,10 @@ export function TimeHistogram({
   const [hover, setHover] = useState<{ x: number; y: number; bucket: HistogramBucket } | null>(
     null,
   );
-  const fallbackRef = useRef<SVGSVGElement | null>(null);
-  const ref = svgRef ?? fallbackRef;
+  const ref = useChartRef(svgRef);
 
   if (buckets.length === 0) {
-    return (
-      <div className="flex h-[220px] items-center justify-center text-sm text-[var(--color-fg-muted)]">
-        No data in the current filter range.
-      </div>
-    );
+    return <ChartEmptyState>No data in the current filter range.</ChartEmptyState>;
   }
 
   // Domain spans whichever series covers more time — `contextBuckets` (the
