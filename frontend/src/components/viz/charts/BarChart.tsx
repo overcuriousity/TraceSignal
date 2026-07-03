@@ -1,9 +1,11 @@
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { scaleBand, scaleLinear } from "d3-scale";
 import { format as formatNum } from "d3-format";
 import { AxisBottom } from "@/components/viz/primitives/Axis";
+import { ChartEmptyState } from "@/components/viz/primitives/ChartEmptyState";
 import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
 import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
+import { useChartRef } from "@/components/viz/primitives/useChartRef";
 import { buildSeriesColorMap, OTHER_KEY, OTHER_LABEL } from "@/components/viz/lib/colors";
 import type { FieldTermsResponse } from "@/api/types";
 
@@ -35,8 +37,7 @@ export function BarChart({ terms, svgRef, height, rowHeight = 26 }: BarChartProp
     label: string;
     count: number;
   } | null>(null);
-  const fallbackRef = useRef<SVGSVGElement | null>(null);
-  const ref = svgRef ?? fallbackRef;
+  const ref = useChartRef(svgRef);
 
   const rows = terms.values.map((v) => ({ key: v.value, label: v.value, count: v.count }));
   if (terms.other_count > 0) {
@@ -44,11 +45,7 @@ export function BarChart({ terms, svgRef, height, rowHeight = 26 }: BarChartProp
   }
 
   if (rows.length === 0) {
-    return (
-      <div className="flex h-[160px] items-center justify-center text-sm text-[var(--color-fg-muted)]">
-        No values in the current filter range.
-      </div>
-    );
+    return <ChartEmptyState size="sm">No values in the current filter range.</ChartEmptyState>;
   }
 
   const colorMap = buildSeriesColorMap(

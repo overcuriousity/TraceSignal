@@ -1,10 +1,12 @@
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { scaleBand } from "d3-scale";
 import { utcFormat } from "d3-time-format";
 import { format as formatNum } from "d3-format";
 import { AxisBottomBand } from "@/components/viz/primitives/Axis";
+import { ChartEmptyState } from "@/components/viz/primitives/ChartEmptyState";
 import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
 import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
+import { useChartRef } from "@/components/viz/primitives/useChartRef";
 import { sequentialColor } from "@/components/viz/lib/colors";
 import type { FieldTimeseriesResponse } from "@/api/types";
 
@@ -53,15 +55,10 @@ export function Heatmap({ data, svgRef, height }: HeatmapProps) {
     start: string;
     count: number;
   } | null>(null);
-  const fallbackRef = useRef<SVGSVGElement | null>(null);
-  const ref = svgRef ?? fallbackRef;
+  const ref = useChartRef(svgRef);
 
   if (data.series.length === 0 || data.series[0].buckets.length === 0) {
-    return (
-      <div className="flex h-[220px] items-center justify-center text-sm text-[var(--color-fg-muted)]">
-        No data in the current filter range.
-      </div>
-    );
+    return <ChartEmptyState>No data in the current filter range.</ChartEmptyState>;
   }
 
   const bucketStarts = data.series[0].buckets.map((b) => b.start);
