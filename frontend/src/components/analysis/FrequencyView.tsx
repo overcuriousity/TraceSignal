@@ -53,16 +53,21 @@ const STATIC_SERIES_FIELD_OPTIONS = [
 
 interface FreqFindingRowProps {
   finding: FrequencyFinding;
+  zThreshold: number;
   onDrillField?: (field: string, value: string, start: string, end: string) => void;
   onJumpToTime?: (ts: string, eventId?: string, windowEnd?: string) => void;
 }
 
-function FreqFindingRow({ finding, onDrillField, onJumpToTime }: FreqFindingRowProps) {
+function FreqFindingRow({ finding, zThreshold, onDrillField, onJumpToTime }: FreqFindingRowProps) {
   const isSpike = finding.z_score > 0;
+  // Severity bands scale off the analyst's own z_threshold (not fixed
+  // constants) — otherwise a raised threshold (e.g. z >= 6) would still
+  // paint every returned finding "high", since findings this close to a
+  // hardcoded 5 would already all clear a threshold above it.
   const severity =
-    Math.abs(finding.z_score) >= 5
+    Math.abs(finding.z_score) >= zThreshold * 2
       ? "high"
-      : Math.abs(finding.z_score) >= 3
+      : Math.abs(finding.z_score) >= zThreshold * 1.2
         ? "medium"
         : "low";
 
@@ -240,14 +245,15 @@ export function FrequencyView({
     const markers: AnomalyMarker[] = findings.map((f) => {
       const label = `${f.series_field}=${f.series_value} spike`;
       const direction = f.z_score > 0 ? "spike" : "drop";
-      // In self-baseline (non-temporal) z-score mode, "expected" comes from
-      // this series' own overall mean/std, which includes the flagged window
-      // itself — a real caveat worth stating explicitly rather than implying
-      // an independent baseline, which is only true in temporal mode.
+      // In self-baseline (non-temporal) z-score mode, "expected" comes from a
+      // leave-one-out mean/std over the rest of the series — the flagged
+      // window itself is excluded from its own baseline (see
+      // anomaly_stats.py::find_frequency_anomalies) so a single spike can't
+      // inflate its own baseline and suppress its own detection.
       const baselineClause =
         data?.method === "temporal-z-score"
           ? "expected from the pre-baseline event-count distribution"
-          : "expected from this series' own overall event-count distribution, which includes this window";
+          : "expected from the rest of this series' event-count distribution (this window excluded, leave-one-out)";
       const detail =
         `Frequency ${direction}: ${f.series_field}=${f.series_value} — ` +
         `${f.observed} events observed vs ${f.expected.toFixed(1)} ${baselineClause} ` +
@@ -370,6 +376,7 @@ export function FrequencyView({
             <FreqFindingRow
               key={`${f.series_value}:${f.window_start}:${i}`}
               finding={f}
+              zThreshold={data?.z_threshold ?? zThresholdParam ?? 2.5}
               onDrillField={onDrillField}
               onJumpToTime={onJumpToTime}
             />
