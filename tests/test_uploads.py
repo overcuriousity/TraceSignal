@@ -359,3 +359,118 @@ async def test_startup_reconciliation_removes_orphaned_ingests(
     assert deleted == [(case, "s_orphan")]
     assert await store.get_source(case, "s_orphan") is None
     assert await store.list_ingesting_sources() == []
+
+
+class _FakeQdrant:
+    def delete_source_points(self, case_id: str, source_id: str) -> None:
+        pass
+
+    def delete_case_collections(self, case_id: str) -> None:
+        pass
+
+
+class _BrokenClickHouse:
+    def delete_source_events(self, case_id: str, source_id: str) -> None:
+        raise RuntimeError("event store unreachable")
+
+
+@pytest.mark.asyncio
+async def test_source_delete_fails_closed_when_event_store_delete_fails(
+    store: PostgresStore,
+    case: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed ClickHouse delete must abort the request: the Postgres source
+    row stays (delete remains visible and retryable), a source.delete_failed
+    audit row is written, and no success audit exists."""
+    monkeypatch.setattr(cases, "QdrantStore", _FakeQdrant)
+    monkeypatch.setattr(cases, "ClickHouseStore", _BrokenClickHouse)
+    await store.create_source(case, "s_del", "victim", file_hash="hd", size_bytes=1)
+    case_obj = await store.get_case(case)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await cases.delete_source(source_id="s_del", case=case_obj, user=_fake_user())
+
+    assert exc_info.value.status_code == 502
+    assert await store.get_source(case, "s_del") is not None
+    assert await store.query_audit(case_id=case, action="source.delete_failed") != []
+    assert await store.query_audit(case_id=case, action="source.delete") == []
+
+
+@pytest.mark.asyncio
+async def test_case_delete_fails_closed_when_event_store_delete_fails(
+    store: PostgresStore,
+    case: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cases, "QdrantStore", _FakeQdrant)
+    monkeypatch.setattr(cases, "ClickHouseStore", _BrokenClickHouse)
+    await store.create_source(case, "s_keep", "victim", file_hash="hk", size_bytes=1)
+    case_obj = await store.get_case(case)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await cases.delete_case(case=case_obj, user=_fake_user())
+
+    assert exc_info.value.status_code == 502
+    assert await store.get_case(case) is not None
+    assert await store.get_source(case, "s_keep") is not None
+    assert await store.query_audit(case_id=case, action="case.delete_failed") != []
+    assert await store.query_audit(case_id=case, action="case.delete") == []
+
+
+@pytest.mark.asyncio
+async def test_source_delete_succeeds_and_audits(
+    store: PostgresStore,
+    case: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cases, "QdrantStore", _FakeQdrant)
+    monkeypatch.setattr(
+        cases,
+        "ClickHouseStore",
+        lambda: type("CH", (), {"delete_source_events": staticmethod(lambda *a: None)})(),
+    )
+    await store.create_source(case, "s_ok", "victim", file_hash="ho", size_bytes=1)
+    case_obj = await store.get_case(case)
+
+    response = await cases.delete_source(source_id="s_ok", case=case_obj, user=_fake_user())
+
+    assert response == {"deleted": True, "source_id": "s_ok"}
+    assert await store.get_source(case, "s_ok") is None
+    assert await store.query_audit(case_id=case, action="source.delete") != []
+
+
+@pytest.mark.asyncio
+async def test_receive_upload_to_tmp_413_cleans_up(tmp_path, monkeypatch):
+    import tempfile
+
+    from tracesignal.api.uploads import receive_upload_to_tmp
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    upload = _UploadFile("big.bin", b"x" * 100)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await receive_upload_to_tmp(upload, max_bytes=10, suffix=".bin")
+
+    assert exc_info.value.status_code == 413
+    assert list(tmp_path.iterdir()) == []  # temp file unlinked on failure
+
+
+@pytest.mark.asyncio
+async def test_receive_upload_to_tmp_returns_hash_and_size(tmp_path, monkeypatch):
+    import hashlib
+    import tempfile
+
+    from tracesignal.api.uploads import receive_upload_to_tmp
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    payload = b"hello world"
+    upload = _UploadFile("ok.bin", payload)
+
+    result_path, sha256, size = await receive_upload_to_tmp(upload, max_bytes=None, suffix=".bin")
+    try:
+        assert result_path.read_bytes() == payload
+        assert sha256 == hashlib.sha256(payload).hexdigest()
+        assert size == len(payload)
+    finally:
+        result_path.unlink(missing_ok=True)

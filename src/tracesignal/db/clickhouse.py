@@ -3,15 +3,26 @@
 The event table schema is optimised for forensic timeline analysis:
 * MergeTree ordered by (case_id, source_id, timestamp)
 * Projections or token bloom filters for full-text search
-* Immutable forensic provenance columns
+* Forensic provenance columns (``content_hash``/``file_hash``) computed from
+  the raw record/file bytes at ingest and never recomputed afterwards.
 
 Events are scoped by ``source_id`` (one ingested file) so that a Source can be
 shared across multiple Timelines without duplication. Timeline queries resolve
 member source IDs and use ``source_id IN (...)`` filtering.
+
+Immutability contract: the *original evidence files* are hashed and immutable;
+this table is a normalized derivative of them. Enrichers amend the
+``attributes`` map after ingest via an atomic per-source partition rewrite
+(``apply_enrichments``) — the provenance columns are never touched, so hash
+verification against the original file is unaffected.
 """
 
 from __future__ import annotations
 
+import contextlib
+import logging
+import re
+from collections.abc import Iterable, Iterator
 from datetime import UTC
 from typing import Any
 
@@ -19,6 +30,8 @@ import clickhouse_connect
 
 from tracesignal.core.config import get_settings
 from tracesignal.models.event import Event
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_event_datetimes(row: dict[str, Any]) -> dict[str, Any]:
@@ -39,6 +52,30 @@ def _normalize_event_datetimes(row: dict[str, Any]) -> dict[str, Any]:
             value = value.replace(tzinfo=UTC)
         row[key] = value.isoformat()
     return row
+
+
+def _validate_partition_id(value: str, label: str) -> str:
+    """Fail closed on any ID that can't be safely interpolated into a partition expression.
+
+    ``ALTER TABLE ... DROP/REPLACE PARTITION`` expressions cannot be
+    query-parameterized, so IDs are string-interpolated there. All case and
+    source IDs are server-generated via ``postgres.generate_id``, which only
+    emits alphanumeric characters (Unicode-aware, matching ``str.isalnum``)
+    plus ``-``/``_`` — the same predicate is enforced here, so quotes,
+    whitespace, and control characters can never reach the DDL string.
+    Anything else is a bug or tampering.
+    """
+    if not value or not all(c.isalnum() or c in "-_" for c in value):
+        raise ValueError(f"unsafe {label} for partition expression: {value!r}")
+    return value
+
+
+def _partition_expr(case_id: str, source_id: str) -> str:
+    """Build a validated ``(case_id, source_id)`` partition tuple expression."""
+    return (
+        f"tuple('{_validate_partition_id(case_id, 'case_id')}', "
+        f"'{_validate_partition_id(source_id, 'source_id')}')"
+    )
 
 
 _EVENT_COLUMNS = [
@@ -99,6 +136,10 @@ PARTITION BY (case_id, source_id)
 SETTINGS index_granularity = 8192, allow_nullable_key = 1
 """.strip()
 
+# Prefix for the transient tables apply_enrichments works through; stale ones
+# (crash mid-apply) are swept at startup by drop_stale_enrichment_scratch_tables.
+_ENRICH_SCRATCH_PREFIX = "tmp_enrich_"
+
 
 class ClickHouseStore:
     """Sync ClickHouse client for event data."""
@@ -132,10 +173,28 @@ class ClickHouseStore:
         parts = url.split("://")[-1].split(":")
         return int(parts[1]) if len(parts) > 1 else 8123
 
+    @staticmethod
+    def _string_in_clause(prefix: str, values: list[str]) -> tuple[str, dict[str, str]]:
+        """Build a parameterized IN-list body and its bindings for String values.
+
+        Returns ``("{p0:String}, {p1:String}, ...", {"p0": v0, ...})`` — the
+        caller wraps the body in ``... IN (<body>)`` and merges the bindings
+        into its parameters dict. Prefixes must be distinct across clauses in
+        the same query.
+        """
+        names = [f"{prefix}{i}" for i in range(len(values))]
+        body = ", ".join(f"{{{name}:String}}" for name in names)
+        return body, dict(zip(names, values, strict=False))
+
     def init_schema(self) -> None:
         """Create the target database and events table if they do not exist."""
         self.client.command(f"CREATE DATABASE IF NOT EXISTS {self.database}")
         self.client.command(_EVENTS_TABLE_DDL.format(database=self.database))
+        # Enrichment output moved into events.attributes (apply_enrichments);
+        # the former side table is dead. Destructive, but pre-release
+        # databases are documented as deprecated and the data is derived —
+        # re-running the enricher regenerates it.
+        self.client.command(f"DROP TABLE IF EXISTS {self.database}.event_enrichments")
 
     def insert_events(self, events: list[Event]) -> int:
         """Insert a batch of events into ClickHouse.
@@ -158,6 +217,132 @@ class ClickHouseStore:
         )
         return response.written_rows
 
+    def apply_enrichments(
+        self,
+        case_id: str,
+        source_id: str,
+        scratch_suffix: str,
+        row_chunks: Iterable[list[tuple[str, str, str]]],
+        owned_suffixes: list[str] | None = None,
+    ) -> int:
+        """Merge enrichment key/value pairs into one source's ``events.attributes``.
+
+        Atomic per-source partition rewrite: the ``(event_id, field_key,
+        value)`` triples are inserted into a scratch rows table, an enriched
+        copy of the source's partition is built into a scratch events table
+        via ``mapUpdate`` over a LEFT JOIN, and the live partition is swapped
+        in one ``ALTER TABLE ... REPLACE PARTITION``. Idempotent — re-applying
+        the same rows overwrites the same map keys with the same values — so
+        a crashed apply can simply be re-run from the Postgres staging rows.
+
+        ``owned_suffixes`` is the enricher's ``output_fields`` (the ``<field>``
+        half of each derived ``<attr_key>:<field>`` key). Before merging, every
+        existing attribute key ending in one of these suffixes is stripped, so
+        a re-run whose output *shrank* — e.g. an updated GeoLite2 database that
+        no longer resolves an IP — does not leave a stale derived value behind
+        (mapUpdate alone only overwrites keys that are re-emitted). Left None
+        for callers that only add keys; then nothing is stripped. Note: if two
+        enrichers ever shared an output-field suffix, one's apply would strip
+        the other's keys — today GeoIP is the only enricher, so suffixes are
+        unique.
+
+        Transiently doubles the partition's disk footprint (scratch copy).
+        Caller must serialize applies per ``(case_id, source_id)`` — two
+        concurrent REPLACEs would silently discard one side's keys.
+
+        Returns the number of enrichment pairs applied.
+        """
+        # Suffix comes from the in-process job id (uuid4 hex); defensive
+        # strip anyway since it lands in DDL identifiers.
+        suffix = re.sub(r"[^a-zA-Z0-9_]", "", scratch_suffix)
+        rows_table = f"{self.database}.{_ENRICH_SCRATCH_PREFIX}rows_{suffix}"
+        events_table = f"{self.database}.{_ENRICH_SCRATCH_PREFIX}events_{suffix}"
+        partition_expr = _partition_expr(case_id, source_id)
+        # Strip this enricher's previously-derived keys (last ':'-segment in
+        # owned_suffixes) before merging the fresh output, so stale values are
+        # removed rather than lingering. With no suffixes the mapFilter is a
+        # no-op (has() over an empty array is always false → nothing dropped).
+        attr_source = (
+            "mapFilter((k, v) -> NOT has({owned_suffixes:Array(String)}, "
+            "splitByChar(':', k)[-1]), e.attributes)"
+        )
+        select_columns = ",\n            ".join(
+            f"mapUpdate({attr_source}, m.enr) AS attributes"
+            if column == "attributes"
+            else f"e.{column}"
+            for column in _EVENT_COLUMNS
+        )
+        try:
+            self.client.command(f"DROP TABLE IF EXISTS {rows_table}")
+            self.client.command(
+                f"CREATE TABLE {rows_table} "
+                "(event_id UUID, field_key String, value String) "
+                "ENGINE = MergeTree ORDER BY event_id"
+            )
+            applied = 0
+            for chunk in row_chunks:
+                if not chunk:
+                    continue
+                self.client.insert(
+                    table=rows_table,
+                    data=chunk,
+                    column_names=["event_id", "field_key", "value"],
+                )
+                applied += len(chunk)
+            if applied == 0:
+                return 0
+            self.client.command(f"DROP TABLE IF EXISTS {events_table}")
+            # AS clones the full DDL (engine, ORDER BY, PARTITION BY, skip
+            # indexes, settings) — required for REPLACE PARTITION.
+            self.client.command(f"CREATE TABLE {events_table} AS {self.database}.events")
+            self.client.query(
+                f"""
+                INSERT INTO {events_table} ({", ".join(_EVENT_COLUMNS)})
+                SELECT
+                    {select_columns}
+                FROM {self.database}.events AS e
+                LEFT JOIN (
+                    SELECT
+                        event_id,
+                        CAST(
+                            (groupArray(field_key), groupArray(value)),
+                            'Map(String, String)'
+                        ) AS enr
+                    FROM {rows_table}
+                    GROUP BY event_id
+                ) AS m ON e.event_id = m.event_id
+                WHERE e.case_id = {{case_id:String}} AND e.source_id = {{source_id:String}}
+                SETTINGS join_use_nulls = 0
+                """,
+                parameters={
+                    "case_id": case_id,
+                    "source_id": source_id,
+                    "owned_suffixes": owned_suffixes or [],
+                },
+            )
+            self.client.command(
+                f"ALTER TABLE {self.database}.events "
+                f"REPLACE PARTITION {partition_expr} FROM {events_table}"
+            )
+            return applied
+        finally:
+            with contextlib.suppress(Exception):
+                self.client.command(f"DROP TABLE IF EXISTS {events_table}")
+            with contextlib.suppress(Exception):
+                self.client.command(f"DROP TABLE IF EXISTS {rows_table}")
+
+    def drop_stale_enrichment_scratch_tables(self) -> int:
+        """Drop scratch tables orphaned by a crash mid-apply. Returns how many were dropped."""
+        result = self.client.query(
+            "SELECT name FROM system.tables WHERE database = {db:String} AND name LIKE {p:String}",
+            parameters={"db": self.database, "p": f"{_ENRICH_SCRATCH_PREFIX}%"},
+        )
+        names = [row[0] for row in result.result_rows]
+        for name in names:
+            with contextlib.suppress(Exception):
+                self.client.command(f"DROP TABLE IF EXISTS {self.database}.{name}")
+        return len(names)
+
     def count_events(
         self,
         case_id: str | None = None,
@@ -167,16 +352,22 @@ class ClickHouseStore:
         """Return the number of events, optionally filtered by case/source."""
         query = f"SELECT count() FROM {self.database}.events"
         conditions: list[str] = []
+        parameters: dict[str, str] = {}
         if case_id is not None:
-            conditions.append(f"case_id = {case_id!r}")
+            conditions.append("case_id = {case_id:String}")
+            parameters["case_id"] = case_id
         if source_id is not None:
-            conditions.append(f"source_id = {source_id!r}")
+            conditions.append("source_id = {source_id:String}")
+            parameters["source_id"] = source_id
         if source_ids is not None:
-            ids = ", ".join(f"{s!r}" for s in source_ids)
-            conditions.append(f"source_id IN ({ids})")
+            if not source_ids:
+                return 0
+            source_in, source_binds = self._string_in_clause("s", source_ids)
+            conditions.append(f"source_id IN ({source_in})")
+            parameters.update(source_binds)
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
-        result = self.client.query(query)
+        result = self.client.query(query, parameters=parameters)
         return result.result_rows[0][0] if result.result_rows else 0
 
     def list_events(
@@ -230,6 +421,32 @@ class ClickHouseStore:
             for row in result.result_rows
         ]
 
+    def iter_source_events(
+        self,
+        case_id: str,
+        source_id: str,
+        batch_size: int,
+    ) -> Iterator[list[dict[str, Any]]]:
+        """Yield successive ``list_events`` batches for one source.
+
+        Shared batching primitive for whole-source jobs (embedding pipeline,
+        enrichers). Stops on an empty batch; a short batch also ends the
+        iteration (the table can't grow mid-job — sources are ingest-once).
+        Each ``next()`` issues one blocking query, so async callers should
+        drive the iterator from a worker thread.
+        """
+        offset = 0
+        while True:
+            batch = self.list_events(
+                case_id=case_id, source_id=source_id, limit=batch_size, offset=offset
+            )
+            if not batch:
+                return
+            yield batch
+            if len(batch) < batch_size:
+                return
+            offset += len(batch)
+
     def get_events_by_ids(
         self,
         case_id: str,
@@ -244,14 +461,11 @@ class ClickHouseStore:
         if not event_ids:
             return {}
         self.init_schema()
-        # Build parameterized IN clauses.
-        event_params = [f"e{i}" for i in range(len(event_ids))]
-        event_in = ", ".join(f"{{{name}:String}}" for name in event_params)
-        source_params = [f"s{i}" for i in range(len(source_ids))]
-        source_in = ", ".join(f"{{{name}:String}}" for name in source_params)
-        parameters: dict[str, str] = dict(zip(event_params, event_ids, strict=False))
-        parameters.update(zip(source_params, source_ids, strict=False))
-        parameters["case_id"] = case_id
+        # Build parameterized IN clauses (distinct prefixes so the bindings
+        # don't collide in the merged parameters dict).
+        event_in, event_binds = self._string_in_clause("e", event_ids)
+        source_in, source_binds = self._string_in_clause("s", source_ids)
+        parameters: dict[str, str] = {**event_binds, **source_binds, "case_id": case_id}
         result = self.client.query(
             f"""
             SELECT
@@ -278,20 +492,48 @@ class ClickHouseStore:
 
         The ``events`` table is partitioned by ``(case_id, source_id)`` so
         ``DROP PARTITION`` is instant and does not require a full-table scan.
-        If the partition does not exist the call is a silent no-op.
+        A missing partition is a server-side no-op; a missing ``events``
+        table (fresh install, schema never initialized) is treated as a
+        benign no-op too. Any other failure is logged and re-raised — a
+        silently failed evidence delete would leave orphan events behind a
+        "successful" delete, which is a forensic-integrity violation.
         """
+        partition_expr = _partition_expr(case_id, source_id)
         try:
-            partition_expr = f"tuple('{case_id}', '{source_id}')"
             self.client.command(
                 f"ALTER TABLE {self.database}.events DROP PARTITION {partition_expr}"
             )
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:
+            if "UNKNOWN_TABLE" in str(exc):
+                logger.debug(
+                    "events table missing while deleting source %s (case %s); nothing to drop",
+                    source_id,
+                    case_id,
+                )
+                return
+            logger.exception(
+                "Failed to drop events partition for source %s (case %s)", source_id, case_id
+            )
+            raise
 
     def delete_timeline_events(self, case_id: str, source_ids: list[str]) -> None:
-        """Remove all events for a timeline by dropping partitions for its sources."""
+        """Remove all events for a timeline by dropping partitions for its sources.
+
+        Attempts every source even if some fail, then raises a single
+        ``RuntimeError`` naming the failed sources so one bad partition
+        doesn't silently skip the rest.
+        """
+        failed: list[str] = []
         for source_id in source_ids:
-            self.delete_source_events(case_id, source_id)
+            try:
+                self.delete_source_events(case_id, source_id)
+            except Exception:
+                failed.append(source_id)
+        if failed:
+            raise RuntimeError(
+                f"failed to delete events for {len(failed)} source(s) "
+                f"in case {case_id}: {', '.join(failed)}"
+            )
 
     def health(self) -> dict[str, Any]:
         """Return a simple health status for the ClickHouse connection."""

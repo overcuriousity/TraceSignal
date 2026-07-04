@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -16,6 +17,7 @@ from sqlalchemy import (
     String,
     delete,
     func,
+    insert,
     inspect,
     select,
     text,
@@ -245,6 +247,194 @@ class TimelineSource(Base):
     source_id: Mapped[str] = mapped_column(
         String(64), ForeignKey("sources.id", ondelete="CASCADE"), primary_key=True
     )
+
+
+class TimelineEnricher(Base):
+    """Per-timeline enricher configuration: which enrichers run, and how.
+
+    ``mode`` controls whether this enricher fires automatically after
+    ingestion succeeds for a source belonging to this timeline, or only when
+    an analyst manually triggers it. Mirrors the ``timeline_sources`` join
+    table in spirit, but carries config rather than being a pure M:N link.
+    """
+
+    __tablename__ = "timeline_enrichers"
+    __table_args__ = (
+        Index("ix_timeline_enrichers_unique", "timeline_id", "enricher_key", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    timeline_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("timelines.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    enricher_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False, default="automatic")
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    updated_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary."""
+        return {
+            "id": self.id,
+            "timeline_id": self.timeline_id,
+            "enricher_key": self.enricher_key,
+            "mode": self.mode,
+            "enabled": self.enabled,
+            "updated_by": self.updated_by,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class EnricherGlobalConfig(Base):
+    """Instance-wide enricher defaults, set by admins.
+
+    ``auto_run_default`` makes an enricher run automatically after ingestion
+    for every timeline that has *no explicit* ``timeline_enrichers`` row for
+    it — an explicit per-timeline config always overrides this default. This
+    lets an admin turn on e.g. GeoIP for the whole instance without touching
+    each timeline.
+    """
+
+    __tablename__ = "enricher_global_configs"
+
+    enricher_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    auto_run_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    updated_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary."""
+        return {
+            "enricher_key": self.enricher_key,
+            "auto_run_default": self.auto_run_default,
+            "updated_by": self.updated_by,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class EnrichmentResultStaging(Base):
+    """Crash-safe staging area for in-flight enrichment jobs.
+
+    Rows accumulate here as an enrichment job processes batches; at job end
+    they are merged into the ClickHouse ``events.attributes`` map via an
+    atomic per-source partition rewrite (``ClickHouseStore.apply_enrichments``)
+    and deleted only after the swap succeeds. If the process dies mid-run,
+    rows survive here (Postgres is transactional) even though the in-memory
+    JobStore does not — see ``list_orphaned_enrichment_job_runs``, which
+    mirrors ``list_ingesting_sources`` for reconciliation on restart.
+    """
+
+    __tablename__ = "enrichment_results_staging"
+    __table_args__ = (
+        Index("ix_staging_job_id", "job_id"),
+        Index(
+            "ix_staging_unique_row",
+            "job_id",
+            "event_id",
+            "enricher_key",
+            "field_key",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    job_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    timeline_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    enricher_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    field_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    value: Mapped[str] = mapped_column(String(1024), nullable=False)
+    computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    enricher_config_hash: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default=""
+    )
+
+
+class EnrichmentJobRun(Base):
+    """Durable marker for an in-flight enrichment job.
+
+    The Postgres-side complement to the ephemeral JobStore (``core/jobs.py``):
+    written when a job starts, deleted only after its final ClickHouse flush
+    succeeds. A row still present at startup means the process died mid-run —
+    the same signal ``Source.status == "ingesting"`` gives
+    ``list_ingesting_sources`` for orphaned ingest jobs.
+    """
+
+    __tablename__ = "enrichment_job_runs"
+
+    job_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    timeline_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    enricher_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+
+class SourceEnrichment(Base):
+    """Durable provenance for enrichment applied to a source's events.
+
+    Enrichment output is merged directly into the ClickHouse ``events``
+    table's ``attributes`` map (atomic per-source partition rewrite), so the
+    per-row provenance a separate results table would give does not exist —
+    this row records which enricher configuration/data version produced the
+    derived fields currently present on a source. Re-applying with a new
+    config overwrites the same keys and upserts this row.
+    """
+
+    __tablename__ = "source_enrichments"
+    __table_args__ = (
+        Index("ix_source_enrichments_unique", "source_id", "enricher_key", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    timeline_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    enricher_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    enricher_config_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    job_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    rows_applied: Mapped[int] = mapped_column(nullable=False, default=0)
+    applied_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize for API responses."""
+        return {
+            "case_id": self.case_id,
+            "source_id": self.source_id,
+            "timeline_id": self.timeline_id,
+            "enricher_key": self.enricher_key,
+            "enricher_config_hash": self.enricher_config_hash,
+            "job_id": self.job_id,
+            "rows_applied": self.rows_applied,
+            "applied_at": self.applied_at.isoformat() if self.applied_at else None,
+        }
 
 
 class View(Base):
@@ -698,6 +888,19 @@ class PostgresStore:
                         "ALTER TABLE sources ADD COLUMN status VARCHAR(16) NOT NULL DEFAULT 'ready'"
                     )
                 )
+            staging_columns = await conn.run_sync(
+                lambda sync_conn: {
+                    col["name"]
+                    for col in inspect(sync_conn).get_columns("enrichment_results_staging")
+                }
+            )
+            if "enricher_config_hash" not in staging_columns:
+                await conn.execute(
+                    text(
+                        "ALTER TABLE enrichment_results_staging "
+                        "ADD COLUMN enricher_config_hash VARCHAR(64) NOT NULL DEFAULT ''"
+                    )
+                )
             # No migration for the earlier `annotation_type="outlier"` rows
             # (renamed to "anomaly" when the statistical anomaly engine
             # landed): no releases exist yet and pre-this-branch databases
@@ -924,12 +1127,306 @@ class PostgresStore:
             result = await session.execute(select(Source).where(Source.status == "ingesting"))
             return list(result.scalars().all())
 
+    # ------------------------------------------------------------------
+    # Enrichers
+    # ------------------------------------------------------------------
+
+    async def list_timeline_enrichers(self, timeline_id: str) -> list[TimelineEnricher]:
+        """Return every enricher config row for a timeline."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(TimelineEnricher).where(TimelineEnricher.timeline_id == timeline_id)
+            )
+            return list(result.scalars().all())
+
+    async def get_timeline_enricher(
+        self, timeline_id: str, enricher_key: str
+    ) -> TimelineEnricher | None:
+        """Return one timeline's config for a specific enricher, if set."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(TimelineEnricher).where(
+                    TimelineEnricher.timeline_id == timeline_id,
+                    TimelineEnricher.enricher_key == enricher_key,
+                )
+            )
+            return result.scalar_one_or_none()
+
+    async def upsert_timeline_enricher(
+        self,
+        timeline_id: str,
+        enricher_key: str,
+        mode: str,
+        enabled: bool,
+        updated_by: str | None,
+    ) -> TimelineEnricher:
+        """Create or update a timeline's config for one enricher."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(TimelineEnricher).where(
+                    TimelineEnricher.timeline_id == timeline_id,
+                    TimelineEnricher.enricher_key == enricher_key,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                row = TimelineEnricher(
+                    id=generate_id(f"enricher_{enricher_key}"),
+                    timeline_id=timeline_id,
+                    enricher_key=enricher_key,
+                    mode=mode,
+                    enabled=enabled,
+                    updated_by=updated_by,
+                )
+                session.add(row)
+            else:
+                row.mode = mode
+                row.enabled = enabled
+                row.updated_by = updated_by
+                row.updated_at = datetime.now(UTC)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def list_automatic_enrichers_for_source(
+        self, source_id: str, default_auto_keys: Iterable[str] = ()
+    ) -> list[tuple[str, str]]:
+        """Return ``(timeline_id, enricher_key)`` pairs to auto-run after this source ingests.
+
+        A pair is included when the timeline has an explicit config row with
+        ``mode="automatic", enabled=True`` — or, for enrichers in
+        ``default_auto_keys`` (the admin-set instance-wide defaults), when the
+        timeline has *no* explicit row for that enricher at all. An explicit
+        row always overrides the instance default, in either direction.
+        """
+        from tracesignal.enrichers.base import effective_enricher_state
+
+        default_keys = set(default_auto_keys)
+        async with self.session_factory() as session:
+            timeline_result = await session.execute(
+                select(TimelineSource.timeline_id).where(TimelineSource.source_id == source_id)
+            )
+            timeline_ids = [row[0] for row in timeline_result.all()]
+            if not timeline_ids:
+                return []
+            config_result = await session.execute(
+                select(TimelineEnricher).where(TimelineEnricher.timeline_id.in_(timeline_ids))
+            )
+            configs = list(config_result.scalars().all())
+
+        explicit = {(c.timeline_id, c.enricher_key): c for c in configs}
+        candidates = set(explicit) | {
+            (timeline_id, key) for timeline_id in timeline_ids for key in default_keys
+        }
+        pairs: list[tuple[str, str]] = []
+        for timeline_id, key in sorted(candidates):
+            config = explicit.get((timeline_id, key))
+            enabled, mode = effective_enricher_state(
+                config.enabled if config else None,
+                config.mode if config else None,
+                key in default_keys,
+            )
+            if enabled and mode == "automatic":
+                pairs.append((timeline_id, key))
+        return pairs
+
+    async def list_enricher_global_configs(self) -> list[EnricherGlobalConfig]:
+        """Return every instance-wide enricher config row."""
+        async with self.session_factory() as session:
+            result = await session.execute(select(EnricherGlobalConfig))
+            return list(result.scalars().all())
+
+    async def upsert_enricher_global_config(
+        self, enricher_key: str, auto_run_default: bool, updated_by: str | None
+    ) -> EnricherGlobalConfig:
+        """Create or update the instance-wide config for one enricher."""
+        async with self.session_factory() as session:
+            row = await session.get(EnricherGlobalConfig, enricher_key)
+            if row is None:
+                row = EnricherGlobalConfig(
+                    enricher_key=enricher_key,
+                    auto_run_default=auto_run_default,
+                    updated_by=updated_by,
+                )
+                session.add(row)
+            else:
+                row.auto_run_default = auto_run_default
+                row.updated_by = updated_by
+                row.updated_at = datetime.now(UTC)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def stage_enrichment_results(self, rows: list[dict[str, Any]]) -> None:
+        """Bulk-insert enrichment result rows into the crash-safe staging table."""
+        if not rows:
+            return
+        async with self.session_factory() as session:
+            await session.execute(insert(EnrichmentResultStaging), rows)
+            await session.commit()
+
+    async def pop_staged_rows_for_job(
+        self, job_id: str, limit: int
+    ) -> list[EnrichmentResultStaging]:
+        """Return up to ``limit`` staged rows for a job, oldest first (does not delete them)."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(EnrichmentResultStaging)
+                .where(EnrichmentResultStaging.job_id == job_id)
+                .order_by(EnrichmentResultStaging.id.asc())
+                .limit(limit)
+            )
+            return list(result.scalars().all())
+
+    async def delete_staged_rows(self, ids: list[int]) -> None:
+        """Delete staged rows by primary key, after they've been flushed to ClickHouse."""
+        if not ids:
+            return
+        async with self.session_factory() as session:
+            await session.execute(
+                delete(EnrichmentResultStaging).where(EnrichmentResultStaging.id.in_(ids))
+            )
+            await session.commit()
+
+    async def delete_staged_rows_for_job(self, job_id: str) -> None:
+        """Delete every staged row for a job — used to discard an orphaned/unflushed run."""
+        async with self.session_factory() as session:
+            await session.execute(
+                delete(EnrichmentResultStaging).where(EnrichmentResultStaging.job_id == job_id)
+            )
+            await session.commit()
+
+    async def list_staged_sources(self, job_id: str) -> list[tuple[str, str]]:
+        """Return the distinct ``(case_id, source_id)`` pairs a job has staged rows for."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(EnrichmentResultStaging.case_id, EnrichmentResultStaging.source_id)
+                .where(EnrichmentResultStaging.job_id == job_id)
+                .distinct()
+                .order_by(EnrichmentResultStaging.source_id.asc())
+            )
+            return [(row[0], row[1]) for row in result.all()]
+
+    async def list_staged_rows_for_source(
+        self, job_id: str, source_id: str, limit: int, after_id: int = 0
+    ) -> list[EnrichmentResultStaging]:
+        """Keyset-paged staged rows for one source of a job (does not delete).
+
+        Unlike ``pop_staged_rows_for_job``'s pop-after-insert pattern, apply
+        needs the rows to survive until the partition ``REPLACE`` succeeds —
+        deletion happens separately via ``delete_staged_rows_for_source``.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(EnrichmentResultStaging)
+                .where(
+                    EnrichmentResultStaging.job_id == job_id,
+                    EnrichmentResultStaging.source_id == source_id,
+                    EnrichmentResultStaging.id > after_id,
+                )
+                .order_by(EnrichmentResultStaging.id.asc())
+                .limit(limit)
+            )
+            return list(result.scalars().all())
+
+    async def delete_staged_rows_for_source(self, job_id: str, source_id: str) -> None:
+        """Delete a job's staged rows for one source — only after its partition swap succeeded."""
+        async with self.session_factory() as session:
+            await session.execute(
+                delete(EnrichmentResultStaging).where(
+                    EnrichmentResultStaging.job_id == job_id,
+                    EnrichmentResultStaging.source_id == source_id,
+                )
+            )
+            await session.commit()
+
+    async def record_source_enrichment(
+        self,
+        *,
+        case_id: str,
+        source_id: str,
+        timeline_id: str,
+        enricher_key: str,
+        enricher_config_hash: str,
+        job_id: str,
+        rows_applied: int,
+    ) -> SourceEnrichment:
+        """Upsert the per-source provenance row after enrichment was applied."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(SourceEnrichment).where(
+                    SourceEnrichment.source_id == source_id,
+                    SourceEnrichment.enricher_key == enricher_key,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                row = SourceEnrichment(
+                    id=generate_id(f"srcenrich_{enricher_key}"),
+                    case_id=case_id,
+                    source_id=source_id,
+                )
+                session.add(row)
+            row.timeline_id = timeline_id
+            row.enricher_key = enricher_key
+            row.enricher_config_hash = enricher_config_hash
+            row.job_id = job_id
+            row.rows_applied = rows_applied
+            row.applied_at = datetime.now(UTC)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def list_source_enrichments(self, source_id: str) -> list[SourceEnrichment]:
+        """Return every enrichment provenance row for a source."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(SourceEnrichment).where(SourceEnrichment.source_id == source_id)
+            )
+            return list(result.scalars().all())
+
+    async def start_enrichment_job_run(
+        self, job_id: str, timeline_id: str, case_id: str, enricher_key: str
+    ) -> None:
+        """Write the durable in-flight marker for an enrichment job, before any processing starts."""
+        async with self.session_factory() as session:
+            session.add(
+                EnrichmentJobRun(
+                    job_id=job_id,
+                    timeline_id=timeline_id,
+                    case_id=case_id,
+                    enricher_key=enricher_key,
+                )
+            )
+            await session.commit()
+
+    async def finish_enrichment_job_run(self, job_id: str) -> None:
+        """Delete the durable marker for an enrichment job — only call after its final flush succeeds."""
+        async with self.session_factory() as session:
+            await session.execute(delete(EnrichmentJobRun).where(EnrichmentJobRun.job_id == job_id))
+            await session.commit()
+
+    async def list_orphaned_enrichment_job_runs(self) -> list[EnrichmentJobRun]:
+        """Return every enrichment job marker still present at startup.
+
+        Mirrors ``list_ingesting_sources``: enrichment jobs live in the
+        in-memory JobStore, so any marker row found on a fresh boot was
+        orphaned by a mid-run restart and never reached its final flush.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(select(EnrichmentJobRun))
+            return list(result.scalars().all())
+
     async def delete_source(self, case_id: str, source_id: str) -> bool:
-        """Delete a source row.
+        """Delete a source row and its enrichment provenance/staging.
+
+        ``SourceEnrichment`` and ``EnrichmentResultStaging`` reference the
+        source by a plain ``source_id`` column (no FK/cascade), so they are
+        deleted here too or they'd orphan when the source is removed.
 
         Returns True if a row was removed, False if it did not exist.
         """
-        from sqlalchemy import select
+        from sqlalchemy import delete, select
 
         async with self.session_factory() as session:
             result = await session.execute(
@@ -941,6 +1438,18 @@ class PostgresStore:
             source = result.scalar_one_or_none()
             if source is None:
                 return False
+            await session.execute(
+                delete(SourceEnrichment).where(
+                    SourceEnrichment.case_id == case_id,
+                    SourceEnrichment.source_id == source_id,
+                )
+            )
+            await session.execute(
+                delete(EnrichmentResultStaging).where(
+                    EnrichmentResultStaging.case_id == case_id,
+                    EnrichmentResultStaging.source_id == source_id,
+                )
+            )
             await session.delete(source)
             await session.commit()
             return True
@@ -1251,11 +1760,14 @@ class PostgresStore:
 
         Returns True if the case existed and was removed, False otherwise.
 
-        ``View``, ``Annotation``, and ``DetectorRun`` are case-scoped by a
-        plain ``case_id`` column (no FK/cascade — they aren't declared with
-        a ``ForeignKey`` to ``cases.id``), so they must be deleted explicitly
-        here alongside ``Timeline``/``Source`` or they'd silently orphan on
-        every case delete.
+        ``View``, ``Annotation``, ``DetectorRun``, and the enrichment tables
+        (``SourceEnrichment``, ``EnrichmentResultStaging``,
+        ``EnrichmentJobRun``) are case-scoped by a plain ``case_id`` column
+        (no FK/cascade — they aren't declared with a ``ForeignKey`` to
+        ``cases.id``), so they must be deleted explicitly here alongside
+        ``Timeline``/``Source`` or they'd silently orphan on every case delete
+        — and a leftover ``EnrichmentJobRun`` marker would even be picked up by
+        startup reconciliation for evidence that no longer exists.
         """
         from sqlalchemy import delete
 
@@ -1268,6 +1780,15 @@ class PostgresStore:
             await session.execute(delete(View).where(View.case_id == case_id))
             await session.execute(delete(Annotation).where(Annotation.case_id == case_id))
             await session.execute(delete(DetectorRun).where(DetectorRun.case_id == case_id))
+            await session.execute(
+                delete(SourceEnrichment).where(SourceEnrichment.case_id == case_id)
+            )
+            await session.execute(
+                delete(EnrichmentResultStaging).where(EnrichmentResultStaging.case_id == case_id)
+            )
+            await session.execute(
+                delete(EnrichmentJobRun).where(EnrichmentJobRun.case_id == case_id)
+            )
             await session.delete(case)
             await session.commit()
             return True

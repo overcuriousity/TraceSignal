@@ -88,7 +88,17 @@ in `db/queries.py:18`, just not yet exposed by any endpoint.
 Each Event additionally carries `content_hash` (SHA-256 of the raw record), `byte_offset`,
 and `line_number` so it can be located in the original file.
 
-**The Timeline is a derived, non-authoritative projection.** It is a view over immutable
+**Immutability lives on the original file, not the events table.** The ClickHouse `events`
+table is a normalized *derivative* of the hashed source file. Enrichers (see
+`enrichers/`) may amend an event's `attributes` map after ingest — derived keys follow the
+`<attr_key>:<output_field>` contract (e.g. `src_ip:geo_country`) and are written via an
+atomic per-source partition rewrite. The provenance columns (`content_hash`, `file_hash`,
+`byte_offset`, `line_number`) are computed from raw bytes at ingest and never recomputed
+or touched afterwards, so hash verification against the original evidence is unaffected;
+which enricher config/data version produced a source's derived fields is recorded in
+Postgres (`source_enrichments`).
+
+**The Timeline is a derived, non-authoritative projection.** It is a view over
 Source events — sorting, filtering, and coloring them — and does not itself constitute
 evidence. Analysts should always trace findings back to the Source and its `file_hash`.
 

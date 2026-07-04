@@ -1,6 +1,101 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-03 (session 14, continued — source ingest-status lifecycle:
+Last updated: 2026-07-04 (session 17 — final PR #54 cleanup batch, M16 bulk. Four commits on
+`feat/enricher-subsystem`: **(1) micro-fixes** — GeoIP output-field names single-sourced
+(order locked, config_hash-stable), `refresh_availability(key)` single-enricher form,
+batched `count_events(source_ids=...)`, concurrent eligibility checks via `asyncio.gather`,
+sidecar-first `check_availability` (no full `.mmdb` mmap when `.meta.json` carries
+`database_type`), plus comments documenting: eligibility-regex role (#15), create_task-over-
+BackgroundTasks rationale (#17/#21), deliberate reconcile divergence (#20 won't-fix), sorted
+`list_fields` attributes (#33). **(2) shared abstractions** —
+`ClickHouseStore.iter_source_events` batching generator (embedding pipeline + enricher jobs),
+`api/uploads.py::receive_upload_to_tmp` (temp-file + hash + 413 handling, used by source and
+asset uploads), `enrichers/base.py::effective_enricher_state` (single "explicit overrides
+admin default" rule for `list_timeline_enrichers` and
+`list_automatic_enrichers_for_source`). **(3) generic asset abstraction** — Enricher ABC
+gains `asset_spec`/`asset_status()`/`install_asset()` + `AssetValidationError`; GeoIP
+implements them (City-flavor validation moved out of admin.py; lazy db-path resolution);
+GET/POST `/admin/enrichers/geoip/database` replaced by asset state folded into
+`GET /admin/enrichers/config` + generic `POST /admin/enrichers/{key}/asset`; audit action now
+`admin.enricher_asset_upload`; field-key contract extracted to
+`base.FIELD_KEY_SEPARATOR`/`derived_field_key`. **(4) frontend** — new `lib/enrichment.ts`
+(key contract mirror + `hasEnrichmentSiblings` + decorator registry), Explorer flag and
+private/public badge now data-gated on enrichment siblings (user decision: badge means "was
+enriched", so un-enriched private IPs show nothing), `AdminEnrichersPage` fully generic
+(maps configs, asset section from `config.asset`), `privateIp.ts` IPv6 parsed to hextets
+(zone suffixes, `::`, embedded IPv4; bitmask range checks; fixes uncompressed loopback and
+`FEBF::` misclassification). Deferred to fresh branch: staging-format redesign + #34
+(ColumnPicker cardinality) — roadmap M16 rewritten accordingly. 450 backend + 164 frontend
+tests passing.)
+
+Previous (session 16 — roadmap hardening batch M1–M4, M7, M8, shipped on
+the enricher PR branch. **M1**: evidence-mutation failures now surface — `delete_source_events`
+re-raises (only a missing `events` table stays a benign no-op), `delete_timeline_events`
+aggregates per-source failures, DELETE source/case endpoints fail closed with 502 +
+`source.delete_failed`/`case.delete_failed` audit rows and keep the Postgres row (the
+authoritative evidence record) so the delete stays visible and retryable; ingest rollback is
+still best-effort but logs each failed step and flags `cleanup incomplete` on the job error.
+**M2**: one SQL escaping regime — `count_events` on `{name:String}` binds (numbered params
+for the IN-list, empty list short-circuits), partition expressions built via a shared
+validated `_partition_expr` (fail-closed charset guard mirroring `generate_id`'s contract,
+Unicode `isalnum` + `-`/`_`). **M3**: in-memory exponential login backoff per
+(username, client IP) — 429 + `Retry-After` after `TS_LOGIN_BACKOFF_THRESHOLD` (5) failures,
+`base*2^(n-threshold)` capped at `TS_LOGIN_BACKOFF_MAX_SECONDS`; identical behavior for
+unknown user vs. wrong password (no existence leak, tested); `auth.login_rate_limited`
+audit action. **M4**: compose publishes Postgres/ClickHouse/Qdrant on `127.0.0.1` only
+(loopback binds instead of the roadmap's internal-network+override idea — the native
+`uv run tsig-web` dev workflow depends on localhost ports); README compose section un-staled
+(app service is opt-in/commented). **M7**: JobStore caps retained terminal jobs at 200,
+evicting oldest-finished first, never queued/running; mutations now behind a real lock.
+**M8**: dead `secret_key` setting deleted everywhere. Roadmap also gained M17–M19 (PR #7
+follow-ups rescued from the archive: job authz via case RBAC, `access_level` from the case
+API, SSE invalidation misses histogram/anomaly panels). 438 tests passing.)
+
+Previous (session 15, continued — enrichment persisted into
+`events.attributes` (user decision: the ClickHouse events table is a normalized derivative
+of the hashed, immutable source files, so dataset mutation is the better design): the
+separate `event_enrichments` table, its read-time `_hydrate_enrichments` join, and the
+`list_fields` "enrichments" response key are gone — **destructive**: `init_schema` now
+`DROP TABLE IF EXISTS event_enrichments` (pre-release DBs deprecated; derived data,
+re-running the enricher regenerates it). New write path: results stage in Postgres as
+before, then one atomic per-source partition rewrite at job end
+(`ClickHouseStore.apply_enrichments`: scratch triples table → `mapUpdate` LEFT JOIN copy of
+the `(case_id, source_id)` partition → `REPLACE PARTITION`; idempotent, per-(case,source)
+apply lock, scratch tables swept at startup; smoke-tested against live CH 24 — counts
+stable, originals untouched, re-apply idempotent). Periodic flush +
+`enrichment_flush_batch_count` removed (apply-once). Per-row `enricher_config_hash`
+replaced by per-source Postgres provenance (`source_enrichments` upsert, audit
+`enricher.applied`). Derived-field naming contract now `<attr_key>:<output_field>`
+(`src_ip:geo_country`; GeoIP output fields renamed geo_country/geo_city/geo_country_code)
+— sorts beside its source column and is filterable/exportable/visible in every read path
+for free since it's a real attribute key. Frontend: `countryFlag.ts` reads the new sibling
+keys, dead "Enrichments" ColumnPicker group removed, `FieldsResponse.enrichments` dropped,
+EventDetailPanel long field labels now wrap (`break-all`) instead of overlapping values.
+Immutability language reframed across `clickhouse.py`/`enrichers/*`/`field_mappings.py`/
+`MODEL_REFINEMENT.md`: immutable = original evidence file + provenance hash columns, not
+the derived attributes map.)
+
+Previous (session 15 — enricher hardening, roadmap M9–M13 from the PR #54
+review: per-run enricher instances via `Enricher.spawn()` (registry singleton now
+metadata/availability-only; the shared-`_reader` close race is gone) with an in-memory
+`(timeline_id, enricher_key)` run guard — manual "Run now" returns 409 with the conflicting
+job id, auto-trigger skips with a log; GeoIP `enrich_value` validates input with stdlib
+`ipaddress` and only swallows `AddressNotFoundError` — reader failures now fail the job
+loudly (context note, no raw values) and a failed-but-alive job flushes+clears its own
+marker; `enricher_config_hash` populated end-to-end (new `Enricher.config_hash()` mirroring
+`ParserConfig`, GeoIP hashes db sha256+build_epoch from a `.meta.json` sidecar written at
+upload — the upload's `copy_and_hash` digest is now captured — with a hash-and-persist
+fallback for pre-sidecar installs; staging table gained the column via additive migration);
+upload validation rejects non-City `.mmdb` flavors with an actionable 400 and
+`check_availability` checks flavor too; startup reconciliation now *flushes* orphaned staged
+rows to ClickHouse (audit `enricher.job_recovered`) and auto-schedules a re-run over the
+timeline's current ready sources after availability refresh (argMax read-dedup makes the
+overlap safe; ClickHouse-down leaves marker+rows for the next restart);
+`EnrichersDialog.tsx` toggle/mode lost-update race fixed with the standard TanStack
+optimistic-update pattern (`onMutate` cache patch, rollback on error, invalidate only when
+last mutation settles))
+
+Previous (session 14, continued — source ingest-status lifecycle:
 `Source.status` (`ingesting`/`ready`, additive migration backfills `ready`); uploads create
 the row as `ingesting` and the background job flips it to `ready`; `_resolve_timeline_scope`
 (the single scope choke point) excludes non-ready sources so the explorer, histogram,

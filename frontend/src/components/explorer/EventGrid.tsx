@@ -31,6 +31,8 @@ import { Tooltip } from "@/components/ui/Tooltip";
 import { useAnnotationMutations } from "@/hooks/useAnnotationMutations";
 import { RETIRED_COLUMN_IDS, useUiStore } from "@/stores/ui";
 import { cn } from "@/lib/cn";
+import { isIpAddress, isPrivateIp } from "@/lib/privateIp";
+import { getAttributeDecoration, hasEnrichmentSiblings } from "@/lib/enrichment";
 
 // Keep in sync with --grid-row-height in index.css.
 const ROW_HEIGHT_BY_DENSITY = { comfortable: 42, compact: 34 } as const;
@@ -561,11 +563,38 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
           size: 160,
           minSize: 60,
           maxSize: 600,
-          cell: ({ row }) => (
-            <span className="font-mono text-sm leading-snug truncate text-[var(--color-fg-secondary)]">
-              {row.original.attributes[colId] ?? "—"}
-            </span>
-          ),
+          cell: ({ row }) => {
+            const value = row.original.attributes[colId];
+            // Data-driven gating: flag and badge render only when an enricher
+            // actually produced sibling keys for this attribute on this row —
+            // "badge" means "this value was enriched", not "this looks like an
+            // IP". Rows with no enrichment output (notably private IPs, which
+            // GeoIP yields nothing for) show neither.
+            const enriched =
+              value != null && hasEnrichmentSiblings(row.original.attributes, colId);
+            const deco = enriched ? getAttributeDecoration(row.original.attributes, colId) : null;
+            const showIpBadge = enriched && value != null && isIpAddress(value);
+            return (
+              <span className="flex items-center gap-1.5 font-mono text-sm leading-snug truncate text-[var(--color-fg-secondary)]">
+                <span className="truncate">{value ?? "—"}</span>
+                {deco && (
+                  <span className="shrink-0" title={deco.label}>
+                    {deco.flag}
+                  </span>
+                )}
+                {showIpBadge && (
+                  <span
+                    className="shrink-0"
+                    title={isPrivateIp(value) ? "Private/reserved IP range" : "Public IP address"}
+                  >
+                    <Badge variant={isPrivateIp(value) ? "muted" : "accent"} className="text-[10px]">
+                      {isPrivateIp(value) ? "private" : "public"}
+                    </Badge>
+                  </span>
+                )}
+              </span>
+            );
+          },
         });
       }
     }

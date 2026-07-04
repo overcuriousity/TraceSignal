@@ -22,25 +22,12 @@ The audit's Critical/High items were fixed directly on `fix/audit-critical-high`
   (`ingestion/files.py::copy_and_hash`), capped by `TS_MAX_UPLOAD_BYTES`
   (default 10 GiB, 0 disables) with a 413 mid-stream rejection.
 
+Point-in-time PR review findings are archived under `docs/archive/PR{N}_REVIEW_FINDINGS.md`
+(full unrestricted finding set, one file per reviewed PR) once triaged into this backlog or
+resolved — this file holds only the condensed, still-open action items.
+
 ## Milestone 1 — correctness & forensic integrity (Medium severity)
 
-- [ ] **M1 — No silent failures on evidence mutation.** `ClickHouseStore.delete_source_events`
-  swallows all exceptions (`db/clickhouse.py`, bare `except: pass` around DROP PARTITION);
-  `cases.py` ingest-failure cleanup likewise. A failed delete must log loudly and surface to
-  the caller — orphan events reappearing after a "successful" source delete is a forensic
-  integrity bug. Distinguish "partition doesn't exist" (fine, no-op) from real errors.
-- [ ] **M2 — One SQL escaping regime.** `db/clickhouse.py::count_events` interpolates with
-  `{value!r}`; `delete_source_events` f-strings IDs into the partition expression. Everything
-  else in `db/` uses `{name:String}` binds. Parameterize both (or validate ID charset
-  explicitly where DROP PARTITION can't bind). Low exploitability today (IDs are
-  server-generated and RBAC-validated) but two regimes is how injection ships later.
-- [ ] **M3 — Login backoff.** No rate limiting on `POST /api/auth/login`; argon2 slows one
-  attempt, not a loop. In-memory per-username+IP failure counter with exponential delay fits
-  the single-process design.
-- [ ] **M4 — Compose network hygiene.** Reference `docker-compose.yml` publishes Postgres
-  (default creds), ClickHouse (default user, no password) and Qdrant (no auth) to the host —
-  app-layer RBAC is bypassable by anyone with network reach. Keep backing services on the
-  compose-internal network by default; document a dev override file that exposes them.
 
 ## Milestone 2 — high-leverage improvements
 
@@ -50,13 +37,37 @@ The audit's Critical/High items were fixed directly on `fix/audit-critical-high`
   `sentence-transformers` to an optional `embeddings` extra with graceful capability
   degradation (health endpoint flag, clear error on embed endpoints) so the base install
   drops ~2 GB.
-- [ ] **M7 — JobStore cap.** `core/jobs.py` never prunes; long-lived server leaks job dicts.
-  Retain last N (e.g. 200) terminal jobs, evict oldest. Stays ephemeral/in-memory by design.
-- [ ] **M8 — Remove dead `secret_key` setting.** `core/config.py` defines it, nothing reads it
-  (sessions are DB-backed random tokens); `docker-compose.yml` dutifully sets it. Delete both
-  or actually use it.
 - [ ] **Container smoke test in CI.** Build the image, `docker compose up`, curl
   `/api/health`. Would have caught C1 before it shipped.
+- [ ] **M15 — Precompute per-source field stats at ingest time.** Four call sites do a live
+  full-scan ClickHouse aggregation over `events` on every read — `db/anomaly_stats.py`'s
+  `field_inventory` (backs both the Visualize page's field dropdown and the anomaly wizard's
+  field recommender), `db/queries.py::list_fields` (Explorer ColumnPicker),
+  `db/queries.py::field_coverage` (timeline-creation wizard, scans up to 20k rows/source with
+  sample values every time the wizard opens), and `db/queries.py::list_fields_by_artifact`.
+  Since sources are immutable once ingested, none of this needs to be live: compute once per
+  source right after ingestion (same trigger point `_trigger_automatic_enrichments` uses),
+  cache in Postgres keyed by `source_id`, and merge cheaply per timeline. `coverage` merges
+  exactly via addition; exact `distinct` needs a sketch (HyperLogLog) or a cheap approximation
+  (e.g. max-across-sources) since it only feeds a UI hint. Short-term mitigation already
+  shipped: `VisualizePage` shows a "can take a while" hint under the spinner and the field
+  dropdown scrolls instead of overflowing (`ui/Select.tsx`).
+- [ ] **M16 — Enricher follow-ups (fresh branch after PR #54 merges).** The 2026-07-04
+  cleanup batch on `feat/enricher-subsystem` resolved the bulk of the PR #54 review residue
+  (#9–#13 generic asset abstraction + de-GeoIP'd frontend, #15–#19 reuse, #24–#26
+  simplification, #28/#30/#31 efficiency, #32/#33 minors; #20 documented won't-fix). Full
+  finding set + status in `docs/archive/PR54_REVIEW_FINDINGS.md`. Deliberately deferred:
+  - Staging-format redesign: staging is one Postgres row per (event, attr, output_field) —
+    a row-per-event JSON-map format would shrink staging ~3x and simplify the apply join.
+  - #34: derived-key cardinality can balloon the ColumnPicker on wide/vendor-inconsistent
+    datasets (`src_ip:geo_country`, `source_ip:geo_country`, ...) — needs a grouping/limit
+    design in the ColumnPicker.
+
+- [ ] **M17 — Job authorization via case RBAC.** PR #7 review #9 follow-up (guard itself was
+  fixed): jobs are only guarded by `created_by == user.id or is_admin`; a `Job.case_id` +
+  `resolve_case_access` check would let case members see each other's jobs and align job
+  visibility with the rest of the RBAC model. Flagged in `docs/PROGRESS.md` at the time;
+  full context in `docs/archive/PR7_REVIEW_FINDINGS.md` #9.
 
 ## Milestone 3 — polish
 
@@ -66,10 +77,17 @@ The audit's Critical/High items were fixed directly on `fix/audit-critical-high`
   forms — use `urllib.parse`.
 - [ ] Startup config sanity report: log resolved offline mode, cookie security
   (warn when `environment=production` and `auth_cookie_secure=false`), datastore targets.
-- [ ] Finish repo directory rename TraceVector → TraceSignal (coordinate with GitHub repo
-  rename; see `docs/MIGRATION_RENAME.md`).
 - [ ] Large-file ingest regression test: bound peak memory (or assert lazy yielding) over a
   generated ~100 MB CSV, protecting the H1 fix.
+- [ ] **M18 — Return `access_level` from the case API.** PR #7 cleanup #9 follow-up:
+  `frontend/src/lib/caseAccess.ts` re-implements `resolve_case_access` client-side; the
+  backend already computes the level per request. Needs a bulk access-resolution path in
+  `list_cases_for_user` first to avoid introducing an N+1 (`docs/archive/PR7_REVIEW_FINDINGS.md`
+  cleanup 9).
+- [ ] **M19 — SSE invalidation misses histogram/anomaly panels.** PR #7 follow-up:
+  `frontend/src/hooks/useCaseStream.ts`'s `INVALIDATE_PREFIXES` covers annotation/tag query
+  keys but not histogram/anomaly-view keys — bulk anomaly-tagging by a teammate leaves those
+  panels stale. Read the views' actual query-key names before extending the prefix list.
 
 ## Explicitly out of scope (decided during the audit)
 
@@ -77,5 +95,5 @@ The audit's Critical/High items were fixed directly on `fix/audit-critical-high`
   deployment model.
 - CSRF tokens — SameSite=Lax cookies plus the LAN threat model are adequate for now.
 - Alembic adoption — hand-rolled additive migration works at the current schema churn;
-  revisit at ~5+ migrated columns.
+  revisit at v1.0.
 - Proactive router/query-builder splits — churn risk outweighs payoff at current velocity.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
+import math
 from collections.abc import Generator
 from typing import Any
 from urllib.parse import urlencode
@@ -17,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from tracesignal.api.deps import get_current_user, get_store
 from tracesignal.core.config import get_settings
+from tracesignal.core.login_backoff import get_login_backoff
 from tracesignal.core.security import (
     hash_password,
     new_session_token,
@@ -96,20 +98,41 @@ async def _issue_session(user: User, request: Request, response: Response) -> No
 async def login(payload: LoginRequest, request: Request, response: Response) -> dict[str, Any]:
     """Authenticate with a local username/password and start a session."""
     store = get_store()
+    # No proxy-header trust by design: the deployment model is direct-connect
+    # on a LAN, so X-Forwarded-For would be attacker-controlled if honored.
+    ip = request.client.host if request.client else None
+    backoff = get_login_backoff()
+    retry_after = backoff.retry_after(payload.username, ip)
+    if retry_after > 0:
+        await store.record_audit(
+            action="auth.login_rate_limited",
+            username_snapshot=payload.username,
+            ip=ip,
+            user_agent=request.headers.get("user-agent"),
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed login attempts",
+            headers={"Retry-After": str(math.ceil(retry_after))},
+        )
     user = await store.get_user_by_username(payload.username)
     if user is None or not await asyncio.to_thread(
         verify_password, payload.password, user.password_hash
     ):
+        # Same failure handling for unknown username and wrong password —
+        # neither the response nor the backoff state leaks user existence.
+        backoff.register_failure(payload.username, ip)
         await store.record_audit(
             action="auth.login_failed",
             username_snapshot=payload.username,
-            ip=request.client.host if request.client else None,
+            ip=ip,
             user_agent=request.headers.get("user-agent"),
         )
         raise HTTPException(status_code=401, detail="Invalid username or password")
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account disabled")
 
+    backoff.reset(payload.username, ip)
     await _issue_session(user, request, response)
     await store.record_audit(
         action="auth.login",

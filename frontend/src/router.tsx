@@ -18,6 +18,7 @@ import { AdminUsersPage } from "@/pages/admin/AdminUsersPage";
 import { AdminTeamsPage } from "@/pages/admin/AdminTeamsPage";
 import { AdminTeamDetailPage } from "@/pages/admin/AdminTeamDetailPage";
 import { AdminAuditPage } from "@/pages/admin/AdminAuditPage";
+import { AdminEnrichersPage } from "@/pages/admin/AdminEnrichersPage";
 
 export const router = createBrowserRouter(
   createRoutesFromElements(
@@ -43,6 +44,7 @@ export const router = createBrowserRouter(
               <Route path="teams" element={<AdminTeamsPage />} />
               <Route path="teams/:teamId" element={<AdminTeamDetailPage />} />
               <Route path="audit" element={<AdminAuditPage />} />
+              <Route path="enrichers" element={<AdminEnrichersPage />} />
             </Route>
           </Route>
           <Route path="*" element={<NotFoundPage />} />

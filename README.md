@@ -93,6 +93,10 @@ Run PostgreSQL, ClickHouse, and Qdrant natively, or use the reference Docker/Pod
 docker compose up -d
 ```
 
+The compose file publishes all three services on `127.0.0.1` only — they run with default or
+no credentials, so they are deliberately unreachable from the LAN. The app's defaults
+(`.env.example`) connect via these localhost ports.
+
 ### 2. Install and run the application
 
 ```bash
@@ -107,13 +111,12 @@ For active frontend development, run `npm install && npm run dev` in `frontend/`
 `uv run tsig-web` — see `frontend/README.md`. Configuration is env-driven (`TS_*` variables); see
 `.env.example` for the full list.
 
-### Docker/Podman Compose (app + backing services in one command)
+### Docker/Podman Compose (optional containerized app)
 
-`docker compose up -d` (or `podman compose up -d`) also builds and starts the TraceSignal
-application itself, alongside PostgreSQL, ClickHouse, and Qdrant — see the `app` service in
-`docker-compose.yml`. Use this when you want one command to bring up the whole stack; use the
-native `uv run tsig-web` path above for development or when running the app directly on the
-host.
+By default `docker-compose.yml` brings up only the three backing services; the app runs
+natively via `uv run tsig-web`. Operators who prefer one command for the whole stack can
+uncomment the `app` service in `docker-compose.yml` — it builds the image from the local
+checkout and reaches the backing services over the compose-internal network.
 
 ### Airgapped installation
 

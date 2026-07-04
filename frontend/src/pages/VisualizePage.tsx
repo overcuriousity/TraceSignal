@@ -749,8 +749,15 @@ export function VisualizePage() {
           </div>
         )}
         {dataKind !== "time" && !field ? (
-          <div className="flex h-full items-center justify-center text-sm text-[var(--color-fg-muted)]">
-            {fieldsQuery.isLoading ? <Spinner size={20} /> : "Choose a field to visualize."}
+          <div className="flex h-full flex-col items-center justify-center gap-2 text-sm text-[var(--color-fg-muted)]">
+            {fieldsQuery.isLoading ? (
+              <>
+                <Spinner size={20} />
+                <span className="text-xs">Scanning fields — can take a while on large timelines…</span>
+              </>
+            ) : (
+              "Choose a field to visualize."
+            )}
           </div>
         ) : loading ? (
           <div className="flex h-full items-center justify-center">

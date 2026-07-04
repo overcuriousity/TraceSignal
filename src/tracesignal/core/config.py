@@ -18,8 +18,14 @@ class Settings(BaseSettings):
 
     environment: str = "development"
     log_level: str = "INFO"
-    secret_key: str = "change-me-in-production"
     allow_online: bool = False
+
+    # Login backoff: after `threshold` consecutive failures per
+    # (username, client IP), attempts are rejected with 429 for
+    # base * 2**(n - threshold) seconds, capped at max.
+    login_backoff_threshold: int = 5
+    login_backoff_base_seconds: float = 2.0
+    login_backoff_max_seconds: float = 300.0
 
     # Metadata store
     postgres_url: str = "postgresql+asyncpg://tracesignal:tracesignal@localhost:5432/tracesignal"
@@ -64,6 +70,10 @@ class Settings(BaseSettings):
     # bounding how much disk one request can consume (uploads are copied to a
     # temp file plus a retained content-addressed copy).
     max_upload_bytes: int = Field(default=10 * 1024**3, ge=0)
+
+    # Enrichers: where admin-uploaded enricher assets (e.g. the MaxMind
+    # GeoLite2 database) are stored.
+    enricher_data_path: str = "data/enrichers"
 
     # Authentication: local admin bootstrap
     # Seeds the first administrator on startup if no users exist yet. The

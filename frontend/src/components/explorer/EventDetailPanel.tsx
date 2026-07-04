@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/Input";
 import { Spinner } from "@/components/ui/Spinner";
 import { fmtTimestampFull, fmtRelative } from "@/lib/time";
 import { truncateHash } from "@/lib/format";
+import { getAttributeDecoration } from "@/lib/enrichment";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { useAnnotationMutations } from "@/hooks/useAnnotationMutations";
 import { useUiStore } from "@/stores/ui";
@@ -65,6 +66,7 @@ function FieldRow({
   filterKey,
   onAddFilter,
   onShowHistogram,
+  flag,
 }: {
   label: string;
   value: string | null | undefined;
@@ -72,19 +74,25 @@ function FieldRow({
   filterKey?: string | null;
   onAddFilter?: (fieldKey: string, value: string, include: boolean) => void;
   onShowHistogram?: (fieldKey: string, value: string) => void;
+  flag?: { flag: string; label: string } | null;
 }) {
   if (!value) return null;
   const canFilter = !!filterKey && !!onAddFilter;
 
   return (
     <div className="group flex items-start gap-1.5 py-1.5 border-b border-[var(--color-border-subtle)] hover:bg-[var(--color-bg-hover)] -mx-2 px-2 rounded-sm transition-base">
-      <span className="w-36 shrink-0 text-sm text-[var(--color-fg-secondary)] pt-0.5 select-none">
+      <span className="w-36 shrink-0 break-all text-sm text-[var(--color-fg-secondary)] pt-0.5 select-none">
         {label}
       </span>
       <span
         className={`flex-1 min-w-0 break-all text-sm text-[var(--color-fg-primary)] ${mono ? "font-mono" : ""}`}
       >
         {value}
+        {flag && (
+          <span className="ml-1.5" title={flag.label}>
+            {flag.flag}
+          </span>
+        )}
       </span>
 
       {/* Action buttons — visible on row hover */}
@@ -504,6 +512,7 @@ export function EventDetailPanel({
                 filterKey={k}
                 onAddFilter={onAddFilter}
                 onShowHistogram={onShowFieldHistogram}
+                flag={getAttributeDecoration(event.attributes ?? {}, k)}
               />
             ))}
           </div>

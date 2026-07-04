@@ -10,10 +10,12 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 
 from tracesignal.api.deps import get_store, require_admin
+from tracesignal.api.uploads import receive_upload_to_tmp
+from tracesignal.core.config import get_settings
 from tracesignal.core.security import hash_password
 from tracesignal.db.postgres import User, generate_id
 
@@ -339,3 +341,142 @@ async def query_audit(
     store = get_store()
     rows = await store.query_audit(user_id=user_id, case_id=case_id, action=action, limit=limit)
     return {"audit": [r.to_dict() for r in rows]}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Enricher assets (GeoIP database upload)
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class EnricherGlobalConfigUpdate(BaseModel):
+    """Payload to set an enricher's instance-wide defaults."""
+
+    auto_run_default: bool
+
+
+@router.get("/enrichers/config")
+async def list_enricher_global_configs(admin: User = Depends(require_admin)) -> dict[str, Any]:
+    """Return every registered enricher with its instance-wide config and asset state.
+
+    Asset status is folded into this response (instead of a per-enricher GET)
+    because the admin page is the sole consumer and already fetches this list
+    — one payload keeps the frontend fully generic with no N+1.
+    """
+    from tracesignal.enrichers.registry import all_enrichers, get_cached_availability
+
+    store = get_store()
+    configs = {c.enricher_key: c for c in await store.list_enricher_global_configs()}
+    result = []
+    for enricher in all_enrichers():
+        availability = get_cached_availability(enricher.key)
+        config = configs.get(enricher.key)
+        asset: dict[str, Any] | None = None
+        if enricher.asset_spec is not None:
+            # asset_status() stats the filesystem — keep it off the event loop.
+            status = await asyncio.to_thread(enricher.asset_status)
+            asset = {
+                "name": enricher.asset_spec.name,
+                "description": enricher.asset_spec.description,
+                "accepted_extensions": list(enricher.asset_spec.file_extensions),
+                "uploaded": bool(status and status["uploaded"]),
+                "size_bytes": status["size_bytes"] if status else None,
+                "detail": status["detail"] if status else {},
+            }
+        result.append(
+            {
+                "key": enricher.key,
+                "display_name": enricher.display_name,
+                "description": enricher.description,
+                "available": availability.available if availability else False,
+                "reason": availability.reason if availability else None,
+                "auto_run_default": config.auto_run_default if config else False,
+                "asset": asset,
+            }
+        )
+    return {"enrichers": result}
+
+
+@router.put("/enrichers/{enricher_key}/config")
+async def set_enricher_global_config(
+    enricher_key: str,
+    body: EnricherGlobalConfigUpdate,
+    admin: User = Depends(require_admin),
+) -> dict[str, Any]:
+    """Set instance-wide defaults for one enricher (currently: auto-run on ingest)."""
+    from tracesignal.enrichers.registry import get_enricher
+
+    if get_enricher(enricher_key) is None:
+        raise HTTPException(status_code=404, detail="Unknown enricher")
+
+    store = get_store()
+    config = await store.upsert_enricher_global_config(
+        enricher_key=enricher_key,
+        auto_run_default=body.auto_run_default,
+        updated_by=admin.id,
+    )
+    await store.record_audit(
+        action="admin.enricher_global_config",
+        actor=admin,
+        target_type="enricher",
+        target_id=enricher_key,
+        detail={"auto_run_default": body.auto_run_default},
+    )
+    return {"config": config.to_dict()}
+
+
+@router.post("/enrichers/{enricher_key}/asset")
+async def upload_enricher_asset(
+    enricher_key: str,
+    file: UploadFile = File(...),  # noqa: B008
+    admin: User = Depends(require_admin),
+) -> dict[str, Any]:
+    """Upload (or replace) the data asset an enricher declares via ``asset_spec``.
+
+    Content validation and atomic installation are the enricher's job
+    (``Enricher.install_asset``, e.g. GeoIP's City-flavor check + metadata
+    sidecar); this endpoint only streams the upload, maps
+    ``AssetValidationError`` to 400, refreshes availability, and audits.
+
+    Replacing an asset under a running system needs no invalidation: each
+    job run works on a fresh enricher instance (``Enricher.spawn()``) with
+    its own file handles, so new runs see the new file. A job already in
+    flight keeps its old open handle (safe on Linux — the inode lives until
+    the handle closes) and its results carry the *old* asset's config hash
+    captured at job start, so provenance stays accurate either way.
+    """
+    from tracesignal.enrichers.base import AssetValidationError
+    from tracesignal.enrichers.registry import get_enricher, refresh_availability
+
+    enricher = get_enricher(enricher_key)
+    if enricher is None:
+        raise HTTPException(status_code=404, detail="Unknown enricher")
+    if enricher.asset_spec is None:
+        raise HTTPException(status_code=400, detail="Enricher requires no uploaded asset")
+
+    store = get_store()
+    max_bytes = get_settings().max_upload_bytes or None
+    suffix = enricher.asset_spec.file_extensions[0] if enricher.asset_spec.file_extensions else ""
+    tmp_path, sha256, _size = await receive_upload_to_tmp(file, max_bytes=max_bytes, suffix=suffix)
+
+    try:
+        install_detail = await asyncio.to_thread(enricher.install_asset, tmp_path, sha256)
+    except AssetValidationError as exc:
+        tmp_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+    availability = (await asyncio.to_thread(refresh_availability, enricher_key)).get(enricher_key)
+    await store.record_audit(
+        action="admin.enricher_asset_upload",
+        actor=admin,
+        target_type="enricher",
+        target_id=enricher_key,
+        detail={"filename": file.filename, "sha256": sha256, **install_detail},
+    )
+    return {
+        "available": availability.available if availability else False,
+        "reason": availability.reason if availability else None,
+        "detail": install_detail,
+    }

@@ -10,6 +10,7 @@ import { CreateTimelineDialog } from "./CreateTimelineDialog";
 import { DeleteTimelineDialog } from "./DeleteTimelineDialog";
 import { EditFieldMappingsDialog } from "./EditFieldMappingsDialog";
 import { EmbedWizard } from "./EmbedWizard";
+import { EnrichersDialog } from "./EnrichersDialog";
 import type { Source, Timeline } from "@/api/types";
 
 interface Props {
@@ -104,6 +105,9 @@ function TimelineRow({
         )}
         {tl.source_ids.length > 0 && (
           <EmbedWizard caseId={caseId} timeline={tl} />
+        )}
+        {tl.source_ids.length > 0 && (
+          <EnrichersDialog caseId={caseId} timeline={tl} />
         )}
         {!tl.is_default && <DeleteTimelineDialog caseId={caseId} timeline={tl} />}
       </div>

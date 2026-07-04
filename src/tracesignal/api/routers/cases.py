@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +22,7 @@ from tracesignal.api.deps import (
     require_case_read,
     require_password_current,
 )
+from tracesignal.api.uploads import receive_upload_to_tmp
 from tracesignal.core.config import get_settings
 from tracesignal.core.events_bus import publish_annotation_change
 from tracesignal.core.jobs import JobStore, get_job_store
@@ -31,7 +31,6 @@ from tracesignal.db.field_mappings import validate_field_mappings
 from tracesignal.db.postgres import Case, PostgresStore, User, generate_id
 from tracesignal.db.qdrant import QdrantStore
 from tracesignal.db.queries import EventQueryService
-from tracesignal.ingestion.files import UploadTooLargeError, copy_and_hash
 from tracesignal.ingestion.parser import detect_format
 from tracesignal.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
 
@@ -244,10 +243,29 @@ async def delete_case(
     ch = ClickHouseStore()
 
     sources = await store.list_sources(case_id)
-    for source in sources:
-        qdrant.delete_source_points(case_id, source.id)
-        ch.delete_source_events(case_id, source.id)
-    qdrant.delete_case_collections(case_id)
+    # The Postgres case row is the authoritative record that this evidence
+    # exists — it is only removed after every event/vector cascade succeeded.
+    # A failed cascade aborts with 502 so the delete stays visible and
+    # retryable instead of leaving orphan events behind a "successful" delete.
+    try:
+        for source in sources:
+            qdrant.delete_source_points(case_id, source.id)
+            await asyncio.to_thread(ch.delete_source_events, case_id, source.id)
+        qdrant.delete_case_collections(case_id)
+    except Exception as exc:
+        await store.record_audit(
+            action="case.delete_failed",
+            actor=user,
+            case_id=case_id,
+            target_type="case",
+            target_id=case_id,
+            detail={"error": str(exc)},
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to delete case events from the event store; case was not deleted. "
+            "Retry once the event store is reachable.",
+        ) from exc
     await store.delete_case(case_id)
 
     await store.record_audit(
@@ -323,6 +341,72 @@ async def _revalidate_stale_field_mappings(
             )
 
 
+async def _trigger_automatic_enrichments(
+    store: PostgresStore,
+    clickhouse: ClickHouseStore,
+    job_store: JobStore,
+    case_id: str,
+    source_id: str,
+) -> None:
+    """Fire background enrichment jobs for every timeline configured to auto-run on this source.
+
+    Called right after a source flips to "ready" — the same point
+    ``_revalidate_stale_field_mappings`` uses, since that's the single place
+    in the codebase that knows ingestion just succeeded. Skips any enricher
+    that is currently unavailable (e.g. its required database was never
+    uploaded); the config still exists and will fire again on the next
+    ingestion once availability is restored.
+    """
+    from tracesignal.enrichers.jobs import (
+        get_active_enricher_run,
+        run_enrichment_job,
+        spawn_tracked_enrichment_task,
+        try_claim_enricher_run,
+    )
+    from tracesignal.enrichers.registry import get_cached_availability, get_enricher
+
+    global_configs = await store.list_enricher_global_configs()
+    default_auto_keys = {c.enricher_key for c in global_configs if c.auto_run_default}
+    pairs = await store.list_automatic_enrichers_for_source(source_id, default_auto_keys)
+    for timeline_id, enricher_key in pairs:
+        enricher = get_enricher(enricher_key)
+        availability = get_cached_availability(enricher_key)
+        if enricher is None or availability is None or not availability.available:
+            continue
+        # Check before creating the job so a skip leaves no orphan pending
+        # job in the store; check + create + claim happen in the same event-
+        # loop tick, so there is no window for a competing claim.
+        active = get_active_enricher_run(timeline_id, enricher_key)
+        if active is not None:
+            logger.info(
+                "Enrichment %s already running for timeline %s (job %s); skipping auto-trigger",
+                enricher_key,
+                timeline_id,
+                active,
+            )
+            continue
+        job = job_store.create(
+            kind="enrich", progress={"processed": 0, "total": 0}, created_by=None
+        )
+        try_claim_enricher_run(timeline_id, enricher_key, job.id)
+        # create_task (not FastAPI BackgroundTasks) is deliberate: this runs
+        # inside the background ingestion job, where no request scope exists.
+        # spawn_tracked_enrichment_task keeps the strong reference that stops
+        # asyncio garbage-collecting the run mid-flight.
+        spawn_tracked_enrichment_task(
+            run_enrichment_job(
+                job_id=job.id,
+                case_id=case_id,
+                timeline_id=timeline_id,
+                enricher_key=enricher_key,
+                source_ids=[source_id],
+                job_store=job_store,
+                store=store,
+                ch_store=clickhouse,
+            )
+        )
+
+
 async def _run_ingestion_job(
     job_id: str,
     case_id: str,
@@ -377,6 +461,20 @@ async def _run_ingestion_job(
         # detectors, and embedding (see events._resolve_timeline_scope).
         await store.set_source_status(case_id, source_id, "ready")
         await _revalidate_stale_field_mappings(store, case_id, source_id)
+        # Auto-enrichment scheduling runs *after* the source is committed
+        # "ready"; a failure here must never fall through to the ingest
+        # rollback below (which would delete a fully-ingested source). Isolate
+        # it — a missed auto-trigger self-heals on the next ingest or a manual
+        # run, whereas a destroyed source does not.
+        try:
+            await _trigger_automatic_enrichments(store, clickhouse, job_store, case_id, source_id)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Auto-enrichment scheduling failed for source %s (case %s); "
+                "ingest itself succeeded and is kept",
+                source_id,
+                case_id,
+            )
         await store.record_audit(
             action="source.upload",
             actor=user,
@@ -397,14 +495,34 @@ async def _run_ingestion_job(
             },
         )
     except Exception as exc:  # noqa: BLE001
+        # Best-effort rollback (the job is already failing; raising here helps
+        # nobody) — but never silent: each failed step is logged and flagged on
+        # the job so the orphaned partition/row is visible in the UI.
+        cleanup_errors: list[str] = []
         try:
             await asyncio.to_thread(clickhouse.delete_source_events, case_id, source_id)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Ingest rollback: failed to delete events for source %s (case %s)",
+                source_id,
+                case_id,
+            )
+            cleanup_errors.append("event deletion failed")
+        try:
             await store.delete_source(case_id, source_id)
             if not await store.source_hash_in_use(file_hash, exclude_source_id=source_id):
                 _retention_path(file_hash).unlink(missing_ok=True)
-        except Exception:  # noqa: BLE001, S110 — best-effort cleanup
-            pass
-        job_store.update(job_id, status="failed", error=str(exc))
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Ingest rollback: failed to remove source row %s (case %s)",
+                source_id,
+                case_id,
+            )
+            cleanup_errors.append("source-row removal failed")
+        error = str(exc)
+        if cleanup_errors:
+            error += f" (cleanup incomplete: {'; '.join(cleanup_errors)})"
+        job_store.update(job_id, status="failed", error=error)
     finally:
         tmp_path.unlink(missing_ok=True)
 
@@ -447,19 +565,9 @@ async def upload_source(
     # reads the stream once instead of twice.
     max_bytes = get_settings().max_upload_bytes or None
     suffix = Path(file.filename or "upload").suffix or ".tmp"
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)  # noqa: SIM115
-    tmp_path = Path(tmp.name)
-    try:
-        with tmp:
-            file_hash, size_bytes = await asyncio.to_thread(
-                copy_and_hash, file.file, tmp, chunk_size=1024 * 1024, max_bytes=max_bytes
-            )
-    except UploadTooLargeError as exc:
-        tmp_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=413, detail=str(exc)) from exc
-    except Exception:
-        tmp_path.unlink(missing_ok=True)
-        raise
+    tmp_path, file_hash, size_bytes = await receive_upload_to_tmp(
+        file, max_bytes=max_bytes, suffix=suffix
+    )
 
     existing_source = await store.get_source_by_hash(case_id, file_hash)
     if existing_source is not None:
@@ -613,8 +721,27 @@ async def delete_source(
 
     qdrant = QdrantStore()
     ch = ClickHouseStore()
-    qdrant.delete_source_points(case_id, source_id)
-    ch.delete_source_events(case_id, source_id)
+    # The Postgres source row is the authoritative record that this evidence
+    # exists — it is only removed after the event/vector cascades succeeded.
+    # A failed cascade aborts with 502 so the delete stays visible and
+    # retryable instead of leaving orphan events behind a "successful" delete.
+    try:
+        qdrant.delete_source_points(case_id, source_id)
+        await asyncio.to_thread(ch.delete_source_events, case_id, source_id)
+    except Exception as exc:
+        await store.record_audit(
+            action="source.delete_failed",
+            actor=user,
+            case_id=case_id,
+            target_type="source",
+            target_id=source_id,
+            detail={"error": str(exc)},
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to delete source events from the event store; source was not "
+            "deleted. Retry once the event store is reachable.",
+        ) from exc
     await store.delete_source(case_id, source_id)
 
     await store.record_audit(
@@ -1211,5 +1338,184 @@ async def start_timeline_embedding(
         source_ids,
         job_store,
         field_config,
+    )
+    return {"job_id": job.id, "status": job.status, "source_ids": source_ids}
+
+
+class TimelineEnricherConfigUpdate(BaseModel):
+    """Payload to enable/configure an enricher for a timeline."""
+
+    mode: str = Field(..., pattern="^(automatic|manual)$")
+    enabled: bool
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/enrichers")
+async def list_timeline_enrichers(
+    timeline_id: str,
+    case: Case = Depends(require_case_read),
+) -> dict[str, Any]:
+    """List every *available* enricher for this timeline, with eligibility and current config.
+
+    Enrichers that fail their availability check (e.g. GeoIP with no
+    uploaded database) are omitted entirely — they should not appear in the
+    GUI until an admin makes them available.
+    """
+    from tracesignal.enrichers.base import effective_enricher_state
+    from tracesignal.enrichers.registry import all_enrichers, get_cached_availability
+
+    store = get_store()
+    case_id = case.id
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    sources = await store.list_timeline_sources(case_id, timeline_id)
+    ready_source_ids = [s.id for s in sources if s.is_ready]
+    configs = {c.enricher_key: c for c in await store.list_timeline_enrichers(timeline_id)}
+    global_defaults = {
+        c.enricher_key: c.auto_run_default for c in await store.list_enricher_global_configs()
+    }
+
+    clickhouse = ClickHouseStore()
+    available = [
+        enricher
+        for enricher in all_enrichers()
+        if (availability := get_cached_availability(enricher.key)) is not None
+        and availability.available
+    ]
+    # Each eligibility check is a ClickHouse scan; run them concurrently so
+    # dialog latency stays flat as more enrichers get registered.
+    eligibilities = await asyncio.gather(
+        *(
+            run_in_threadpool(enricher.check_eligibility, clickhouse, case_id, ready_source_ids)
+            for enricher in available
+        )
+    )
+    result = []
+    for enricher, eligibility in zip(available, eligibilities, strict=True):
+        config = configs.get(enricher.key)
+        enabled, mode = effective_enricher_state(
+            config.enabled if config else None,
+            config.mode if config else None,
+            global_defaults.get(enricher.key, False),
+        )
+        result.append(
+            {
+                "key": enricher.key,
+                "display_name": enricher.display_name,
+                "description": enricher.description,
+                "eligible": eligibility.eligible,
+                "sample_checked": eligibility.sample_checked,
+                "sample_matched": eligibility.sample_matched,
+                "mode": mode,
+                "enabled": enabled,
+            }
+        )
+    return {"enrichers": result}
+
+
+@router.put("/{case_id}/timelines/{timeline_id}/enrichers/{enricher_key}")
+async def set_timeline_enricher_config(
+    timeline_id: str,
+    enricher_key: str,
+    body: TimelineEnricherConfigUpdate,
+    case: Case = Depends(require_case_manage),
+    user: User = Depends(require_password_current),
+) -> dict[str, Any]:
+    """Enable/disable an enricher for a timeline and set its trigger mode."""
+    from tracesignal.enrichers.registry import get_enricher
+
+    if get_enricher(enricher_key) is None:
+        raise HTTPException(status_code=404, detail="Unknown enricher")
+
+    store = get_store()
+    case_id = case.id
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    config = await store.upsert_timeline_enricher(
+        timeline_id=timeline_id,
+        enricher_key=enricher_key,
+        mode=body.mode,
+        enabled=body.enabled,
+        updated_by=user.id,
+    )
+    await store.record_audit(
+        action="timeline.enricher_config",
+        actor=user,
+        case_id=case_id,
+        target_type="timeline",
+        target_id=timeline_id,
+        detail={"enricher_key": enricher_key, "mode": body.mode, "enabled": body.enabled},
+    )
+    return {"enricher": config.to_dict()}
+
+
+@router.post("/{case_id}/timelines/{timeline_id}/enrichers/{enricher_key}/run")
+async def run_timeline_enricher(
+    timeline_id: str,
+    enricher_key: str,
+    background_tasks: BackgroundTasks,
+    case: Case = Depends(require_case_contribute),
+    user: User = Depends(require_password_current),
+) -> dict[str, Any]:
+    """Manually trigger an enrichment run for a timeline's sources."""
+    from tracesignal.enrichers.jobs import (
+        get_active_enricher_run,
+        run_enrichment_job,
+        try_claim_enricher_run,
+    )
+    from tracesignal.enrichers.registry import get_cached_availability, get_enricher
+
+    if get_enricher(enricher_key) is None:
+        raise HTTPException(status_code=404, detail="Unknown enricher")
+    availability = get_cached_availability(enricher_key)
+    if availability is None or not availability.available:
+        raise HTTPException(status_code=409, detail="Enricher is not currently available")
+
+    store = get_store()
+    case_id = case.id
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+
+    sources = await store.list_timeline_sources(case_id, timeline_id)
+    source_ids = [s.id for s in sources if s.is_ready]
+    if not source_ids:
+        raise HTTPException(status_code=422, detail="Timeline has no ready sources to enrich")
+
+    active_job_id = get_active_enricher_run(timeline_id, enricher_key)
+    if active_job_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Enrichment already running (job {active_job_id})",
+        )
+
+    job_store = get_job_store()
+    # Construct the ClickHouse client *before* claiming the run slot: its
+    # constructor can raise when ClickHouse is unreachable, and a claim taken
+    # before a raise would never be released (the job never starts, so its
+    # finally-block release never runs), wedging this (timeline, enricher) at
+    # 409 until restart.
+    ch_store = ClickHouseStore()
+    job = job_store.create(
+        kind="enrich",
+        progress={"processed": 0, "total": 0},
+        created_by=user.id,
+    )
+    # Claim now (before the response) so a double-click is rejected with 409
+    # even though the job itself only starts after the response is sent.
+    try_claim_enricher_run(timeline_id, enricher_key, job.id)
+    background_tasks.add_task(
+        run_enrichment_job,
+        job_id=job.id,
+        case_id=case_id,
+        timeline_id=timeline_id,
+        enricher_key=enricher_key,
+        source_ids=source_ids,
+        job_store=job_store,
+        store=store,
+        ch_store=ch_store,
     )
     return {"job_id": job.id, "status": job.status, "source_ids": source_ids}

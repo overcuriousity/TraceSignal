@@ -126,6 +126,9 @@ export const post = <T>(path: string, body?: unknown) =>
 export const patch = <T>(path: string, body?: unknown) =>
   request<T>("PATCH", path, { body });
 
+export const put = <T>(path: string, body?: unknown) =>
+  request<T>("PUT", path, { body });
+
 export const del = <T>(path: string, params?: Record<string, string | number | boolean | undefined | null>) =>
   request<T>("DELETE", path, { params });
 
