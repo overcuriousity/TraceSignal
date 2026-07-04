@@ -35,7 +35,7 @@ from tracesignal.core.config import get_settings
 from tracesignal.core.jobs import JobStore
 from tracesignal.db.clickhouse import ClickHouseStore
 from tracesignal.db.postgres import EnrichmentJobRun, PostgresStore
-from tracesignal.enrichers.base import Enricher
+from tracesignal.enrichers.base import Enricher, derived_field_key
 from tracesignal.enrichers.registry import get_cached_availability, get_enricher
 
 logger = logging.getLogger(__name__)
@@ -135,11 +135,9 @@ def _process_batch(
                         "timeline_id": timeline_id,
                         "event_id": event_id,
                         "enricher_key": enricher_key,
-                        # Derived-field naming contract: "<attr_key>:<output_field>"
-                        # (e.g. "src_ip:geo_country"), so derived columns sort
-                        # beside their source attribute. Mirrored in
-                        # frontend/src/lib/countryFlag.ts.
-                        "field_key": f"{attr_key}:{output_field}",
+                        # Naming contract lives in base.derived_field_key
+                        # (mirrored in frontend/src/lib/enrichment.ts).
+                        "field_key": derived_field_key(attr_key, output_field),
                         "value": value,
                         "computed_at": now,
                         "enricher_config_hash": enricher_config_hash,

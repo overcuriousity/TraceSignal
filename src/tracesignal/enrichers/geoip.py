@@ -22,7 +22,12 @@ import geoip2.database
 import geoip2.errors
 
 from tracesignal.core.config import get_settings
-from tracesignal.enrichers.base import AvailabilityResult, Enricher
+from tracesignal.enrichers.base import (
+    AssetSpec,
+    AssetValidationError,
+    AvailabilityResult,
+    Enricher,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,14 +96,30 @@ class GeoIPEnricher(Enricher):
     )
     eligibility_regex = IPV4_REGEX
     output_fields = (_FIELD_COUNTRY, _FIELD_CITY, _FIELD_COUNTRY_CODE)
+    asset_spec = AssetSpec(
+        name="GeoLite2 City database",
+        description=(
+            "MaxMind GeoLite2 City database (.mmdb). Download from maxmind.com "
+            "(free with a GeoLite2 account) and upload here; the City flavor is "
+            "required — Country/ASN databases are rejected."
+        ),
+        file_extensions=(".mmdb",),
+    )
 
     def __init__(self, db_path: Path | None = None) -> None:
-        self._db_path = db_path or geoip_database_path()
+        self._db_path_override = db_path
         self._reader: geoip2.database.Reader | None = None
+
+    @property
+    def _db_path(self) -> Path:
+        # Resolved lazily (not captured in __init__) so the long-lived
+        # registry instance follows configuration/test changes to
+        # geoip_database_path() instead of freezing the import-time value.
+        return self._db_path_override or geoip_database_path()
 
     def spawn(self) -> GeoIPEnricher:
         """Fresh instance for one job run, keeping the configured database path."""
-        return GeoIPEnricher(db_path=self._db_path)
+        return GeoIPEnricher(db_path=self._db_path_override)
 
     def check_availability(self) -> AvailabilityResult:
         if not self._db_path.exists():
@@ -122,6 +143,55 @@ class GeoIPEnricher(Enricher):
                 f"Wrong database flavor: {database_type!r}; a City database is required",
             )
         return AvailabilityResult(True)
+
+    def asset_status(self) -> dict[str, Any] | None:
+        """Installed-database state for the admin UI, read from file + sidecar."""
+        if not self._db_path.exists():
+            return {"uploaded": False, "size_bytes": None, "detail": {}}
+        return {
+            "uploaded": True,
+            "size_bytes": self._db_path.stat().st_size,
+            "detail": read_geoip_sidecar(self._db_path) or {},
+        }
+
+    def install_asset(self, tmp_path: Path, sha256: str) -> dict[str, Any]:
+        """Validate an uploaded ``.mmdb`` and atomically install it.
+
+        Confirms the file opens as a real GeoLite2 database *and* is
+        City-flavored (``enrich_value`` calls ``.city()``, which a Country/ASN
+        database would blow up on mid-job), then replaces any previous
+        database and records its identity in the metadata sidecar (hash +
+        build epoch, the inputs to ``config_hash()``).
+        """
+        from datetime import UTC, datetime
+
+        try:
+            with geoip2.database.Reader(str(tmp_path)) as reader:
+                meta = reader.metadata()
+        except Exception as exc:  # noqa: BLE001
+            raise AssetValidationError(f"Invalid GeoLite2 database: {exc}") from exc
+        if "City" not in meta.database_type:
+            raise AssetValidationError(
+                f"Wrong database flavor: {meta.database_type!r}; a City database is "
+                "required (the GeoIP enricher performs city lookups)"
+            )
+        sidecar = {
+            "sha256": sha256,
+            "build_epoch": meta.build_epoch,
+            "database_type": meta.database_type,
+            "uploaded_at": datetime.now(UTC).isoformat(),
+        }
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        # tmp_path is under the system temp dir, which may be a different
+        # filesystem than the target data dir — Path.replace() (os.rename)
+        # fails cross-device, so use shutil.move (copy+unlink fallback).
+        import shutil
+
+        shutil.move(str(tmp_path), str(self._db_path))
+        # Sidecar must exist before availability is refreshed, so a job
+        # triggered right after this upload hashes against the new metadata.
+        write_geoip_sidecar(self._db_path, sidecar)
+        return sidecar
 
     def config_extras(self) -> dict[str, Any]:
         """Identity of the installed database file (hash + build metadata).

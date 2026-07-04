@@ -1,10 +1,11 @@
-"""Tests for the admin GeoIP database upload endpoint.
+"""Tests for the generic admin enricher-asset endpoints (GeoIP as reference).
 
 A real GeoLite2 .mmdb fixture isn't vendored in this repo (MaxMind's
 distributable test databases aren't available offline here), so tests that
 need a readable database monkeypatch ``geoip2.database.Reader`` with a fake.
-Covered: RBAC, invalid-file rejection, wrong-flavor (non-City) rejection,
-and the City happy path including the metadata sidecar.
+Covered: RBAC, unknown-key/asset-less rejection, invalid-file rejection,
+wrong-flavor (non-City) rejection, the City happy path including the metadata
+sidecar, and the asset block folded into ``GET /admin/enrichers/config``.
 """
 
 from __future__ import annotations
@@ -14,14 +15,14 @@ import io
 from tests.conftest import as_admin, login
 
 
-def test_non_admin_cannot_upload_geoip_database(client, admin_bootstrap, store):
+def test_non_admin_cannot_upload_enricher_asset(client, admin_bootstrap, store):
     as_admin(client, admin_bootstrap)
     client.post("/api/admin/users", json={"username": "plain", "password": "abcdefgh12"})
 
     plain_client = client.__class__(client.app)
     login(plain_client, "plain", "abcdefgh12")
     resp = plain_client.post(
-        "/api/admin/enrichers/geoip/database",
+        "/api/admin/enrichers/geoip/asset",
         files={
             "file": (
                 "GeoLite2-City.mmdb",
@@ -33,10 +34,50 @@ def test_non_admin_cannot_upload_geoip_database(client, admin_bootstrap, store):
     assert resp.status_code == 403
 
 
-def test_invalid_geoip_database_rejected(client, admin_bootstrap, store):
+def test_upload_asset_unknown_enricher_404(client, admin_bootstrap, store):
     as_admin(client, admin_bootstrap)
     resp = client.post(
-        "/api/admin/enrichers/geoip/database",
+        "/api/admin/enrichers/nope/asset",
+        files={"file": ("x.bin", io.BytesIO(b"x"), "application/octet-stream")},
+    )
+    assert resp.status_code == 404
+
+
+def test_upload_asset_assetless_enricher_400(client, admin_bootstrap, store, monkeypatch):
+    from tracesignal.enrichers import registry
+    from tracesignal.enrichers.base import AvailabilityResult, Enricher
+
+    class Stub(Enricher):
+        key = "stub-no-asset"
+        display_name = "Stub"
+        description = ""
+        eligibility_regex = ".*"
+        output_fields = ("x",)
+
+        def check_availability(self):
+            return AvailabilityResult(True)
+
+        def enrich_value(self, raw_value):
+            return None
+
+    monkeypatch.setitem(registry._REGISTRY, "stub-no-asset", Stub())
+
+    as_admin(client, admin_bootstrap)
+    resp = client.post(
+        "/api/admin/enrichers/stub-no-asset/asset",
+        files={"file": ("x.bin", io.BytesIO(b"x"), "application/octet-stream")},
+    )
+    assert resp.status_code == 400
+    assert "no uploaded asset" in resp.json()["detail"]
+
+
+def test_invalid_geoip_database_rejected(client, admin_bootstrap, store, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "tracesignal.enrichers.geoip.geoip_database_path", lambda: tmp_path / "GeoLite2-City.mmdb"
+    )
+    as_admin(client, admin_bootstrap)
+    resp = client.post(
+        "/api/admin/enrichers/geoip/asset",
         files={
             "file": (
                 "GeoLite2-City.mmdb",
@@ -46,6 +87,7 @@ def test_invalid_geoip_database_rejected(client, admin_bootstrap, store):
         },
     )
     assert resp.status_code == 400
+    assert "Invalid GeoLite2 database" in resp.json()["detail"]
 
 
 class _FakeReader:
@@ -84,7 +126,7 @@ def test_country_flavored_database_rejected_with_actionable_message(
 
     as_admin(client, admin_bootstrap)
     resp = client.post(
-        "/api/admin/enrichers/geoip/database",
+        "/api/admin/enrichers/geoip/asset",
         files={
             "file": (
                 "GeoLite2-Country.mmdb",
@@ -107,24 +149,28 @@ def test_city_database_upload_installs_and_writes_sidecar(
 
     import geoip2.database
 
-    from tracesignal.enrichers.geoip import read_geoip_sidecar
+    from tracesignal.enrichers import registry
+    from tracesignal.enrichers.geoip import GeoIPEnricher, read_geoip_sidecar
 
     target = tmp_path / "GeoLite2-City.mmdb"
     monkeypatch.setattr(geoip2.database, "Reader", _FakeReader)
     monkeypatch.setattr("tracesignal.enrichers.geoip.geoip_database_path", lambda: target)
+    # Other tests may have registered a GeoIP instance pinned to their own
+    # tmp path; pin a fresh default-path instance for this test only.
+    monkeypatch.setitem(registry._REGISTRY, "geoip", GeoIPEnricher())
 
     payload = b"city db bytes"
     as_admin(client, admin_bootstrap)
     resp = client.post(
-        "/api/admin/enrichers/geoip/database",
+        "/api/admin/enrichers/geoip/asset",
         files={"file": ("GeoLite2-City.mmdb", io.BytesIO(payload), "application/octet-stream")},
     )
     assert resp.status_code == 200
     body = resp.json()
     expected_sha = hashlib.sha256(payload).hexdigest()
-    assert body["sha256"] == expected_sha
-    assert body["build_epoch"] == 1700000000
-    assert body["database_type"] == "GeoLite2-City"
+    assert body["detail"]["sha256"] == expected_sha
+    assert body["detail"]["build_epoch"] == 1700000000
+    assert body["detail"]["database_type"] == "GeoLite2-City"
 
     assert target.read_bytes() == payload
     sidecar = read_geoip_sidecar(target)
@@ -132,26 +178,26 @@ def test_city_database_upload_installs_and_writes_sidecar(
     assert sidecar["database_type"] == "GeoLite2-City"
 
 
-def test_geoip_status_reports_unavailable_before_upload(
-    client, admin_bootstrap, store, tmp_path, monkeypatch
-):
+def test_config_list_reports_asset_state(client, admin_bootstrap, store, tmp_path, monkeypatch):
     from tracesignal.enrichers import registry
     from tracesignal.enrichers.geoip import GeoIPEnricher
 
     missing_path = tmp_path / "missing.mmdb"
-    # The status endpoint resolves the path via geoip_database_path()
-    # directly (not through the registry), so both must point at the same
-    # (non-existent, test-isolated) location.
     monkeypatch.setattr("tracesignal.enrichers.geoip.geoip_database_path", lambda: missing_path)
-    registry.register(GeoIPEnricher(db_path=missing_path))
-    registry.refresh_availability()
+    monkeypatch.setitem(registry._REGISTRY, "geoip", GeoIPEnricher())
+    registry.refresh_availability("geoip")
 
     as_admin(client, admin_bootstrap)
-    resp = client.get("/api/admin/enrichers/geoip/database")
+    resp = client.get("/api/admin/enrichers/config")
     assert resp.status_code == 200
-    body = resp.json()
-    assert body["uploaded"] is False
-    assert body["available"] is False
+    geoip_entry = next(e for e in resp.json()["enrichers"] if e["key"] == "geoip")
+    assert geoip_entry["available"] is False
+    asset = geoip_entry["asset"]
+    assert asset is not None
+    assert asset["uploaded"] is False
+    assert asset["size_bytes"] is None
+    assert asset["accepted_extensions"] == [".mmdb"]
+    assert asset["name"]
 
 
 def test_list_enrichers_reports_geoip_unavailable(client, admin_bootstrap, store, tmp_path):

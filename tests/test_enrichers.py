@@ -712,6 +712,87 @@ def test_geoip_availability_uses_sidecar_without_opening_reader(tmp_path, monkey
     assert GeoIPEnricher(db_path=db_path).check_availability() == AvailabilityResult(True)
 
 
+def test_derived_field_key_contract():
+    from tracesignal.enrichers.base import derived_field_key
+
+    assert derived_field_key("src_ip", "geo_country") == "src_ip:geo_country"
+
+
+def test_geoip_asset_status_and_install(tmp_path, monkeypatch):
+    import geoip2.database
+
+    from tracesignal.enrichers.base import AssetValidationError
+    from tracesignal.enrichers.geoip import read_geoip_sidecar
+
+    db_path = tmp_path / "data" / "GeoLite2-City.mmdb"
+    enricher = GeoIPEnricher(db_path=db_path)
+
+    assert enricher.asset_status() == {"uploaded": False, "size_bytes": None, "detail": {}}
+
+    class _FakeMeta:
+        database_type = "GeoLite2-City"
+        build_epoch = 1700000000
+
+    class _FakeReader:
+        def __init__(self, path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def metadata(self):
+            return _FakeMeta()
+
+    monkeypatch.setattr(geoip2.database, "Reader", _FakeReader)
+    upload = tmp_path / "upload.mmdb"
+    upload.write_bytes(b"payload")
+    detail = enricher.install_asset(upload, "sha-abc")
+    assert detail["sha256"] == "sha-abc"
+    assert db_path.read_bytes() == b"payload"
+    assert read_geoip_sidecar(db_path)["database_type"] == "GeoLite2-City"
+
+    status = enricher.asset_status()
+    assert status["uploaded"] is True
+    assert status["size_bytes"] == len(b"payload")
+    assert status["detail"]["sha256"] == "sha-abc"
+
+    # Wrong flavor raises AssetValidationError and installs nothing new.
+    class _CountryMeta(_FakeMeta):
+        database_type = "GeoLite2-Country"
+
+    monkeypatch.setattr(_FakeReader, "metadata", lambda self: _CountryMeta())
+    upload2 = tmp_path / "upload2.mmdb"
+    upload2.write_bytes(b"country")
+    with pytest.raises(AssetValidationError, match="City database"):
+        enricher.install_asset(upload2, "sha-def")
+    assert db_path.read_bytes() == b"payload"
+
+
+def test_install_asset_default_raises_for_assetless_enricher(tmp_path):
+    from tracesignal.enrichers.base import Enricher
+
+    class Stub(Enricher):
+        key = "stub"
+        display_name = "Stub"
+        description = ""
+        eligibility_regex = ".*"
+        output_fields = ("x",)
+
+        def check_availability(self):
+            return AvailabilityResult(True)
+
+        def enrich_value(self, raw_value):
+            return None
+
+    assert Stub().asset_spec is None
+    assert Stub().asset_status() is None
+    with pytest.raises(NotImplementedError):
+        Stub().install_asset(tmp_path / "x", "sha")
+
+
 def test_geoip_output_fields_contract_locked():
     # Order is part of config_hash() — a reorder silently changes every
     # enricher identity, so lock the exact tuple.

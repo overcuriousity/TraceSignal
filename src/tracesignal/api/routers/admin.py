@@ -356,7 +356,12 @@ class EnricherGlobalConfigUpdate(BaseModel):
 
 @router.get("/enrichers/config")
 async def list_enricher_global_configs(admin: User = Depends(require_admin)) -> dict[str, Any]:
-    """Return every registered enricher with its instance-wide config."""
+    """Return every registered enricher with its instance-wide config and asset state.
+
+    Asset status is folded into this response (instead of a per-enricher GET)
+    because the admin page is the sole consumer and already fetches this list
+    — one payload keeps the frontend fully generic with no N+1.
+    """
     from tracesignal.enrichers.registry import all_enrichers, get_cached_availability
 
     store = get_store()
@@ -365,6 +370,18 @@ async def list_enricher_global_configs(admin: User = Depends(require_admin)) -> 
     for enricher in all_enrichers():
         availability = get_cached_availability(enricher.key)
         config = configs.get(enricher.key)
+        asset: dict[str, Any] | None = None
+        if enricher.asset_spec is not None:
+            # asset_status() stats the filesystem — keep it off the event loop.
+            status = await asyncio.to_thread(enricher.asset_status)
+            asset = {
+                "name": enricher.asset_spec.name,
+                "description": enricher.asset_spec.description,
+                "accepted_extensions": list(enricher.asset_spec.file_extensions),
+                "uploaded": bool(status and status["uploaded"]),
+                "size_bytes": status["size_bytes"] if status else None,
+                "detail": status["detail"] if status else {},
+            }
         result.append(
             {
                 "key": enricher.key,
@@ -373,6 +390,7 @@ async def list_enricher_global_configs(admin: User = Depends(require_admin)) -> 
                 "available": availability.available if availability else False,
                 "reason": availability.reason if availability else None,
                 "auto_run_default": config.auto_run_default if config else False,
+                "asset": asset,
             }
         )
     return {"enrichers": result}
@@ -406,125 +424,59 @@ async def set_enricher_global_config(
     return {"config": config.to_dict()}
 
 
-@router.get("/enrichers/geoip/database")
-async def get_geoip_database_status(admin: User = Depends(require_admin)) -> dict[str, Any]:
-    """Return whether a GeoLite2 database is currently uploaded and its availability."""
-    from tracesignal.enrichers.geoip import geoip_database_path, read_geoip_sidecar
-    from tracesignal.enrichers.registry import get_cached_availability, refresh_availability
-
-    path = geoip_database_path()
-    exists = await asyncio.to_thread(path.exists)
-    size_bytes = await asyncio.to_thread(lambda: path.stat().st_size) if exists else None
-    sidecar = await asyncio.to_thread(read_geoip_sidecar, path) if exists else None
-    availability = get_cached_availability("geoip") or (
-        await asyncio.to_thread(refresh_availability, "geoip")
-    ).get("geoip")
-    return {
-        "uploaded": exists,
-        "size_bytes": size_bytes,
-        "available": availability.available if availability else False,
-        "reason": availability.reason if availability else None,
-        "sha256": sidecar.get("sha256") if sidecar else None,
-        "build_epoch": sidecar.get("build_epoch") if sidecar else None,
-        "database_type": sidecar.get("database_type") if sidecar else None,
-    }
-
-
-@router.post("/enrichers/geoip/database")
-async def upload_geoip_database(
+@router.post("/enrichers/{enricher_key}/asset")
+async def upload_enricher_asset(
+    enricher_key: str,
     file: UploadFile = File(...),  # noqa: B008
     admin: User = Depends(require_admin),
 ) -> dict[str, Any]:
-    """Upload (or replace) the MaxMind GeoLite2 database used by the GeoIP enricher.
+    """Upload (or replace) the data asset an enricher declares via ``asset_spec``.
 
-    Validates the file opens as a real ``.mmdb`` *and* is a City-flavored
-    database (``enrich_value`` calls ``.city()``, which a Country/ASN
-    database would blow up on mid-job), then atomically replaces any previous
-    database, records its identity in a metadata sidecar (hash + build epoch,
-    the inputs to ``GeoIPEnricher.config_hash()``), and re-evaluates enricher
-    availability so ``GET /api/enrichers`` reflects the change immediately.
+    Content validation and atomic installation are the enricher's job
+    (``Enricher.install_asset``, e.g. GeoIP's City-flavor check + metadata
+    sidecar); this endpoint only streams the upload, maps
+    ``AssetValidationError`` to 400, refreshes availability, and audits.
 
-    Replacing the database under a running system needs no reader
-    invalidation: each job run opens its own reader on a fresh enricher
-    instance (``Enricher.spawn()``), so new runs see the new file. A job
-    already in flight keeps its old open file handle (safe on Linux — the
-    inode lives until the handle closes) and its rows carry the *old*
-    database's config hash captured at job start, so provenance stays
-    accurate either way.
+    Replacing an asset under a running system needs no invalidation: each
+    job run works on a fresh enricher instance (``Enricher.spawn()``) with
+    its own file handles, so new runs see the new file. A job already in
+    flight keeps its old open handle (safe on Linux — the inode lives until
+    the handle closes) and its results carry the *old* asset's config hash
+    captured at job start, so provenance stays accurate either way.
     """
-    import shutil
-    from datetime import UTC, datetime
+    from tracesignal.enrichers.base import AssetValidationError
+    from tracesignal.enrichers.registry import get_enricher, refresh_availability
 
-    import geoip2.database
-
-    from tracesignal.enrichers.geoip import geoip_database_path, write_geoip_sidecar
-    from tracesignal.enrichers.registry import refresh_availability
+    enricher = get_enricher(enricher_key)
+    if enricher is None:
+        raise HTTPException(status_code=404, detail="Unknown enricher")
+    if enricher.asset_spec is None:
+        raise HTTPException(status_code=400, detail="Enricher requires no uploaded asset")
 
     store = get_store()
     max_bytes = get_settings().max_upload_bytes or None
-    tmp_path, sha256, _size = await receive_upload_to_tmp(file, max_bytes=max_bytes, suffix=".mmdb")
-
-    class _WrongFlavorError(Exception):
-        def __init__(self, database_type: str) -> None:
-            super().__init__(database_type)
-            self.database_type = database_type
-
-    def _validate_and_install() -> dict[str, Any]:
-        with geoip2.database.Reader(str(tmp_path)) as reader:
-            meta = reader.metadata()
-            if "City" not in meta.database_type:
-                raise _WrongFlavorError(meta.database_type)
-            sidecar = {
-                "sha256": sha256,
-                "build_epoch": meta.build_epoch,
-                "database_type": meta.database_type,
-                "uploaded_at": datetime.now(UTC).isoformat(),
-            }
-        target = geoip_database_path()
-        target.parent.mkdir(parents=True, exist_ok=True)
-        # tmp_path is under the system temp dir, which may be a different
-        # filesystem than the target data dir — Path.replace() (os.rename)
-        # fails cross-device, so use shutil.move (copy+unlink fallback).
-        shutil.move(str(tmp_path), str(target))
-        # Sidecar must exist before refresh_availability() returns, so a job
-        # triggered right after this upload hashes against the new metadata.
-        write_geoip_sidecar(target, sidecar)
-        return sidecar
+    suffix = enricher.asset_spec.file_extensions[0] if enricher.asset_spec.file_extensions else ""
+    tmp_path, sha256, _size = await receive_upload_to_tmp(file, max_bytes=max_bytes, suffix=suffix)
 
     try:
-        sidecar = await asyncio.to_thread(_validate_and_install)
-    except _WrongFlavorError as exc:
+        install_detail = await asyncio.to_thread(enricher.install_asset, tmp_path, sha256)
+    except AssetValidationError as exc:
         tmp_path.unlink(missing_ok=True)
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Uploaded database is '{exc.database_type}', but the GeoIP enricher "
-                "requires a City database (e.g. GeoLite2-City.mmdb). Download the City "
-                "edition from MaxMind and upload that instead."
-            ),
-        ) from exc
-    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
         tmp_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail=f"Invalid GeoLite2 database: {exc}") from exc
+        raise
 
-    availability_map = await asyncio.to_thread(refresh_availability)
+    availability = (await asyncio.to_thread(refresh_availability, enricher_key)).get(enricher_key)
     await store.record_audit(
-        action="admin.geoip_database_upload",
+        action="admin.enricher_asset_upload",
         actor=admin,
         target_type="enricher",
-        target_id="geoip",
-        detail={
-            "filename": file.filename,
-            "sha256": sha256,
-            "build_epoch": sidecar["build_epoch"],
-            "database_type": sidecar["database_type"],
-        },
+        target_id=enricher_key,
+        detail={"filename": file.filename, "sha256": sha256, **install_detail},
     )
-    availability = availability_map.get("geoip")
     return {
         "available": availability.available if availability else False,
         "reason": availability.reason if availability else None,
-        "sha256": sha256,
-        "build_epoch": sidecar["build_epoch"],
-        "database_type": sidecar["database_type"],
+        "detail": install_detail,
     }

@@ -17,6 +17,7 @@ import json
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from tracesignal.db.clickhouse import ClickHouseStore
@@ -25,6 +26,17 @@ from tracesignal.db.clickhouse import ClickHouseStore
 # event) are sampled when checking eligibility, to keep the check a bounded
 # query rather than a full scan.
 _ELIGIBILITY_SAMPLE_LIMIT = 5000
+
+# Derived-attribute naming contract: "<attr_key>:<output_field>" (e.g.
+# "src_ip:geo_country"), so derived columns sort beside their source
+# attribute in every read path. Mirrored in frontend/src/lib/enrichment.ts —
+# keep the two definitions in sync.
+FIELD_KEY_SEPARATOR = ":"
+
+
+def derived_field_key(attr_key: str, output_field: str) -> str:
+    """Build the derived-attribute key for one enrichment output (see contract above)."""
+    return f"{attr_key}{FIELD_KEY_SEPARATOR}{output_field}"
 
 
 def effective_enricher_state(
@@ -54,6 +66,25 @@ class AvailabilityResult:
 
 
 @dataclass(frozen=True, slots=True)
+class AssetSpec:
+    """A single uploadable data asset an enricher needs to become available.
+
+    Declared on the enricher class (``Enricher.asset_spec``) so the admin API
+    and UI can render a generic upload flow instead of hardcoding per-enricher
+    endpoints. ``file_extensions`` is advisory (UI file-picker filter);
+    ``install_asset`` does the real content validation.
+    """
+
+    name: str
+    description: str
+    file_extensions: tuple[str, ...]
+
+
+class AssetValidationError(Exception):
+    """Uploaded asset failed enricher-specific validation (maps to HTTP 400)."""
+
+
+@dataclass(frozen=True, slots=True)
 class EligibilityResult:
     """Whether a timeline's sources have any field values this enricher can process."""
 
@@ -70,6 +101,10 @@ class Enricher(ABC):
     description: str
     eligibility_regex: str
     output_fields: tuple[str, ...]
+    # Set on enrichers that need an admin-uploaded data asset (e.g. GeoIP's
+    # .mmdb). Not a config_hash() input — asset identity flows through
+    # config_extras() so only *content* changes alter enricher identity.
+    asset_spec: AssetSpec | None = None
 
     def spawn(self) -> Enricher:
         """Return a fresh instance for a single job run.
@@ -117,6 +152,25 @@ class Enricher(ABC):
             separators=(",", ":"),
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def asset_status(self) -> dict[str, Any] | None:
+        """Current installed-asset state, or None when ``asset_spec`` is None.
+
+        Shape: ``{"uploaded": bool, "size_bytes": int | None, "detail": dict}``
+        — ``detail`` carries enricher-specific identity metadata (e.g. the
+        GeoIP sidecar's sha256/build_epoch). Does filesystem I/O; call from a
+        worker thread in async contexts.
+        """
+        return None
+
+    def install_asset(self, tmp_path: Path, sha256: str) -> dict[str, Any]:
+        """Validate and atomically install an uploaded asset; return audit detail.
+
+        Raises ``AssetValidationError`` for content the enricher can't use
+        (mapped to HTTP 400 by the generic upload endpoint). Only reachable
+        when ``asset_spec`` is set, so the default raises.
+        """
+        raise NotImplementedError(f"Enricher {self.key!r} declares no uploadable asset")
 
     @abstractmethod
     def check_availability(self) -> AvailabilityResult:
