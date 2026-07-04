@@ -56,9 +56,6 @@ resolved — this file holds only the condensed, still-open action items.
   drops ~2 GB.
 - [ ] **M7 — JobStore cap.** `core/jobs.py` never prunes; long-lived server leaks job dicts.
   Retain last N (e.g. 200) terminal jobs, evict oldest. Stays ephemeral/in-memory by design.
-- [ ] **M8 — Remove dead `secret_key` setting.** `core/config.py` defines it, nothing reads it
-  (sessions are DB-backed random tokens); `docker-compose.yml` dutifully sets it. Delete both
-  or actually use it.
 - [ ] **Container smoke test in CI.** Build the image, `docker compose up`, curl
   `/api/health`. Would have caught C1 before it shipped.
 - [ ] **M15 — Precompute per-source field stats at ingest time.** Four call sites do a live
@@ -102,6 +99,12 @@ resolved — this file holds only the condensed, still-open action items.
   - New (from the redesign): staging is one Postgres row per (event, attr, output_field) —
     a row-per-event JSON-map format would shrink staging ~3x and simplify the apply join.
 
+- [ ] **M17 — Job authorization via case RBAC.** PR #7 review #9 follow-up (guard itself was
+  fixed): jobs are only guarded by `created_by == user.id or is_admin`; a `Job.case_id` +
+  `resolve_case_access` check would let case members see each other's jobs and align job
+  visibility with the rest of the RBAC model. Flagged in `docs/PROGRESS.md` at the time;
+  full context in `docs/archive/PR7_REVIEW_FINDINGS.md` #9.
+
 ## Milestone 3 — polish
 
 - [ ] Split `api/routers/events.py` (1500+ lines: query parsing, export streaming, anomaly
@@ -112,6 +115,15 @@ resolved — this file holds only the condensed, still-open action items.
   (warn when `environment=production` and `auth_cookie_secure=false`), datastore targets.
 - [ ] Large-file ingest regression test: bound peak memory (or assert lazy yielding) over a
   generated ~100 MB CSV, protecting the H1 fix.
+- [ ] **M18 — Return `access_level` from the case API.** PR #7 cleanup #9 follow-up:
+  `frontend/src/lib/caseAccess.ts` re-implements `resolve_case_access` client-side; the
+  backend already computes the level per request. Needs a bulk access-resolution path in
+  `list_cases_for_user` first to avoid introducing an N+1 (`docs/archive/PR7_REVIEW_FINDINGS.md`
+  cleanup 9).
+- [ ] **M19 — SSE invalidation misses histogram/anomaly panels.** PR #7 follow-up:
+  `frontend/src/hooks/useCaseStream.ts`'s `INVALIDATE_PREFIXES` covers annotation/tag query
+  keys but not histogram/anomaly-view keys — bulk anomaly-tagging by a teammate leaves those
+  panels stale. Read the views' actual query-key names before extending the prefix list.
 
 ## Explicitly out of scope (decided during the audit)
 

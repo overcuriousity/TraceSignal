@@ -56,7 +56,6 @@ services:
 #      - "8080:8080"
 #    environment:
 #      TS_ENVIRONMENT: production
-#      TS_SECRET_KEY: change-me-in-production
 #      TS_POSTGRES_URL: postgresql+asyncpg://tracesignal:tracesignal@postgres:5432/tracesignal
 #      TS_CLICKHOUSE_URL: http://clickhouse:8123
 #      TS_CLICKHOUSE_DATABASE: tracesignal

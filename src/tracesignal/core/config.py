@@ -18,7 +18,6 @@ class Settings(BaseSettings):
 
     environment: str = "development"
     log_level: str = "INFO"
-    secret_key: str = "change-me-in-production"
     allow_online: bool = False
 
     # Metadata store
