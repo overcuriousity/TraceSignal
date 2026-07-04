@@ -27,6 +27,24 @@ from tracesignal.db.clickhouse import ClickHouseStore
 _ELIGIBILITY_SAMPLE_LIMIT = 5000
 
 
+def effective_enricher_state(
+    explicit_enabled: bool | None,
+    explicit_mode: str | None,
+    default_auto: bool,
+) -> tuple[bool, str]:
+    """Resolve the effective ``(enabled, mode)`` for one timeline+enricher.
+
+    Single source for the "explicit per-timeline config overrides the
+    admin-set instance default" rule: an explicit row always wins in either
+    direction; without one, ``default_auto`` decides ``enabled`` and the mode
+    is ``"automatic"``. Callers that only care about auto-runnable enrichers
+    filter on ``mode == "automatic"`` themselves.
+    """
+    if explicit_mode is not None:
+        return bool(explicit_enabled), explicit_mode
+    return default_auto, "automatic"
+
+
 @dataclass(frozen=True, slots=True)
 class AvailabilityResult:
     """Whether an enricher's runtime requirements (e.g. a database file) are met."""

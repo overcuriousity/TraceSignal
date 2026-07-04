@@ -277,17 +277,10 @@ async def run_enrichment_job(
 
         processed = 0
         for source_id in source_ids:
-            offset = 0
-            while True:
-                batch = await asyncio.to_thread(
-                    ch_store.list_events,
-                    case_id=case_id,
-                    source_id=source_id,
-                    limit=batch_size,
-                    offset=offset,
-                )
-                if not batch:
-                    break
+            batches = ch_store.iter_source_events(case_id, source_id, batch_size)
+            # Each next() runs one blocking ClickHouse query — keep it off the
+            # event loop.
+            while (batch := await asyncio.to_thread(next, batches, None)) is not None:
                 rows = await asyncio.to_thread(
                     _process_batch,
                     enricher,
@@ -303,11 +296,7 @@ async def run_enrichment_job(
                     await store.stage_enrichment_results(rows)
 
                 processed += len(batch)
-                offset += batch_size
                 job_store.update(job_id, progress={"processed": processed, "total": total})
-
-                if len(batch) < batch_size:
-                    break
 
         applied = await _apply_staged_rows(store, ch_store, job_id)
         await store.finish_enrichment_job_run(job_id)

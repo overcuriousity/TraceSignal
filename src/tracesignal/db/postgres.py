@@ -1199,6 +1199,8 @@ class PostgresStore:
         timeline has *no* explicit row for that enricher at all. An explicit
         row always overrides the instance default, in either direction.
         """
+        from tracesignal.enrichers.base import effective_enricher_state
+
         default_keys = set(default_auto_keys)
         async with self.session_factory() as session:
             timeline_result = await session.execute(
@@ -1212,17 +1214,20 @@ class PostgresStore:
             )
             configs = list(config_result.scalars().all())
 
-        pairs: list[tuple[str, str]] = [
-            (c.timeline_id, c.enricher_key) for c in configs if c.mode == "automatic" and c.enabled
-        ]
-        if default_keys:
-            explicit = {(c.timeline_id, c.enricher_key) for c in configs}
-            pairs.extend(
-                (timeline_id, key)
-                for timeline_id in timeline_ids
-                for key in sorted(default_keys)
-                if (timeline_id, key) not in explicit
+        explicit = {(c.timeline_id, c.enricher_key): c for c in configs}
+        candidates = set(explicit) | {
+            (timeline_id, key) for timeline_id in timeline_ids for key in default_keys
+        }
+        pairs: list[tuple[str, str]] = []
+        for timeline_id, key in sorted(candidates):
+            config = explicit.get((timeline_id, key))
+            enabled, mode = effective_enricher_state(
+                config.enabled if config else None,
+                config.mode if config else None,
+                key in default_keys,
             )
+            if enabled and mode == "automatic":
+                pairs.append((timeline_id, key))
         return pairs
 
     async def list_enricher_global_configs(self) -> list[EnricherGlobalConfig]:

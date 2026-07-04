@@ -438,3 +438,39 @@ async def test_source_delete_succeeds_and_audits(
     assert response == {"deleted": True, "source_id": "s_ok"}
     assert await store.get_source(case, "s_ok") is None
     assert await store.query_audit(case_id=case, action="source.delete") != []
+
+
+@pytest.mark.asyncio
+async def test_receive_upload_to_tmp_413_cleans_up(tmp_path, monkeypatch):
+    import tempfile
+
+    from tracesignal.api.uploads import receive_upload_to_tmp
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    upload = _UploadFile("big.bin", b"x" * 100)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await receive_upload_to_tmp(upload, max_bytes=10, suffix=".bin")
+
+    assert exc_info.value.status_code == 413
+    assert list(tmp_path.iterdir()) == []  # temp file unlinked on failure
+
+
+@pytest.mark.asyncio
+async def test_receive_upload_to_tmp_returns_hash_and_size(tmp_path, monkeypatch):
+    import hashlib
+    import tempfile
+
+    from tracesignal.api.uploads import receive_upload_to_tmp
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    payload = b"hello world"
+    upload = _UploadFile("ok.bin", payload)
+
+    result_path, sha256, size = await receive_upload_to_tmp(upload, max_bytes=None, suffix=".bin")
+    try:
+        assert result_path.read_bytes() == payload
+        assert sha256 == hashlib.sha256(payload).hexdigest()
+        assert size == len(payload)
+    finally:
+        result_path.unlink(missing_ok=True)

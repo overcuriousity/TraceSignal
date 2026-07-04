@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+from tracesignal.db.clickhouse import ClickHouseStore
 from tracesignal.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
 from tracesignal.models.embeddings import EmbeddingConfig, EmbeddingModel
 from tracesignal.models.event import Event
@@ -43,6 +44,9 @@ class FakeClickHouseStore:
             e.as_dict() for e in self.events if e.case_id == case_id and e.source_id == source_id
         ]
         return events[offset : offset + limit]
+
+    # Reuse the real batching iterator on top of the fake list_events.
+    iter_source_events = ClickHouseStore.iter_source_events
 
 
 class FakeQdrantStore:

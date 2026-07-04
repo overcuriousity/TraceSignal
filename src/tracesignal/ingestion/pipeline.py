@@ -287,15 +287,13 @@ class EmbeddingPipeline:
         first_exception: BaseException | None = None
         processed = 0
         for source_id in self.source_ids:
-            offset = 0
+            batches = self.clickhouse.iter_source_events(
+                case_id=self.case_id, source_id=source_id, batch_size=self.batch_size
+            )
+            offset = 0  # tracked for error messages only; batching lives in the iterator
             while True:
                 try:
-                    batch = self.clickhouse.list_events(
-                        case_id=self.case_id,
-                        source_id=source_id,
-                        limit=self.batch_size,
-                        offset=offset,
-                    )
+                    batch = next(batches, None)
                 except Exception as exc:  # noqa: BLE001
                     error = (
                         f"Failed to read events for source {source_id} "
@@ -306,7 +304,7 @@ class EmbeddingPipeline:
                         first_exception = exc
                     break
 
-                if not batch:
+                if batch is None:
                     break
 
                 try:

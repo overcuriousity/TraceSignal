@@ -22,7 +22,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from datetime import UTC
 from typing import Any
 
@@ -384,6 +384,32 @@ class ClickHouseStore:
             _normalize_event_datetimes(dict(zip(columns, row, strict=False)))
             for row in result.result_rows
         ]
+
+    def iter_source_events(
+        self,
+        case_id: str,
+        source_id: str,
+        batch_size: int,
+    ) -> Iterator[list[dict[str, Any]]]:
+        """Yield successive ``list_events`` batches for one source.
+
+        Shared batching primitive for whole-source jobs (embedding pipeline,
+        enrichers). Stops on an empty batch; a short batch also ends the
+        iteration (the table can't grow mid-job — sources are ingest-once).
+        Each ``next()`` issues one blocking query, so async callers should
+        drive the iterator from a worker thread.
+        """
+        offset = 0
+        while True:
+            batch = self.list_events(
+                case_id=case_id, source_id=source_id, limit=batch_size, offset=offset
+            )
+            if not batch:
+                return
+            yield batch
+            if len(batch) < batch_size:
+                return
+            offset += len(batch)
 
     def get_events_by_ids(
         self,

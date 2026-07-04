@@ -8,17 +8,16 @@ teams and memberships.
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 
 from tracesignal.api.deps import get_store, require_admin
+from tracesignal.api.uploads import receive_upload_to_tmp
 from tracesignal.core.config import get_settings
 from tracesignal.core.security import hash_password
 from tracesignal.db.postgres import User, generate_id
-from tracesignal.ingestion.files import UploadTooLargeError, copy_and_hash
 
 router = APIRouter(prefix="/api/admin", tags=["admin"], dependencies=[Depends(require_admin)])
 
@@ -454,7 +453,6 @@ async def upload_geoip_database(
     accurate either way.
     """
     import shutil
-    import tempfile
     from datetime import UTC, datetime
 
     import geoip2.database
@@ -464,19 +462,7 @@ async def upload_geoip_database(
 
     store = get_store()
     max_bytes = get_settings().max_upload_bytes or None
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mmdb")  # noqa: SIM115
-    tmp_path = Path(tmp.name)
-    try:
-        with tmp:
-            sha256, _size = await asyncio.to_thread(
-                copy_and_hash, file.file, tmp, chunk_size=1024 * 1024, max_bytes=max_bytes
-            )
-    except UploadTooLargeError as exc:
-        tmp_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=413, detail=str(exc)) from exc
-    except Exception:
-        tmp_path.unlink(missing_ok=True)
-        raise
+    tmp_path, sha256, _size = await receive_upload_to_tmp(file, max_bytes=max_bytes, suffix=".mmdb")
 
     class _WrongFlavorError(Exception):
         def __init__(self, database_type: str) -> None:

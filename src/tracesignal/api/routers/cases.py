@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +22,7 @@ from tracesignal.api.deps import (
     require_case_read,
     require_password_current,
 )
+from tracesignal.api.uploads import receive_upload_to_tmp
 from tracesignal.core.config import get_settings
 from tracesignal.core.events_bus import publish_annotation_change
 from tracesignal.core.jobs import JobStore, get_job_store
@@ -31,7 +31,6 @@ from tracesignal.db.field_mappings import validate_field_mappings
 from tracesignal.db.postgres import Case, PostgresStore, User, generate_id
 from tracesignal.db.qdrant import QdrantStore
 from tracesignal.db.queries import EventQueryService
-from tracesignal.ingestion.files import UploadTooLargeError, copy_and_hash
 from tracesignal.ingestion.parser import detect_format
 from tracesignal.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
 
@@ -555,19 +554,9 @@ async def upload_source(
     # reads the stream once instead of twice.
     max_bytes = get_settings().max_upload_bytes or None
     suffix = Path(file.filename or "upload").suffix or ".tmp"
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)  # noqa: SIM115
-    tmp_path = Path(tmp.name)
-    try:
-        with tmp:
-            file_hash, size_bytes = await asyncio.to_thread(
-                copy_and_hash, file.file, tmp, chunk_size=1024 * 1024, max_bytes=max_bytes
-            )
-    except UploadTooLargeError as exc:
-        tmp_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=413, detail=str(exc)) from exc
-    except Exception:
-        tmp_path.unlink(missing_ok=True)
-        raise
+    tmp_path, file_hash, size_bytes = await receive_upload_to_tmp(
+        file, max_bytes=max_bytes, suffix=suffix
+    )
 
     existing_source = await store.get_source_by_hash(case_id, file_hash)
     if existing_source is not None:
@@ -1360,6 +1349,7 @@ async def list_timeline_enrichers(
     uploaded database) are omitted entirely — they should not appear in the
     GUI until an admin makes them available.
     """
+    from tracesignal.enrichers.base import effective_enricher_state
     from tracesignal.enrichers.registry import all_enrichers, get_cached_availability
 
     store = get_store()
@@ -1393,9 +1383,11 @@ async def list_timeline_enrichers(
     result = []
     for enricher, eligibility in zip(available, eligibilities, strict=True):
         config = configs.get(enricher.key)
-        # Without an explicit per-timeline row, the admin-set instance
-        # default decides whether this enricher auto-runs here.
-        default_enabled = global_defaults.get(enricher.key, False)
+        enabled, mode = effective_enricher_state(
+            config.enabled if config else None,
+            config.mode if config else None,
+            global_defaults.get(enricher.key, False),
+        )
         result.append(
             {
                 "key": enricher.key,
@@ -1404,8 +1396,8 @@ async def list_timeline_enrichers(
                 "eligible": eligibility.eligible,
                 "sample_checked": eligibility.sample_checked,
                 "sample_matched": eligibility.sample_matched,
-                "mode": config.mode if config else "automatic",
-                "enabled": config.enabled if config else default_enabled,
+                "mode": mode,
+                "enabled": enabled,
             }
         )
     return {"enrichers": result}

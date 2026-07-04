@@ -549,6 +549,47 @@ def test_enricher_run_guard_claim_release():
     assert jobs.get_active_enricher_run("t1", "geoip") is None
 
 
+def test_iter_source_events_batches_and_stops():
+    from tracesignal.db.clickhouse import ClickHouseStore
+
+    calls: list[int] = []
+
+    class _FakeCH:
+        iter_source_events = ClickHouseStore.iter_source_events
+
+        def list_events(self, case_id, source_id, limit, offset):
+            calls.append(offset)
+            data = [{"event_id": str(i)} for i in range(5)]  # 5 rows total
+            return data[offset : offset + limit]
+
+    batches = list(_FakeCH().iter_source_events("c1", "s1", batch_size=2))
+    assert [len(b) for b in batches] == [2, 2, 1]
+    assert calls == [0, 2, 4]  # short final batch ends iteration, no extra query
+
+    calls.clear()
+
+    class _EmptyCH(_FakeCH):
+        def list_events(self, case_id, source_id, limit, offset):
+            calls.append(offset)
+            return []
+
+    assert list(_EmptyCH().iter_source_events("c1", "s1", batch_size=2)) == []
+    assert calls == [0]
+
+
+def test_effective_enricher_state_resolution():
+    from tracesignal.enrichers.base import effective_enricher_state
+
+    # Explicit row always wins, in either direction.
+    assert effective_enricher_state(True, "automatic", False) == (True, "automatic")
+    assert effective_enricher_state(False, "automatic", True) == (False, "automatic")
+    assert effective_enricher_state(True, "manual", True) == (True, "manual")
+    assert effective_enricher_state(False, "manual", False) == (False, "manual")
+    # No explicit row: instance default decides, mode is automatic.
+    assert effective_enricher_state(None, None, True) == (True, "automatic")
+    assert effective_enricher_state(None, None, False) == (False, "automatic")
+
+
 def test_config_hash_deterministic_and_sensitive_to_extras():
     from tracesignal.enrichers.base import Enricher
 
@@ -783,7 +824,11 @@ async def test_run_enrichment_job_stamps_config_hash_and_fails_loudly(store, mon
     await store.create_case("c1", "Case One")
     await store.create_source("c1", "s1", "src", file_hash="b" * 64, size_bytes=1)
 
+    from tracesignal.db.clickhouse import ClickHouseStore
+
     class _FakeCH(_RecordingClickHouse):
+        iter_source_events = ClickHouseStore.iter_source_events
+
         def count_events(self, case_id, source_ids):
             return len(source_ids)
 
