@@ -1139,19 +1139,6 @@ class PostgresStore:
             )
             return list(result.scalars().all())
 
-    async def get_timeline_enricher(
-        self, timeline_id: str, enricher_key: str
-    ) -> TimelineEnricher | None:
-        """Return one timeline's config for a specific enricher, if set."""
-        async with self.session_factory() as session:
-            result = await session.execute(
-                select(TimelineEnricher).where(
-                    TimelineEnricher.timeline_id == timeline_id,
-                    TimelineEnricher.enricher_key == enricher_key,
-                )
-            )
-            return result.scalar_one_or_none()
-
     async def upsert_timeline_enricher(
         self,
         timeline_id: str,

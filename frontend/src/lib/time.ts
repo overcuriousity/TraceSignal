@@ -63,19 +63,6 @@ export function fmtRelative(value: string | null | undefined): string {
   }
 }
 
-/** Format a datetime for use as a query param (ISO 8601). */
-export function toIsoParam(value: Date | null): string | undefined {
-  if (!value) return undefined;
-  return value.toISOString();
-}
-
-/** Parse a query param datetime string back to a Date. */
-export function fromIsoParam(value: string | null): Date | null {
-  if (!value) return null;
-  const d = parseISO(value);
-  return isValid(d) ? d : null;
-}
-
 /**
  * Convert a `<input type="datetime-local">` value ("YYYY-MM-DDTHH:mm") to a
  * UTC ISO string, treating the typed wall-clock time as UTC. The widget has

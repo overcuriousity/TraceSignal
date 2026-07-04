@@ -516,29 +516,3 @@ class ClickHouseStore:
             )
             raise
 
-    def delete_timeline_events(self, case_id: str, source_ids: list[str]) -> None:
-        """Remove all events for a timeline by dropping partitions for its sources.
-
-        Attempts every source even if some fail, then raises a single
-        ``RuntimeError`` naming the failed sources so one bad partition
-        doesn't silently skip the rest.
-        """
-        failed: list[str] = []
-        for source_id in source_ids:
-            try:
-                self.delete_source_events(case_id, source_id)
-            except Exception:
-                failed.append(source_id)
-        if failed:
-            raise RuntimeError(
-                f"failed to delete events for {len(failed)} source(s) "
-                f"in case {case_id}: {', '.join(failed)}"
-            )
-
-    def health(self) -> dict[str, Any]:
-        """Return a simple health status for the ClickHouse connection."""
-        try:
-            result = self.client.query("SELECT 1")
-            return {"status": "ok", "ping": result.result_rows[0][0] == 1}
-        except Exception as exc:  # noqa: BLE001
-            return {"status": "error", "error": str(exc)}

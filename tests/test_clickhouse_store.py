@@ -115,17 +115,3 @@ class TestDeleteSourceEventsErrors:
     def test_missing_table_is_benign_noop(self, store):
         store.client = _FailingClient("Code: 60. DB::Exception: UNKNOWN_TABLE")
         store.delete_source_events("case-1", "src-1")  # must not raise
-
-    def test_timeline_delete_attempts_all_and_aggregates(self, store):
-        attempted: list[str] = []
-
-        def flaky_command(cmd):
-            source_id = cmd.split("'")[3]
-            attempted.append(source_id)
-            if source_id in ("bad-1", "bad-2"):
-                raise RuntimeError("boom")
-
-        store.client = type("C", (), {"command": staticmethod(flaky_command)})()
-        with pytest.raises(RuntimeError, match="bad-1, bad-2"):
-            store.delete_timeline_events("case-1", ["ok-1", "bad-1", "ok-2", "bad-2"])
-        assert attempted == ["ok-1", "bad-1", "ok-2", "bad-2"]

@@ -3,7 +3,6 @@ import { Check, ChevronDown } from "lucide-react";
 import { cn } from "@/lib/cn";
 
 export const Select = RadixSelect.Root;
-export const SelectGroup = RadixSelect.Group;
 export const SelectValue = RadixSelect.Value;
 
 export function SelectTrigger({
