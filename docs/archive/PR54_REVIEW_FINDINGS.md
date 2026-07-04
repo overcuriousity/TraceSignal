@@ -12,9 +12,16 @@ owners/managers enable an enricher and choose automatic vs. manual trigger mode.
 (MaxMind GeoLite2) end to end: admin `.mmdb` upload, availability/eligibility checks, a
 background enrichment job, Explorer column exposure, and a client-side IP badge.
 
-**Status: open.** Filed against `feat/enricher-subsystem` before merge; nothing below has been
-fixed yet. Condensed backlog checkboxes live in `docs/ROADMAP.md`; this file is the full
-unrestricted finding set for reference when working the backlog.
+**Status: resolved except two deferred items (2026-07-04).** Correctness findings #1–#8 were
+fixed in the M9–M13 hardening pass; #14/#22/#23/#27/#29 dissolved in the
+enrichment-into-attributes redesign; the final pre-merge cleanup batch on
+`feat/enricher-subsystem` resolved #9–#13 (generic `asset_spec`/`install_asset` abstraction,
+generic admin endpoints + page, `derived_field_key` contract constants both sides, data-driven
+badge gating), #15–#19 (comment/`iter_source_events`/`receive_upload_to_tmp`/
+`effective_enricher_state`), #24–#26, #28/#30/#31, #32/#33. #20 is a documented won't-fix
+(the two reconciliation paths diverged: recover-forward vs roll-back). Still open, deferred to
+a fresh branch (see `docs/ROADMAP.md` M16): #34 (derived-key ColumnPicker cardinality) and the
+staging-format redesign (row-per-event JSON map).
 
 ## Correctness / concurrency
 

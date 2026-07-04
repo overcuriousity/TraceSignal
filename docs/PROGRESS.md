@@ -1,6 +1,34 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-04 (session 16 — roadmap hardening batch M1–M4, M7, M8, shipped on
+Last updated: 2026-07-04 (session 17 — final PR #54 cleanup batch, M16 bulk. Four commits on
+`feat/enricher-subsystem`: **(1) micro-fixes** — GeoIP output-field names single-sourced
+(order locked, config_hash-stable), `refresh_availability(key)` single-enricher form,
+batched `count_events(source_ids=...)`, concurrent eligibility checks via `asyncio.gather`,
+sidecar-first `check_availability` (no full `.mmdb` mmap when `.meta.json` carries
+`database_type`), plus comments documenting: eligibility-regex role (#15), create_task-over-
+BackgroundTasks rationale (#17/#21), deliberate reconcile divergence (#20 won't-fix), sorted
+`list_fields` attributes (#33). **(2) shared abstractions** —
+`ClickHouseStore.iter_source_events` batching generator (embedding pipeline + enricher jobs),
+`api/uploads.py::receive_upload_to_tmp` (temp-file + hash + 413 handling, used by source and
+asset uploads), `enrichers/base.py::effective_enricher_state` (single "explicit overrides
+admin default" rule for `list_timeline_enrichers` and
+`list_automatic_enrichers_for_source`). **(3) generic asset abstraction** — Enricher ABC
+gains `asset_spec`/`asset_status()`/`install_asset()` + `AssetValidationError`; GeoIP
+implements them (City-flavor validation moved out of admin.py; lazy db-path resolution);
+GET/POST `/admin/enrichers/geoip/database` replaced by asset state folded into
+`GET /admin/enrichers/config` + generic `POST /admin/enrichers/{key}/asset`; audit action now
+`admin.enricher_asset_upload`; field-key contract extracted to
+`base.FIELD_KEY_SEPARATOR`/`derived_field_key`. **(4) frontend** — new `lib/enrichment.ts`
+(key contract mirror + `hasEnrichmentSiblings` + decorator registry), Explorer flag and
+private/public badge now data-gated on enrichment siblings (user decision: badge means "was
+enriched", so un-enriched private IPs show nothing), `AdminEnrichersPage` fully generic
+(maps configs, asset section from `config.asset`), `privateIp.ts` IPv6 parsed to hextets
+(zone suffixes, `::`, embedded IPv4; bitmask range checks; fixes uncompressed loopback and
+`FEBF::` misclassification). Deferred to fresh branch: staging-format redesign + #34
+(ColumnPicker cardinality) — roadmap M16 rewritten accordingly. 450 backend + 164 frontend
+tests passing.)
+
+Previous (session 16 — roadmap hardening batch M1–M4, M7, M8, shipped on
 the enricher PR branch. **M1**: evidence-mutation failures now surface — `delete_source_events`
 re-raises (only a missing `events` table stays a benign no-op), `delete_timeline_events`
 aggregates per-source failures, DELETE source/case endpoints fail closed with 502 +

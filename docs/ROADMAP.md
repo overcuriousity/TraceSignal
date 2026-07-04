@@ -52,33 +52,16 @@ resolved — this file holds only the condensed, still-open action items.
   (e.g. max-across-sources) since it only feeds a UI hint. Short-term mitigation already
   shipped: `VisualizePage` shows a "can take a while" hint under the spinner and the field
   dropdown scrolls instead of overflowing (`ui/Select.tsx`).
-- [ ] **M16 — Enricher subsystem cleanup pass (PR #54).** Lower-severity design/reuse/
-  efficiency items to fold in when next touching this code — full detail and rationale in
-  `docs/archive/PR54_REVIEW_FINDINGS.md` #9–#34. Resolved by the 2026-07-04
-  enrichment-into-attributes redesign: #14/#27 (hydration bolt-on + per-page query — gone,
-  enrichment lives in `events.attributes`), #22 (duplicated DROP PARTITION), #23 (duck-typed
-  `close()`), #29 (sequential field-key query — removed). Still open:
-  - GeoIP is special-cased throughout the frontend/admin instead of the enricher abstraction
-    being load-bearing (hardcoded admin card, hardcoded field-key prefixes in
-    `countryFlag.ts`, GeoIP-only badge logic baked into the generic Explorer cell renderer,
-    asset-upload bolted onto the generic config endpoint pattern) — #9–#13.
-  - Reuse: hand-rolled IPv4 regex in `privateIp.ts` (backend now uses stdlib `ipaddress` for
-    validation but the regex remains as the eligibility pattern); manual
-    `asyncio.create_task` + tracking set instead of `BackgroundTasks`; pagination loop
-    duplicated from `EmbeddingPipeline`; temp-file upload boilerplate duplicated between
-    `admin.py`/`cases.py`; orphan reconciliation duplicated from `api/main.py`'s ingest
-    cleanup — #15–#20.
-  - Simplification: `output_fields` duplicated as literal dict keys, "effective config"
-    computed twice with diverging logic, status endpoint triggering a full availability
-    sweep — #24–#26.
-  - Efficiency: sequential per-source `count_events` calls; sequential (not concurrent)
-    eligibility queries; `check_availability` opens the whole database just to prove it's
-    readable — #28, #30, #31.
-  - Minor: `isPrivateIpv6` misses some valid representations; undocumented `sorted(keys)`
-    behavior change; derived-key cardinality can balloon the ColumnPicker on wide datasets —
-    #32–#34.
-  - New (from the redesign): staging is one Postgres row per (event, attr, output_field) —
+- [ ] **M16 — Enricher follow-ups (fresh branch after PR #54 merges).** The 2026-07-04
+  cleanup batch on `feat/enricher-subsystem` resolved the bulk of the PR #54 review residue
+  (#9–#13 generic asset abstraction + de-GeoIP'd frontend, #15–#19 reuse, #24–#26
+  simplification, #28/#30/#31 efficiency, #32/#33 minors; #20 documented won't-fix). Full
+  finding set + status in `docs/archive/PR54_REVIEW_FINDINGS.md`. Deliberately deferred:
+  - Staging-format redesign: staging is one Postgres row per (event, attr, output_field) —
     a row-per-event JSON-map format would shrink staging ~3x and simplify the apply join.
+  - #34: derived-key cardinality can balloon the ColumnPicker on wide/vendor-inconsistent
+    datasets (`src_ip:geo_country`, `source_ip:geo_country`, ...) — needs a grouping/limit
+    design in the ColumnPicker.
 
 - [ ] **M17 — Job authorization via case RBAC.** PR #7 review #9 follow-up (guard itself was
   fixed): jobs are only guarded by `created_by == user.id or is_admin`; a `Job.case_id` +
