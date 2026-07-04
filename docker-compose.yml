@@ -48,28 +48,28 @@ services:
       timeout: 5s
       retries: 5
 
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    ports:
-      - "8080:8080"
-    environment:
-      TS_ENVIRONMENT: production
-      TS_SECRET_KEY: change-me-in-production
-      TS_POSTGRES_URL: postgresql+asyncpg://tracesignal:tracesignal@postgres:5432/tracesignal
-      TS_CLICKHOUSE_URL: http://clickhouse:8123
-      TS_CLICKHOUSE_DATABASE: tracesignal
-      TS_QDRANT_URL: http://qdrant:6333
+#  app:
+#    build:
+#      context: .
+#      dockerfile: Dockerfile
+#    ports:
+#      - "8080:8080"
+#    environment:
+#      TS_ENVIRONMENT: production
+#      TS_SECRET_KEY: change-me-in-production
+#      TS_POSTGRES_URL: postgresql+asyncpg://tracesignal:tracesignal@postgres:5432/tracesignal
+#      TS_CLICKHOUSE_URL: http://clickhouse:8123
+#      TS_CLICKHOUSE_DATABASE: tracesignal
+#      TS_QDRANT_URL: http://qdrant:6333
       # TS_QDRANT_API_KEY: change-me
-      TS_ALLOW_ONLINE: "false"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      clickhouse:
-        condition: service_healthy
-      qdrant:
-        condition: service_healthy
+ #     TS_ALLOW_ONLINE: "false"
+ #   depends_on:
+ #     postgres:
+#        condition: service_healthy
+#      clickhouse:
+ #       condition: service_healthy
+#      qdrant:
+#        condition: service_healthy
 
 volumes:
   postgres_data:
