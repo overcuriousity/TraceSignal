@@ -47,6 +47,48 @@ def test_bad_credentials_are_rejected_and_audited(client, admin_bootstrap):
     assert resp.status_code == 401
 
 
+def test_login_backoff_returns_429_after_threshold(client, admin_bootstrap):
+    """After TS_LOGIN_BACKOFF_THRESHOLD (default 5) consecutive failures the
+    next attempt is rejected with 429 and a Retry-After header — even with the
+    correct password, until the delay elapses."""
+    for _ in range(5):
+        resp = client.post("/api/auth/login", json={"username": "admin", "password": "wrong"})
+        assert resp.status_code == 401
+    resp = client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": admin_bootstrap["password"]},
+    )
+    assert resp.status_code == 429
+    assert int(resp.headers["Retry-After"]) >= 1
+
+
+def test_login_backoff_does_not_leak_username_existence(client, admin_bootstrap):
+    """Unknown usernames and wrong passwords for a real account must produce
+    identical status sequences (401...401, then 429)."""
+
+    def sequence(username: str) -> list[int]:
+        return [
+            client.post(
+                "/api/auth/login", json={"username": username, "password": "wrong"}
+            ).status_code
+            for _ in range(6)
+        ]
+
+    assert sequence("admin") == sequence("no-such-user")
+
+
+def test_successful_login_resets_backoff(client, admin_bootstrap):
+    """Failures below the threshold are cleared by a successful login."""
+    for _ in range(4):
+        resp = client.post("/api/auth/login", json={"username": "admin", "password": "wrong"})
+        assert resp.status_code == 401
+    login(client, admin_bootstrap["username"], admin_bootstrap["password"])
+    # Counter reset: four more failures stay below the threshold again.
+    for _ in range(4):
+        resp = client.post("/api/auth/login", json={"username": "admin", "password": "wrong"})
+        assert resp.status_code == 401
+
+
 def test_mutating_action_blocked_until_password_rotated(client, admin_bootstrap):
     login(client, admin_bootstrap["username"], admin_bootstrap["password"])
     resp = client.post("/api/cases/", json={"name": "should-be-blocked"})

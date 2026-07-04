@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from tracesignal.api import deps
 from tracesignal.api.main import create_app
 from tracesignal.core.config import get_settings
+from tracesignal.core.login_backoff import reset_login_backoff
 from tracesignal.db.postgres import PostgresStore, User
 
 
@@ -47,9 +48,13 @@ def admin_bootstrap(monkeypatch):
 @pytest.fixture()
 def client(store, admin_bootstrap):
     """A TestClient over the real app (lifespan seeds the admin on entry)."""
+    # The login-backoff singleton is process-wide; reset it so failed-login
+    # tests can't rate-limit each other across test boundaries.
+    reset_login_backoff()
     app = create_app()
     with TestClient(app) as c:
         yield c
+    reset_login_backoff()
 
 
 def login(client: TestClient, username: str, password: str) -> dict:

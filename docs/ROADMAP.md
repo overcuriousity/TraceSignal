@@ -28,9 +28,6 @@ resolved — this file holds only the condensed, still-open action items.
 
 ## Milestone 1 — correctness & forensic integrity (Medium severity)
 
-- [ ] **M3 — Login backoff.** No rate limiting on `POST /api/auth/login`; argon2 slows one
-  attempt, not a loop. In-memory per-username+IP failure counter with exponential delay fits
-  the single-process design.
 - [ ] **M4 — Compose network hygiene.** Reference `docker-compose.yml` publishes Postgres
   (default creds), ClickHouse (default user, no password) and Qdrant (no auth) to the host —
   app-layer RBAC is bypassable by anyone with network reach. Keep backing services on the

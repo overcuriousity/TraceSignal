@@ -20,6 +20,13 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     allow_online: bool = False
 
+    # Login backoff: after `threshold` consecutive failures per
+    # (username, client IP), attempts are rejected with 429 for
+    # base * 2**(n - threshold) seconds, capped at max.
+    login_backoff_threshold: int = 5
+    login_backoff_base_seconds: float = 2.0
+    login_backoff_max_seconds: float = 300.0
+
     # Metadata store
     postgres_url: str = "postgresql+asyncpg://tracesignal:tracesignal@localhost:5432/tracesignal"
 
