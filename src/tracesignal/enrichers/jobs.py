@@ -297,7 +297,11 @@ async def run_enrichment_job(
         job_store.update(job_id, status="failed", error=f"Unknown enricher: {enricher_key}")
         _release_enricher_run(timeline_id, enricher_key, job_id)
         return
-    enricher = prototype.spawn()
+    # spawn() can do blocking I/O (GeoIP reads the whole database into memory to
+    # pin its identity for the run) — keep it off the event loop. spawn is
+    # best-effort and does not raise, so the finally-block cleanup contract of
+    # the try below is unaffected by running it here.
+    enricher = await asyncio.to_thread(prototype.spawn)
 
     settings = get_settings()
     batch_size = settings.embedding_batch_size
@@ -310,8 +314,9 @@ async def run_enrichment_job(
     processed = 0
     completed_sources = 0
     try:
-        # Worker thread: the GeoIP fallback path may hash a multi-GB-adjacent
-        # database file when no metadata sidecar exists yet.
+        # Worker thread: config_hash may do disk I/O on enrichers without a
+        # pinned identity. For GeoIP the identity is already pinned in spawn(),
+        # so this is cheap, but stay off the loop for the general case.
         config_hash = await asyncio.to_thread(enricher.config_hash)
 
         total = await asyncio.to_thread(

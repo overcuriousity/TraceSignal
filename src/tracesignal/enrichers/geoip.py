@@ -19,6 +19,7 @@ from typing import Any
 
 import geoip2.database
 import geoip2.errors
+import maxminddb
 
 from tracesignal.core.config import get_settings
 from tracesignal.enrichers.base import (
@@ -101,6 +102,13 @@ class GeoIPEnricher(Enricher):
     def __init__(self, db_path: Path | None = None) -> None:
         self._db_path_override = db_path
         self._reader: geoip2.database.Reader | None = None
+        # Set by _pin() on a spawned per-run instance: the identity (hash +
+        # build metadata) of the exact database bytes this run reads, captured
+        # once so config_hash() and every lookup describe the same file even if
+        # an admin replaces the .mmdb mid-run. None on the registry singleton
+        # (which never enriches), where config_extras() falls back to the
+        # current sidecar/file.
+        self._pinned_meta: dict[str, Any] | None = None
 
     @property
     def _db_path(self) -> Path:
@@ -110,8 +118,59 @@ class GeoIPEnricher(Enricher):
         return self._db_path_override or geoip_database_path()
 
     def spawn(self) -> GeoIPEnricher:
-        """Fresh instance for one job run, keeping the configured database path."""
-        return GeoIPEnricher(db_path=self._db_path_override)
+        """Fresh per-run instance with its database bytes pinned at spawn time.
+
+        Opens the ``.mmdb`` once and reads it fully into memory (``MODE_FD``),
+        hashing the *same* file object so the reader and the recorded
+        ``config_hash`` identity are guaranteed to describe identical bytes.
+        This closes the forensic-provenance gap that a lazily-opened reader
+        left: without pinning, an admin replacing the database between job
+        start and the first lookup would produce values from the new database
+        stamped with the old database's hash. Best-effort — if the file can't
+        be opened/read, the instance falls back to a lazy path-based reader and
+        the sidecar-derived identity (prior behavior).
+        """
+        inst = GeoIPEnricher(db_path=self._db_path_override)
+        inst._pin()
+        return inst
+
+    def _pin(self) -> None:
+        """Read the database into memory once and capture its exact identity."""
+        path = self._db_path
+        try:
+            fh = path.open("rb")
+        except OSError as exc:
+            logger.warning(
+                "Could not open GeoIP database %s to pin it at spawn (%s); "
+                "falling back to lazy open",
+                path,
+                exc,
+            )
+            return
+        try:
+            # hash_file reads the stream and rewinds it to the start, so the
+            # Reader below consumes the identical bytes we just hashed. MODE_FD
+            # loads the whole database into memory, so the fd can be closed
+            # afterward and a later on-disk replacement cannot affect this run.
+            sha256 = hash_file(fh)
+            reader = geoip2.database.Reader(fh, mode=maxminddb.MODE_FD)
+            reader_meta = reader.metadata()
+            self._reader = reader
+            self._pinned_meta = {
+                "sha256": sha256,
+                "build_epoch": reader_meta.build_epoch,
+                "database_type": reader_meta.database_type,
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not pin GeoIP database %s at spawn (%s); falling back to lazy open",
+                path,
+                exc,
+            )
+            self._reader = None
+            self._pinned_meta = None
+        finally:
+            fh.close()
 
     def check_availability(self) -> AvailabilityResult:
         if not self._db_path.exists():
@@ -188,10 +247,20 @@ class GeoIPEnricher(Enricher):
     def config_extras(self) -> dict[str, Any]:
         """Identity of the installed database file (hash + build metadata).
 
-        Read from the sidecar written at upload time; for databases installed
-        before the sidecar existed, compute it once and persist it (best
-        effort — a read-only data dir just means recomputing next time).
+        On a spawned per-run instance, returns the identity pinned at
+        ``spawn()`` from the exact bytes this run reads — never the sidecar,
+        which an admin could have rewritten to a newer database mid-run. On the
+        unpinned registry singleton, falls back to the sidecar written at
+        upload time; for databases installed before the sidecar existed,
+        compute it once and persist it (best effort — a read-only data dir just
+        means recomputing next time).
         """
+        if self._pinned_meta is not None:
+            return {
+                "database_sha256": self._pinned_meta.get("sha256", ""),
+                "build_epoch": self._pinned_meta.get("build_epoch", 0),
+                "database_type": self._pinned_meta.get("database_type", ""),
+            }
         meta = read_geoip_sidecar(self._db_path)
         if meta is None:
             with geoip2.database.Reader(str(self._db_path)) as reader:

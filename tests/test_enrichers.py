@@ -523,6 +523,52 @@ def test_spawn_returns_fresh_instance_preserving_db_path(tmp_path):
     assert clone._db_path == original._db_path
 
 
+def test_spawn_pins_identity_against_mid_run_db_replacement(tmp_path, monkeypatch):
+    """spawn() captures the exact bytes it reads; a later on-disk swap can't change them."""
+    import hashlib
+
+    import geoip2.database
+    import maxminddb
+
+    db_path = tmp_path / "GeoLite2-City.mmdb"
+    db_path.write_bytes(b"v1-bytes")
+
+    captured: dict = {}
+
+    class _FakeMeta:
+        build_epoch = 111
+        database_type = "GeoLite2-City"
+
+    class _FakeReader:
+        def __init__(self, fileish, mode=0):
+            # Pinning must hand the Reader an open file object (MODE_FD), not a
+            # path — that's what makes the read immune to a later replacement.
+            captured["is_fileobj"] = hasattr(fileish, "read")
+            captured["mode"] = mode
+
+        def metadata(self):
+            return _FakeMeta()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(geoip2.database, "Reader", _FakeReader)
+
+    enricher = GeoIPEnricher(db_path=db_path).spawn()
+    pinned = enricher.config_extras()
+    assert captured["is_fileobj"] is True
+    assert captured["mode"] == maxminddb.MODE_FD
+    assert pinned["database_sha256"] == hashlib.sha256(b"v1-bytes").hexdigest()
+    assert pinned["database_type"] == "GeoLite2-City"
+
+    # Admin replaces the database on disk after the run has started.
+    db_path.write_bytes(b"v2-completely-different-bytes")
+
+    # Identity is unchanged — still the bytes pinned at spawn.
+    assert enricher.config_extras() == pinned
+    enricher.close()
+
+
 def test_base_close_is_noop():
     from tracesignal.enrichers.base import Enricher
 
