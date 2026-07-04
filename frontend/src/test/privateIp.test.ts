@@ -37,6 +37,11 @@ describe("isPrivateIp", () => {
     expect(isPrivateIp("8.8.8.8")).toBe(false);
     expect(isPrivateIp("1.1.1.1")).toBe(false);
   });
+  it("flags reserved IPv4 (unspecified, multicast, broadcast) as private", () => {
+    expect(isPrivateIp("0.0.0.0")).toBe(true); // unspecified
+    expect(isPrivateIp("224.0.0.1")).toBe(true); // multicast
+    expect(isPrivateIp("255.255.255.255")).toBe(true); // broadcast
+  });
   it("flags IPv6 loopback and unique-local as private", () => {
     expect(isPrivateIp("::1")).toBe(true);
     expect(isPrivateIp("fd00::1")).toBe(true);
@@ -53,6 +58,16 @@ describe("isPrivateIp", () => {
     expect(isPrivateIp("fec0::1")).toBe(false); // site-local is outside fe80::/10
     expect(isPrivateIp("fe00::1")).toBe(false);
     expect(isPrivateIp("2001:db8::1")).toBe(false);
+  });
+  it("classifies IPv4-mapped IPv6 by the embedded address", () => {
+    expect(isPrivateIp("::ffff:10.0.0.1")).toBe(true); // mapped RFC1918
+    expect(isPrivateIp("::ffff:127.0.0.1")).toBe(true); // mapped loopback
+    expect(isPrivateIp("::ffff:192.168.0.1")).toBe(true);
+    expect(isPrivateIp("::ffff:8.8.8.8")).toBe(false); // mapped public stays public
+  });
+  it("flags unspecified :: and multicast ff00::/8 as private", () => {
+    expect(isPrivateIp("::")).toBe(true); // unspecified
+    expect(isPrivateIp("ff02::1")).toBe(true); // multicast
   });
 });
 

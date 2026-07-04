@@ -173,6 +173,19 @@ class ClickHouseStore:
         parts = url.split("://")[-1].split(":")
         return int(parts[1]) if len(parts) > 1 else 8123
 
+    @staticmethod
+    def _string_in_clause(prefix: str, values: list[str]) -> tuple[str, dict[str, str]]:
+        """Build a parameterized IN-list body and its bindings for String values.
+
+        Returns ``("{p0:String}, {p1:String}, ...", {"p0": v0, ...})`` — the
+        caller wraps the body in ``... IN (<body>)`` and merges the bindings
+        into its parameters dict. Prefixes must be distinct across clauses in
+        the same query.
+        """
+        names = [f"{prefix}{i}" for i in range(len(values))]
+        body = ", ".join(f"{{{name}:String}}" for name in names)
+        return body, dict(zip(names, values, strict=False))
+
     def init_schema(self) -> None:
         """Create the target database and events table if they do not exist."""
         self.client.command(f"CREATE DATABASE IF NOT EXISTS {self.database}")
@@ -210,6 +223,7 @@ class ClickHouseStore:
         source_id: str,
         scratch_suffix: str,
         row_chunks: Iterable[list[tuple[str, str, str]]],
+        owned_suffixes: list[str] | None = None,
     ) -> int:
         """Merge enrichment key/value pairs into one source's ``events.attributes``.
 
@@ -220,6 +234,17 @@ class ClickHouseStore:
         in one ``ALTER TABLE ... REPLACE PARTITION``. Idempotent — re-applying
         the same rows overwrites the same map keys with the same values — so
         a crashed apply can simply be re-run from the Postgres staging rows.
+
+        ``owned_suffixes`` is the enricher's ``output_fields`` (the ``<field>``
+        half of each derived ``<attr_key>:<field>`` key). Before merging, every
+        existing attribute key ending in one of these suffixes is stripped, so
+        a re-run whose output *shrank* — e.g. an updated GeoLite2 database that
+        no longer resolves an IP — does not leave a stale derived value behind
+        (mapUpdate alone only overwrites keys that are re-emitted). Left None
+        for callers that only add keys; then nothing is stripped. Note: if two
+        enrichers ever shared an output-field suffix, one's apply would strip
+        the other's keys — today GeoIP is the only enricher, so suffixes are
+        unique.
 
         Transiently doubles the partition's disk footprint (scratch copy).
         Caller must serialize applies per ``(case_id, source_id)`` — two
@@ -233,8 +258,16 @@ class ClickHouseStore:
         rows_table = f"{self.database}.{_ENRICH_SCRATCH_PREFIX}rows_{suffix}"
         events_table = f"{self.database}.{_ENRICH_SCRATCH_PREFIX}events_{suffix}"
         partition_expr = _partition_expr(case_id, source_id)
+        # Strip this enricher's previously-derived keys (last ':'-segment in
+        # owned_suffixes) before merging the fresh output, so stale values are
+        # removed rather than lingering. With no suffixes the mapFilter is a
+        # no-op (has() over an empty array is always false → nothing dropped).
+        attr_source = (
+            "mapFilter((k, v) -> NOT has({owned_suffixes:Array(String)}, "
+            "splitByChar(':', k)[-1]), e.attributes)"
+        )
         select_columns = ",\n            ".join(
-            "mapUpdate(e.attributes, m.enr) AS attributes"
+            f"mapUpdate({attr_source}, m.enr) AS attributes"
             if column == "attributes"
             else f"e.{column}"
             for column in _EVENT_COLUMNS
@@ -281,7 +314,11 @@ class ClickHouseStore:
                 WHERE e.case_id = {{case_id:String}} AND e.source_id = {{source_id:String}}
                 SETTINGS join_use_nulls = 0
                 """,
-                parameters={"case_id": case_id, "source_id": source_id},
+                parameters={
+                    "case_id": case_id,
+                    "source_id": source_id,
+                    "owned_suffixes": owned_suffixes or [],
+                },
             )
             self.client.command(
                 f"ALTER TABLE {self.database}.events "
@@ -325,10 +362,9 @@ class ClickHouseStore:
         if source_ids is not None:
             if not source_ids:
                 return 0
-            source_params = [f"s{i}" for i in range(len(source_ids))]
-            source_in = ", ".join(f"{{{name}:String}}" for name in source_params)
+            source_in, source_binds = self._string_in_clause("s", source_ids)
             conditions.append(f"source_id IN ({source_in})")
-            parameters.update(zip(source_params, source_ids, strict=False))
+            parameters.update(source_binds)
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
         result = self.client.query(query, parameters=parameters)
@@ -425,14 +461,11 @@ class ClickHouseStore:
         if not event_ids:
             return {}
         self.init_schema()
-        # Build parameterized IN clauses.
-        event_params = [f"e{i}" for i in range(len(event_ids))]
-        event_in = ", ".join(f"{{{name}:String}}" for name in event_params)
-        source_params = [f"s{i}" for i in range(len(source_ids))]
-        source_in = ", ".join(f"{{{name}:String}}" for name in source_params)
-        parameters: dict[str, str] = dict(zip(event_params, event_ids, strict=False))
-        parameters.update(zip(source_params, source_ids, strict=False))
-        parameters["case_id"] = case_id
+        # Build parameterized IN clauses (distinct prefixes so the bindings
+        # don't collide in the merged parameters dict).
+        event_in, event_binds = self._string_in_clause("e", event_ids)
+        source_in, source_binds = self._string_in_clause("s", source_ids)
+        parameters: dict[str, str] = {**event_binds, **source_binds, "case_id": case_id}
         result = self.client.query(
             f"""
             SELECT

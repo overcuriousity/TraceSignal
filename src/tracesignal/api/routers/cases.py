@@ -358,9 +358,9 @@ async def _trigger_automatic_enrichments(
     ingestion once availability is restored.
     """
     from tracesignal.enrichers.jobs import (
-        background_enrichment_tasks,
         get_active_enricher_run,
         run_enrichment_job,
+        spawn_tracked_enrichment_task,
         try_claim_enricher_run,
     )
     from tracesignal.enrichers.registry import get_cached_availability, get_enricher
@@ -389,7 +389,11 @@ async def _trigger_automatic_enrichments(
             kind="enrich", progress={"processed": 0, "total": 0}, created_by=None
         )
         try_claim_enricher_run(timeline_id, enricher_key, job.id)
-        task = asyncio.create_task(
+        # create_task (not FastAPI BackgroundTasks) is deliberate: this runs
+        # inside the background ingestion job, where no request scope exists.
+        # spawn_tracked_enrichment_task keeps the strong reference that stops
+        # asyncio garbage-collecting the run mid-flight.
+        spawn_tracked_enrichment_task(
             run_enrichment_job(
                 job_id=job.id,
                 case_id=case_id,
@@ -401,12 +405,6 @@ async def _trigger_automatic_enrichments(
                 ch_store=clickhouse,
             )
         )
-        # Keep a strong reference so the task isn't garbage-collected
-        # mid-run (asyncio only holds a weak reference once scheduled).
-        # create_task (not FastAPI BackgroundTasks) is deliberate: this runs
-        # inside the background ingestion job, where no request scope exists.
-        background_enrichment_tasks.add(task)
-        task.add_done_callback(background_enrichment_tasks.discard)
 
 
 async def _run_ingestion_job(
@@ -463,7 +461,20 @@ async def _run_ingestion_job(
         # detectors, and embedding (see events._resolve_timeline_scope).
         await store.set_source_status(case_id, source_id, "ready")
         await _revalidate_stale_field_mappings(store, case_id, source_id)
-        await _trigger_automatic_enrichments(store, clickhouse, job_store, case_id, source_id)
+        # Auto-enrichment scheduling runs *after* the source is committed
+        # "ready"; a failure here must never fall through to the ingest
+        # rollback below (which would delete a fully-ingested source). Isolate
+        # it — a missed auto-trigger self-heals on the next ingest or a manual
+        # run, whereas a destroyed source does not.
+        try:
+            await _trigger_automatic_enrichments(store, clickhouse, job_store, case_id, source_id)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Auto-enrichment scheduling failed for source %s (case %s); "
+                "ingest itself succeeded and is kept",
+                source_id,
+                case_id,
+            )
         await store.record_audit(
             action="source.upload",
             actor=user,
@@ -1482,6 +1493,12 @@ async def run_timeline_enricher(
         )
 
     job_store = get_job_store()
+    # Construct the ClickHouse client *before* claiming the run slot: its
+    # constructor can raise when ClickHouse is unreachable, and a claim taken
+    # before a raise would never be released (the job never starts, so its
+    # finally-block release never runs), wedging this (timeline, enricher) at
+    # 409 until restart.
+    ch_store = ClickHouseStore()
     job = job_store.create(
         kind="enrich",
         progress={"processed": 0, "total": 0},
@@ -1499,6 +1516,6 @@ async def run_timeline_enricher(
         source_ids=source_ids,
         job_store=job_store,
         store=store,
-        ch_store=ClickHouseStore(),
+        ch_store=ch_store,
     )
     return {"job_id": job.id, "status": job.status, "source_ids": source_ids}

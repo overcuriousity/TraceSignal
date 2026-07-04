@@ -329,14 +329,18 @@ class _RecordingClickHouse:
     def __init__(self) -> None:
         self.applied: list[tuple[str, str, str, list]] = []
 
-    def apply_enrichments(self, case_id, source_id, scratch_suffix, row_chunks) -> int:
+    def apply_enrichments(
+        self, case_id, source_id, scratch_suffix, row_chunks, owned_suffixes=None
+    ) -> int:
         chunks = [list(chunk) for chunk in row_chunks]
         self.applied.append((case_id, source_id, scratch_suffix, chunks))
         return sum(len(chunk) for chunk in chunks)
 
 
 class _BrokenClickHouse:
-    def apply_enrichments(self, case_id, source_id, scratch_suffix, row_chunks) -> int:
+    def apply_enrichments(
+        self, case_id, source_id, scratch_suffix, row_chunks, owned_suffixes=None
+    ) -> int:
         raise ConnectionError("clickhouse down")
 
 
@@ -472,8 +476,12 @@ def test_apply_enrichments_runs_atomic_partition_rewrite():
         ("tsig.tmp_enrich_rows_job1", [("e1", "ip:geo_country", "DE"), ("e1", "ip:geo_city", "X")])
     ]
     # Enriched partition copy built via mapUpdate join, pinned join_use_nulls.
+    # The source map is first passed through mapFilter to strip this enricher's
+    # own previously-derived keys (stale-value cleanup) before the merge.
     insert_select = client.queries[0][0]
-    assert "mapUpdate(e.attributes, m.enr)" in insert_select
+    assert "mapUpdate(mapFilter(" in insert_select
+    assert "m.enr) AS attributes" in insert_select
+    assert "owned_suffixes:Array(String)" in insert_select
     assert "join_use_nulls = 0" in insert_select
     # Atomic swap of exactly this source's partition, then scratch cleanup.
     commands = client.commands

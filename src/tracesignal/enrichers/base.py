@@ -193,10 +193,11 @@ class Enricher(ABC):
                 count() AS checked,
                 countIf(match(v, {{pattern:String}})) AS matched
             FROM (
-                SELECT v
+                SELECT k, v
                 FROM {ch_store.database}.events
-                ARRAY JOIN mapValues(attributes) AS v
+                ARRAY JOIN mapKeys(attributes) AS k, mapValues(attributes) AS v
                 WHERE case_id = {{case_id:String}} AND source_id IN {{source_ids:Array(String)}}
+                    AND position(k, '{FIELD_KEY_SEPARATOR}') = 0
                 LIMIT {_ELIGIBILITY_SAMPLE_LIMIT}
             )
             """,

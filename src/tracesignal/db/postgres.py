@@ -1418,11 +1418,15 @@ class PostgresStore:
             return list(result.scalars().all())
 
     async def delete_source(self, case_id: str, source_id: str) -> bool:
-        """Delete a source row.
+        """Delete a source row and its enrichment provenance/staging.
+
+        ``SourceEnrichment`` and ``EnrichmentResultStaging`` reference the
+        source by a plain ``source_id`` column (no FK/cascade), so they are
+        deleted here too or they'd orphan when the source is removed.
 
         Returns True if a row was removed, False if it did not exist.
         """
-        from sqlalchemy import select
+        from sqlalchemy import delete, select
 
         async with self.session_factory() as session:
             result = await session.execute(
@@ -1434,6 +1438,18 @@ class PostgresStore:
             source = result.scalar_one_or_none()
             if source is None:
                 return False
+            await session.execute(
+                delete(SourceEnrichment).where(
+                    SourceEnrichment.case_id == case_id,
+                    SourceEnrichment.source_id == source_id,
+                )
+            )
+            await session.execute(
+                delete(EnrichmentResultStaging).where(
+                    EnrichmentResultStaging.case_id == case_id,
+                    EnrichmentResultStaging.source_id == source_id,
+                )
+            )
             await session.delete(source)
             await session.commit()
             return True
@@ -1744,11 +1760,14 @@ class PostgresStore:
 
         Returns True if the case existed and was removed, False otherwise.
 
-        ``View``, ``Annotation``, and ``DetectorRun`` are case-scoped by a
-        plain ``case_id`` column (no FK/cascade — they aren't declared with
-        a ``ForeignKey`` to ``cases.id``), so they must be deleted explicitly
-        here alongside ``Timeline``/``Source`` or they'd silently orphan on
-        every case delete.
+        ``View``, ``Annotation``, ``DetectorRun``, and the enrichment tables
+        (``SourceEnrichment``, ``EnrichmentResultStaging``,
+        ``EnrichmentJobRun``) are case-scoped by a plain ``case_id`` column
+        (no FK/cascade — they aren't declared with a ``ForeignKey`` to
+        ``cases.id``), so they must be deleted explicitly here alongside
+        ``Timeline``/``Source`` or they'd silently orphan on every case delete
+        — and a leftover ``EnrichmentJobRun`` marker would even be picked up by
+        startup reconciliation for evidence that no longer exists.
         """
         from sqlalchemy import delete
 
@@ -1761,6 +1780,15 @@ class PostgresStore:
             await session.execute(delete(View).where(View.case_id == case_id))
             await session.execute(delete(Annotation).where(Annotation.case_id == case_id))
             await session.execute(delete(DetectorRun).where(DetectorRun.case_id == case_id))
+            await session.execute(
+                delete(SourceEnrichment).where(SourceEnrichment.case_id == case_id)
+            )
+            await session.execute(
+                delete(EnrichmentResultStaging).where(EnrichmentResultStaging.case_id == case_id)
+            )
+            await session.execute(
+                delete(EnrichmentJobRun).where(EnrichmentJobRun.case_id == case_id)
+            )
             await session.delete(case)
             await session.commit()
             return True

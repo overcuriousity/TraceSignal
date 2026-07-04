@@ -35,7 +35,7 @@ from tracesignal.core.config import get_settings
 from tracesignal.core.jobs import JobStore
 from tracesignal.db.clickhouse import ClickHouseStore
 from tracesignal.db.postgres import EnrichmentJobRun, PostgresStore
-from tracesignal.enrichers.base import Enricher, derived_field_key
+from tracesignal.enrichers.base import FIELD_KEY_SEPARATOR, Enricher, derived_field_key
 from tracesignal.enrichers.registry import get_cached_availability, get_enricher
 
 logger = logging.getLogger(__name__)
@@ -67,6 +67,20 @@ _APPLY_LOCKS: dict[tuple[str, str], asyncio.Lock] = {}
 
 def _apply_lock(case_id: str, source_id: str) -> asyncio.Lock:
     return _APPLY_LOCKS.setdefault((case_id, source_id), asyncio.Lock())
+
+
+def spawn_tracked_enrichment_task(coro: Any) -> asyncio.Task:
+    """Schedule ``coro`` and hold a strong reference until it finishes.
+
+    Centralizes the fire-and-forget bookkeeping shared by the auto-trigger
+    (``api/routers/cases.py``) and startup re-run scheduling: asyncio only
+    keeps a weak reference to a scheduled task, so without ``background_
+    enrichment_tasks`` the run could be garbage-collected mid-flight.
+    """
+    task = asyncio.create_task(coro)
+    background_enrichment_tasks.add(task)
+    task.add_done_callback(background_enrichment_tasks.discard)
+    return task
 
 
 def get_active_enricher_run(timeline_id: str, enricher_key: str) -> str | None:
@@ -113,6 +127,12 @@ def _process_batch(
         event_id = str(event["event_id"])
         attributes = event.get("attributes") or {}
         for attr_key, raw_value in attributes.items():
+            # Skip keys an enricher already derived (they carry the
+            # "<attr>:<field>" separator): re-running must not enrich prior
+            # output, which would grow second-generation keys unboundedly for
+            # any enricher whose output can match its own eligibility regex.
+            if FIELD_KEY_SEPARATOR in attr_key:
+                continue
             if not raw_value or not enricher.is_field_eligible(raw_value):
                 continue
             try:
@@ -201,9 +221,31 @@ async def _apply_staged_rows(store: PostgresStore, ch_store: ClickHouseStore, jo
             if not chunks:
                 continue
 
+            # Pass the enricher's output-field names so apply_enrichments can
+            # strip stale derived keys (values that no longer resolve) instead
+            # of leaving them behind. Unknown enricher -> no stripping.
+            enricher = get_enricher(enricher_key)
+            owned_suffixes = list(enricher.output_fields) if enricher is not None else []
             applied = await asyncio.to_thread(
-                ch_store.apply_enrichments, case_id, source_id, job_id, chunks
+                ch_store.apply_enrichments, case_id, source_id, job_id, chunks, owned_suffixes
             )
+            # Close the check-then-swap window: apply_enrichments rebuilds the
+            # partition from a pre-apply snapshot, so a source deleted *during*
+            # the rewrite (its DROP PARTITION already applied) would be
+            # resurrected by our REPLACE. Re-verify after the swap and, if the
+            # source is now gone, drop the partition we just re-materialized so
+            # no orphaned evidence survives. (A delete landing after this point
+            # runs its own DROP PARTITION and is unaffected.)
+            if await store.get_source(case_id, source_id) is None:
+                logger.warning(
+                    "Source %s deleted during enrichment apply (job %s); "
+                    "dropping resurrected partition",
+                    source_id,
+                    job_id,
+                )
+                await asyncio.to_thread(ch_store.delete_source_events, case_id, source_id)
+                await store.delete_staged_rows_for_source(job_id, source_id)
+                continue
             await store.record_source_enrichment(
                 case_id=case_id,
                 source_id=source_id,
@@ -263,6 +305,10 @@ async def run_enrichment_job(
     await store.start_enrichment_job_run(job_id, timeline_id, case_id, enricher_key)
     job_store.update(job_id, status="running", progress={"processed": 0, "total": 0})
 
+    # Defined before the try so the failure path can always report coverage,
+    # even if the very first step (config_hash / count) is what raised.
+    processed = 0
+    completed_sources = 0
     try:
         # Worker thread: the GeoIP fallback path may hash a multi-GB-adjacent
         # database file when no metadata sidecar exists yet.
@@ -273,7 +319,6 @@ async def run_enrichment_job(
         )
         job_store.update(job_id, progress={"processed": 0, "total": total})
 
-        processed = 0
         for source_id in source_ids:
             batches = ch_store.iter_source_events(case_id, source_id, batch_size)
             # Each next() runs one blocking ClickHouse query — keep it off the
@@ -295,6 +340,7 @@ async def run_enrichment_job(
 
                 processed += len(batch)
                 job_store.update(job_id, progress={"processed": processed, "total": total})
+            completed_sources += 1
 
         applied = await _apply_staged_rows(store, ch_store, job_id)
         await store.finish_enrichment_job_run(job_id)
@@ -310,8 +356,31 @@ async def run_enrichment_job(
             },
         )
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Enrichment job %s failed", job_id)
-        job_store.update(job_id, status="failed", error=str(exc))
+        # Coverage is partial: sources after completed_sources were never
+        # processed. Surface that explicitly (job error, result, audit) rather
+        # than silently marking "failed" — the marker is cleared below so this
+        # won't auto re-run, so an operator must re-trigger to finish coverage.
+        covered = completed_sources
+        remaining = max(len(source_ids) - covered, 0)
+        logger.exception(
+            "Enrichment job %s failed after covering %d/%d sources; %d source(s) left unenriched",
+            job_id,
+            covered,
+            len(source_ids),
+            remaining,
+        )
+        job_store.update(
+            job_id,
+            status="failed",
+            error=str(exc),
+            result={
+                "enricher_key": enricher_key,
+                "sources_covered": covered,
+                "sources_total": len(source_ids),
+                "sources_remaining": remaining,
+                "partial_coverage": remaining > 0,
+            },
+        )
         # The process is still alive, so clean up now instead of leaving the
         # marker for startup reconciliation: apply what was staged (those
         # results are valid — partial coverage, idempotent rewrite) and clear
@@ -321,6 +390,21 @@ async def run_enrichment_job(
         try:
             await _apply_staged_rows(store, ch_store, job_id)
             await store.finish_enrichment_job_run(job_id)
+            if remaining > 0:
+                await store.record_audit(
+                    action="enricher.partial",
+                    case_id=case_id,
+                    target_type="timeline",
+                    target_id=timeline_id,
+                    detail={
+                        "job_id": job_id,
+                        "enricher_key": enricher_key,
+                        "sources_covered": covered,
+                        "sources_total": len(source_ids),
+                        "sources_remaining": remaining,
+                        "error": str(exc),
+                    },
+                )
         except Exception:  # noqa: BLE001
             logger.exception(
                 "Post-failure cleanup for enrichment job %s failed; leaving marker for "
@@ -422,11 +506,23 @@ async def schedule_enrichment_reruns(
                 run.timeline_id,
             )
             continue
+        # Construct the ClickHouse client before claiming the run slot: a
+        # constructor failure (ClickHouse unreachable) after a claim would
+        # never be released and would wedge this (timeline, enricher) at 409.
+        try:
+            ch_store = ClickHouseStore()
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Could not construct ClickHouse client for enrichment re-run of timeline %s; "
+                "leaving it for the next restart",
+                run.timeline_id,
+            )
+            continue
         job = job_store.create(kind="enrich", progress={"processed": 0, "total": 0})
         if try_claim_enricher_run(run.timeline_id, run.enricher_key, job.id) is not None:
             job_store.update(job.id, status="failed", error="Enrichment already running")
             continue
-        task = asyncio.create_task(
+        spawn_tracked_enrichment_task(
             run_enrichment_job(
                 job_id=job.id,
                 case_id=run.case_id,
@@ -435,8 +531,6 @@ async def schedule_enrichment_reruns(
                 source_ids=source_ids,
                 job_store=job_store,
                 store=store,
-                ch_store=ClickHouseStore(),
+                ch_store=ch_store,
             )
         )
-        background_enrichment_tasks.add(task)
-        task.add_done_callback(background_enrichment_tasks.discard)

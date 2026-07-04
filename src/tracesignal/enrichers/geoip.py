@@ -10,7 +10,6 @@ source attribute key it came from.
 
 from __future__ import annotations
 
-import hashlib
 import ipaddress
 import json
 import logging
@@ -28,6 +27,7 @@ from tracesignal.enrichers.base import (
     AvailabilityResult,
     Enricher,
 )
+from tracesignal.ingestion.files import hash_file
 
 logger = logging.getLogger(__name__)
 
@@ -75,14 +75,6 @@ def read_geoip_sidecar(db_path: Path) -> dict[str, Any] | None:
         return json.loads(sidecar.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-
-
-def _hash_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as fh:
-        while chunk := fh.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 class GeoIPEnricher(Enricher):
@@ -205,7 +197,7 @@ class GeoIPEnricher(Enricher):
             with geoip2.database.Reader(str(self._db_path)) as reader:
                 reader_meta = reader.metadata()
                 meta = {
-                    "sha256": _hash_file(self._db_path),
+                    "sha256": hash_file(self._db_path),
                     "build_epoch": reader_meta.build_epoch,
                     "database_type": reader_meta.database_type,
                 }

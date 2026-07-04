@@ -73,17 +73,33 @@ function isPrivateIpv4(value: string): boolean {
   if (a === 192 && b === 168) return true;
   if (a === 127) return true; // loopback
   if (a === 169 && b === 254) return true; // link-local
+  if (a === 0) return true; // "this network" / unspecified 0.0.0.0/8
+  if (a >= 224) return true; // multicast 224/4, reserved 240/4, broadcast 255.255.255.255
   return false;
 }
 
 function isPrivateIpv6(value: string): boolean {
   const hextets = parseIpv6Hextets(value);
   if (hextets === null) return false;
+  // Unspecified :: (all zero).
+  if (hextets.every((h) => h === 0)) return true;
   // Loopback ::1 in any textual form (compressed or not).
   if (hextets.slice(0, 7).every((h) => h === 0) && hextets[7] === 1) return true;
+  // IPv4-mapped (::ffff:a.b.c.d) — classify by the embedded IPv4 so a mapped
+  // RFC1918/loopback address isn't reported as public. parseIpv6Hextets has
+  // already folded the dotted tail into hextets[6]/[7].
+  if (hextets.slice(0, 5).every((h) => h === 0) && hextets[5] === 0xffff) {
+    return isPrivateIpv4(embeddedIpv4(hextets));
+  }
   if ((hextets[0] & 0xfe00) === 0xfc00) return true; // unique local fc00::/7
   if ((hextets[0] & 0xffc0) === 0xfe80) return true; // link-local fe80::/10
+  if ((hextets[0] & 0xff00) === 0xff00) return true; // multicast ff00::/8
   return false;
+}
+
+/** Reconstruct the dotted IPv4 from the low two hextets of a v4-mapped address. */
+function embeddedIpv4(hextets: number[]): string {
+  return [hextets[6] >> 8, hextets[6] & 0xff, hextets[7] >> 8, hextets[7] & 0xff].join(".");
 }
 
 /** Whether an IP-shaped string is within a private/reserved range (RFC1918, loopback, link-local). */
