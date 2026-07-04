@@ -1,6 +1,17 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-04 (session 17 — final PR #54 cleanup batch, M16 bulk. Four commits on
+Last updated: 2026-07-05 (session 18 — Milestone 2 batch, PR 1/7: ingest throughput.
+`TS_INGEST_BATCH_SIZE` (default 20k) replaces the accidental reuse of
+`embedding_batch_size` (64) as the ClickHouse insert batch in `IngestionPipeline` —
+one HTTP insert per 20k rows instead of per 64, the dominant fix for the 100 GiB-over-LAN
+ingest goal. CLI `--batch-size` falls through to the setting; enricher read paging
+bumped to ≥1000; 413 upload rejection names `TS_MAX_UPLOAD_BYTES` and points at
+`tsig ingest` for huge files; deferred native-protocol/async_insert options recorded
+as ROADMAP M20. Remaining Milestone 2 PRs planned: M5 dependency diet, M17 job RBAC,
+CI container smoke test, M15 field-stats precompute, M16 staging redesign +
+ColumnPicker grouping.)
+
+Previous (session 17 — final PR #54 cleanup batch, M16 bulk. Four commits on
 `feat/enricher-subsystem`: **(1) micro-fixes** — GeoIP output-field names single-sourced
 (order locked, config_hash-stable), `refresh_availability(key)` single-enricher form,
 batched `count_events(source_ids=...)`, concurrent eligibility checks via `asyncio.gather`,
