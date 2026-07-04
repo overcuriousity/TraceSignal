@@ -75,6 +75,9 @@ export function EnrichersDialog({ caseId, timeline }: Props) {
   const runMutation = useMutation({
     mutationFn: (key: string) => enrichersApi.run(caseId, timeline.id, key),
     onSuccess: (res, key) => {
+      // Skipped run: every ready source already enriched at the current config
+      // (same enricher + data version), so no job started — nothing to track.
+      if (res.job_id === null) return;
       addJob(res.job_id, `${key} enrichment`, [
         ["events", caseId, timeline.id],
         ["fields", caseId, timeline.id],

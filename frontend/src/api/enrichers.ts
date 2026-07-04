@@ -58,10 +58,14 @@ export const enrichersApi = {
     put(`/cases/${caseId}/timelines/${timelineId}/enrichers/${key}`, body),
 
   run: (caseId: string, timelineId: string, key: string) =>
-    post<{ job_id: string; status: string; source_ids: string[] }>(
-      `/cases/${caseId}/timelines/${timelineId}/enrichers/${key}/run`,
-      {},
-    ),
+    post<{
+      // null when every ready source is already enriched at the current config
+      // (status "skipped") — no job is started.
+      job_id: string | null;
+      status: string;
+      source_ids: string[];
+      skipped_source_ids: string[];
+    }>(`/cases/${caseId}/timelines/${timelineId}/enrichers/${key}/run`, {}),
 
   adminConfigs: () =>
     get<{ enrichers: AdminEnricherConfig[] }>("/admin/enrichers/config").then(

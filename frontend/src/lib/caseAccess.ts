@@ -11,7 +11,7 @@ import type { Case, User } from "@/api/types";
  * per case), which is a bigger API-shape change than this cleanup pass. */
 export type CaseAccessLevel = "none" | "read" | "contribute" | "manage";
 
-export function resolveCaseAccess(case_: Case, user: User | null): CaseAccessLevel {
+function resolveCaseAccess(case_: Case, user: User | null): CaseAccessLevel {
   if (!user) return "none";
   if (user.is_admin) return "manage";
   if (case_.team_id) {
