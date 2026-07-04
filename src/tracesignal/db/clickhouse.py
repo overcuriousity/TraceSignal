@@ -515,4 +515,3 @@ class ClickHouseStore:
                 "Failed to drop events partition for source %s (case %s)", source_id, case_id
             )
             raise
-
