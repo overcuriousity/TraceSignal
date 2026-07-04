@@ -1,6 +1,16 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-04 (session 17 — final PR #54 cleanup batch, M16 bulk. Four commits on
+Last updated: 2026-07-05 (session 18 — Milestone 2 batch, PR 2/7: M5 dependency diet.
+Removed never-imported `torchvision`/`onnxruntime`/`jinja2`/`alembic`; `torch` +
+`sentence-transformers` moved to an optional `embeddings` extra
+(`uv sync --extra embeddings`) — base install drops ~2 GB. Sole ML import
+(`models/embeddings.py`) is now lazy inside `load()` with an actionable RuntimeError;
+new `embeddings_available()` (importability OR `TS_EMBEDDING_API_BASE_URL` — remote mode
+needs no torch) surfaces as `embeddings_available` on `/api/health` and gates embed-start
+and semantic-search with a request-time 503 instead of a job that dies on ImportError.
+Field-recommend already degraded gracefully. README quick-start/airgapped docs updated.)
+
+Previous (session 17 — final PR #54 cleanup batch, M16 bulk. Four commits on
 `feat/enricher-subsystem`: **(1) micro-fixes** — GeoIP output-field names single-sourced
 (order locked, config_hash-stable), `refresh_availability(key)` single-enricher form,
 batched `count_events(source_ids=...)`, concurrent eligibility checks via `asyncio.gather`,
