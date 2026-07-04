@@ -20,6 +20,15 @@ export interface TimelineEnricherInfo {
   enabled: boolean;
 }
 
+export interface EnricherAssetInfo {
+  name: string;
+  description: string;
+  accepted_extensions: string[];
+  uploaded: boolean;
+  size_bytes: number | null;
+  detail: Record<string, string | number | null>;
+}
+
 export interface AdminEnricherConfig {
   key: string;
   display_name: string;
@@ -27,16 +36,8 @@ export interface AdminEnricherConfig {
   available: boolean;
   reason: string | null;
   auto_run_default: boolean;
-}
-
-export interface GeoipDatabaseStatus {
-  uploaded: boolean;
-  size_bytes: number | null;
-  available: boolean;
-  reason: string | null;
-  sha256: string | null;
-  build_epoch: number | null;
-  database_type: string | null;
+  // Present when the enricher declares an uploadable data asset (asset_spec).
+  asset: EnricherAssetInfo | null;
 }
 
 export const enrichersApi = {
@@ -70,13 +71,11 @@ export const enrichersApi = {
   setAdminConfig: (key: string, body: { auto_run_default: boolean }) =>
     put(`/admin/enrichers/${key}/config`, body),
 
-  geoipStatus: () => get<GeoipDatabaseStatus>("/admin/enrichers/geoip/database"),
-
-  uploadGeoipDb: (file: File) => {
+  uploadAsset: (key: string, file: File) => {
     const form = new FormData();
     form.append("file", file);
     return postForm<{ available: boolean; reason: string | null }>(
-      "/admin/enrichers/geoip/database",
+      `/admin/enrichers/${key}/asset`,
       form,
     );
   },

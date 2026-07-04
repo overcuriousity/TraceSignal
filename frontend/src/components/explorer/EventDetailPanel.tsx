@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/Input";
 import { Spinner } from "@/components/ui/Spinner";
 import { fmtTimestampFull, fmtRelative } from "@/lib/time";
 import { truncateHash } from "@/lib/format";
-import { geoipFlagForAttribute } from "@/lib/countryFlag";
+import { getAttributeDecoration } from "@/lib/enrichment";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { useAnnotationMutations } from "@/hooks/useAnnotationMutations";
 import { useUiStore } from "@/stores/ui";
@@ -512,7 +512,7 @@ export function EventDetailPanel({
                 filterKey={k}
                 onAddFilter={onAddFilter}
                 onShowHistogram={onShowFieldHistogram}
-                flag={geoipFlagForAttribute(event.attributes ?? {}, k)}
+                flag={getAttributeDecoration(event.attributes ?? {}, k)}
               />
             ))}
           </div>

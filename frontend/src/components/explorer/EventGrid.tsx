@@ -32,7 +32,7 @@ import { useAnnotationMutations } from "@/hooks/useAnnotationMutations";
 import { RETIRED_COLUMN_IDS, useUiStore } from "@/stores/ui";
 import { cn } from "@/lib/cn";
 import { isIpAddress, isPrivateIp } from "@/lib/privateIp";
-import { geoipFlagForAttribute } from "@/lib/countryFlag";
+import { getAttributeDecoration, hasEnrichmentSiblings } from "@/lib/enrichment";
 
 // Keep in sync with --grid-row-height in index.css.
 const ROW_HEIGHT_BY_DENSITY = { comfortable: 42, compact: 34 } as const;
@@ -565,16 +565,21 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
           maxSize: 600,
           cell: ({ row }) => {
             const value = row.original.attributes[colId];
-            const showIpBadge = value != null && isIpAddress(value);
-            const geo = showIpBadge
-              ? geoipFlagForAttribute(row.original.attributes, colId)
-              : null;
+            // Data-driven gating: flag and badge render only when an enricher
+            // actually produced sibling keys for this attribute on this row —
+            // "badge" means "this value was enriched", not "this looks like an
+            // IP". Rows with no enrichment output (notably private IPs, which
+            // GeoIP yields nothing for) show neither.
+            const enriched =
+              value != null && hasEnrichmentSiblings(row.original.attributes, colId);
+            const deco = enriched ? getAttributeDecoration(row.original.attributes, colId) : null;
+            const showIpBadge = enriched && value != null && isIpAddress(value);
             return (
               <span className="flex items-center gap-1.5 font-mono text-sm leading-snug truncate text-[var(--color-fg-secondary)]">
                 <span className="truncate">{value ?? "—"}</span>
-                {geo && (
-                  <span className="shrink-0" title={geo.label}>
-                    {geo.flag}
+                {deco && (
+                  <span className="shrink-0" title={deco.label}>
+                    {deco.flag}
                   </span>
                 )}
                 {showIpBadge && (

@@ -1,7 +1,7 @@
 import { useRef } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { UploadCloud } from "lucide-react";
-import { enrichersApi } from "@/api/enrichers";
+import { enrichersApi, type AdminEnricherConfig } from "@/api/enrichers";
 import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
 import { Spinner } from "@/components/ui/Spinner";
@@ -13,91 +13,75 @@ function fmtBytes(bytes: number | null): string {
   return mb >= 1 ? `${mb.toFixed(1)} MB` : `${(bytes / 1024).toFixed(1)} KB`;
 }
 
-export function AdminEnrichersPage() {
+function EnricherCard({ config }: { config: AdminEnricherConfig }) {
   const qc = useQueryClient();
   const fileInput = useRef<HTMLInputElement>(null);
 
-  const { data: status, isLoading } = useQuery({
-    queryKey: ["admin", "enrichers", "geoip", "status"],
-    queryFn: () => enrichersApi.geoipStatus(),
-  });
-
-  const { data: configs } = useQuery({
-    queryKey: ["admin", "enrichers", "config"],
-    queryFn: () => enrichersApi.adminConfigs(),
-  });
-  const geoipConfig = configs?.find((c) => c.key === "geoip");
+  const invalidate = () => {
+    qc.invalidateQueries({ queryKey: ["admin", "enrichers", "config"] });
+    qc.invalidateQueries({ queryKey: ["enrichers"] });
+  };
 
   const autoRunMutation = useMutation({
     mutationFn: (autoRunDefault: boolean) =>
-      enrichersApi.setAdminConfig("geoip", { auto_run_default: autoRunDefault }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["admin", "enrichers", "config"] });
-    },
+      enrichersApi.setAdminConfig(config.key, { auto_run_default: autoRunDefault }),
+    onSuccess: invalidate,
   });
 
   const uploadMutation = useMutation({
-    mutationFn: (file: File) => enrichersApi.uploadGeoipDb(file),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["admin", "enrichers", "geoip", "status"] });
-      qc.invalidateQueries({ queryKey: ["enrichers"] });
-    },
+    mutationFn: (file: File) => enrichersApi.uploadAsset(config.key, file),
+    onSuccess: invalidate,
   });
 
+  const asset = config.asset;
+
   return (
-    <div className="space-y-4">
-      <h2 className="text-sm font-semibold text-[var(--color-fg-primary)]">Enrichers</h2>
-
-      <div className="rounded-lg border border-[var(--color-border)] p-4 space-y-3">
-        <div className="flex items-center justify-between gap-3">
-          <div>
-            <p className="text-sm font-medium text-[var(--color-fg-primary)]">
-              GeoIP (MaxMind GeoLite2)
-            </p>
-            <p className="text-xs text-[var(--color-fg-muted)]">
-              Resolves IP address fields to country/city. Requires an uploaded GeoLite2 City
-              database (.mmdb).
-            </p>
-          </div>
-          {isLoading ? (
-            <Spinner size={16} />
-          ) : (
-            <Badge variant={status?.available ? "accent" : "muted"}>
-              {status?.available ? "Available" : "Unavailable"}
-            </Badge>
-          )}
-        </div>
-
-        {status && !status.available && status.reason && (
-          <p className="text-xs text-[var(--color-warning)]">{status.reason}</p>
-        )}
-
-        <div className="flex items-center gap-3 text-xs text-[var(--color-fg-muted)]">
-          <span>{status?.uploaded ? `Database uploaded (${fmtBytes(status.size_bytes)})` : "No database uploaded"}</span>
-        </div>
-
-        <div className="flex items-center justify-between gap-3 rounded border border-[var(--color-border-subtle)] px-3 py-2">
-          <div>
-            <p className="text-xs font-medium text-[var(--color-fg-primary)]">
-              Run automatically on new ingests
-            </p>
-            <p className="text-xs text-[var(--color-fg-muted)]">
-              Instance-wide default. Applies to every timeline without its own enricher
-              configuration; per-timeline settings override this.
-            </p>
-          </div>
-          <Switch
-            checked={geoipConfig?.auto_run_default ?? false}
-            disabled={autoRunMutation.isPending || !geoipConfig}
-            onCheckedChange={(v) => autoRunMutation.mutate(v)}
-          />
-        </div>
-
+    <div className="rounded-lg border border-[var(--color-border)] p-4 space-y-3">
+      <div className="flex items-center justify-between gap-3">
         <div>
+          <p className="text-sm font-medium text-[var(--color-fg-primary)]">
+            {config.display_name}
+          </p>
+          <p className="text-xs text-[var(--color-fg-muted)]">{config.description}</p>
+        </div>
+        <Badge variant={config.available ? "accent" : "muted"}>
+          {config.available ? "Available" : "Unavailable"}
+        </Badge>
+      </div>
+
+      {!config.available && config.reason && (
+        <p className="text-xs text-[var(--color-warning)]">{config.reason}</p>
+      )}
+
+      <div className="flex items-center justify-between gap-3 rounded border border-[var(--color-border-subtle)] px-3 py-2">
+        <div>
+          <p className="text-xs font-medium text-[var(--color-fg-primary)]">
+            Run automatically on new ingests
+          </p>
+          <p className="text-xs text-[var(--color-fg-muted)]">
+            Instance-wide default. Applies to every timeline without its own enricher
+            configuration; per-timeline settings override this.
+          </p>
+        </div>
+        <Switch
+          checked={config.auto_run_default}
+          disabled={autoRunMutation.isPending}
+          onCheckedChange={(v) => autoRunMutation.mutate(v)}
+        />
+      </div>
+
+      {asset && (
+        <div className="space-y-2">
+          <div className="text-xs text-[var(--color-fg-muted)]">
+            <span className="font-medium text-[var(--color-fg-primary)]">{asset.name}</span>
+            {" — "}
+            {asset.uploaded ? `uploaded (${fmtBytes(asset.size_bytes)})` : "not uploaded"}
+          </div>
+          <p className="text-xs text-[var(--color-fg-muted)]">{asset.description}</p>
           <input
             ref={fileInput}
             type="file"
-            accept=".mmdb"
+            accept={asset.accepted_extensions.join(",")}
             className="hidden"
             onChange={(e) => {
               const file = e.target.files?.[0];
@@ -114,9 +98,9 @@ export function AdminEnrichersPage() {
             <UploadCloud size={14} className="mr-1.5" />
             {uploadMutation.isPending
               ? "Uploading…"
-              : status?.uploaded
-                ? "Replace database"
-                : "Upload database"}
+              : asset.uploaded
+                ? `Replace ${asset.name}`
+                : `Upload ${asset.name}`}
           </Button>
           {uploadMutation.isError && (
             <p className="mt-2 text-xs text-[var(--color-danger)]">
@@ -124,7 +108,25 @@ export function AdminEnrichersPage() {
             </p>
           )}
         </div>
-      </div>
+      )}
+    </div>
+  );
+}
+
+export function AdminEnrichersPage() {
+  const { data: configs, isLoading } = useQuery({
+    queryKey: ["admin", "enrichers", "config"],
+    queryFn: () => enrichersApi.adminConfigs(),
+  });
+
+  return (
+    <div className="space-y-4">
+      <h2 className="text-sm font-semibold text-[var(--color-fg-primary)]">Enrichers</h2>
+      {isLoading && <Spinner size={16} />}
+      {configs?.map((config) => <EnricherCard key={config.key} config={config} />)}
+      {configs && configs.length === 0 && (
+        <p className="text-xs text-[var(--color-fg-muted)]">No enrichers registered.</p>
+      )}
     </div>
   );
 }

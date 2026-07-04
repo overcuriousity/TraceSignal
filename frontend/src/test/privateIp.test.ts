@@ -42,7 +42,30 @@ describe("isPrivateIp", () => {
     expect(isPrivateIp("fd00::1")).toBe(true);
     expect(isPrivateIp("fe80::1")).toBe(true);
   });
+  it("handles non-canonical IPv6 forms", () => {
+    expect(isPrivateIp("0:0:0:0:0:0:0:1")).toBe(true); // uncompressed loopback
+    expect(isPrivateIp("fe80::1%eth0")).toBe(true); // zone-suffixed link-local
+    expect(isPrivateIp("FEBF::1")).toBe(true); // upper edge of fe80::/10
+    expect(isPrivateIp("FC00::1")).toBe(true); // unique local, uppercase
+  });
   it("does not flag public IPv6 addresses", () => {
     expect(isPrivateIp("2001:4860:4860::8888")).toBe(false);
+    expect(isPrivateIp("fec0::1")).toBe(false); // site-local is outside fe80::/10
+    expect(isPrivateIp("fe00::1")).toBe(false);
+    expect(isPrivateIp("2001:db8::1")).toBe(false);
+  });
+});
+
+describe("isIpAddress IPv6 parsing", () => {
+  it("accepts valid forms including embedded IPv4 and zones", () => {
+    expect(isIpAddress("::ffff:192.168.0.1")).toBe(true);
+    expect(isIpAddress("fe80::1%eth0")).toBe(true);
+    expect(isIpAddress("0:0:0:0:0:0:0:1")).toBe(true);
+  });
+  it("rejects malformed IPv6", () => {
+    expect(isIpAddress(":::")).toBe(false);
+    expect(isIpAddress("12345::")).toBe(false);
+    expect(isIpAddress("1:2:3:4:5:6:7:8:9")).toBe(false);
+    expect(isIpAddress("1:2:3:4:5:6:7")).toBe(false); // 7 groups, no ::
   });
 });
