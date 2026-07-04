@@ -21,7 +21,27 @@ Read `docs/CONCEPT.md` and `docs/MODEL_REFINEMENT.md` before touching the data m
 stack were both TBD in that doc but have since been decided and implemented — session-cookie
 auth with optional OIDC, case-RBAC, teams, and an audit trail (see `api/routers/auth.py`,
 `admin.py`, `deps.py`) and React 19 + Vite (see `frontend/`).
-there are multiple plans and roadmaps, which should be consulted, kept up to date and removed when done.
+
+### `docs/` map
+
+- `CONCEPT.md` / `MODEL_REFINEMENT.md` — product vision and the Case/Source/Timeline/Event/
+  Artifact data model. Read before touching the model; rarely changes.
+- `TECH_STACK.md` — backing-service decision record (*why*, not *what's shipped*).
+- `ANOMALY_DETECTION.md` — reference for every detector actually running (value novelty,
+  frequency, semantic similarity). Update alongside any detector change in the same commit.
+- `ROADMAP.md` — **the only open backlog.** Condensed, checkbox-per-item, current phase only.
+  Keep it up to date as items land; delete items once fixed rather than marking them done and
+  leaving them.
+- `PROGRESS.md` — append-only chronological session log ("what changed and why"), newest entry
+  on top. Not a plan — don't add TODOs here, that's `ROADMAP.md`'s job.
+- `archive/` — completed roadmap phases (`ROADMAP_PHASEN.md`) and point-in-time PR review
+  findings (`PR{N}_REVIEW_FINDINGS.md`, one file per reviewed PR, full unrestricted finding
+  set). Write a new `PR{N}_REVIEW_FINDINGS.md` when a review surfaces more than can fit as a
+  couple of `ROADMAP.md` lines; `ROADMAP.md` should then hold only condensed items that point
+  back into it, not the full text.
+
+Don't let ad hoc plans/reviews/audit dumps accumulate as their own top-level `docs/*.md` files
+or as bloated sections inside `ROADMAP.md` — triage into the structure above instead.
 
 ## Commands
 
