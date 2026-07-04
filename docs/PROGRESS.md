@@ -1,6 +1,29 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-04 (session 15, continued — enrichment persisted into
+Last updated: 2026-07-04 (session 16 — roadmap hardening batch M1–M4, M7, M8, shipped on
+the enricher PR branch. **M1**: evidence-mutation failures now surface — `delete_source_events`
+re-raises (only a missing `events` table stays a benign no-op), `delete_timeline_events`
+aggregates per-source failures, DELETE source/case endpoints fail closed with 502 +
+`source.delete_failed`/`case.delete_failed` audit rows and keep the Postgres row (the
+authoritative evidence record) so the delete stays visible and retryable; ingest rollback is
+still best-effort but logs each failed step and flags `cleanup incomplete` on the job error.
+**M2**: one SQL escaping regime — `count_events` on `{name:String}` binds (numbered params
+for the IN-list, empty list short-circuits), partition expressions built via a shared
+validated `_partition_expr` (fail-closed charset guard mirroring `generate_id`'s contract,
+Unicode `isalnum` + `-`/`_`). **M3**: in-memory exponential login backoff per
+(username, client IP) — 429 + `Retry-After` after `TS_LOGIN_BACKOFF_THRESHOLD` (5) failures,
+`base*2^(n-threshold)` capped at `TS_LOGIN_BACKOFF_MAX_SECONDS`; identical behavior for
+unknown user vs. wrong password (no existence leak, tested); `auth.login_rate_limited`
+audit action. **M4**: compose publishes Postgres/ClickHouse/Qdrant on `127.0.0.1` only
+(loopback binds instead of the roadmap's internal-network+override idea — the native
+`uv run tsig-web` dev workflow depends on localhost ports); README compose section un-staled
+(app service is opt-in/commented). **M7**: JobStore caps retained terminal jobs at 200,
+evicting oldest-finished first, never queued/running; mutations now behind a real lock.
+**M8**: dead `secret_key` setting deleted everywhere. Roadmap also gained M17–M19 (PR #7
+follow-ups rescued from the archive: job authz via case RBAC, `access_level` from the case
+API, SSE invalidation misses histogram/anomaly panels). 438 tests passing.)
+
+Previous (session 15, continued — enrichment persisted into
 `events.attributes` (user decision: the ClickHouse events table is a normalized derivative
 of the hashed, immutable source files, so dataset mutation is the better design): the
 separate `event_enrichments` table, its read-time `_hydrate_enrichments` join, and the

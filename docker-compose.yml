@@ -1,7 +1,12 @@
-# Reference deployment for TraceSignal: backing services plus the app itself.
-# TraceSignal is a native Python/uv app and runs fine directly on the host (see README
-# "Quick start") — the `app` service here is for operators who prefer one `docker compose up`
-# to bring up everything, including building the app image from the local checkout.
+# Reference deployment for the TraceSignal backing services (Postgres, ClickHouse, Qdrant).
+# TraceSignal itself is a native Python/uv app and runs directly on the host (see README
+# "Quick start"); uncomment the `app` service below for a containerized all-in-one instead.
+#
+# All published ports are bound to 127.0.0.1 on purpose: these services run with default or
+# no credentials, so exposing them beyond loopback would let anyone with network reach bypass
+# the app-layer RBAC entirely. To expose a service on the LAN, change its bind address AND
+# set real credentials (e.g. the commented QDRANT__SERVICE__API_KEY below, a real
+# POSTGRES_PASSWORD, and a ClickHouse user/password).
 
 services:
   postgres:
@@ -11,7 +16,7 @@ services:
       POSTGRES_PASSWORD: tracesignal
       POSTGRES_DB: tracesignal
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -23,8 +28,8 @@ services:
   clickhouse:
     image: docker.io/clickhouse/clickhouse-server:24-alpine
     ports:
-      - "8123:8123"
-      - "9000:9000"
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9000:9000"
     volumes:
       - clickhouse_data:/var/lib/clickhouse
     healthcheck:
@@ -36,7 +41,7 @@ services:
   qdrant:
     image: docker.io/qdrant/qdrant:v1.18.2
     ports:
-      - "6333:6333"
+      - "127.0.0.1:6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
     # Uncomment to require an API key (must match TS_QDRANT_API_KEY on `app`):
@@ -60,13 +65,13 @@ services:
 #      TS_CLICKHOUSE_URL: http://clickhouse:8123
 #      TS_CLICKHOUSE_DATABASE: tracesignal
 #      TS_QDRANT_URL: http://qdrant:6333
-      # TS_QDRANT_API_KEY: change-me
- #     TS_ALLOW_ONLINE: "false"
- #   depends_on:
- #     postgres:
+#      # TS_QDRANT_API_KEY: change-me
+#      TS_ALLOW_ONLINE: "false"
+#    depends_on:
+#      postgres:
 #        condition: service_healthy
 #      clickhouse:
- #       condition: service_healthy
+#        condition: service_healthy
 #      qdrant:
 #        condition: service_healthy
 
@@ -74,5 +79,3 @@ volumes:
   postgres_data:
   clickhouse_data:
   qdrant_data:
-
-

@@ -28,10 +28,6 @@ resolved — this file holds only the condensed, still-open action items.
 
 ## Milestone 1 — correctness & forensic integrity (Medium severity)
 
-- [ ] **M4 — Compose network hygiene.** Reference `docker-compose.yml` publishes Postgres
-  (default creds), ClickHouse (default user, no password) and Qdrant (no auth) to the host —
-  app-layer RBAC is bypassable by anyone with network reach. Keep backing services on the
-  compose-internal network by default; document a dev override file that exposes them.
 
 ## Milestone 2 — high-leverage improvements
 
