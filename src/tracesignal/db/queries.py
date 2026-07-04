@@ -777,6 +777,10 @@ class EventQueryService:
         hidden from ``attributes`` and replaced by their canonical names;
         ``mapped`` carries the merge provenance so the UI can render
         ``ip_address ← src_ip, ip_addr``.
+
+        ``attributes`` is returned sorted — deliberate, so the ColumnPicker
+        (and any other consumer) gets deterministic ordering regardless of
+        ClickHouse aggregation order.
         """
         self.store.init_schema()
         database = self.store.database

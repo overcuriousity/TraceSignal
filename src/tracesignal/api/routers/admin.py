@@ -418,7 +418,7 @@ async def get_geoip_database_status(admin: User = Depends(require_admin)) -> dic
     size_bytes = await asyncio.to_thread(lambda: path.stat().st_size) if exists else None
     sidecar = await asyncio.to_thread(read_geoip_sidecar, path) if exists else None
     availability = get_cached_availability("geoip") or (
-        await asyncio.to_thread(refresh_availability)
+        await asyncio.to_thread(refresh_availability, "geoip")
     ).get("geoip")
     return {
         "uploaded": exists,

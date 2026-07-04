@@ -50,7 +50,9 @@ _ACTIVE_RUNS: dict[tuple[str, str], str] = {}
 # Strong references to fire-and-forget enrichment tasks so asyncio doesn't
 # garbage-collect them mid-run (asyncio only holds a weak reference once
 # scheduled). Shared by the auto-trigger (api/routers/cases.py) and startup
-# re-run scheduling below.
+# re-run scheduling below. create_task + this set (rather than FastAPI
+# BackgroundTasks) is deliberate: both callers run in job/startup context
+# with no live request, where BackgroundTasks is structurally unavailable.
 background_enrichment_tasks: set[asyncio.Task] = set()
 
 # Serializes partition rewrites per (case_id, source_id). Mandatory, not an
@@ -268,11 +270,9 @@ async def run_enrichment_job(
         # database file when no metadata sidecar exists yet.
         config_hash = await asyncio.to_thread(enricher.config_hash)
 
-        total = 0
-        for source_id in source_ids:
-            total += await asyncio.to_thread(
-                ch_store.count_events, case_id=case_id, source_id=source_id
-            )
+        total = await asyncio.to_thread(
+            ch_store.count_events, case_id=case_id, source_ids=source_ids
+        )
         job_store.update(job_id, progress={"processed": 0, "total": total})
 
         processed = 0
@@ -350,9 +350,12 @@ async def reconcile_orphaned_enrichment_jobs(
 ) -> list[EnrichmentJobRun]:
     """Recover enrichment jobs left running by a mid-run process restart.
 
-    Mirrors the orphaned-ingest cleanup in ``api/main.py``: the in-memory
-    JobStore is empty on a fresh boot, so any ``EnrichmentJobRun`` marker
-    still present means the process died mid-run. Staged rows are valid,
+    Mirrors the *shape* of the orphaned-ingest cleanup in ``api/main.py`` but
+    deliberately not its code: ingest recovery rolls partial data back
+    (delete), this recovers forward (apply + reschedule) — a shared helper
+    would need mode flags that obscure both. The in-memory JobStore is empty
+    on a fresh boot, so any ``EnrichmentJobRun`` marker still present means
+    the process died mid-run. Staged rows are valid,
     complete results — they are applied to ``events.attributes`` here rather
     than discarded, then the marker is cleared. Returns the recovered runs so
     the caller can schedule fresh re-runs (``schedule_enrichment_reruns``) to

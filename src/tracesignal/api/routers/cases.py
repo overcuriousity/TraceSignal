@@ -404,6 +404,8 @@ async def _trigger_automatic_enrichments(
         )
         # Keep a strong reference so the task isn't garbage-collected
         # mid-run (asyncio only holds a weak reference once scheduled).
+        # create_task (not FastAPI BackgroundTasks) is deliberate: this runs
+        # inside the background ingestion job, where no request scope exists.
         background_enrichment_tasks.add(task)
         task.add_done_callback(background_enrichment_tasks.discard)
 
@@ -1374,14 +1376,22 @@ async def list_timeline_enrichers(
     }
 
     clickhouse = ClickHouseStore()
-    result = []
-    for enricher in all_enrichers():
-        availability = get_cached_availability(enricher.key)
-        if availability is None or not availability.available:
-            continue
-        eligibility = await run_in_threadpool(
-            enricher.check_eligibility, clickhouse, case_id, ready_source_ids
+    available = [
+        enricher
+        for enricher in all_enrichers()
+        if (availability := get_cached_availability(enricher.key)) is not None
+        and availability.available
+    ]
+    # Each eligibility check is a ClickHouse scan; run them concurrently so
+    # dialog latency stays flat as more enrichers get registered.
+    eligibilities = await asyncio.gather(
+        *(
+            run_in_threadpool(enricher.check_eligibility, clickhouse, case_id, ready_source_ids)
+            for enricher in available
         )
+    )
+    result = []
+    for enricher, eligibility in zip(available, eligibilities, strict=True):
         config = configs.get(enricher.key)
         # Without an explicit per-timeline row, the admin-set instance
         # default decides whether this enricher auto-runs here.

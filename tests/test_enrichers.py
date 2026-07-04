@@ -74,6 +74,49 @@ def test_registry_lists_geoip_and_caches_availability(tmp_path, monkeypatch):
     assert registry.get_cached_availability("geoip").available is False
 
 
+def test_refresh_availability_single_key_only_touches_that_enricher(monkeypatch):
+    from tracesignal.enrichers import registry
+    from tracesignal.enrichers.base import Enricher
+
+    calls: list[str] = []
+
+    def _make_stub(stub_key):
+        class Stub(Enricher):
+            key = stub_key
+            display_name = "Stub"
+            description = ""
+            eligibility_regex = ".*"
+            output_fields = ("x",)
+
+            def check_availability(self):
+                calls.append(self.key)
+                return AvailabilityResult(True)
+
+            def enrich_value(self, raw_value):
+                return None
+
+        return Stub()
+
+    monkeypatch.setattr(
+        registry, "_REGISTRY", {"stub-a": _make_stub("stub-a"), "stub-b": _make_stub("stub-b")}
+    )
+    monkeypatch.setattr(registry, "_AVAILABILITY_CACHE", {})
+
+    result = registry.refresh_availability("stub-a")
+    assert list(result) == ["stub-a"]
+    assert calls == ["stub-a"]
+    assert registry.get_cached_availability("stub-a").available is True
+    assert registry.get_cached_availability("stub-b") is None
+
+    # Unknown key: no-op, empty result.
+    assert registry.refresh_availability("nope") == {}
+    assert calls == ["stub-a"]
+
+    # No key: full sweep.
+    assert set(registry.refresh_availability()) == {"stub-a", "stub-b"}
+    assert sorted(calls) == ["stub-a", "stub-a", "stub-b"]
+
+
 # ---------------------------------------------------------------------------
 # PostgresStore: timeline_enrichers config
 # ---------------------------------------------------------------------------
@@ -582,6 +625,62 @@ def test_geoip_config_extras_reads_and_writes_sidecar(tmp_path, monkeypatch):
     assert read_geoip_sidecar(db_path)["sha256"] == expected_sha
 
 
+def test_geoip_availability_uses_sidecar_without_opening_reader(tmp_path, monkeypatch):
+    import geoip2.database
+
+    from tracesignal.enrichers.geoip import write_geoip_sidecar
+
+    db_path = tmp_path / "GeoLite2-City.mmdb"
+    db_path.write_bytes(b"fake-mmdb-content")
+
+    def _boom(path):
+        raise AssertionError("Reader must not be opened when the sidecar has database_type")
+
+    monkeypatch.setattr(geoip2.database, "Reader", _boom)
+
+    # Sidecar with the right flavor: available, no Reader opened.
+    write_geoip_sidecar(db_path, {"sha256": "a", "database_type": "GeoLite2-City"})
+    assert GeoIPEnricher(db_path=db_path).check_availability() == AvailabilityResult(True)
+
+    # Sidecar with the wrong flavor: unavailable with the flavor message.
+    write_geoip_sidecar(db_path, {"sha256": "a", "database_type": "GeoLite2-Country"})
+    result = GeoIPEnricher(db_path=db_path).check_availability()
+    assert result.available is False
+    assert "Wrong database flavor" in result.reason
+
+    # No sidecar (pre-sidecar install): falls back to opening a Reader.
+    (tmp_path / "GeoLite2-City.mmdb.meta.json").unlink()
+
+    class _FakeMeta:
+        database_type = "GeoLite2-City"
+
+    class _FakeReader:
+        def __init__(self, path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def metadata(self):
+            return _FakeMeta()
+
+    monkeypatch.setattr(geoip2.database, "Reader", _FakeReader)
+    assert GeoIPEnricher(db_path=db_path).check_availability() == AvailabilityResult(True)
+
+
+def test_geoip_output_fields_contract_locked():
+    # Order is part of config_hash() — a reorder silently changes every
+    # enricher identity, so lock the exact tuple.
+    assert GeoIPEnricher(db_path=None).output_fields == (
+        "geo_country",
+        "geo_city",
+        "geo_country_code",
+    )
+
+
 def test_enrich_value_invalid_ip_returns_none_but_reader_errors_propagate(tmp_path):
     enricher = GeoIPEnricher(db_path=tmp_path / "whatever.mmdb")
     # Invalid input is a legitimate None — never touches the reader.
@@ -685,8 +784,8 @@ async def test_run_enrichment_job_stamps_config_hash_and_fails_loudly(store, mon
     await store.create_source("c1", "s1", "src", file_hash="b" * 64, size_bytes=1)
 
     class _FakeCH(_RecordingClickHouse):
-        def count_events(self, case_id, source_id):
-            return 1
+        def count_events(self, case_id, source_ids):
+            return len(source_ids)
 
         def list_events(self, case_id, source_id, limit, offset):
             if offset > 0:

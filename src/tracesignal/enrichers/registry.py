@@ -30,16 +30,24 @@ def get_enricher(key: str) -> Enricher | None:
     return _REGISTRY.get(key)
 
 
-def refresh_availability() -> dict[str, AvailabilityResult]:
-    """Recompute and cache ``check_availability()`` for every registered enricher.
+def refresh_availability(key: str | None = None) -> dict[str, AvailabilityResult]:
+    """Recompute and cache ``check_availability()`` for one enricher, or all.
 
-    Called at app startup and by any endpoint that changes an enricher's
-    runtime requirements (e.g. the GeoIP database upload endpoint), so
+    With ``key`` given, only that enricher is re-checked (an unknown key is a
+    no-op returning ``{}``); with ``key=None`` every registered enricher is
+    swept. Called at app startup and by any endpoint that changes an
+    enricher's runtime requirements (e.g. an asset upload), so
     ``get_cached_availability`` always reflects current state without every
     caller re-running a filesystem/DB check.
     """
-    for key, enricher in _REGISTRY.items():
+    if key is not None:
+        enricher = _REGISTRY.get(key)
+        if enricher is None:
+            return {}
         _AVAILABILITY_CACHE[key] = enricher.check_availability()
+        return {key: _AVAILABILITY_CACHE[key]}
+    for reg_key, enricher in _REGISTRY.items():
+        _AVAILABILITY_CACHE[reg_key] = enricher.check_availability()
     return dict(_AVAILABILITY_CACHE)
 
 

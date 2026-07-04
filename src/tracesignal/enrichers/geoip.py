@@ -27,9 +27,21 @@ from tracesignal.enrichers.base import AvailabilityResult, Enricher
 logger = logging.getLogger(__name__)
 
 # IPv4 only for v1; IPv6 support is a documented follow-up.
+#
+# This is the *eligibility pattern*, not a validator: it is pushed into
+# ClickHouse match() by check_eligibility and reused as the cheap per-value
+# gate in is_field_eligible, so it must stay a ClickHouse-compatible re2
+# regex. Correctness validation happens via stdlib ipaddress in enrich_value.
 IPV4_REGEX = (
     r"^(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])$"
 )
+
+# Single source for the output-field names: the `output_fields` contract tuple
+# and enrich_value's return-dict keys must always agree. Order is part of
+# config_hash() — never reorder.
+_FIELD_COUNTRY = "geo_country"
+_FIELD_CITY = "geo_city"
+_FIELD_COUNTRY_CODE = "geo_country_code"
 
 
 def geoip_database_path() -> Path:
@@ -78,7 +90,7 @@ class GeoIPEnricher(Enricher):
         "locally uploaded MaxMind GeoLite2 City database."
     )
     eligibility_regex = IPV4_REGEX
-    output_fields = ("geo_country", "geo_city", "geo_country_code")
+    output_fields = (_FIELD_COUNTRY, _FIELD_CITY, _FIELD_COUNTRY_CODE)
 
     def __init__(self, db_path: Path | None = None) -> None:
         self._db_path = db_path or geoip_database_path()
@@ -91,11 +103,19 @@ class GeoIPEnricher(Enricher):
     def check_availability(self) -> AvailabilityResult:
         if not self._db_path.exists():
             return AvailabilityResult(False, "GeoLite2 database not uploaded")
-        try:
-            with geoip2.database.Reader(str(self._db_path)) as reader:
-                database_type = reader.metadata().database_type
-        except Exception as exc:  # noqa: BLE001
-            return AvailabilityResult(False, f"Database unreadable: {exc}")
+        # Sidecar-first: the .meta.json is written atomically with the install
+        # (upload endpoint), so its database_type is trustworthy — no need to
+        # mmap the whole .mmdb just to read metadata. Opening a Reader is the
+        # fallback for pre-sidecar (hand-copied) installs only.
+        meta = read_geoip_sidecar(self._db_path)
+        if meta and meta.get("database_type"):
+            database_type = str(meta["database_type"])
+        else:
+            try:
+                with geoip2.database.Reader(str(self._db_path)) as reader:
+                    database_type = reader.metadata().database_type
+            except Exception as exc:  # noqa: BLE001
+                return AvailabilityResult(False, f"Database unreadable: {exc}")
         if "City" not in database_type:
             return AvailabilityResult(
                 False,
@@ -161,7 +181,7 @@ class GeoIPEnricher(Enricher):
         if not country and not city:
             return None
         return {
-            "geo_country": country,
-            "geo_city": city,
-            "geo_country_code": country_code,
+            _FIELD_COUNTRY: country,
+            _FIELD_CITY: city,
+            _FIELD_COUNTRY_CODE: country_code,
         }
