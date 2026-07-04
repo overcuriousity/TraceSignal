@@ -7,9 +7,12 @@ raw attribute keys from badly normalized sources into one canonical field::
 
 Keys are canonical field names; values are ordered lists of raw ``attributes``
 Map keys — order defines coalesce precedence when one event carries several of
-the raw keys. Mappings are pure timeline metadata applied at query time: the
-ingested events are never rewritten (forensic requirement), and the ``attr:``
-token prefix keeps addressing raw keys directly, bypassing any mapping.
+the raw keys. Mappings are pure timeline metadata applied at query time —
+they are per-timeline *views*, so rewriting shared source events for one
+timeline's mapping would be wrong (enrichers, whose output is source-scoped
+and derived, do amend ``events.attributes`` — see ``enrichers/jobs.py``).
+The ``attr:`` token prefix keeps addressing raw keys directly, bypassing any
+mapping.
 
 This module owns the three mapping concerns shared by the query layer
 (`queries.py`), the statistical detectors (`anomaly_stats.py`), and the API

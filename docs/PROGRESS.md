@@ -1,6 +1,50 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-03 (session 14, continued — source ingest-status lifecycle:
+Last updated: 2026-07-04 (session 15, continued — enrichment persisted into
+`events.attributes` (user decision: the ClickHouse events table is a normalized derivative
+of the hashed, immutable source files, so dataset mutation is the better design): the
+separate `event_enrichments` table, its read-time `_hydrate_enrichments` join, and the
+`list_fields` "enrichments" response key are gone — **destructive**: `init_schema` now
+`DROP TABLE IF EXISTS event_enrichments` (pre-release DBs deprecated; derived data,
+re-running the enricher regenerates it). New write path: results stage in Postgres as
+before, then one atomic per-source partition rewrite at job end
+(`ClickHouseStore.apply_enrichments`: scratch triples table → `mapUpdate` LEFT JOIN copy of
+the `(case_id, source_id)` partition → `REPLACE PARTITION`; idempotent, per-(case,source)
+apply lock, scratch tables swept at startup; smoke-tested against live CH 24 — counts
+stable, originals untouched, re-apply idempotent). Periodic flush +
+`enrichment_flush_batch_count` removed (apply-once). Per-row `enricher_config_hash`
+replaced by per-source Postgres provenance (`source_enrichments` upsert, audit
+`enricher.applied`). Derived-field naming contract now `<attr_key>:<output_field>`
+(`src_ip:geo_country`; GeoIP output fields renamed geo_country/geo_city/geo_country_code)
+— sorts beside its source column and is filterable/exportable/visible in every read path
+for free since it's a real attribute key. Frontend: `countryFlag.ts` reads the new sibling
+keys, dead "Enrichments" ColumnPicker group removed, `FieldsResponse.enrichments` dropped,
+EventDetailPanel long field labels now wrap (`break-all`) instead of overlapping values.
+Immutability language reframed across `clickhouse.py`/`enrichers/*`/`field_mappings.py`/
+`MODEL_REFINEMENT.md`: immutable = original evidence file + provenance hash columns, not
+the derived attributes map.)
+
+Previous (session 15 — enricher hardening, roadmap M9–M13 from the PR #54
+review: per-run enricher instances via `Enricher.spawn()` (registry singleton now
+metadata/availability-only; the shared-`_reader` close race is gone) with an in-memory
+`(timeline_id, enricher_key)` run guard — manual "Run now" returns 409 with the conflicting
+job id, auto-trigger skips with a log; GeoIP `enrich_value` validates input with stdlib
+`ipaddress` and only swallows `AddressNotFoundError` — reader failures now fail the job
+loudly (context note, no raw values) and a failed-but-alive job flushes+clears its own
+marker; `enricher_config_hash` populated end-to-end (new `Enricher.config_hash()` mirroring
+`ParserConfig`, GeoIP hashes db sha256+build_epoch from a `.meta.json` sidecar written at
+upload — the upload's `copy_and_hash` digest is now captured — with a hash-and-persist
+fallback for pre-sidecar installs; staging table gained the column via additive migration);
+upload validation rejects non-City `.mmdb` flavors with an actionable 400 and
+`check_availability` checks flavor too; startup reconciliation now *flushes* orphaned staged
+rows to ClickHouse (audit `enricher.job_recovered`) and auto-schedules a re-run over the
+timeline's current ready sources after availability refresh (argMax read-dedup makes the
+overlap safe; ClickHouse-down leaves marker+rows for the next restart);
+`EnrichersDialog.tsx` toggle/mode lost-update race fixed with the standard TanStack
+optimistic-update pattern (`onMutate` cache patch, rollback on error, invalidate only when
+last mutation settles))
+
+Previous (session 14, continued — source ingest-status lifecycle:
 `Source.status` (`ingesting`/`ready`, additive migration backfills `ready`); uploads create
 the row as `ingesting` and the background job flips it to `ready`; `_resolve_timeline_scope`
 (the single scope choke point) excludes non-ready sources so the explorer, histogram,

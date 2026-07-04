@@ -45,29 +45,6 @@ resolved — this file holds only the condensed, still-open action items.
   (default creds), ClickHouse (default user, no password) and Qdrant (no auth) to the host —
   app-layer RBAC is bypassable by anyone with network reach. Keep backing services on the
   compose-internal network by default; document a dev override file that exposes them.
-- [ ] **M9 — Enricher singleton race (PR #54).** `enrichers/registry.py` registers one shared
-  `GeoIPEnricher()` instance; `enrichers/jobs.py`'s `finally` unconditionally calls
-  `enricher.close()`. Concurrent runs of the same enricher (auto-trigger overlapping a manual
-  "Run now") race on the shared `_reader`, and the broad `except ValueError` in `enrich_value`
-  silently swallows the resulting failure as "no match" instead of surfacing it. Needs either
-  per-run instantiation or a lock, plus narrower exception handling. Also add dedup so two
-  runs for the same `(timeline_id, enricher_key)` can't overlap in the first place. Full
-  detail: `docs/archive/PR54_REVIEW_FINDINGS.md` #1, #2, #6.
-- [ ] **M10 — `enricher_config_hash` never populated (PR #54).** The `event_enrichments`
-  column exists specifically to distinguish which enricher config/database version produced a
-  row but is always written `""` — defeats forensic reproducibility once a GeoIP database is
-  ever replaced. Detail: `PR54_REVIEW_FINDINGS.md` #3.
-- [ ] **M11 — GeoIP database upload/replace gaps (PR #54).** Upload validation only checks the
-  `.mmdb` opens, not that it's City-flavored (a Country-only upload fails silently on first
-  real job run); replacing the database doesn't reset the shared reader, so an in-flight job
-  keeps resolving against the old file. Detail: `PR54_REVIEW_FINDINGS.md` #4, #5.
-- [ ] **M12 — `EnrichersDialog.tsx` lost-update race (PR #54).** Toggle and mode mutations
-  both close over stale enricher state; rapid interaction can silently revert a just-made
-  change before the refetch lands. Detail: `PR54_REVIEW_FINDINGS.md` #7.
-- [ ] **M13 — Orphan enrichment job reconciliation discards unflushed work silently (PR #54).**
-  A crash just before a flush interval loses that interval's computed rows with only a warning
-  log — no automatic re-run triggered, despite the docstring implying resumability. Detail:
-  `PR54_REVIEW_FINDINGS.md` #8.
 
 ## Milestone 2 — high-leverage improvements
 
@@ -99,27 +76,31 @@ resolved — this file holds only the condensed, still-open action items.
   dropdown scrolls instead of overflowing (`ui/Select.tsx`).
 - [ ] **M16 — Enricher subsystem cleanup pass (PR #54).** Lower-severity design/reuse/
   efficiency items to fold in when next touching this code — full detail and rationale in
-  `docs/archive/PR54_REVIEW_FINDINGS.md` #9–#34:
+  `docs/archive/PR54_REVIEW_FINDINGS.md` #9–#34. Resolved by the 2026-07-04
+  enrichment-into-attributes redesign: #14/#27 (hydration bolt-on + per-page query — gone,
+  enrichment lives in `events.attributes`), #22 (duplicated DROP PARTITION), #23 (duck-typed
+  `close()`), #29 (sequential field-key query — removed). Still open:
   - GeoIP is special-cased throughout the frontend/admin instead of the enricher abstraction
     being load-bearing (hardcoded admin card, hardcoded field-key prefixes in
     `countryFlag.ts`, GeoIP-only badge logic baked into the generic Explorer cell renderer,
-    asset-upload bolted onto the generic config endpoint pattern) — #9–#14.
-  - Reuse: hand-rolled IPv4 regex in both `geoip.py` and `privateIp.ts` instead of stdlib
-    `ipaddress`; manual `asyncio.create_task` + tracking set instead of `BackgroundTasks`;
-    pagination loop duplicated from `EmbeddingPipeline`; temp-file upload boilerplate
-    duplicated between `admin.py`/`cases.py`; orphan reconciliation duplicated from
-    `api/main.py`'s ingest cleanup — #15–#20.
-  - Simplification: unnecessary task-tracking set, duplicated `DROP PARTITION` statements,
-    duck-typed `close()` instead of a base-class no-op, `output_fields` duplicated as literal
-    dict keys, "effective config" computed twice with diverging logic, status endpoint
-    triggering a full availability sweep — #21–#26.
-  - Efficiency: unconditional `_hydrate_enrichments` query on every Explorer page load even
-    with no enrichers configured; sequential per-source `count_events` calls; sequential
-    (not concurrent) field-key and eligibility queries; `check_availability` mmaps the whole
-    database just to prove it's readable — #27–#31.
+    asset-upload bolted onto the generic config endpoint pattern) — #9–#13.
+  - Reuse: hand-rolled IPv4 regex in `privateIp.ts` (backend now uses stdlib `ipaddress` for
+    validation but the regex remains as the eligibility pattern); manual
+    `asyncio.create_task` + tracking set instead of `BackgroundTasks`; pagination loop
+    duplicated from `EmbeddingPipeline`; temp-file upload boilerplate duplicated between
+    `admin.py`/`cases.py`; orphan reconciliation duplicated from `api/main.py`'s ingest
+    cleanup — #15–#20.
+  - Simplification: `output_fields` duplicated as literal dict keys, "effective config"
+    computed twice with diverging logic, status endpoint triggering a full availability
+    sweep — #24–#26.
+  - Efficiency: sequential per-source `count_events` calls; sequential (not concurrent)
+    eligibility queries; `check_availability` opens the whole database just to prove it's
+    readable — #28, #30, #31.
   - Minor: `isPrivateIpv6` misses some valid representations; undocumented `sorted(keys)`
-    behavior change; `field_key` cardinality can balloon the ColumnPicker on wide datasets —
+    behavior change; derived-key cardinality can balloon the ColumnPicker on wide datasets —
     #32–#34.
+  - New (from the redesign): staging is one Postgres row per (event, attr, output_field) —
+    a row-per-event JSON-map format would shrink staging ~3x and simplify the apply join.
 
 ## Milestone 3 — polish
 

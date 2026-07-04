@@ -18,17 +18,18 @@ export function countryFlagEmoji(isoCode: string | null | undefined): string | n
 /**
  * Look up the GeoIP enrichment sibling fields for an event attribute and
  * return flag + tooltip label, or null when the attribute has no country
- * enrichment. Enrichment values are hydrated into `attributes` under
- * `enrich.<output_field>__<attr_key>` (see backend `_hydrate_enrichments`).
+ * enrichment. Enrichment lives directly in `attributes` under the derived-key
+ * contract `<attr_key>:<output_field>` (e.g. `src_ip:geo_country`), written
+ * by the backend enrichment job (see enrichers/jobs.py `_process_batch`).
  */
 export function geoipFlagForAttribute(
   attributes: Record<string, string | null | undefined>,
   attrKey: string,
 ): { flag: string; label: string } | null {
-  const flag = countryFlagEmoji(attributes[`enrich.geoip_country_code__${attrKey}`]);
+  const flag = countryFlagEmoji(attributes[`${attrKey}:geo_country_code`]);
   if (!flag) return null;
-  const country = attributes[`enrich.geoip_country__${attrKey}`] || "";
-  const city = attributes[`enrich.geoip_city__${attrKey}`] || "";
+  const country = attributes[`${attrKey}:geo_country`] || "";
+  const city = attributes[`${attrKey}:geo_city`] || "";
   const label = [city, country].filter(Boolean).join(", ") || "GeoIP match";
   return { flag, label };
 }

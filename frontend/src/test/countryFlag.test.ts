@@ -21,9 +21,9 @@ describe("countryFlagEmoji", () => {
 describe("geoipFlagForAttribute", () => {
   const attributes = {
     src_ip: "8.8.8.8",
-    "enrich.geoip_country_code__src_ip": "US",
-    "enrich.geoip_country__src_ip": "United States",
-    "enrich.geoip_city__src_ip": "Mountain View",
+    "src_ip:geo_country_code": "US",
+    "src_ip:geo_country": "United States",
+    "src_ip:geo_city": "Mountain View",
     dst_ip: "10.0.0.1",
   };
 
@@ -40,7 +40,7 @@ describe("geoipFlagForAttribute", () => {
 
   it("falls back to a generic label when only the code is present", () => {
     expect(
-      geoipFlagForAttribute({ "enrich.geoip_country_code__ip": "DE" }, "ip"),
+      geoipFlagForAttribute({ "ip:geo_country_code": "DE" }, "ip"),
     ).toEqual({ flag: "🇩🇪", label: "GeoIP match" });
   });
 });

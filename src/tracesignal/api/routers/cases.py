@@ -35,11 +35,6 @@ from tracesignal.ingestion.files import UploadTooLargeError, copy_and_hash
 from tracesignal.ingestion.parser import detect_format
 from tracesignal.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
 
-# Strong references for fire-and-forget automatic enrichment tasks (see
-# _trigger_automatic_enrichments) so asyncio doesn't garbage-collect them
-# mid-run; entries are removed once each task finishes.
-_background_enrichment_tasks: set[asyncio.Task] = set()
-
 
 class CaseCreate(BaseModel):
     """Payload to create a case."""
@@ -344,7 +339,12 @@ async def _trigger_automatic_enrichments(
     uploaded); the config still exists and will fire again on the next
     ingestion once availability is restored.
     """
-    from tracesignal.enrichers.jobs import run_enrichment_job
+    from tracesignal.enrichers.jobs import (
+        background_enrichment_tasks,
+        get_active_enricher_run,
+        run_enrichment_job,
+        try_claim_enricher_run,
+    )
     from tracesignal.enrichers.registry import get_cached_availability, get_enricher
 
     global_configs = await store.list_enricher_global_configs()
@@ -355,9 +355,22 @@ async def _trigger_automatic_enrichments(
         availability = get_cached_availability(enricher_key)
         if enricher is None or availability is None or not availability.available:
             continue
+        # Check before creating the job so a skip leaves no orphan pending
+        # job in the store; check + create + claim happen in the same event-
+        # loop tick, so there is no window for a competing claim.
+        active = get_active_enricher_run(timeline_id, enricher_key)
+        if active is not None:
+            logger.info(
+                "Enrichment %s already running for timeline %s (job %s); skipping auto-trigger",
+                enricher_key,
+                timeline_id,
+                active,
+            )
+            continue
         job = job_store.create(
             kind="enrich", progress={"processed": 0, "total": 0}, created_by=None
         )
+        try_claim_enricher_run(timeline_id, enricher_key, job.id)
         task = asyncio.create_task(
             run_enrichment_job(
                 job_id=job.id,
@@ -372,8 +385,8 @@ async def _trigger_automatic_enrichments(
         )
         # Keep a strong reference so the task isn't garbage-collected
         # mid-run (asyncio only holds a weak reference once scheduled).
-        _background_enrichment_tasks.add(task)
-        task.add_done_callback(_background_enrichment_tasks.discard)
+        background_enrichment_tasks.add(task)
+        task.add_done_callback(background_enrichment_tasks.discard)
 
 
 async def _run_ingestion_job(
@@ -1377,7 +1390,11 @@ async def run_timeline_enricher(
     user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
     """Manually trigger an enrichment run for a timeline's sources."""
-    from tracesignal.enrichers.jobs import run_enrichment_job
+    from tracesignal.enrichers.jobs import (
+        get_active_enricher_run,
+        run_enrichment_job,
+        try_claim_enricher_run,
+    )
     from tracesignal.enrichers.registry import get_cached_availability, get_enricher
 
     if get_enricher(enricher_key) is None:
@@ -1397,12 +1414,22 @@ async def run_timeline_enricher(
     if not source_ids:
         raise HTTPException(status_code=422, detail="Timeline has no ready sources to enrich")
 
+    active_job_id = get_active_enricher_run(timeline_id, enricher_key)
+    if active_job_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Enrichment already running (job {active_job_id})",
+        )
+
     job_store = get_job_store()
     job = job_store.create(
         kind="enrich",
         progress={"processed": 0, "total": 0},
         created_by=user.id,
     )
+    # Claim now (before the response) so a double-click is rejected with 409
+    # even though the job itself only starts after the response is sent.
+    try_claim_enricher_run(timeline_id, enricher_key, job.id)
     background_tasks.add_task(
         run_enrichment_job,
         job_id=job.id,

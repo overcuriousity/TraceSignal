@@ -34,6 +34,9 @@ export interface GeoipDatabaseStatus {
   size_bytes: number | null;
   available: boolean;
   reason: string | null;
+  sha256: string | null;
+  build_epoch: number | null;
+  database_type: string | null;
 }
 
 export const enrichersApi = {

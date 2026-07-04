@@ -81,7 +81,7 @@ function FieldRow({
 
   return (
     <div className="group flex items-start gap-1.5 py-1.5 border-b border-[var(--color-border-subtle)] hover:bg-[var(--color-bg-hover)] -mx-2 px-2 rounded-sm transition-base">
-      <span className="w-36 shrink-0 text-sm text-[var(--color-fg-secondary)] pt-0.5 select-none">
+      <span className="w-36 shrink-0 break-all text-sm text-[var(--color-fg-secondary)] pt-0.5 select-none">
         {label}
       </span>
       <span

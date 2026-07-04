@@ -484,10 +484,11 @@ export interface EventFilters {
 export interface FieldsResponse {
   /** Fixed top-level columns present on every event */
   top_level: string[];
-  /** Dynamic keys aggregated from the attributes Map */
+  /**
+   * Dynamic keys aggregated from the attributes Map, including
+   * enrichment-derived keys ("src_ip:geo_country") — all filterable.
+   */
   attributes: string[];
-  /** `enrich.<field_key>` columns hydrated at query time; not filterable */
-  enrichments: string[];
 }
 
 export interface HistogramBucket {

@@ -410,12 +410,13 @@ async def set_enricher_global_config(
 @router.get("/enrichers/geoip/database")
 async def get_geoip_database_status(admin: User = Depends(require_admin)) -> dict[str, Any]:
     """Return whether a GeoLite2 database is currently uploaded and its availability."""
-    from tracesignal.enrichers.geoip import geoip_database_path
+    from tracesignal.enrichers.geoip import geoip_database_path, read_geoip_sidecar
     from tracesignal.enrichers.registry import get_cached_availability, refresh_availability
 
     path = geoip_database_path()
     exists = await asyncio.to_thread(path.exists)
     size_bytes = await asyncio.to_thread(lambda: path.stat().st_size) if exists else None
+    sidecar = await asyncio.to_thread(read_geoip_sidecar, path) if exists else None
     availability = get_cached_availability("geoip") or (
         await asyncio.to_thread(refresh_availability)
     ).get("geoip")
@@ -424,6 +425,9 @@ async def get_geoip_database_status(admin: User = Depends(require_admin)) -> dic
         "size_bytes": size_bytes,
         "available": availability.available if availability else False,
         "reason": availability.reason if availability else None,
+        "sha256": sidecar.get("sha256") if sidecar else None,
+        "build_epoch": sidecar.get("build_epoch") if sidecar else None,
+        "database_type": sidecar.get("database_type") if sidecar else None,
     }
 
 
@@ -434,16 +438,28 @@ async def upload_geoip_database(
 ) -> dict[str, Any]:
     """Upload (or replace) the MaxMind GeoLite2 database used by the GeoIP enricher.
 
-    Validates the file opens as a real ``.mmdb`` before committing it, then
-    atomically replaces any previous database and re-evaluates enricher
+    Validates the file opens as a real ``.mmdb`` *and* is a City-flavored
+    database (``enrich_value`` calls ``.city()``, which a Country/ASN
+    database would blow up on mid-job), then atomically replaces any previous
+    database, records its identity in a metadata sidecar (hash + build epoch,
+    the inputs to ``GeoIPEnricher.config_hash()``), and re-evaluates enricher
     availability so ``GET /api/enrichers`` reflects the change immediately.
+
+    Replacing the database under a running system needs no reader
+    invalidation: each job run opens its own reader on a fresh enricher
+    instance (``Enricher.spawn()``), so new runs see the new file. A job
+    already in flight keeps its old open file handle (safe on Linux — the
+    inode lives until the handle closes) and its rows carry the *old*
+    database's config hash captured at job start, so provenance stays
+    accurate either way.
     """
     import shutil
     import tempfile
+    from datetime import UTC, datetime
 
     import geoip2.database
 
-    from tracesignal.enrichers.geoip import geoip_database_path
+    from tracesignal.enrichers.geoip import geoip_database_path, write_geoip_sidecar
     from tracesignal.enrichers.registry import refresh_availability
 
     store = get_store()
@@ -452,7 +468,7 @@ async def upload_geoip_database(
     tmp_path = Path(tmp.name)
     try:
         with tmp:
-            await asyncio.to_thread(
+            sha256, _size = await asyncio.to_thread(
                 copy_and_hash, file.file, tmp, chunk_size=1024 * 1024, max_bytes=max_bytes
             )
     except UploadTooLargeError as exc:
@@ -462,18 +478,45 @@ async def upload_geoip_database(
         tmp_path.unlink(missing_ok=True)
         raise
 
-    def _validate_and_install() -> None:
-        with geoip2.database.Reader(str(tmp_path)):
-            pass
+    class _WrongFlavorError(Exception):
+        def __init__(self, database_type: str) -> None:
+            super().__init__(database_type)
+            self.database_type = database_type
+
+    def _validate_and_install() -> dict[str, Any]:
+        with geoip2.database.Reader(str(tmp_path)) as reader:
+            meta = reader.metadata()
+            if "City" not in meta.database_type:
+                raise _WrongFlavorError(meta.database_type)
+            sidecar = {
+                "sha256": sha256,
+                "build_epoch": meta.build_epoch,
+                "database_type": meta.database_type,
+                "uploaded_at": datetime.now(UTC).isoformat(),
+            }
         target = geoip_database_path()
         target.parent.mkdir(parents=True, exist_ok=True)
         # tmp_path is under the system temp dir, which may be a different
         # filesystem than the target data dir — Path.replace() (os.rename)
         # fails cross-device, so use shutil.move (copy+unlink fallback).
         shutil.move(str(tmp_path), str(target))
+        # Sidecar must exist before refresh_availability() returns, so a job
+        # triggered right after this upload hashes against the new metadata.
+        write_geoip_sidecar(target, sidecar)
+        return sidecar
 
     try:
-        await asyncio.to_thread(_validate_and_install)
+        sidecar = await asyncio.to_thread(_validate_and_install)
+    except _WrongFlavorError as exc:
+        tmp_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Uploaded database is '{exc.database_type}', but the GeoIP enricher "
+                "requires a City database (e.g. GeoLite2-City.mmdb). Download the City "
+                "edition from MaxMind and upload that instead."
+            ),
+        ) from exc
     except Exception as exc:  # noqa: BLE001
         tmp_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=f"Invalid GeoLite2 database: {exc}") from exc
@@ -484,10 +527,18 @@ async def upload_geoip_database(
         actor=admin,
         target_type="enricher",
         target_id="geoip",
-        detail={"filename": file.filename},
+        detail={
+            "filename": file.filename,
+            "sha256": sha256,
+            "build_epoch": sidecar["build_epoch"],
+            "database_type": sidecar["database_type"],
+        },
     )
     availability = availability_map.get("geoip")
     return {
         "available": availability.available if availability else False,
         "reason": availability.reason if availability else None,
+        "sha256": sha256,
+        "build_epoch": sidecar["build_epoch"],
+        "database_type": sidecar["database_type"],
     }

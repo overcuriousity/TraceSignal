@@ -2,16 +2,22 @@
 
 An Enricher reads existing event attribute values, derives new information
 from ones matching its ``eligibility_regex``, and returns it as additional
-fields. Enrichers never mutate the immutable ``events`` table — results are
-staged in Postgres during a job run and bulk-flushed to the append-only
-ClickHouse ``event_enrichments`` table (see ``enrichers/jobs.py``).
+fields. Results are staged in Postgres during a job run and merged into the
+ClickHouse ``events.attributes`` map in one atomic per-source partition
+rewrite at job end (see ``enrichers/jobs.py``). Derived keys follow the
+``"<attr_key>:<output_field>"`` naming contract (e.g. ``src_ip:geo_country``).
+The original evidence files stay hashed and immutable; ``events`` is a
+normalized derivative and its provenance hash columns are never touched.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Any
 
 from tracesignal.db.clickhouse import ClickHouseStore
 
@@ -46,6 +52,53 @@ class Enricher(ABC):
     description: str
     eligibility_regex: str
     output_fields: tuple[str, ...]
+
+    def spawn(self) -> Enricher:
+        """Return a fresh instance for a single job run.
+
+        The registry holds one long-lived instance per enricher for metadata
+        and availability checks only; every job run must work on its own
+        instance (own file handles/resources) so concurrent runs of the same
+        enricher can't race on shared mutable state. Subclasses whose
+        ``__init__`` takes configuration must override this to carry it over.
+        """
+        return type(self)()
+
+    def close(self) -> None:  # noqa: B027 — deliberate no-op default, not abstract
+        """Release per-instance resources. No-op by default."""
+
+    def config_extras(self) -> dict[str, Any]:
+        """Enricher-specific inputs for ``config_hash()`` (e.g. data-file identity).
+
+        Override in subclasses whose output depends on more than the static
+        class attributes — the GeoIP enricher includes its database file's
+        hash and build metadata here so results from different database
+        versions are distinguishable.
+        """
+        return {}
+
+    def config_hash(self) -> str:
+        """Deterministic hash of everything that shapes this enricher's output.
+
+        Mirrors ``models/event.py``'s ``ParserConfig.config_hash`` /
+        ``EmbeddingConfig.config_hash``: canonical JSON, SHA-256. Stamped onto
+        staged result rows and recorded per source in Postgres
+        (``SourceEnrichment``) at apply time, so derived fields remain
+        attributable to the exact enricher configuration and data version
+        that produced them.
+        """
+        canonical = json.dumps(
+            {
+                "key": self.key,
+                "eligibility_regex": self.eligibility_regex,
+                "output_fields": list(self.output_fields),
+                "extras": self.config_extras(),
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     @abstractmethod
     def check_availability(self) -> AvailabilityResult:

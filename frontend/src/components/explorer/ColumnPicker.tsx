@@ -86,17 +86,15 @@ export function ColumnPicker({ caseId, timelineId }: Props) {
       label: TOP_LEVEL_LABELS[id] ?? id,
       group: "Standard",
     }));
+    // Enrichment-derived keys ("src_ip:geo_country") live in `attributes`
+    // like any other dynamic field — filterable and sortable beside their
+    // source attribute, no separate group needed.
     const attrs = (fields?.attributes ?? []).map((id) => ({
       id,
       label: id,
       group: "Dynamic fields",
     }));
-    const enrichments = (fields?.enrichments ?? []).map((id) => ({
-      id,
-      label: id,
-      group: "Enrichments",
-    }));
-    return [...top, ...attrs, ...enrichments];
+    return [...top, ...attrs];
   }, [fields]);
 
   const filtered = useMemo(() => {

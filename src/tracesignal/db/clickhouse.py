@@ -3,16 +3,25 @@
 The event table schema is optimised for forensic timeline analysis:
 * MergeTree ordered by (case_id, source_id, timestamp)
 * Projections or token bloom filters for full-text search
-* Immutable forensic provenance columns
+* Forensic provenance columns (``content_hash``/``file_hash``) computed from
+  the raw record/file bytes at ingest and never recomputed afterwards.
 
 Events are scoped by ``source_id`` (one ingested file) so that a Source can be
 shared across multiple Timelines without duplication. Timeline queries resolve
 member source IDs and use ``source_id IN (...)`` filtering.
+
+Immutability contract: the *original evidence files* are hashed and immutable;
+this table is a normalized derivative of them. Enrichers amend the
+``attributes`` map after ingest via an atomic per-source partition rewrite
+(``apply_enrichments``) — the provenance columns are never touched, so hash
+verification against the original file is unaffected.
 """
 
 from __future__ import annotations
 
 import contextlib
+import re
+from collections.abc import Iterable
 from datetime import UTC
 from typing import Any
 
@@ -100,32 +109,9 @@ PARTITION BY (case_id, source_id)
 SETTINGS index_granularity = 8192, allow_nullable_key = 1
 """.strip()
 
-_ENRICHMENT_COLUMNS = [
-    "event_id",
-    "case_id",
-    "source_id",
-    "enricher_key",
-    "field_key",
-    "value",
-    "computed_at",
-    "enricher_config_hash",
-]
-
-_EVENT_ENRICHMENTS_TABLE_DDL = """
-CREATE TABLE IF NOT EXISTS {database}.event_enrichments (
-    event_id UUID,
-    case_id LowCardinality(String),
-    source_id LowCardinality(String),
-    enricher_key LowCardinality(String),
-    field_key LowCardinality(String),
-    value String,
-    computed_at DateTime64(3),
-    enricher_config_hash String DEFAULT ''
-)
-ENGINE = MergeTree()
-ORDER BY (case_id, source_id, event_id, enricher_key, field_key)
-PARTITION BY (case_id, source_id)
-""".strip()
+# Prefix for the transient tables apply_enrichments works through; stale ones
+# (crash mid-apply) are swept at startup by drop_stale_enrichment_scratch_tables.
+_ENRICH_SCRATCH_PREFIX = "tmp_enrich_"
 
 
 class ClickHouseStore:
@@ -161,10 +147,14 @@ class ClickHouseStore:
         return int(parts[1]) if len(parts) > 1 else 8123
 
     def init_schema(self) -> None:
-        """Create the target database and events/event_enrichments tables if they do not exist."""
+        """Create the target database and events table if they do not exist."""
         self.client.command(f"CREATE DATABASE IF NOT EXISTS {self.database}")
         self.client.command(_EVENTS_TABLE_DDL.format(database=self.database))
-        self.client.command(_EVENT_ENRICHMENTS_TABLE_DDL.format(database=self.database))
+        # Enrichment output moved into events.attributes (apply_enrichments);
+        # the former side table is dead. Destructive, but pre-release
+        # databases are documented as deprecated and the data is derived —
+        # re-running the enricher regenerates it.
+        self.client.command(f"DROP TABLE IF EXISTS {self.database}.event_enrichments")
 
     def insert_events(self, events: list[Event]) -> int:
         """Insert a batch of events into ClickHouse.
@@ -187,26 +177,109 @@ class ClickHouseStore:
         )
         return response.written_rows
 
-    def bulk_insert_enrichments(self, rows: list[dict[str, Any]]) -> int:
-        """Bulk-insert enrichment result rows into the append-only ``event_enrichments`` table.
+    def apply_enrichments(
+        self,
+        case_id: str,
+        source_id: str,
+        scratch_suffix: str,
+        row_chunks: Iterable[list[tuple[str, str, str]]],
+    ) -> int:
+        """Merge enrichment key/value pairs into one source's ``events.attributes``.
 
-        Each row is one ``(event_id, enricher_key, field_key)`` -> value pair.
-        Never mutates the ``events`` table itself — enrichment output is
-        joined in at query time (see ``db/queries.py``).
+        Atomic per-source partition rewrite: the ``(event_id, field_key,
+        value)`` triples are inserted into a scratch rows table, an enriched
+        copy of the source's partition is built into a scratch events table
+        via ``mapUpdate`` over a LEFT JOIN, and the live partition is swapped
+        in one ``ALTER TABLE ... REPLACE PARTITION``. Idempotent — re-applying
+        the same rows overwrites the same map keys with the same values — so
+        a crashed apply can simply be re-run from the Postgres staging rows.
+
+        Transiently doubles the partition's disk footprint (scratch copy).
+        Caller must serialize applies per ``(case_id, source_id)`` — two
+        concurrent REPLACEs would silently discard one side's keys.
+
+        Returns the number of enrichment pairs applied.
         """
-        if not rows:
-            return 0
-        rows = [
-            {**row, "enricher_config_hash": row.get("enricher_config_hash", "")} for row in rows
-        ]
-        data = [[row[column] for column in _ENRICHMENT_COLUMNS] for row in rows]
-        response = self.client.insert(
-            table=f"{self.database}.event_enrichments",
-            data=data,
-            column_names=_ENRICHMENT_COLUMNS,
-            database=self.database,
+        # Suffix comes from the in-process job id (uuid4 hex); defensive
+        # strip anyway since it lands in DDL identifiers.
+        suffix = re.sub(r"[^a-zA-Z0-9_]", "", scratch_suffix)
+        rows_table = f"{self.database}.{_ENRICH_SCRATCH_PREFIX}rows_{suffix}"
+        events_table = f"{self.database}.{_ENRICH_SCRATCH_PREFIX}events_{suffix}"
+        # ALTER ... PARTITION expressions cannot be query-parameterized; IDs
+        # are server-generated (same style as delete_source_events).
+        partition_expr = f"tuple('{case_id}', '{source_id}')"
+        select_columns = ",\n            ".join(
+            "mapUpdate(e.attributes, m.enr) AS attributes"
+            if column == "attributes"
+            else f"e.{column}"
+            for column in _EVENT_COLUMNS
         )
-        return response.written_rows
+        try:
+            self.client.command(f"DROP TABLE IF EXISTS {rows_table}")
+            self.client.command(
+                f"CREATE TABLE {rows_table} "
+                "(event_id UUID, field_key String, value String) "
+                "ENGINE = MergeTree ORDER BY event_id"
+            )
+            applied = 0
+            for chunk in row_chunks:
+                if not chunk:
+                    continue
+                self.client.insert(
+                    table=rows_table,
+                    data=chunk,
+                    column_names=["event_id", "field_key", "value"],
+                )
+                applied += len(chunk)
+            if applied == 0:
+                return 0
+            self.client.command(f"DROP TABLE IF EXISTS {events_table}")
+            # AS clones the full DDL (engine, ORDER BY, PARTITION BY, skip
+            # indexes, settings) — required for REPLACE PARTITION.
+            self.client.command(f"CREATE TABLE {events_table} AS {self.database}.events")
+            self.client.query(
+                f"""
+                INSERT INTO {events_table} ({", ".join(_EVENT_COLUMNS)})
+                SELECT
+                    {select_columns}
+                FROM {self.database}.events AS e
+                LEFT JOIN (
+                    SELECT
+                        event_id,
+                        CAST(
+                            (groupArray(field_key), groupArray(value)),
+                            'Map(String, String)'
+                        ) AS enr
+                    FROM {rows_table}
+                    GROUP BY event_id
+                ) AS m ON e.event_id = m.event_id
+                WHERE e.case_id = {{case_id:String}} AND e.source_id = {{source_id:String}}
+                SETTINGS join_use_nulls = 0
+                """,
+                parameters={"case_id": case_id, "source_id": source_id},
+            )
+            self.client.command(
+                f"ALTER TABLE {self.database}.events "
+                f"REPLACE PARTITION {partition_expr} FROM {events_table}"
+            )
+            return applied
+        finally:
+            with contextlib.suppress(Exception):
+                self.client.command(f"DROP TABLE IF EXISTS {events_table}")
+            with contextlib.suppress(Exception):
+                self.client.command(f"DROP TABLE IF EXISTS {rows_table}")
+
+    def drop_stale_enrichment_scratch_tables(self) -> int:
+        """Drop scratch tables orphaned by a crash mid-apply. Returns how many were dropped."""
+        result = self.client.query(
+            "SELECT name FROM system.tables WHERE database = {db:String} AND name LIKE {p:String}",
+            parameters={"db": self.database, "p": f"{_ENRICH_SCRATCH_PREFIX}%"},
+        )
+        names = [row[0] for row in result.result_rows]
+        for name in names:
+            with contextlib.suppress(Exception):
+                self.client.command(f"DROP TABLE IF EXISTS {self.database}.{name}")
+        return len(names)
 
     def count_events(
         self,
@@ -334,10 +407,6 @@ class ClickHouseStore:
         with contextlib.suppress(Exception):
             self.client.command(
                 f"ALTER TABLE {self.database}.events DROP PARTITION {partition_expr}"
-            )
-        with contextlib.suppress(Exception):
-            self.client.command(
-                f"ALTER TABLE {self.database}.event_enrichments DROP PARTITION {partition_expr}"
             )
 
     def delete_timeline_events(self, case_id: str, source_ids: list[str]) -> None:

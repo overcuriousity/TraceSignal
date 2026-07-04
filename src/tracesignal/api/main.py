@@ -27,7 +27,7 @@ from tracesignal.api.routers import (
 )
 from tracesignal.core.config import get_settings
 from tracesignal.core.security import hash_password
-from tracesignal.db.postgres import generate_id
+from tracesignal.db.postgres import EnrichmentJobRun, generate_id
 
 logger = logging.getLogger(__name__)
 
@@ -159,15 +159,27 @@ async def _reconcile_orphaned_ingests() -> None:
             )
 
 
-async def _reconcile_orphaned_enrichment_jobs() -> None:
-    """Discard enrichment jobs left running by a mid-run restart. See ``enrichers/jobs.py``."""
+async def _reconcile_orphaned_enrichment_jobs() -> list[EnrichmentJobRun]:
+    """Recover enrichment jobs left running by a mid-run restart. See ``enrichers/jobs.py``.
+
+    Returns the recovered runs so the lifespan can schedule re-runs once
+    enricher availability has been refreshed.
+    """
+    from tracesignal.db.clickhouse import ClickHouseStore
     from tracesignal.enrichers.jobs import reconcile_orphaned_enrichment_jobs
 
     store = get_store()
     try:
-        await reconcile_orphaned_enrichment_jobs(store)
+        ch_store = ClickHouseStore()
+        # A crash mid-apply can leave tmp_enrich_* scratch tables behind;
+        # they carry no state (Postgres staging is the source of truth).
+        dropped = await asyncio.to_thread(ch_store.drop_stale_enrichment_scratch_tables)
+        if dropped:
+            logger.info("Dropped %d stale enrichment scratch table(s).", dropped)
+        return await reconcile_orphaned_enrichment_jobs(store, ch_store)
     except Exception:
         logger.exception("Failed to reconcile orphaned enrichment jobs; retrying on next restart.")
+        return []
 
 
 @asynccontextmanager
@@ -176,11 +188,21 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     await store.init_schema()
     await _seed_admin()
     await _reconcile_orphaned_ingests()
-    await _reconcile_orphaned_enrichment_jobs()
+    enrichment_reruns = await _reconcile_orphaned_enrichment_jobs()
 
     from tracesignal.enrichers.registry import refresh_availability
 
+    # Re-runs are scheduled only after availability is refreshed — they skip
+    # enrichers whose runtime requirements (e.g. GeoIP database) are missing.
     await asyncio.to_thread(refresh_availability)
+    if enrichment_reruns:
+        from tracesignal.core.jobs import get_job_store
+        from tracesignal.enrichers.jobs import schedule_enrichment_reruns
+
+        try:
+            await schedule_enrichment_reruns(enrichment_reruns, get_job_store(), store)
+        except Exception:
+            logger.exception("Failed to schedule enrichment re-runs after recovery.")
     # No cron/scheduler in this single-process deployment (see JobStore),
     # so a startup-only sweep is the simple option — good enough to keep
     # `sessions` from growing unbounded across restarts without adding a

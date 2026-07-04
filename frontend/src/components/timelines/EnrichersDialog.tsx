@@ -31,20 +31,44 @@ export function EnrichersDialog({ caseId, timeline }: Props) {
   const qc = useQueryClient();
   const addJob = useJobsStore((s) => s.addJob);
 
+  const queryKey = ["timeline-enrichers", caseId, timeline.id] as const;
+  const configMutationKey = ["enricher-config", caseId, timeline.id] as const;
+
   const { data: enrichers, isLoading } = useQuery({
-    queryKey: ["timeline-enrichers", caseId, timeline.id],
+    queryKey,
     queryFn: () => enrichersApi.listForTimeline(caseId, timeline.id),
     enabled: open,
   });
 
+  // Optimistic update: patch the cached list synchronously in onMutate so a
+  // rapid toggle-then-mode-change reads the fresh value instead of the stale
+  // pre-mutation snapshot (lost-update race).
   const configMutation = useMutation({
+    mutationKey: configMutationKey,
     mutationFn: (vars: { key: string; mode: "automatic" | "manual"; enabled: boolean }) =>
       enrichersApi.setConfig(caseId, timeline.id, vars.key, {
         mode: vars.mode,
         enabled: vars.enabled,
       }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["timeline-enrichers", caseId, timeline.id] });
+    onMutate: async (vars) => {
+      await qc.cancelQueries({ queryKey });
+      const previous = qc.getQueryData<TimelineEnricherInfo[]>(queryKey);
+      qc.setQueryData<TimelineEnricherInfo[]>(queryKey, (old) =>
+        old?.map((e) =>
+          e.key === vars.key ? { ...e, mode: vars.mode, enabled: vars.enabled } : e,
+        ),
+      );
+      return { previous };
+    },
+    onError: (_err, _vars, ctx) => {
+      if (ctx?.previous) qc.setQueryData(queryKey, ctx.previous);
+    },
+    onSettled: () => {
+      // Only refetch after the last in-flight config mutation settles, so an
+      // earlier response doesn't clobber a later optimistic patch.
+      if (qc.isMutating({ mutationKey: configMutationKey }) === 1) {
+        qc.invalidateQueries({ queryKey });
+      }
     },
   });
 
