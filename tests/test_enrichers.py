@@ -872,6 +872,92 @@ def test_enrich_value_invalid_ip_returns_none_but_reader_errors_propagate(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_manual_run_skips_sources_already_enriched_at_current_config(store, monkeypatch):
+    from fastapi import BackgroundTasks
+
+    from tracesignal.api import deps
+    from tracesignal.api.routers.cases import run_timeline_enricher
+    from tracesignal.db.postgres import User
+    from tracesignal.enrichers import registry
+    from tracesignal.enrichers.base import Enricher
+
+    class Stub(Enricher):
+        key = "stub-skip"
+        display_name = "Stub"
+        description = ""
+        eligibility_regex = ".*"
+        output_fields = ("x",)
+
+        def check_availability(self):
+            return AvailabilityResult(True)
+
+        def enrich_value(self, raw_value):
+            return None
+
+    registry.register(Stub())
+    registry.refresh_availability()
+    monkeypatch.setattr(deps, "_store", store)
+    # The re-run path constructs a ClickHouseStore and claims a run slot before
+    # returning (the job body only runs later via BackgroundTasks, never here).
+    # Stub the client so no real ClickHouse is needed.
+    monkeypatch.setattr("tracesignal.api.routers.cases.ClickHouseStore", lambda: object())
+
+    case = await store.create_case("ck", "Skip Case")
+    timeline = await store.create_timeline("ck", "tk", "Skip Timeline")
+    await store.create_source("ck", "sk", "src", file_hash="h" * 64, size_bytes=1)
+    await store.add_source_to_timeline("ck", timeline.id, "sk")
+
+    config_hash = registry.get_enricher("stub-skip").config_hash()
+    user = User(id="u1", username="t", is_admin=True, is_active=True)
+
+    # Provenance at the current config hash -> source is skipped, no job starts.
+    await store.record_source_enrichment(
+        case_id="ck",
+        source_id="sk",
+        timeline_id=timeline.id,
+        enricher_key="stub-skip",
+        enricher_config_hash=config_hash,
+        job_id="prior-job",
+        rows_applied=3,
+    )
+    res = await run_timeline_enricher(
+        timeline_id=timeline.id,
+        enricher_key="stub-skip",
+        background_tasks=BackgroundTasks(),
+        case=case,
+        user=user,
+    )
+    assert res["job_id"] is None
+    assert res["status"] == "skipped"
+    assert res["skipped_source_ids"] == ["sk"]
+
+    # Provenance at a *different* hash (config or GeoIP DB changed) -> re-runs.
+    await store.record_source_enrichment(
+        case_id="ck",
+        source_id="sk",
+        timeline_id=timeline.id,
+        enricher_key="stub-skip",
+        enricher_config_hash="stale" + "0" * 59,
+        job_id="prior-job",
+        rows_applied=3,
+    )
+    res = await run_timeline_enricher(
+        timeline_id=timeline.id,
+        enricher_key="stub-skip",
+        background_tasks=BackgroundTasks(),
+        case=case,
+        user=user,
+    )
+    assert res["job_id"] is not None
+    assert res["source_ids"] == ["sk"]
+    assert res["skipped_source_ids"] == []
+    # Release the slot claimed by the re-run so it doesn't leak into other tests.
+    from tracesignal.enrichers import jobs as _jobs
+
+    _jobs._release_enricher_run(timeline.id, "stub-skip", res["job_id"])
+
+
+@pytest.mark.asyncio
 async def test_manual_run_409_and_auto_trigger_skip_when_run_active(store, monkeypatch):
     from fastapi import BackgroundTasks, HTTPException
 

@@ -1372,6 +1372,28 @@ class PostgresStore:
             )
             return list(result.scalars().all())
 
+    async def list_enriched_source_ids(
+        self, case_id: str, enricher_key: str, config_hash: str
+    ) -> set[str]:
+        """Source IDs already enriched by this enricher at exactly ``config_hash``.
+
+        Lets a re-run skip sources whose derived fields are already current: a
+        matching ``(enricher_key, enricher_config_hash)`` provenance row means
+        the exact enricher configuration *and* data version already produced
+        this source's fields — for GeoIP that includes the installed database's
+        hash, so an admin swapping the ``.mmdb`` bumps ``config_hash`` and no
+        longer matches, forcing a re-run.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(SourceEnrichment.source_id).where(
+                    SourceEnrichment.case_id == case_id,
+                    SourceEnrichment.enricher_key == enricher_key,
+                    SourceEnrichment.enricher_config_hash == config_hash,
+                )
+            )
+            return set(result.scalars().all())
+
     async def start_enrichment_job_run(
         self, job_id: str, timeline_id: str, case_id: str, enricher_key: str
     ) -> None:

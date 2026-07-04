@@ -1468,7 +1468,8 @@ async def run_timeline_enricher(
     )
     from tracesignal.enrichers.registry import get_cached_availability, get_enricher
 
-    if get_enricher(enricher_key) is None:
+    enricher = get_enricher(enricher_key)
+    if enricher is None:
         raise HTTPException(status_code=404, detail="Unknown enricher")
     availability = get_cached_availability(enricher_key)
     if availability is None or not availability.available:
@@ -1484,6 +1485,24 @@ async def run_timeline_enricher(
     source_ids = [s.id for s in sources if s.is_ready]
     if not source_ids:
         raise HTTPException(status_code=422, detail="Timeline has no ready sources to enrich")
+
+    # Skip sources already enriched at the current config: a source's derived
+    # fields live on its ClickHouse partition, not on the timeline, so a source
+    # carried into a new timeline is already enriched. config_hash folds in the
+    # enricher config *and* data version (for GeoIP, the installed database's
+    # hash), so an admin swapping the .mmdb bumps the hash and forces a re-run.
+    # Compute off the loop — config_extras() reads the sidecar/file from disk.
+    config_hash = await asyncio.to_thread(enricher.config_hash)
+    already = await store.list_enriched_source_ids(case_id, enricher_key, config_hash)
+    skipped_source_ids = [sid for sid in source_ids if sid in already]
+    source_ids = [sid for sid in source_ids if sid not in already]
+    if not source_ids:
+        return {
+            "job_id": None,
+            "status": "skipped",
+            "source_ids": [],
+            "skipped_source_ids": skipped_source_ids,
+        }
 
     active_job_id = get_active_enricher_run(timeline_id, enricher_key)
     if active_job_id is not None:
@@ -1518,4 +1537,9 @@ async def run_timeline_enricher(
         store=store,
         ch_store=ch_store,
     )
-    return {"job_id": job.id, "status": job.status, "source_ids": source_ids}
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "source_ids": source_ids,
+        "skipped_source_ids": skipped_source_ids,
+    }
