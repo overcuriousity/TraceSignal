@@ -1,6 +1,22 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-05 (session 18 — Milestone 2 batch, PR 7/7: M16b ColumnPicker
+Last updated: 2026-07-05 (session 19 — CLI ingestion promoted to a real feature. `tsig ingest
+--case` previously accepted a case *name* and passed it straight through as the case ID with
+no validation (`get_case` was never called), silently writing Sources against a
+possibly-nonexistent case; it also never set `Source.created_by` and printed nothing during
+multi-hour large-file runs. Now: new `tsig cases list` (unscoped, admin/CLI use — resolves
+`owner_id`/`team_id` to usernames/team names via `list_users`/`list_teams`); `tsig ingest`
+validates `--case` via `store.get_case()` before touching the file and rejects unknown IDs;
+adds optional `--user` attribution (defaults to the sole active admin if unambiguous, else
+errors) written to `Source.created_by` plus a `cli.ingest.source` audit-log row
+(`record_audit`); and a new `src/tracesignal/cli/progress.py` ported near-verbatim from
+ScalarForensic (`_ETATracker` Kalman throughput/ETA estimator, block-element progress bar,
+duration formatter) driven by bytes off the existing `IngestionPipeline.progress_callback`
+(same signal the web upload job already uses — no new plumbing in `pipeline.py`). New
+`tests/test_cli.py` (11 tests: case listing, case/user validation, Kalman tracker math).
+`tsig embed` also gained the same case-ID validation for consistency.)
+
+Previous (session 18 — Milestone 2 batch, PR 7/7: M16b ColumnPicker
 derived-key grouping (PR #54 finding #34). New `splitDerivedKey` in
 `frontend/src/lib/enrichment.ts` (last-separator split, keeps the key contract mirrored
 in one file). ColumnPicker's Dynamic fields group now collapses enrichment-derived keys
