@@ -17,6 +17,24 @@ export function derivedFieldKey(attrKey: string, outputField: string): string {
   return `${attrKey}${FIELD_KEY_SEPARATOR}${outputField}`;
 }
 
+export interface DerivedKeyParts {
+  parent: string;
+  field: string;
+}
+
+/**
+ * Split a derived attribute key into its parent attribute and output field,
+ * or null when the key has no separator (a plain attribute). Splits on the
+ * *last* separator so a parent that itself contains one (rare, but raw keys
+ * are vendor-controlled) resolves correctly — callers deciding grouping
+ * should additionally check the parent actually exists in the field list.
+ */
+export function splitDerivedKey(key: string): DerivedKeyParts | null {
+  const idx = key.lastIndexOf(FIELD_KEY_SEPARATOR);
+  if (idx <= 0 || idx === key.length - 1) return null;
+  return { parent: key.slice(0, idx), field: key.slice(idx + 1) };
+}
+
 type Attributes = Record<string, string | null | undefined>;
 
 /**

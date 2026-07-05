@@ -39,14 +39,6 @@ resolved — this file holds only the condensed, still-open action items.
   Revisit only if the wizard's latency becomes a complaint. HyperLogLog sketches for exact
   merged `distinct` likewise deferred (max-across-sources approximation documented in the
   module).
-- [ ] **M16 — Enricher follow-ups (fresh branch after PR #54 merges).** The 2026-07-04
-  cleanup batch on `feat/enricher-subsystem` resolved the bulk of the PR #54 review residue
-  (#9–#13 generic asset abstraction + de-GeoIP'd frontend, #15–#19 reuse, #24–#26
-  simplification, #28/#30/#31 efficiency, #32/#33 minors; #20 documented won't-fix). Full
-  finding set + status in `docs/archive/PR54_REVIEW_FINDINGS.md`. Remaining:
-  - #34: derived-key cardinality can balloon the ColumnPicker on wide/vendor-inconsistent
-    datasets (`src_ip:geo_country`, `source_ip:geo_country`, ...) — needs a grouping/limit
-    design in the ColumnPicker.
 
 - [ ] **M20 — Ingest-throughput follow-ups (only if needed).** `TS_INGEST_BATCH_SIZE`
   (default 20k, one HTTP insert per batch) should carry a 100 GiB ingest fine (~5k inserts
