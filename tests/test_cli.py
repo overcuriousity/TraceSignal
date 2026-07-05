@@ -16,7 +16,8 @@ import pytest
 from typer.testing import CliRunner
 
 from tracesignal.cli import main as cli_main
-from tracesignal.cli.progress import BytesProgressPrinter, _ETATracker
+from tracesignal.cli.progress import BytesProgressPrinter
+from tracesignal.core.eta import ETATracker
 from tracesignal.db.postgres import PostgresStore, generate_id
 from tracesignal.ingestion.pipeline import IngestionResult
 
@@ -246,14 +247,14 @@ def test_ingest_unknown_user_rejected(store, tmp_path):
 
 
 def test_eta_tracker_steady_state_gain_approaches_half():
-    tracker = _ETATracker()
+    tracker = ETATracker()
     for _ in range(200):
         tracker.update(1000, 1.0)
     assert tracker.kalman_gain == pytest.approx(0.5, abs=0.05)
 
 
 def test_eta_tracker_eta_none_before_two_updates():
-    tracker = _ETATracker()
+    tracker = ETATracker()
     assert tracker.eta(1000) is None
     tracker.update(100, 1.0)
     assert tracker.eta(1000) is None
@@ -266,5 +267,6 @@ def test_bytes_progress_printer_advances_without_crashing():
     total = 10_000_000
     for processed in range(0, total + 1, 1_000_000):
         printer.on_progress(total=total, processed=processed)
-    # No exception, and the tracker picked up a rate estimate.
-    assert printer._tracker.rate is not None
+    # No exception, and the meter picked up a rate estimate.
+    assert printer._latest is not None
+    assert printer._latest.rate_bps is not None
