@@ -212,7 +212,7 @@ class SimilarityService:
         try:
             query_vector = self._get_embedding_model().encode([query])[0]
         except Exception as exc:
-            raise EncoderUnavailableError(str(exc)) from exc
+            raise EncoderUnavailableError("Embedding encoder unavailable") from exc
         return self._search_and_hydrate(case_id, collection, query_vector, source_ids, limit)
 
     def _search_and_hydrate(

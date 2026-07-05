@@ -165,7 +165,11 @@ def ingest(
             source_name=source,
             progress_callback=printer.on_progress,
         )
-        result = pipeline.run(path_obj, format_name=format)
+        try:
+            result = pipeline.run(path_obj, format_name=format)
+        except RuntimeError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(code=1) from exc
         typer.echo(result.summary())
 
         await store.create_source(
@@ -241,7 +245,11 @@ def embed(
             source_ids=[source],
             batch_size=batch_size,
         )
-        result = pipeline.run()
+        try:
+            result = pipeline.run()
+        except RuntimeError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(code=1) from exc
         typer.echo(result.summary())
 
         await store.update_source_counts(
