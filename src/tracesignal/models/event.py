@@ -118,7 +118,6 @@ class Event:
         attributes: Additional format-specific fields.
         embedding_model: Name of the embedding model.
         embedding_config_hash: Hash of the embedding configuration.
-        vector_id: Identifier used for the vector record (same as event_id).
     """
 
     case_id: str
@@ -143,11 +142,9 @@ class Event:
     embedding_model: str | None = None
     embedding_config_hash: str | None = None
     event_id: uuid.UUID | None = field(default=None, init=False)
-    vector_id: str | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "event_id", self._derive_id())
-        object.__setattr__(self, "vector_id", str(self.event_id))
 
     def _derive_id(self) -> uuid.UUID:
         """Derive a deterministic UUIDv5 for this event.
@@ -230,38 +227,28 @@ class Event:
             "attributes": {str(k): str(v) for k, v in self.attributes.items()},
             "embedding_model": self.embedding_model or "",
             "embedding_config_hash": self.embedding_config_hash or "",
-            "vector_id": self.vector_id or "",
         }
 
     def to_qdrant_payload(self) -> dict[str, Any]:
-        """Serialize to a Qdrant payload dictionary."""
+        """Serialize to a Qdrant payload dictionary.
+
+        The payload is deliberately an index, not a mirror: only the fields
+        needed for native Qdrant payload filtering are stored. Full event
+        detail is resolved from ClickHouse via the point ID (== event_id)
+        after a vector search. Tags are excluded because annotation tags can
+        change after embed time and would silently go stale here.
+        """
         return {
-            "event_id": str(self.event_id),
             "case_id": self.case_id,
             "source_id": self.source_id,
-            "source_file": str(self.source_file),
-            "byte_offset": self.byte_offset,
-            "line_number": self.line_number,
-            "content_hash": self.content_hash,
-            "file_hash": self.file_hash,
-            "parser_name": self.parser_name,
-            "parser_version": self.parser_version,
-            "message": self.message,
-            "timestamp": self.timestamp,
-            "timestamp_desc": self.timestamp_desc,
             "artifact": self.artifact,
-            "artifact_long": self.artifact_long,
-            "display_name": self.display_name,
-            "tags": self.tags,
-            "embedding_model": self.embedding_model,
-            "embedding_config_hash": self.embedding_config_hash,
+            "timestamp": self.timestamp,
         }
 
     def as_dict(self) -> dict[str, Any]:
         """Return a full serializable dictionary representation."""
         data = asdict(self)
         data["event_id"] = str(self.event_id)
-        data["vector_id"] = self.vector_id
         data["source_file"] = str(self.source_file)
         return data
 

@@ -77,31 +77,38 @@ def _l2_normalize_rows(matrix: np.ndarray) -> np.ndarray:
     return matrix / norms
 
 
-def _payload_to_event(payload: dict[str, Any]) -> dict[str, Any]:
-    """Convert a Qdrant point payload into a minimal EventRecord-compatible dict."""
+def _payload_to_event(event_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Convert a trimmed Qdrant point payload into an EventRecord-compatible dict.
+
+    The Qdrant payload is an index, not a mirror — it only carries the
+    filter-relevant fields (``case_id``, ``source_id``, ``artifact``,
+    ``timestamp``). This fallback is used only when the authoritative
+    ClickHouse row is missing (which should not happen in practice, since
+    source deletion removes events and vectors together); everything not in
+    the payload is left empty.
+    """
     ts = ensure_utc_iso(payload.get("timestamp"))
     return {
-        "event_id": payload.get("event_id", ""),
+        "event_id": event_id,
         "case_id": payload.get("case_id", ""),
         "source_id": payload.get("source_id", ""),
-        "message": payload.get("message", ""),
+        "message": "",
         "timestamp": ts,
-        "timestamp_desc": payload.get("timestamp_desc", ""),
+        "timestamp_desc": "",
         "artifact": payload.get("artifact", ""),
-        "artifact_long": payload.get("artifact_long", ""),
-        "display_name": payload.get("display_name", ""),
-        "tags": payload.get("tags") or [],
+        "artifact_long": "",
+        "display_name": "",
+        "tags": [],
         "attributes": {},
-        "source_file": payload.get("source_file", ""),
-        "byte_offset": payload.get("byte_offset"),
-        "line_number": payload.get("line_number"),
-        "content_hash": payload.get("content_hash", ""),
-        "file_hash": payload.get("file_hash", ""),
-        "parser_name": payload.get("parser_name", ""),
-        "parser_version": payload.get("parser_version", ""),
-        "embedding_model": payload.get("embedding_model", ""),
-        "embedding_config_hash": payload.get("embedding_config_hash", ""),
-        "vector_id": payload.get("event_id", ""),
+        "source_file": "",
+        "byte_offset": None,
+        "line_number": None,
+        "content_hash": "",
+        "file_hash": "",
+        "parser_name": "",
+        "parser_version": "",
+        "embedding_model": "",
+        "embedding_config_hash": "",
         "ingest_time": None,
     }
 
@@ -131,7 +138,6 @@ def _row_to_event(row: dict[str, Any]) -> dict[str, Any]:
         "parser_version": row.get("parser_version", ""),
         "embedding_model": row.get("embedding_model", ""),
         "embedding_config_hash": row.get("embedding_config_hash", ""),
-        "vector_id": row.get("vector_id", ""),
         "ingest_time": ingest,
     }
 
@@ -255,7 +261,7 @@ class SimilarityService:
                 event = _row_to_event(ch_rows[eid])
             else:
                 payload = hit.payload or {}
-                event = _payload_to_event(payload)
+                event = _payload_to_event(eid, payload)
             results.append(SimilarResult(event_id=eid, score=score, event=event))
 
         return SimilaritySearchResult(status="ok", results=results)

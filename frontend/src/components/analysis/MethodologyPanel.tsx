@@ -17,11 +17,12 @@ import {
   ShieldCheck,
   BarChart2,
 } from "lucide-react";
-import type { Source } from "@/api/types";
+import type { Source, Timeline } from "@/api/types";
 
 interface Props {
   caseId: string;
   timelineId: string;
+  timeline: Timeline | undefined;
   sources: Source[];
 }
 
@@ -38,7 +39,12 @@ function tokenLabel(token: string): string {
   return TOP_LEVEL_LABELS[token] ?? token;
 }
 
-export function MethodologyPanel({ caseId: _caseId, timelineId: _timelineId, sources }: Props) {
+export function MethodologyPanel({
+  caseId: _caseId,
+  timelineId: _timelineId,
+  timeline,
+  sources,
+}: Props) {
   const hasVectors = sources.some((s) => s.vector_count > 0);
 
   return (
@@ -141,72 +147,63 @@ export function MethodologyPanel({ caseId: _caseId, timelineId: _timelineId, sou
           </p>
         )}
 
-        {sources.map((source) => {
-          const rawCfg = source.embedding_config;
-          const cfg = rawCfg ?? undefined;
+        <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3 space-y-2">
+          <div className="flex items-start gap-2">
+            <span className="text-[var(--color-fg-muted)] w-24 shrink-0">Model</span>
+            <span className="font-mono text-[var(--color-fg-primary)] break-all">
+              {timeline?.embedding_model ?? "all-MiniLM-L6-v2 (default)"}
+            </span>
+          </div>
 
-          return (
-            <div
-              key={source.id}
-              className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3 space-y-2"
-            >
-              <div className="flex items-start gap-2">
-                <span className="text-[var(--color-fg-muted)] w-24 shrink-0">Source</span>
+          {sources.map((source) => (
+            <div key={source.id} className="flex items-start gap-2">
+              <span className="text-[var(--color-fg-muted)] w-24 shrink-0">Source</span>
+              <span className="min-w-0 flex-1">
                 <span className="font-mono text-[var(--color-fg-primary)] break-all text-xs">
                   {source.name}
                 </span>
-              </div>
-              <div className="flex items-start gap-2">
-                <span className="text-[var(--color-fg-muted)] w-24 shrink-0">Model</span>
-                <span className="font-mono text-[var(--color-fg-primary)] break-all">
-                  {source.embedding_model ?? "all-MiniLM-L6-v2 (default)"}
-                </span>
-              </div>
-              {source.vector_count > 0 && (
-                <div className="flex items-start gap-2">
-                  <span className="text-[var(--color-fg-muted)] w-24 shrink-0">Vectors</span>
-                  <span className="text-[var(--color-fg-primary)]">
-                    {source.vector_count.toLocaleString()}
+                {source.vector_count > 0 && (
+                  <span className="ml-2 text-[var(--color-fg-muted)]">
+                    {source.vector_count.toLocaleString()} vectors
                   </span>
-                </div>
-              )}
-
-              {cfg ? (
-                <div className="space-y-1.5">
-                  {Object.entries(cfg.artifacts).map(([artifact, fields]) => (
-                    <div
-                      key={artifact}
-                      className="rounded border border-[var(--color-border)] px-2.5 py-2 space-y-1"
-                    >
-                      <p className="font-semibold font-mono text-[var(--color-fg-primary)]">
-                        {artifact || "(unknown artifact)"}
-                      </p>
-                      <div className="flex flex-wrap gap-1">
-                        {(fields as string[]).map((f) => (
-                          <span
-                            key={f}
-                            className="rounded bg-[var(--color-accent-dim)] px-1.5 py-0.5 font-mono text-[var(--color-accent)] text-xs"
-                          >
-                            {tokenLabel(f)}
-                          </span>
-                        ))}
-                        {fields.length === 0 && (
-                          <span className="text-[var(--color-warning)]">No fields selected</span>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : source.vector_count > 0 ? (
-                <p className="text-[var(--color-fg-muted)]">
-                  All fields embedded. Re-embed with the wizard to configure
-                  per-artifact field selection.
-                </p>
-              ) : null}
-
+                )}
+              </span>
             </div>
-          );
-        })}
+          ))}
+
+          {timeline?.embedding_config ? (
+            <div className="space-y-1.5">
+              {Object.entries(timeline.embedding_config.artifacts).map(([artifact, fields]) => (
+                <div
+                  key={artifact}
+                  className="rounded border border-[var(--color-border)] px-2.5 py-2 space-y-1"
+                >
+                  <p className="font-semibold font-mono text-[var(--color-fg-primary)]">
+                    {artifact || "(unknown artifact)"}
+                  </p>
+                  <div className="flex flex-wrap gap-1">
+                    {(fields as string[]).map((f) => (
+                      <span
+                        key={f}
+                        className="rounded bg-[var(--color-accent-dim)] px-1.5 py-0.5 font-mono text-[var(--color-accent)] text-xs"
+                      >
+                        {tokenLabel(f)}
+                      </span>
+                    ))}
+                    {fields.length === 0 && (
+                      <span className="text-[var(--color-warning)]">No fields selected</span>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : hasVectors ? (
+            <p className="text-[var(--color-fg-muted)]">
+              All fields embedded. Re-embed with the wizard to configure
+              per-artifact field selection.
+            </p>
+          ) : null}
+        </div>
 
         <div className="flex items-start gap-1.5 text-xs text-[var(--color-fg-muted)]">
           <Info size={10} className="mt-0.5 shrink-0" />

@@ -75,18 +75,20 @@ class FakeQdrantStore:
         event_id: str,
         vector: list[float],
         source_id: str,
-        message: str = "test event",
+        artifact: str = "test",
     ) -> None:
         if collection not in self._points:
             self._points[collection] = []
+        # Trimmed payload shape — an index, not a mirror (see Event.to_qdrant_payload).
         self._points[collection].append(
             FakeScoredPoint(
                 id=event_id,
                 vector=vector,
                 payload={
-                    "event_id": event_id,
+                    "case_id": "case1",
                     "source_id": source_id,
-                    "message": message,
+                    "artifact": artifact,
+                    "timestamp": None,
                 },
             )
         )
@@ -221,9 +223,9 @@ def test_find_similar_vector_not_found():
 def test_find_similar_excludes_query_event():
     """The query event itself must not appear in similarity results."""
     qdrant = FakeQdrantStore()
-    qdrant._add_point("col1", "query", _unit([1.0, 0.0]), "s1", "query event")
-    qdrant._add_point("col1", "close1", _unit([0.99, 0.14]), "s1", "similar event")
-    qdrant._add_point("col1", "far1", _unit([0.0, 1.0]), "s1", "dissimilar event")
+    qdrant._add_point("col1", "query", _unit([1.0, 0.0]), "s1")
+    qdrant._add_point("col1", "close1", _unit([0.99, 0.14]), "s1")
+    qdrant._add_point("col1", "far1", _unit([0.0, 1.0]), "s1")
 
     ch = FakeClickHouseStore()
     svc = SimilarityService(qdrant=qdrant, clickhouse=ch)
@@ -255,7 +257,7 @@ def test_find_similar_hydrates_from_clickhouse():
     """Events found in ClickHouse carry the richer ClickHouse attributes."""
     qdrant = FakeQdrantStore()
     qdrant._add_point("col1", "query", _unit([1.0, 0.0]), "s1")
-    qdrant._add_point("col1", "similar", _unit([0.98, 0.2]), "s1", "payload msg")
+    qdrant._add_point("col1", "similar", _unit([0.98, 0.2]), "s1")
 
     ch_row = {
         "event_id": "similar",
@@ -278,7 +280,6 @@ def test_find_similar_hydrates_from_clickhouse():
         "parser_version": "1",
         "embedding_model": "m",
         "embedding_config_hash": "h",
-        "vector_id": "similar",
         "ingest_time": None,
     }
     ch = FakeClickHouseStore(rows={"similar": ch_row})
@@ -293,10 +294,14 @@ def test_find_similar_hydrates_from_clickhouse():
 
 
 def test_find_similar_falls_back_to_payload():
-    """Events absent from ClickHouse fall back to the Qdrant payload."""
+    """Events absent from ClickHouse fall back to the trimmed Qdrant payload.
+
+    The payload only carries filter-relevant fields, so the fallback event
+    keeps its identity/scope fields but has an empty message.
+    """
     qdrant = FakeQdrantStore()
     qdrant._add_point("col1", "query", _unit([1.0, 0.0]), "s1")
-    qdrant._add_point("col1", "similar", _unit([0.98, 0.2]), "s1", "payload msg")
+    qdrant._add_point("col1", "similar", _unit([0.98, 0.2]), "s1", artifact="syslog")
 
     ch = FakeClickHouseStore(rows={})
     svc = SimilarityService(qdrant=qdrant, clickhouse=ch)
@@ -305,7 +310,11 @@ def test_find_similar_falls_back_to_payload():
     assert result.status == "ok"
     sim = next((r for r in result.results if r.event_id == "similar"), None)
     assert sim is not None
-    assert sim.event["message"] == "payload msg"
+    assert sim.event["event_id"] == "similar"
+    assert sim.event["case_id"] == "case1"
+    assert sim.event["source_id"] == "s1"
+    assert sim.event["artifact"] == "syslog"
+    assert sim.event["message"] == ""
 
 
 # ---------------------------------------------------------------------------

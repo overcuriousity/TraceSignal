@@ -201,6 +201,7 @@ export function AnalysisPanel({
           <MethodologyPanel
             caseId={caseId}
             timelineId={timelineId}
+            timeline={timeline}
             sources={sources ?? []}
           />
         )}

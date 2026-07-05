@@ -219,4 +219,9 @@ Postgres and ClickHouse.
   Qdrant point ID directly) and `Source.embedding_model`/`Source.embedding_config` in Postgres
   (superseded by the Timeline-level fields; currently pure vestigial noise on every Source row).
 
-Tracked as cleanup items in `docs/ROADMAP.md` (Milestone 2/3).
+**Status (2026-07-05, M21):** all three cleanups are implemented. `Event.vector_id` is gone
+(the Qdrant point ID is `event_id` directly), the vestigial `Source.embedding_model`/
+`Source.embedding_config` columns are removed, and the Qdrant payload is trimmed to
+`case_id`/`source_id`/`artifact`/`timestamp`. `tags` was dropped from the payload entirely
+(the second option above) — nothing filtered on it natively, and dropping it removes the
+staleness trap; similarity results resolve tags from the authoritative ClickHouse row.

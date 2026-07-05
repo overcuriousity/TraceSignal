@@ -682,7 +682,6 @@ class StatisticalAnomalyService:
                         "line_number": None,
                         "embedding_model": None,
                         "embedding_config_hash": None,
-                        "vector_id": None,
                         "ingest_time": None,
                     }
 

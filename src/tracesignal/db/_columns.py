@@ -64,7 +64,6 @@ EVENT_SELECT_COLUMNS: tuple[str, ...] = (
     "attributes",
     "embedding_model",
     "embedding_config_hash",
-    "vector_id",
 )
 
 

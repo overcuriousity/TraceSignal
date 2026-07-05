@@ -357,11 +357,8 @@ class EmbeddingPipeline:
         vectors = self.embedding_model.encode(texts)
 
         config_hash = config.config_hash()
-        model_name = self.embedding_model.model_name
         points: list[PointStruct] = []
         for row, vector in zip(batch, vectors, strict=False):
-            row["embedding_model"] = model_name
-            row["embedding_config_hash"] = config_hash
             points.append(
                 PointStruct(
                     id=row["event_id"],
@@ -455,25 +452,16 @@ def _text_for_embedding(
 
 
 def _qdrant_payload(row: dict[str, Any]) -> dict[str, Any]:
-    """Serialize a stored event row to a Qdrant payload dictionary."""
+    """Serialize a stored event row to a Qdrant payload dictionary.
+
+    Deliberately trimmed to the filter-relevant fields — the point ID
+    (== event_id) resolves full event detail from ClickHouse post-search.
+    Must stay in sync with ``Event.to_qdrant_payload``. Tags are excluded
+    because annotation tags mutate after embed time and would go stale.
+    """
     return {
-        "event_id": str(row.get("event_id")),
         "case_id": row.get("case_id"),
         "source_id": row.get("source_id"),
-        "source_file": str(row.get("source_file", "")),
-        "byte_offset": row.get("byte_offset"),
-        "line_number": row.get("line_number"),
-        "content_hash": row.get("content_hash"),
-        "file_hash": row.get("file_hash"),
-        "parser_name": row.get("parser_name"),
-        "parser_version": row.get("parser_version"),
-        "message": row.get("message"),
-        "timestamp": row.get("timestamp"),
-        "timestamp_desc": row.get("timestamp_desc"),
         "artifact": row.get("artifact"),
-        "artifact_long": row.get("artifact_long"),
-        "display_name": row.get("display_name"),
-        "tags": row.get("tags"),
-        "embedding_model": row.get("embedding_model"),
-        "embedding_config_hash": row.get("embedding_config_hash"),
+        "timestamp": row.get("timestamp"),
     }

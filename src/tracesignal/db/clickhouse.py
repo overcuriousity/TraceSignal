@@ -101,7 +101,6 @@ _EVENT_COLUMNS = [
     "attributes",
     "embedding_model",
     "embedding_config_hash",
-    "vector_id",
 ]
 
 _EVENTS_TABLE_DDL = """
@@ -127,7 +126,6 @@ CREATE TABLE IF NOT EXISTS {database}.events (
     attributes Map(String, String),
     embedding_model LowCardinality(String),
     embedding_config_hash FixedString(64),
-    vector_id String,
     INDEX message_idx message TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 1,
     INDEX content_hash_idx content_hash TYPE bloom_filter GRANULARITY 4
 )
@@ -458,8 +456,7 @@ class ClickHouseStore:
                 tags,
                 attributes,
                 embedding_model,
-                embedding_config_hash,
-                vector_id
+                embedding_config_hash
             FROM {self.database}.events
             WHERE case_id = {{case_id:String}} AND source_id = {{source_id:String}}
             ORDER BY event_id
@@ -525,7 +522,7 @@ class ClickHouseStore:
                 event_id, case_id, source_id, source_file, byte_offset, line_number,
                 content_hash, file_hash, parser_name, parser_version, ingest_time,
                 message, timestamp, timestamp_desc, artifact, artifact_long, display_name,
-                tags, attributes, embedding_model, embedding_config_hash, vector_id
+                tags, attributes, embedding_model, embedding_config_hash
             FROM {self.database}.events
             WHERE case_id = {{case_id:String}}
               AND source_id IN ({source_in})

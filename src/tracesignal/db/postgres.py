@@ -117,10 +117,6 @@ class Source(Base):
         """
         return self.status == "ready"
 
-    embedding_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    # Per-source field selection chosen by the analyst in the embedding wizard.
-    # Shape: {"version": 1, "artifacts": {"<artifact>": ["message", "attr:key", ...]}}
-    embedding_config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -153,8 +149,6 @@ class Source(Base):
             "event_count": self.event_count,
             "vector_count": self.vector_count,
             "status": self.status,
-            "embedding_model": self.embedding_model,
-            "embedding_config": self.embedding_config,
             "created_by": self.created_by,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,

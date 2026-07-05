@@ -1175,12 +1175,12 @@ async def delete_event_annotation(
 
 
 class EmbedRequest(BaseModel):
-    """Optional body for the embed endpoint.
+    """Optional body for the timeline embed endpoint.
 
-    When ``embedding_config`` is provided it is persisted on the source and
-    used to drive per-artifact field selection.  Omit the body (or send an empty
-    object) to reuse the source's stored config, falling back to legacy
-    all-fields behaviour when none has been saved.
+    When ``embedding_config`` is provided it drives per-artifact field
+    selection and is persisted on the timeline after a successful run.  Omit
+    the body (or send an empty object) to reuse the timeline's stored config,
+    falling back to legacy all-fields behaviour when none has been saved.
     """
 
     embedding_config: dict[str, Any] | None = Field(
@@ -1190,62 +1190,6 @@ class EmbedRequest(BaseModel):
             '{"<artifact>": ["message", "attr:k", ...]}}'
         ),
     )
-
-
-def _run_embedding_job(
-    job_id: str,
-    case_id: str,
-    source_id: str,
-    job_store: JobStore,
-    field_config: dict[str, Any] | None = None,
-) -> None:
-    """Run the embedding pipeline and update the job store."""
-
-    def progress_callback(total: int, processed: int) -> None:
-        job_store.update(
-            job_id,
-            status="running",
-            progress={"total": total, "processed": processed},
-        )
-
-    try:
-        pipeline = EmbeddingPipeline(
-            case_id=case_id,
-            source_ids=[source_id],
-            batch_size=get_settings().embedding_batch_size,
-            progress_callback=progress_callback,
-            field_config=field_config,
-        )
-        result = pipeline.run()
-
-        # Use a fresh PostgresStore inside the worker thread, and run all of
-        # its awaits in a single asyncio.run() loop: pooled asyncpg
-        # connections are bound to the loop they were created on, so a second
-        # asyncio.run() against the same store would check out a connection
-        # whose futures belong to a closed loop ("attached to a different
-        # loop"). Dispose the engine before the loop closes so no pooled
-        # connection outlives it.
-        store = PostgresStore()
-
-        async def _finalize() -> None:
-            try:
-                await store.update_source_counts(
-                    case_id=case_id,
-                    source_id=source_id,
-                    vector_count=result.vectors_inserted,
-                )
-            finally:
-                await store.engine.dispose()
-
-        asyncio.run(_finalize())
-        job_store.update(
-            job_id,
-            status="completed",
-            progress={"total": result.events_processed, "processed": result.events_processed},
-            result={"vectors_inserted": result.vectors_inserted},
-        )
-    except Exception as exc:  # noqa: BLE001
-        job_store.update(job_id, status="failed", error=str(exc))
 
 
 def _run_timeline_embedding_job(

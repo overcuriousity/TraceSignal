@@ -86,7 +86,7 @@ class FakeQdrantStore:
     ) -> int:
         name = self._name(case_id, embedding_config_hash)
         points = [
-            {"id": event.vector_id, "vector": vector}
+            {"id": str(event.event_id), "vector": vector}
             for event, vector in zip(events, vectors, strict=False)
         ]
         return self.upsert(name, points)

@@ -1,6 +1,24 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-05 (session 20 — PR #65 review fixes. `Source.created_by` for CLI
+Last updated: 2026-07-05 (session 21 — M21 storage redundancy cleanup, all three items from
+the 2026-07-05 storage placement audit. (1) `Event.vector_id` removed everywhere (dataclass,
+ClickHouse DDL/column lists/SELECTs, `_columns.py`, API/frontend event shape) — it was
+unconditionally `str(event_id)`; Qdrant point IDs now use `event_id` directly. Existing
+ClickHouse tables keep the orphaned column harmlessly (CREATE IF NOT EXISTS; inserts name
+columns explicitly). (2) Dead `Source.embedding_model`/`Source.embedding_config` Postgres
+columns deleted (never written; live config is Timeline-scoped) — also removed the orphaned
+`_run_embedding_job` in `cases.py` (zero callers, vestigial source-level embed path from the
+same era) and reworked `MethodologyPanel.tsx` to read the Timeline's embedding model/config
+(it previously read the always-null Source fields, so it always showed the fallback text).
+(3) Qdrant payload trimmed from a full row mirror to filter-relevant fields only
+(`case_id`, `source_id`, `artifact`, `timestamp`) in both `Event.to_qdrant_payload` and the
+embed pipeline's `_qdrant_payload`; full event detail resolves post-search via the existing
+ClickHouse `get_events_by_ids` hydration. `tags` dropped from the payload (nothing filtered
+on it natively; annotation tags mutate after embed and would silently go stale). Existing
+collections keep fat payloads until re-embedded — payload shape is not part of
+`EmbeddingConfig.config_hash`, so no identity change.)
+
+Previous (session 20 — PR #65 review fixes. `Source.created_by` for CLI
 ingests now stores `resolved_user.id` instead of `resolved_user.username`, matching every web
 call site (`api/routers/cases.py`) — the mismatch would have silently broken any future
 id-based creator lookup. `tsig embed` gained the `--user` attribution + `cli.embed.source`

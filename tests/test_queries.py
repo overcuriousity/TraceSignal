@@ -47,7 +47,6 @@ class FakeClickHouseClient:
             "attributes",
             "embedding_model",
             "embedding_config_hash",
-            "vector_id",
         ]
 
     def query(
@@ -785,7 +784,6 @@ _EVENT_COLUMNS = [
     "attributes",
     "embedding_model",
     "embedding_config_hash",
-    "vector_id",
 ]
 
 

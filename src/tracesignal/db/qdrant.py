@@ -114,7 +114,7 @@ class QdrantStore:
         for event, vector in zip(events, vectors, strict=False):
             points.append(
                 PointStruct(
-                    id=event.vector_id,
+                    id=str(event.event_id),
                     vector=vector,
                     payload=event.to_qdrant_payload(),
                 )
