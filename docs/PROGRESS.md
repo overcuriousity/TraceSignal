@@ -1,6 +1,25 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-04 (session 17 — final PR #54 cleanup batch, M16 bulk. Four commits on
+Last updated: 2026-07-05 (session 18 — Milestone 2 batch, PR 5/7: M15 per-source
+field-stats cache. New `db/field_stats.py` + Postgres `source_field_stats` (versioned
+JSON payload: top-level cols + attribute keys with distinct/coverage/3 samples; version
+mismatch = cache miss, no migrations). Computed per source in 2 ClickHouse queries at:
+ingest completion (isolated, never fails the ingest) and after every enrichment apply
+(the only attributes mutation path; on refresh failure the stale row is dropped so reads
+recompute). Read path is compute-on-read + store — pre-existing DBs self-heal. Converted
+call sites: `list_fields` (ColumnPicker, timeline wizard, mapping validation),
+`field_coverage` (timeline wizard — counts now exact instead of 20k-row samples;
+`sampled_rows_per_source` removed from response + frontend type), `field_inventory`
+(Visualize field picker, novelty recommender — `recommend_novelty_fields` accepts a
+pre-merged inventory; canonical field-mapping coalesce aggregates stay live via new
+`canonical_inventory`, since per-source counts can't dedupe multi-raw-key events). Merge
+math: coverage sums exactly, distinct = max-across-sources (documented approximation).
+Deliberately not converted: embedding wizard's `list_fields_by_artifact` (cost is the
+cohesion value-sampling, not inventory). `delete_source` drops the cache row. New
+`tests/test_field_stats.py`: live-ClickHouse parity vs the old scans, self-heal,
+version-mismatch recompute, derived keys visible after `apply_enrichments`.)
+
+Previous (session 17 — final PR #54 cleanup batch, M16 bulk. Four commits on
 `feat/enricher-subsystem`: **(1) micro-fixes** — GeoIP output-field names single-sourced
 (order locked, config_hash-stable), `refresh_availability(key)` single-enricher form,
 batched `count_events(source_ids=...)`, concurrent eligibility checks via `asyncio.gather`,
