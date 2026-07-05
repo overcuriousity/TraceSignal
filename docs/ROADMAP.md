@@ -52,16 +52,10 @@ resolved — this file holds only the condensed, still-open action items.
   (e.g. max-across-sources) since it only feeds a UI hint. Short-term mitigation already
   shipped: `VisualizePage` shows a "can take a while" hint under the spinner and the field
   dropdown scrolls instead of overflowing (`ui/Select.tsx`).
-- [ ] **M16 — Enricher follow-ups (fresh branch after PR #54 merges).** The 2026-07-04
-  cleanup batch on `feat/enricher-subsystem` resolved the bulk of the PR #54 review residue
-  (#9–#13 generic asset abstraction + de-GeoIP'd frontend, #15–#19 reuse, #24–#26
-  simplification, #28/#30/#31 efficiency, #32/#33 minors; #20 documented won't-fix). Full
-  finding set + status in `docs/archive/PR54_REVIEW_FINDINGS.md`. Deliberately deferred:
-  - Staging-format redesign: staging is one Postgres row per (event, attr, output_field) —
-    a row-per-event JSON-map format would shrink staging ~3x and simplify the apply join.
-  - #34: derived-key cardinality can balloon the ColumnPicker on wide/vendor-inconsistent
-    datasets (`src_ip:geo_country`, `source_ip:geo_country`, ...) — needs a grouping/limit
-    design in the ColumnPicker.
+- [ ] **M16 — Enricher follow-ups.** Staging-format redesign shipped separately
+  (row-per-(job, event) JSON map); #34 ColumnPicker derived-key grouping shipped on
+  `feat/m16-columnpicker-derived-grouping`. Full finding set + status in
+  `docs/archive/PR54_REVIEW_FINDINGS.md`. Delete this item once both PRs merge.
 
 - [ ] **M17 — Job authorization via case RBAC.** PR #7 review #9 follow-up (guard itself was
   fixed): jobs are only guarded by `created_by == user.id or is_admin`; a `Job.case_id` +

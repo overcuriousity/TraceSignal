@@ -7,7 +7,7 @@
  */
 import { useState, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Columns3, RotateCcw, Search } from "lucide-react";
+import { ChevronDown, ChevronRight, Columns3, RotateCcw, Search } from "lucide-react";
 import { eventsApi } from "@/api/events";
 import { useUiStore, DEFAULT_COLUMNS } from "@/stores/ui";
 import { Button } from "@/components/ui/Button";
@@ -19,6 +19,7 @@ import {
   PopoverContent,
 } from "@/components/ui/Popover";
 import { cn } from "@/lib/cn";
+import { splitDerivedKey } from "@/lib/enrichment";
 
 interface Props {
   caseId: string;
@@ -67,6 +68,48 @@ function ColumnRow({
   );
 }
 
+function DerivedGroup({
+  childKeys,
+  forceExpand,
+  visibleSet,
+  onToggle,
+}: {
+  childKeys: string[];
+  forceExpand: boolean;
+  visibleSet: Set<string>;
+  onToggle: (id: string, checked: boolean) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const expanded = open || forceExpand;
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className={cn(
+          "flex w-full items-center gap-1 rounded px-2 py-1 pl-6 text-left text-xs",
+          "text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-hover)] hover:text-[var(--color-fg-secondary)] transition-base",
+        )}
+        aria-expanded={expanded}
+      >
+        {expanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
+        Derived ({childKeys.length})
+      </button>
+      {expanded &&
+        childKeys.map((key) => (
+          <div key={key} className="pl-6">
+            <ColumnRow
+              id={key}
+              label={splitDerivedKey(key)?.field ?? key}
+              checked={visibleSet.has(key)}
+              onChange={onToggle}
+            />
+          </div>
+        ))}
+    </div>
+  );
+}
+
 export function ColumnPicker({ caseId, timelineId }: Props) {
   const [search, setSearch] = useState("");
   const tlKey = `${caseId}/${timelineId}`;
@@ -80,31 +123,55 @@ export function ColumnPicker({ caseId, timelineId }: Props) {
     staleTime: 5 * 60 * 1000,
   });
 
-  const allColumns = useMemo(() => {
-    const top = (fields?.top_level ?? DEFAULT_COLUMNS).map((id) => ({
-      id,
-      label: TOP_LEVEL_LABELS[id] ?? id,
-      group: "Standard",
-    }));
-    // Enrichment-derived keys ("src_ip:geo_country") live in `attributes`
-    // like any other dynamic field — filterable and sortable beside their
-    // source attribute, no separate group needed.
-    const attrs = (fields?.attributes ?? []).map((id) => ({
-      id,
-      label: id,
-      group: "Dynamic fields",
-    }));
-    return [...top, ...attrs];
+  const standardAll = useMemo(
+    () =>
+      (fields?.top_level ?? DEFAULT_COLUMNS).map((id) => ({
+        id,
+        label: TOP_LEVEL_LABELS[id] ?? id,
+      })),
+    [fields],
+  );
+
+  // Partition dynamic attributes: enrichment-derived keys
+  // ("src_ip:geo_country") collapse under their parent attribute so a
+  // wide/vendor-inconsistent dataset with many enriched IP columns doesn't
+  // balloon the flat list (PR #54 finding #34). Derived keys whose parent
+  // isn't itself in the field list fall back to a trailing group.
+  const { baseAttrs, derivedByParent, orphanDerived } = useMemo(() => {
+    const attrs = fields?.attributes ?? [];
+    const attrSet = new Set(attrs);
+    const bases: string[] = [];
+    const byParent = new Map<string, string[]>();
+    const orphans: string[] = [];
+    for (const key of attrs) {
+      const parts = splitDerivedKey(key);
+      if (parts && attrSet.has(parts.parent)) {
+        const children = byParent.get(parts.parent) ?? [];
+        children.push(key);
+        byParent.set(parts.parent, children);
+      } else if (parts) {
+        orphans.push(key);
+      } else {
+        bases.push(key);
+      }
+    }
+    return { baseAttrs: bases, derivedByParent: byParent, orphanDerived: orphans };
   }, [fields]);
 
-  const filtered = useMemo(() => {
-    const q = search.toLowerCase();
-    return q
-      ? allColumns.filter(
-          (c) => c.id.toLowerCase().includes(q) || c.label.toLowerCase().includes(q),
-        )
-      : allColumns;
-  }, [allColumns, search]);
+  const query = search.toLowerCase();
+  const matches = (id: string, label?: string) =>
+    !query || id.toLowerCase().includes(query) || (label ?? "").toLowerCase().includes(query);
+
+  const standard = standardAll.filter((c) => matches(c.id, c.label));
+  // A base attribute stays visible when it matches OR any of its derived
+  // children match — a search must never hide a selectable field.
+  const dynamicVisible = baseAttrs
+    .map((id) => {
+      const children = (derivedByParent.get(id) ?? []).filter((k) => matches(k));
+      return { id, selfMatch: matches(id), children };
+    })
+    .filter((entry) => entry.selfMatch || entry.children.length > 0);
+  const orphansVisible = orphanDerived.filter((k) => matches(k));
 
   const visibleSet = new Set(visibleColumns);
 
@@ -119,9 +186,8 @@ export function ColumnPicker({ caseId, timelineId }: Props) {
     }
   };
 
-  // Group the filtered list
-  const standard = filtered.filter((c) => c.group === "Standard");
-  const dynamic = filtered.filter((c) => c.group === "Dynamic fields");
+  const nothingVisible =
+    standard.length === 0 && dynamicVisible.length === 0 && orphansVisible.length === 0;
 
   const activeCount = visibleColumns.filter((c) => c !== "_select" && c !== "_expand").length;
 
@@ -181,24 +247,53 @@ export function ColumnPicker({ caseId, timelineId }: Props) {
                 </div>
               )}
 
-              {dynamic.length > 0 && (
+              {dynamicVisible.length > 0 && (
                 <div className={standard.length > 0 ? "mt-1 border-t border-[var(--color-border-subtle)] pt-1" : ""}>
                   <p className="px-2 pb-1 pt-1.5 text-xs font-semibold uppercase tracking-wider text-[var(--color-fg-secondary)]">
                     Dynamic fields
                   </p>
-                  {dynamic.map((c) => (
+                  {dynamicVisible.map(({ id, children }) => (
+                    <div key={id}>
+                      <ColumnRow
+                        id={id}
+                        label={id}
+                        checked={visibleSet.has(id)}
+                        onChange={toggle}
+                      />
+                      {children.length > 0 && (
+                        <DerivedGroup
+                          childKeys={children}
+                          // An active search that matched a child must show
+                          // it — never hide a selectable field behind a
+                          // collapsed disclosure.
+                          forceExpand={search.length > 0}
+                          visibleSet={visibleSet}
+                          onToggle={toggle}
+                        />
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {orphansVisible.length > 0 && (
+                <div className="mt-1 border-t border-[var(--color-border-subtle)] pt-1">
+                  <p className="px-2 pb-1 pt-1.5 text-xs font-semibold uppercase tracking-wider text-[var(--color-fg-secondary)]">
+                    Derived fields
+                  </p>
+                  {orphansVisible.map((key) => (
                     <ColumnRow
-                      key={c.id}
-                      id={c.id}
-                      label={c.label}
-                      checked={visibleSet.has(c.id)}
+                      key={key}
+                      id={key}
+                      label={key}
+                      checked={visibleSet.has(key)}
                       onChange={toggle}
                     />
                   ))}
                 </div>
               )}
 
-              {filtered.length === 0 && (
+              {nothingVisible && (
                 <p className="px-2 py-3 text-xs text-[var(--color-fg-muted)]">
                   No fields match &ldquo;{search}&rdquo;
                 </p>

@@ -1,6 +1,18 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-04 (session 17 — final PR #54 cleanup batch, M16 bulk. Four commits on
+Last updated: 2026-07-05 (session 18 — Milestone 2 batch, PR 7/7: M16b ColumnPicker
+derived-key grouping (PR #54 finding #34). New `splitDerivedKey` in
+`frontend/src/lib/enrichment.ts` (last-separator split, keeps the key contract mirrored
+in one file). ColumnPicker's Dynamic fields group now collapses enrichment-derived keys
+(`src_ip:geo_country`) under their parent attribute as a collapsed-by-default
+"Derived (N)" disclosure, children labeled by output-field suffix; derived keys whose
+parent isn't in the field list land in a trailing "Derived fields" group; an active
+search auto-expands matching children (never hides a selectable field). Checkbox ids
+stay the full raw key — selection persistence and the grid untouched. Frontend-only.
+New vitest coverage: `columnPicker.test.tsx` (grouping, expansion, orphans,
+search-expansion, raw-key selection) + `splitDerivedKey` unit tests.)
+
+Previous (session 17 — final PR #54 cleanup batch, M16 bulk. Four commits on
 `feat/enricher-subsystem`: **(1) micro-fixes** — GeoIP output-field names single-sourced
 (order locked, config_hash-stable), `refresh_availability(key)` single-enricher form,
 batched `count_events(source_ids=...)`, concurrent eligibility checks via `asyncio.gather`,
