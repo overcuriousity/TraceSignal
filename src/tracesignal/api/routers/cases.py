@@ -386,7 +386,7 @@ async def _trigger_automatic_enrichments(
             )
             continue
         job = job_store.create(
-            kind="enrich", progress={"processed": 0, "total": 0}, created_by=None
+            kind="enrich", progress={"processed": 0, "total": 0}, created_by=None, case_id=case_id
         )
         try_claim_enricher_run(timeline_id, enricher_key, job.id)
         # create_task (not FastAPI BackgroundTasks) is deliberate: this runs
@@ -650,6 +650,7 @@ async def upload_source(
             kind="ingest",
             progress={"total": size_bytes, "processed": 0},
             created_by=user.id,
+            case_id=case_id,
         )
         background_tasks.add_task(
             _run_ingestion_job,
@@ -1329,6 +1330,7 @@ async def start_timeline_embedding(
         kind="embed",
         progress={"total": 0, "processed": 0},
         created_by=user.id,
+        case_id=case_id,
     )
     background_tasks.add_task(
         _run_timeline_embedding_job,
@@ -1522,6 +1524,7 @@ async def run_timeline_enricher(
         kind="enrich",
         progress={"processed": 0, "total": 0},
         created_by=user.id,
+        case_id=case_id,
     )
     # Claim now (before the response) so a double-click is rejected with 409
     # even though the job itself only starts after the response is sent.

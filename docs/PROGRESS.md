@@ -1,6 +1,15 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-04 (session 17 — final PR #54 cleanup batch, M16 bulk. Four commits on
+Last updated: 2026-07-05 (session 18 — Milestone 2 batch, PR 3/7: M17 job authz via case
+RBAC. `Job` gains `case_id` (in `to_dict()` too), threaded through every
+`job_store.create` site (ingest, embed, manual + automatic enrich, startup re-runs —
+`run.case_id`). `GET /api/jobs/{id}`: creator/admin unchanged; otherwise READ access on
+the job's case grants visibility (`resolve_case_access`), so case members can poll each
+other's jobs and system jobs (`created_by=None`) become member-visible instead of
+admin-only. Non-members still get 404 (no existence probing). Case-less jobs keep
+owner-or-admin semantics. New `tests/test_jobs_api.py` covers the four quadrants.)
+
+Previous (session 17 — final PR #54 cleanup batch, M16 bulk. Four commits on
 `feat/enricher-subsystem`: **(1) micro-fixes** — GeoIP output-field names single-sourced
 (order locked, config_hash-stable), `refresh_availability(key)` single-enricher form,
 batched `count_events(source_ids=...)`, concurrent eligibility checks via `asyncio.gather`,
