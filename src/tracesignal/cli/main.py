@@ -9,7 +9,7 @@ import typer
 
 from tracesignal import __version__
 from tracesignal.cli.progress import BytesProgressPrinter
-from tracesignal.db.postgres import Case, PostgresStore, User, generate_id
+from tracesignal.db.postgres import PostgresStore, User, generate_id
 from tracesignal.ingestion.files import hash_file
 from tracesignal.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
 
@@ -79,8 +79,8 @@ def cases_list() -> None:
     asyncio.run(_run())
 
 
-async def _resolve_ingest_user(store: PostgresStore, username: str | None) -> User:
-    """Resolve and validate the user to attribute a CLI ingest to.
+async def _resolve_actor(store: PostgresStore, username: str | None) -> User:
+    """Resolve and validate the user to attribute a CLI ingest/embed run to.
 
     If ``username`` is given, it must name an active user. Otherwise, exactly
     one active admin must exist on the system to default to — anything else
@@ -137,9 +137,9 @@ def ingest(
 
     store = _get_store()
 
-    async def _prepare() -> tuple[User, Case]:
+    async def _run() -> None:
         await store.init_schema()
-        resolved_user = await _resolve_ingest_user(store, user)
+        resolved_user = await _resolve_actor(store, user)
         case_obj = await store.get_case(case)
         if case_obj is None:
             typer.echo(
@@ -147,36 +147,27 @@ def ingest(
                 err=True,
             )
             raise typer.Exit(code=1)
-        return resolved_user, case_obj
 
-    resolved_user, case_obj = asyncio.run(_prepare())
+        file_hash = hash_file(path_obj)
+        source_id = generate_id(f"{case_obj.id}:{source}:{file_hash}")
 
-    file_hash = hash_file(path_obj)
-    source_id = generate_id(f"{case_obj.id}:{source}:{file_hash}")
+        typer.echo(
+            f"Ingesting {path_obj.name} into case '{case_obj.name}' [{case_obj.id}] "
+            f"as user '{resolved_user.username}'"
+        )
+        printer = BytesProgressPrinter()
 
-    total_size = (
-        path_obj.stat().st_size
-        if path_obj.is_file()
-        else sum(p.stat().st_size for p in path_obj.rglob("*") if p.is_file())
-    )
-    typer.echo(
-        f"Ingesting {path_obj.name} ({total_size / 1e6:,.1f} MB) "
-        f"into case '{case_obj.name}' [{case_obj.id}] as user '{resolved_user.username}'"
-    )
-    printer = BytesProgressPrinter()
+        pipeline = IngestionPipeline(
+            case_id=case_obj.id,
+            source_id=source_id,
+            batch_size=batch_size,
+            file_hash=file_hash,
+            source_name=source,
+            progress_callback=printer.on_progress,
+        )
+        result = pipeline.run(path_obj, format_name=format)
+        typer.echo(result.summary())
 
-    pipeline = IngestionPipeline(
-        case_id=case_obj.id,
-        source_id=source_id,
-        batch_size=batch_size,
-        file_hash=file_hash,
-        source_name=source,
-        progress_callback=printer.on_progress,
-    )
-    result = pipeline.run(path_obj, format_name=format)
-    typer.echo(result.summary())
-
-    async def _persist() -> None:
         await store.create_source(
             case_id=case_obj.id,
             source_id=source_id,
@@ -186,7 +177,7 @@ def ingest(
             filename=path_obj.name,
             parser=format or "auto",
             event_count=result.events_inserted,
-            created_by=resolved_user.username,
+            created_by=resolved_user.id,
         )
         default_timeline = await store.get_default_timeline(case_obj.id)
         if default_timeline is not None:
@@ -206,12 +197,12 @@ def ingest(
             },
         )
 
-    asyncio.run(_persist())
+        if result.errors:
+            for error in result.errors:
+                typer.echo(f"ERROR: {error}", err=True)
+            raise typer.Exit(code=1)
 
-    if result.errors:
-        for error in result.errors:
-            typer.echo(f"ERROR: {error}", err=True)
-        raise typer.Exit(code=1)
+    asyncio.run(_run())
 
 
 @app.command()
@@ -224,12 +215,19 @@ def embed(
         "-b",
         help="Number of events to embed per batch.",
     ),
+    user: str | None = typer.Option(
+        None,
+        "--user",
+        "-u",
+        help="Username to attribute this embed run to (default: the sole active admin, if unambiguous).",
+    ),
 ) -> None:
     """Generate embeddings for an already-ingested source."""
     store = _get_store()
 
-    async def _check_case() -> None:
+    async def _run() -> None:
         await store.init_schema()
+        resolved_user = await _resolve_actor(store, user)
         case_obj = await store.get_case(case)
         if case_obj is None:
             typer.echo(
@@ -238,30 +236,37 @@ def embed(
             )
             raise typer.Exit(code=1)
 
-    asyncio.run(_check_case())
+        pipeline = EmbeddingPipeline(
+            case_id=case_obj.id,
+            source_ids=[source],
+            batch_size=batch_size,
+        )
+        result = pipeline.run()
+        typer.echo(result.summary())
 
-    pipeline = EmbeddingPipeline(
-        case_id=case,
-        source_ids=[source],
-        batch_size=batch_size,
-    )
-    result = pipeline.run()
-    typer.echo(result.summary())
-
-    # Update vector count on the source record.
-    async def _update() -> None:
         await store.update_source_counts(
-            case_id=case,
+            case_id=case_obj.id,
             source_id=source,
             vector_count=result.vectors_inserted,
         )
+        await store.record_audit(
+            action="cli.embed.source",
+            actor=resolved_user,
+            case_id=case_obj.id,
+            target_type="source",
+            target_id=source,
+            detail={
+                "vectors_inserted": result.vectors_inserted,
+                "via": "cli",
+            },
+        )
 
-    asyncio.run(_update())
+        if result.errors:
+            for error in result.errors:
+                typer.echo(f"ERROR: {error}", err=True)
+            raise typer.Exit(code=1)
 
-    if result.errors:
-        for error in result.errors:
-            typer.echo(f"ERROR: {error}", err=True)
-        raise typer.Exit(code=1)
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":

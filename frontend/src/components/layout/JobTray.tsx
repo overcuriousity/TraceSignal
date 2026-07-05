@@ -10,7 +10,7 @@ import { useJobsStore, type TrackedJob } from "@/stores/jobs";
 import { Progress } from "@/components/ui/Progress";
 import { cn } from "@/lib/cn";
 
-/** Mirrors core/eta.py's CLI `_fmt_duration` so web ETAs read like the CLI. */
+/** Mirrors cli/progress.py's `_fmt_duration` so web ETAs read like the CLI. */
 function fmtDuration(seconds: number): string {
   const s = Math.floor(seconds);
   if (s < 60) return `${s}s`;
@@ -19,7 +19,7 @@ function fmtDuration(seconds: number): string {
   if (m < 60) return `${m}m ${String(rs).padStart(2, "0")}s`;
   const h = Math.floor(m / 60);
   const rm = m % 60;
-  return `${h}h ${String(rm).padStart(2, "0")}m`;
+  return `${h}h ${String(rm).padStart(2, "0")}m ${String(rs).padStart(2, "0")}s`;
 }
 
 function JobRow({ job }: { job: TrackedJob }) {

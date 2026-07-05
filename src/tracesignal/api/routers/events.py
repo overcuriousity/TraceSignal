@@ -38,7 +38,7 @@ from tracesignal.db.field_stats import (
 )
 from tracesignal.db.postgres import Case, User, generate_id
 from tracesignal.db.queries import EventQuery, EventQueryService, TagFilter
-from tracesignal.db.similarity import SimilarityService
+from tracesignal.db.similarity import EncoderUnavailableError, SimilarityService
 from tracesignal.models.embeddings import embeddings_available
 
 _EMBEDDINGS_UNAVAILABLE_DETAIL = (
@@ -1309,7 +1309,12 @@ async def semantic_search_events(
         raise HTTPException(status_code=503, detail=_EMBEDDINGS_UNAVAILABLE_DETAIL)
     source_ids = await _resolve_similarity_source_ids(case_id, timeline_id)
     svc = _get_similarity_service()
-    result = await run_in_threadpool(svc.find_similar_by_text, case_id, source_ids, q, limit=limit)
+    try:
+        result = await run_in_threadpool(
+            svc.find_similar_by_text, case_id, source_ids, q, limit=limit
+        )
+    except EncoderUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {
         "status": result.status,
         "results": [

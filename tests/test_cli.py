@@ -169,7 +169,7 @@ def test_ingest_success_sets_created_by_and_audit(store, tmp_path):
 
     sources = _list_sources(store, case.id)
     assert len(sources) == 1
-    assert sources[0].created_by == "admin"
+    assert sources[0].created_by == admin.id
     assert sources[0].event_count == 2
 
 
@@ -222,8 +222,7 @@ def test_ingest_explicit_user_used(store, tmp_path):
     )
     assert result.exit_code == 0, result.stdout
     sources = _list_sources(store, case.id)
-    assert sources[0].created_by == "analyst"
-    assert analyst.id  # sanity
+    assert sources[0].created_by == analyst.id
 
 
 def test_ingest_unknown_user_rejected(store, tmp_path):

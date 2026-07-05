@@ -1,6 +1,23 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-05 (session 19 — CLI ingestion promoted to a real feature. `tsig ingest
+Last updated: 2026-07-05 (session 20 — PR #65 review fixes. `Source.created_by` for CLI
+ingests now stores `resolved_user.id` instead of `resolved_user.username`, matching every web
+call site (`api/routers/cases.py`) — the mismatch would have silently broken any future
+id-based creator lookup. `tsig embed` gained the `--user` attribution + `cli.embed.source`
+audit-log row it was missing (PROGRESS.md previously claimed embed got "the same validation for
+consistency" — it hadn't gotten audit parity). `tsig ingest`'s pre-scan `total_size` walk
+(a second full directory `rglob`/`stat` pass, redundant with `IngestionPipeline`'s own byte
+count and racy against directories that change between the two scans) is removed; the banner
+no longer prints a size, the progress box reports it once ingestion starts. `tsig ingest`'s
+three separate `asyncio.run()` calls collapsed into one. `SimilarityService.find_similar_by_text`
+(`db/similarity.py`) now catches encoder failures and raises `EncoderUnavailableError`, mapped
+to a 503 in `api/routers/events.py::semantic_search_events` — previously a flaky remote
+encoder crashed semantic search with an unhandled 500, the exact failure mode the sibling
+`_guard_encoder` fix (session 19) addressed only for the field wizard. Frontend `fmtDuration`
+(`JobTray.tsx`) fixed to include seconds in its hour branch, matching `cli/progress.py`'s
+`_fmt_duration` — they'd drifted, so web ETAs over 1h read differently from the CLI's.
+
+Previous (session 19 — CLI ingestion promoted to a real feature. `tsig ingest
 --case` previously accepted a case *name* and passed it straight through as the case ID with
 no validation (`get_case` was never called), silently writing Sources against a
 possibly-nonexistent case; it also never set `Source.created_by` and printed nothing during
