@@ -7,9 +7,10 @@ applied to ClickHouse **once, at job end**, by merging them into
 ``events.attributes`` via an atomic per-source partition rewrite
 (``ClickHouseStore.apply_enrichments``). There is no periodic flush — a
 partition rewrite is too expensive to repeat mid-run, and staging volume is
-modest (1M events x 2 IP attributes x 3 output fields = 6M small Postgres
-rows; a row-per-event JSON-map optimization is a deliberate follow-up, not
-done here to keep staging simple).
+modest: one row per (job, event) carrying a ``fields`` JSON map, so 1M
+enriched events stage as 1M rows regardless of how many attributes or
+output fields matched (the former row-per-(event, attr, output_field)
+grain was ~3-6x larger).
 
 If the process dies mid-run, the durable ``EnrichmentJobRun`` marker lets
 startup reconciliation apply whatever was staged and schedule a fresh re-run
@@ -126,6 +127,9 @@ def _process_batch(
     for event in batch:
         event_id = str(event["event_id"])
         attributes = event.get("attributes") or {}
+        # One staging row per event: every derived key for this event lands
+        # in a single field_key -> value map (M16 staging format).
+        fields: dict[str, str] = {}
         for attr_key, raw_value in attributes.items():
             # Skip keys an enricher already derived (they carry the
             # "<attr>:<field>" separator): re-running must not enrich prior
@@ -147,22 +151,23 @@ def _process_batch(
             for output_field, value in enriched.items():
                 if not value:
                     continue
-                rows.append(
-                    {
-                        "job_id": job_id,
-                        "case_id": case_id,
-                        "source_id": source_id,
-                        "timeline_id": timeline_id,
-                        "event_id": event_id,
-                        "enricher_key": enricher_key,
-                        # Naming contract lives in base.derived_field_key
-                        # (mirrored in frontend/src/lib/enrichment.ts).
-                        "field_key": derived_field_key(attr_key, output_field),
-                        "value": value,
-                        "computed_at": now,
-                        "enricher_config_hash": enricher_config_hash,
-                    }
-                )
+                # Naming contract lives in base.derived_field_key
+                # (mirrored in frontend/src/lib/enrichment.ts).
+                fields[derived_field_key(attr_key, output_field)] = value
+        if fields:
+            rows.append(
+                {
+                    "job_id": job_id,
+                    "case_id": case_id,
+                    "source_id": source_id,
+                    "timeline_id": timeline_id,
+                    "event_id": event_id,
+                    "enricher_key": enricher_key,
+                    "fields": fields,
+                    "computed_at": now,
+                    "enricher_config_hash": enricher_config_hash,
+                }
+            )
     return rows
 
 
@@ -207,8 +212,11 @@ async def _apply_staged_rows(store: PostgresStore, ch_store: ClickHouseStore, jo
             timeline_id = enricher_key = config_hash = ""
             after_id = 0
             while True:
+                # 4000 rows/page (was 10000 per-field rows): each row now
+                # expands into several (event_id, field_key, value) triples,
+                # so this keeps per-chunk memory in the same ballpark.
                 staged = await store.list_staged_rows_for_source(
-                    job_id, source_id, limit=10000, after_id=after_id
+                    job_id, source_id, limit=4000, after_id=after_id
                 )
                 if not staged:
                     break
@@ -217,7 +225,13 @@ async def _apply_staged_rows(store: PostgresStore, ch_store: ClickHouseStore, jo
                     enricher_key = staged[0].enricher_key
                     config_hash = staged[0].enricher_config_hash
                 after_id = staged[-1].id
-                chunks.append([(row.event_id, row.field_key, row.value) for row in staged])
+                chunks.append(
+                    [
+                        (row.event_id, field_key, value)
+                        for row in staged
+                        for field_key, value in row.fields.items()
+                    ]
+                )
             if not chunks:
                 continue
 

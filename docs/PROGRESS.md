@@ -1,6 +1,20 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-04 (session 17 — final PR #54 cleanup batch, M16 bulk. Four commits on
+Last updated: 2026-07-05 (session 18 — Milestone 2 batch, PR 6/7: M16a staging-format
+redesign. `EnrichmentResultStaging` regrained from row-per-(event, attr, output_field)
+to row-per-(job, event) with a `fields` JSON map (`field_key -> value`, keys already
+attr-prefixed) — ~3-6x fewer staging rows for multi-output enrichers, unique index now
+`(job_id, event_id)`. `_process_batch` accumulates one map per event (empty maps skipped);
+apply loop pages 4000 rows (was 10000 per-field rows) and expands maps back into triples
+for `apply_enrichments` — no ClickHouse-side change. **Destructive migration**:
+`init_schema` drops a legacy staging table (recognized by its `field_key` column) before
+`create_all`; orphaned pre-upgrade staged rows are discarded, matching the pre-release
+stance; the old `enricher_config_hash` ADD COLUMN block is gone. Dead helpers
+`pop_staged_rows_for_job`/`delete_staged_rows` replaced by read-only
+`list_staged_rows_for_job`. New tests: migration drop+recreate (idempotent), one-row-per-
+event `_process_batch` grain.)
+
+Previous (session 17 — final PR #54 cleanup batch, M16 bulk. Four commits on
 `feat/enricher-subsystem`: **(1) micro-fixes** — GeoIP output-field names single-sourced
 (order locked, config_hash-stable), `refresh_availability(key)` single-enricher form,
 batched `count_events(source_ids=...)`, concurrent eligibility checks via `asyncio.gather`,
