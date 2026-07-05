@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { X, Copy, Search, Filter, FilterX, Tag, MessageSquare, Trash2, Plus, Clock, ShieldCheck, AlertTriangle, Save, BarChart2 } from "lucide-react";
+import { X, Copy, Search, Filter, FilterX, Tag, MessageSquare, Trash2, Plus, Clock, ShieldCheck, AlertTriangle, Save, BarChart2, ChevronDown, ChevronRight } from "lucide-react";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -62,6 +62,7 @@ function CopyButton({ value }: { value: string }) {
 function FieldRow({
   label,
   value,
+  fullValue,
   mono = false,
   filterKey,
   onAddFilter,
@@ -70,6 +71,8 @@ function FieldRow({
 }: {
   label: string;
   value: string | null | undefined;
+  /** Untruncated value shown in a tooltip when it differs from `value` (e.g. truncated hashes). */
+  fullValue?: string;
   mono?: boolean;
   filterKey?: string | null;
   onAddFilter?: (fieldKey: string, value: string, include: boolean) => void;
@@ -78,22 +81,31 @@ function FieldRow({
 }) {
   if (!value) return null;
   const canFilter = !!filterKey && !!onAddFilter;
+  const valueSpan = (
+    <span
+      className={`flex-1 min-w-0 break-all text-sm text-[var(--color-fg-primary)] ${mono ? "font-mono" : ""}`}
+    >
+      {value}
+      {flag && (
+        <span className="ml-1.5" title={flag.label}>
+          {flag.flag}
+        </span>
+      )}
+    </span>
+  );
 
   return (
     <div className="group flex items-start gap-1.5 py-1.5 border-b border-[var(--color-border-subtle)] hover:bg-[var(--color-bg-hover)] -mx-2 px-2 rounded-sm transition-base">
       <span className="w-36 shrink-0 break-all text-sm text-[var(--color-fg-secondary)] pt-0.5 select-none">
         {label}
       </span>
-      <span
-        className={`flex-1 min-w-0 break-all text-sm text-[var(--color-fg-primary)] ${mono ? "font-mono" : ""}`}
-      >
-        {value}
-        {flag && (
-          <span className="ml-1.5" title={flag.label}>
-            {flag.flag}
-          </span>
-        )}
-      </span>
+      {fullValue && fullValue !== value ? (
+        <Tooltip content={fullValue} side="top">
+          {valueSpan}
+        </Tooltip>
+      ) : (
+        valueSpan
+      )}
 
       {/* Action buttons — visible on row hover */}
       <div className="flex items-center gap-0.5 shrink-0 opacity-0 group-hover:opacity-100 transition-base">
@@ -248,6 +260,39 @@ function AddAnnotationForm({
   );
 }
 
+/** Collapsible section wrapper — header toggles visibility of its children. */
+function Section({
+  title,
+  hint,
+  collapsed,
+  onToggle,
+  children,
+}: {
+  title: string;
+  hint?: string;
+  collapsed: boolean;
+  onToggle: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="mb-3">
+      <button
+        onClick={onToggle}
+        className="mb-2 flex w-full items-center gap-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)] hover:text-[var(--color-fg-primary)] transition-base"
+      >
+        {collapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
+        {title}
+        {hint && (
+          <span className="normal-case font-normal text-[var(--color-fg-muted)] text-xs opacity-60">
+            {hint}
+          </span>
+        )}
+      </button>
+      {!collapsed && children}
+    </div>
+  );
+}
+
 export function EventDetailPanel({
   event,
   annotations,
@@ -264,6 +309,14 @@ export function EventDetailPanel({
   const [addMode, setAddMode] = useState<"tag" | "comment" | null>(null);
   const { add, remove } = useAnnotationMutations(caseId, sourceId);
   const qc = useQueryClient();
+
+  // Collapsible sections — only Provenance starts closed, everything else
+  // stays open since it's read at a glance during triage.
+  const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({
+    provenance: true,
+  });
+  const toggleSection = (id: string) =>
+    setCollapsedSections((s) => ({ ...s, [id]: !s[id] }));
 
   const persistMutation = useMutation({
     mutationFn: (finding: AnomalyMarker) =>
@@ -329,6 +382,17 @@ export function EventDetailPanel({
     ...effectiveLiveFindings.map((f) => `${f.detail} (not yet tagged)`),
   ];
 
+  // Left accent bar: an analyst marking an event Normal is a deliberate
+  // dismissal, so it always wins over a still-open anomaly finding.
+  const isNormal = userAnnotations.some(
+    (a) => a.annotation_type === "normal" && a.origin === "user",
+  );
+  const accentColor = isNormal
+    ? "var(--color-success)"
+    : anomalyReasons.length > 0
+      ? "var(--color-anomaly)"
+      : "transparent";
+
   function handleAdd(content: string) {
     if (!addMode) return;
     if (
@@ -349,6 +413,11 @@ export function EventDetailPanel({
       className="relative flex h-full flex-col border-l border-[var(--color-border)] bg-[var(--color-bg-surface)] shrink-0"
       style={{ width: detailPanelWidth }}
     >
+      {/* Accent bar — reflects Normal / anomaly state, sits under the drag handle */}
+      <div
+        className="absolute left-0 top-0 h-full w-[3px] pointer-events-none"
+        style={{ backgroundColor: accentColor }}
+      />
       {/* Drag handle — left edge */}
       <div
         onMouseDown={onDragStart}
@@ -414,10 +483,11 @@ export function EventDetailPanel({
         </div>
 
         {/* Timestamps */}
-        <div className="mb-3">
-          <p className="mb-2 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-            Timestamps
-          </p>
+        <Section
+          title="Timestamps"
+          collapsed={!!collapsedSections.timestamps}
+          onToggle={() => toggleSection("timestamps")}
+        >
           <FieldRow
             label="timestamp"
             value={fmtTimestampFull(event.timestamp)}
@@ -436,13 +506,14 @@ export function EventDetailPanel({
             value={fmtRelative(event.ingest_time)}
             filterKey={null}
           />
-        </div>
+        </Section>
 
         {/* Artifact */}
-        <div className="mb-3">
-          <p className="mb-2 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-            Artifact
-          </p>
+        <Section
+          title="Artifact"
+          collapsed={!!collapsedSections.artifact}
+          onToggle={() => toggleSection("artifact")}
+        >
           <FieldRow
             label="artifact"
             value={event.artifact}
@@ -466,14 +537,15 @@ export function EventDetailPanel({
             onAddFilter={onAddFilter}
             onShowHistogram={onShowFieldHistogram}
           />
-        </div>
+        </Section>
 
         {/* Parser tags */}
         {(event.tags ?? []).length > 0 && (
-          <div className="mb-3">
-            <p className="mb-2 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-              Parser Tags
-            </p>
+          <Section
+            title="Parser Tags"
+            collapsed={!!collapsedSections.tags}
+            onToggle={() => toggleSection("tags")}
+          >
             <div className="flex flex-wrap gap-1">
               {(event.tags ?? []).map((t) => (
                 <button
@@ -491,18 +563,17 @@ export function EventDetailPanel({
             <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
               Click a tag to filter
             </p>
-          </div>
+          </Section>
         )}
 
         {/* Attributes — every row has filter-in / filter-out */}
         {Object.keys(event.attributes ?? {}).length > 0 && (
-          <div className="mb-3">
-            <p className="mb-2 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-              Attributes
-              <span className="ml-2 normal-case font-normal text-[var(--color-fg-muted)] text-xs opacity-60">
-                hover to filter
-              </span>
-            </p>
+          <Section
+            title="Attributes"
+            hint="hover to filter"
+            collapsed={!!collapsedSections.attributes}
+            onToggle={() => toggleSection("attributes")}
+          >
             {Object.entries(event.attributes ?? {}).map(([k, v]) => (
               <FieldRow
                 key={k}
@@ -515,14 +586,15 @@ export function EventDetailPanel({
                 flag={getAttributeDecoration(event.attributes ?? {}, k)}
               />
             ))}
-          </div>
+          </Section>
         )}
 
         {/* Annotations — editable */}
-        <div className="mb-3">
-          <p className="mb-2 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-            Annotations
-          </p>
+        <Section
+          title="Annotations"
+          collapsed={!!collapsedSections.annotations}
+          onToggle={() => toggleSection("annotations")}
+        >
 
           {/* User annotations — deletable */}
           {userAnnotations.length === 0 && addMode === null && (
@@ -637,24 +709,27 @@ export function EventDetailPanel({
               />
             </div>
           )}
-        </div>
+        </Section>
 
         {/* Provenance — display-only, no filter buttons */}
-        <div className="mb-3">
-          <p className="mb-2 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-            Provenance
-          </p>
+        <Section
+          title="Provenance"
+          collapsed={!!collapsedSections.provenance}
+          onToggle={() => toggleSection("provenance")}
+        >
           <FieldRow label="event_id" value={event.event_id} mono filterKey={null} />
           <FieldRow label="source_id" value={event.source_id} mono filterKey={null} />
           <FieldRow
             label="content_hash"
             value={truncateHash(event.content_hash, 24)}
+            fullValue={event.content_hash ?? undefined}
             mono
             filterKey={null}
           />
           <FieldRow
             label="file_hash"
             value={truncateHash(event.file_hash, 24)}
+            fullValue={event.file_hash ?? undefined}
             mono
             filterKey={null}
           />
@@ -669,7 +744,7 @@ export function EventDetailPanel({
           {event.embedding_model && (
             <FieldRow label="embed_model" value={event.embedding_model} mono filterKey={null} />
           )}
-        </div>
+        </Section>
       </div>
     </div>
   );

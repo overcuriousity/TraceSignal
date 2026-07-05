@@ -94,12 +94,64 @@ export function ExplorerPage() {
   // ── Filter state (URL-driven) ──────────────────────────────────────────
   const filters = useMemo(() => paramsToFilters(searchParams), [searchParams]);
 
+  const queryClient = useQueryClient();
+  const sortDir = useUiStore((s) => s.sortDir);
+
+  // Anchors the just-committed filter change's query at the timestamp the
+  // analyst was already looking at, so e.g. adding a tag filter doesn't
+  // silently reset the grid to the top of the result set. Only applies when
+  // start/end are untouched — an explicit range change (histogram brush,
+  // frequency drill) should show its own new range, not the old anchor.
+  const pendingSoftAnchorRef = useRef<{ ts: string; seq: number } | null>(null);
+  const softAnchorSeqRef = useRef(0);
+  const softAnchorSeededSeqRef = useRef(0);
+
   const setFilters = useCallback(
     (f: EventFilters) => {
+      const rangeUnchanged = f.start === filters.start && f.end === filters.end;
+      const anchorTs = useScrollPositionStore.getState().currentPositionTs;
+      // A bare `{}` is handleJumpToTime's own clear-and-seek call — it seeds
+      // the same query key itself, so skip here to avoid both racing on it.
+      const isJumpClear = Object.keys(f).length === 0;
+      if (rangeUnchanged && !isJumpClear && anchorTs && caseId && timelineId) {
+        const seq = ++softAnchorSeqRef.current;
+        let nextEffective = f;
+        if (f.annotated?.includes("anomaly") && anomalyRunIdRef.current) {
+          nextEffective = { ...nextEffective, anomalyRunId: anomalyRunIdRef.current };
+        }
+        if (semanticSearchIdsRef.current !== null) {
+          nextEffective = { ...nextEffective, q: undefined, ids: semanticSearchIdsRef.current };
+        }
+        const targetKey = ["events", caseId, timelineId, nextEffective, sortDir];
+        queryClient.cancelQueries({ queryKey: targetKey }).then(async () => {
+          if (softAnchorSeqRef.current !== seq) return;
+          const anchorPage = await eventsApi.list(
+            caseId,
+            timelineId,
+            { ...nextEffective, limit: PAGE_SIZE, order: sortDir },
+            undefined,
+            { before: `${anchorTs},` },
+          );
+          if (softAnchorSeqRef.current !== seq) return;
+          const anchorPageParam: EventsPageParam = { before: cursorParam(anchorPage.prev_cursor) };
+          queryClient.setQueryData(targetKey, {
+            pages: [anchorPage],
+            pageParams: [anchorPageParam],
+          });
+          pendingSoftAnchorRef.current = { ts: anchorTs, seq };
+          softAnchorSeededSeqRef.current = seq;
+        });
+      }
       setSearchParams(filtersToParams(f));
     },
-    [setSearchParams],
+    [setSearchParams, filters, caseId, timelineId, queryClient, sortDir],
   );
+
+  // Latest anomalyRunId/semanticSearchIds for setFilters' soft-anchor seek
+  // above, which runs before those states are declared further down this
+  // component — refs sidestep the ordering (and closure-staleness) issue.
+  const anomalyRunIdRef = useRef<string | undefined>(undefined);
+  const semanticSearchIdsRef = useRef<string[] | null>(null);
 
   const removeFilter = useCallback(
     (key: keyof EventFilters | string, fieldKey?: string, value?: string) => {
@@ -287,7 +339,6 @@ export function ExplorerPage() {
   const visibleColumns = useUiStore((s) => s.visibleColumnsByTimeline[tlKey] ?? DEFAULT_COLUMNS);
   const histogramOpen = useUiStore((s) => s.histogramOpen);
   const setHistogramOpen = useUiStore((s) => s.setHistogramOpen);
-  const sortDir = useUiStore((s) => s.sortDir);
   const setSortDir = useUiStore((s) => s.setSortDir);
 
   // Clear selection when filters or sort direction change so stale IDs are
@@ -337,6 +388,11 @@ export function ExplorerPage() {
     return semanticSearchData.results.map((r) => r.event_id);
   }, [filters.q, semanticMode, hasVectors, semanticSearchData]);
 
+  useEffect(() => {
+    anomalyRunIdRef.current = anomalyRunId;
+    semanticSearchIdsRef.current = semanticSearchIds;
+  }, [anomalyRunId, semanticSearchIds]);
+
   // The filter object actually sent to the events/histogram/export queries.
   // `filters` itself stays URL-serializable/shareable — this augments it
   // with the active Analysis tab's persisted run_id and semantic search
@@ -356,7 +412,6 @@ export function ExplorerPage() {
     return f;
   }, [filters, anomalyRunId, semanticSearchIds]);
 
-  const queryClient = useQueryClient();
   const eventsQueryKey = ["events", caseId, timelineId, effectiveFilters, sortDir];
 
   // When the last ingesting source flips to ready the backend starts
@@ -752,6 +807,18 @@ export function ExplorerPage() {
       if (foundEvent) setExpandedEvent(foundEvent);
       pendingJumpRef.current = null;
     }
+  }, [events]);
+
+  // Once the soft-anchor page seeded in setFilters lands in `events`, scroll
+  // the grid back to where the analyst was — otherwise the grid renders at
+  // whatever page landed by default and reads as "the view jumped".
+  useEffect(() => {
+    const pending = pendingSoftAnchorRef.current;
+    if (!pending) return;
+    if (softAnchorSeededSeqRef.current !== pending.seq) return;
+    if (events.length === 0) return;
+    gridRef.current?.scrollToTimestamp(pending.ts);
+    pendingSoftAnchorRef.current = null;
   }, [events]);
 
   const hasActiveFilters = Object.values(filters).some((v) =>
