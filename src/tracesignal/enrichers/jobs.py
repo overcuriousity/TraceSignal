@@ -5,11 +5,12 @@ are staged in Postgres as each batch completes (transactional, so they
 survive a process crash even though the in-memory JobStore does not), then
 applied to ClickHouse **once, at job end**, by merging them into
 ``events.attributes`` via an atomic per-source partition rewrite
-(``ClickHouseStore.apply_enrichments``). There is no periodic flush — a
+(``ClickHouseStore.stage_enrichment_rows`` / ``finalize_enrichment_apply``). There is no periodic flush — a
 partition rewrite is too expensive to repeat mid-run, and staging volume is
-modest (1M events x 2 IP attributes x 3 output fields = 6M small Postgres
-rows; a row-per-event JSON-map optimization is a deliberate follow-up, not
-done here to keep staging simple).
+modest: one row per (job, event) carrying a ``fields`` JSON map, so 1M
+enriched events stage as 1M rows regardless of how many attributes or
+output fields matched (the former row-per-(event, attr, output_field)
+grain was ~3-6x larger).
 
 If the process dies mid-run, the durable ``EnrichmentJobRun`` marker lets
 startup reconciliation apply whatever was staged and schedule a fresh re-run
@@ -34,6 +35,7 @@ from typing import Any
 from tracesignal.core.config import get_settings
 from tracesignal.core.jobs import JobStore
 from tracesignal.db.clickhouse import ClickHouseStore
+from tracesignal.db.field_stats import refresh_source_field_stats
 from tracesignal.db.postgres import EnrichmentJobRun, PostgresStore
 from tracesignal.enrichers.base import FIELD_KEY_SEPARATOR, Enricher, derived_field_key
 from tracesignal.enrichers.registry import get_cached_availability, get_enricher
@@ -126,6 +128,9 @@ def _process_batch(
     for event in batch:
         event_id = str(event["event_id"])
         attributes = event.get("attributes") or {}
+        # One staging row per event: every derived key for this event lands
+        # in a single field_key -> value map (M16 staging format).
+        fields: dict[str, str] = {}
         for attr_key, raw_value in attributes.items():
             # Skip keys an enricher already derived (they carry the
             # "<attr>:<field>" separator): re-running must not enrich prior
@@ -147,22 +152,23 @@ def _process_batch(
             for output_field, value in enriched.items():
                 if not value:
                     continue
-                rows.append(
-                    {
-                        "job_id": job_id,
-                        "case_id": case_id,
-                        "source_id": source_id,
-                        "timeline_id": timeline_id,
-                        "event_id": event_id,
-                        "enricher_key": enricher_key,
-                        # Naming contract lives in base.derived_field_key
-                        # (mirrored in frontend/src/lib/enrichment.ts).
-                        "field_key": derived_field_key(attr_key, output_field),
-                        "value": value,
-                        "computed_at": now,
-                        "enricher_config_hash": enricher_config_hash,
-                    }
-                )
+                # Naming contract lives in base.derived_field_key
+                # (mirrored in frontend/src/lib/enrichment.ts).
+                fields[derived_field_key(attr_key, output_field)] = value
+        if fields:
+            rows.append(
+                {
+                    "job_id": job_id,
+                    "case_id": case_id,
+                    "source_id": source_id,
+                    "timeline_id": timeline_id,
+                    "event_id": event_id,
+                    "enricher_key": enricher_key,
+                    "fields": fields,
+                    "computed_at": now,
+                    "enricher_config_hash": enricher_config_hash,
+                }
+            )
     return rows
 
 
@@ -172,8 +178,11 @@ async def _apply_staged_rows(store: PostgresStore, ch_store: ClickHouseStore, jo
     Per staged source: serialize on the per-(case, source) apply lock, verify
     the source still exists (a source deleted mid-job must not be resurrected
     by our partition REPLACE; a millisecond residual window between check and
-    swap remains — acceptable pre-release), stream the staged triples into
-    ``ClickHouseStore.apply_enrichments`` (atomic partition rewrite), and
+    swap remains — acceptable pre-release), stream the staged triples page by
+    page into the ClickHouse scratch table via ``stage_enrichment_rows`` (each
+    page discarded from Python memory as soon as it's staged — a large source
+    never holds more than one page's worth of triples at once), then finalize
+    with the atomic partition rewrite (``finalize_enrichment_apply``), and
     only then delete the staged rows and upsert the ``SourceEnrichment``
     provenance row. A failure leaves that source's staged rows intact for the
     next attempt; the rewrite is idempotent, so a crash between REPLACE and
@@ -200,36 +209,62 @@ async def _apply_staged_rows(store: PostgresStore, ch_store: ClickHouseStore, jo
                 await store.delete_staged_rows_for_source(job_id, source_id)
                 continue
 
-            # apply_enrichments is sync (blocking client); collect the chunks
-            # first (bounded by staging volume per source), then hand the
-            # whole apply to a worker thread.
-            chunks: list[list[tuple[str, str, str]]] = []
+            # The ClickHouse client is sync (blocking); each page is staged in
+            # its own worker-thread call and dropped from Python memory
+            # immediately after, so total memory stays bounded by one page
+            # (not the whole source) regardless of source size. The scratch
+            # table (once created) is always cleaned up in the finally below,
+            # matching the crash-mid-apply cleanup already handled by
+            # ``drop_stale_enrichment_scratch_tables`` at startup.
+            had_page = False
+            applied = 0
             timeline_id = enricher_key = config_hash = ""
             after_id = 0
-            while True:
-                staged = await store.list_staged_rows_for_source(
-                    job_id, source_id, limit=10000, after_id=after_id
-                )
-                if not staged:
-                    break
-                if not chunks:
-                    timeline_id = staged[0].timeline_id
-                    enricher_key = staged[0].enricher_key
-                    config_hash = staged[0].enricher_config_hash
-                after_id = staged[-1].id
-                chunks.append([(row.event_id, row.field_key, row.value) for row in staged])
-            if not chunks:
+            try:
+                while True:
+                    # 4000 rows/page (was 10000 per-field rows): each row now
+                    # expands into several (event_id, field_key, value) triples,
+                    # so this keeps per-page memory in the same ballpark.
+                    staged = await store.list_staged_rows_for_source(
+                        job_id, source_id, limit=4000, after_id=after_id
+                    )
+                    if not staged:
+                        break
+                    if not had_page:
+                        timeline_id = staged[0].timeline_id
+                        enricher_key = staged[0].enricher_key
+                        config_hash = staged[0].enricher_config_hash
+                        await asyncio.to_thread(ch_store.create_enrichment_scratch, job_id)
+                        had_page = True
+                    after_id = staged[-1].id
+                    chunk = [
+                        (row.event_id, field_key, value)
+                        for row in staged
+                        for field_key, value in row.fields.items()
+                    ]
+                    applied += await asyncio.to_thread(
+                        ch_store.stage_enrichment_rows, job_id, chunk
+                    )
+                if had_page and applied:
+                    # Pass the enricher's output-field names so the finalize
+                    # step can strip stale derived keys (values that no
+                    # longer resolve) instead of leaving them behind. Unknown
+                    # enricher -> no stripping.
+                    enricher = get_enricher(enricher_key)
+                    owned_suffixes = list(enricher.output_fields) if enricher is not None else []
+                    await asyncio.to_thread(
+                        ch_store.finalize_enrichment_apply,
+                        case_id,
+                        source_id,
+                        job_id,
+                        owned_suffixes,
+                    )
+            finally:
+                if had_page:
+                    await asyncio.to_thread(ch_store.drop_enrichment_scratch, job_id)
+            if not had_page or not applied:
                 continue
-
-            # Pass the enricher's output-field names so apply_enrichments can
-            # strip stale derived keys (values that no longer resolve) instead
-            # of leaving them behind. Unknown enricher -> no stripping.
-            enricher = get_enricher(enricher_key)
-            owned_suffixes = list(enricher.output_fields) if enricher is not None else []
-            applied = await asyncio.to_thread(
-                ch_store.apply_enrichments, case_id, source_id, job_id, chunks, owned_suffixes
-            )
-            # Close the check-then-swap window: apply_enrichments rebuilds the
+            # Close the check-then-swap window: finalize_enrichment_apply rebuilds the
             # partition from a pre-apply snapshot, so a source deleted *during*
             # the rewrite (its DROP PARTITION already applied) would be
             # resurrected by our REPLACE. Re-verify after the swap and, if the
@@ -256,6 +291,41 @@ async def _apply_staged_rows(store: PostgresStore, ch_store: ClickHouseStore, jo
                 rows_applied=applied,
             )
             await store.delete_staged_rows_for_source(job_id, source_id)
+            # Enrichment just added/stripped derived keys in events.attributes
+            # — the only mutation path for an ingested source — so refresh the
+            # per-source field-stats cache (M15). On failure the now-stale row
+            # is dropped instead: a missing row is a cache miss the read path
+            # heals, whereas a stale current-version row would be trusted.
+            try:
+                await refresh_source_field_stats(store, ch_store, case_id, source_id)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Field-stats refresh failed after enrichment apply for source %s; "
+                    "dropping the stale cache row",
+                    source_id,
+                )
+                # Retry the compensating delete a few times — if the refresh's
+                # failure was a transient Postgres hiccup, a single failed
+                # delete would otherwise leave a stale current-version row
+                # trusted by every future read, indefinitely and silently.
+                deleted = False
+                for attempt in range(3):
+                    try:
+                        await store.delete_source_field_stats(source_id)
+                        deleted = True
+                        break
+                    except Exception:  # noqa: BLE001
+                        if attempt < 2:
+                            await asyncio.sleep(0.5 * (attempt + 1))
+                if not deleted:
+                    logger.error("Could not drop stale field-stats row for %s", source_id)
+                    await store.record_audit(
+                        action="source.field_stats_stale",
+                        case_id=case_id,
+                        target_type="source",
+                        target_id=source_id,
+                        detail={"job_id": job_id},
+                    )
             await store.record_audit(
                 action="enricher.applied",
                 case_id=case_id,
@@ -287,7 +357,7 @@ async def run_enrichment_job(
     Works on a fresh per-run enricher instance (``Enricher.spawn()``) so
     concurrent runs never share mutable state such as an open database
     reader. Batches are paginated via the same ``list_events`` primitive the
-    embedding pipeline uses, at ``settings.embedding_batch_size``. All
+    embedding pipeline uses. All
     results are staged in Postgres and merged into ``events.attributes`` in
     one atomic per-source partition rewrite at job end
     (``_apply_staged_rows``).
@@ -304,7 +374,10 @@ async def run_enrichment_job(
     enricher = await asyncio.to_thread(prototype.spawn)
 
     settings = get_settings()
-    batch_size = settings.embedding_batch_size
+    # Read paging over ClickHouse — enrichment is regex + lookup work per
+    # value, not model-bound like embedding, so page at least 1000 events per
+    # round-trip to keep HTTP overhead low on large sources.
+    batch_size = max(settings.embedding_batch_size, 1000)
 
     await store.start_enrichment_job_run(job_id, timeline_id, case_id, enricher_key)
     job_store.update(job_id, status="running", progress={"processed": 0, "total": 0})
@@ -523,7 +596,9 @@ async def schedule_enrichment_reruns(
                 run.timeline_id,
             )
             continue
-        job = job_store.create(kind="enrich", progress={"processed": 0, "total": 0})
+        job = job_store.create(
+            kind="enrich", progress={"processed": 0, "total": 0}, case_id=run.case_id
+        )
         if try_claim_enricher_run(run.timeline_id, run.enricher_key, job.id) is not None:
             job_store.update(job.id, status="failed", error="Enrichment already running")
             continue

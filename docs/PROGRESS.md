@@ -1,6 +1,90 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-04 (session 17 — final PR #54 cleanup batch, M16 bulk. Four commits on
+Last updated: 2026-07-05 (session 18 — Milestone 2 batch, PR 7/7: M16b ColumnPicker
+derived-key grouping (PR #54 finding #34). New `splitDerivedKey` in
+`frontend/src/lib/enrichment.ts` (last-separator split, keeps the key contract mirrored
+in one file). ColumnPicker's Dynamic fields group now collapses enrichment-derived keys
+(`src_ip:geo_country`) under their parent attribute as a collapsed-by-default
+"Derived (N)" disclosure, children labeled by output-field suffix; derived keys whose
+parent isn't in the field list land in a trailing "Derived fields" group; an active
+search auto-expands matching children (never hides a selectable field). Checkbox ids
+stay the full raw key — selection persistence and the grid untouched. Frontend-only.
+New vitest coverage: `columnPicker.test.tsx` (grouping, expansion, orphans,
+search-expansion, raw-key selection) + `splitDerivedKey` unit tests.)
+
+Previous (session 18 — Milestone 2 batch, PR 6/7: M16a staging-format
+redesign. `EnrichmentResultStaging` regrained from row-per-(event, attr, output_field)
+to row-per-(job, event) with a `fields` JSON map (`field_key -> value`, keys already
+attr-prefixed) — ~3-6x fewer staging rows for multi-output enrichers, unique index now
+`(job_id, event_id)`. `_process_batch` accumulates one map per event (empty maps skipped);
+apply loop pages 4000 rows (was 10000 per-field rows) and expands maps back into triples
+for `apply_enrichments` — no ClickHouse-side change. **Destructive migration**:
+`init_schema` drops a legacy staging table (recognized by its `field_key` column) before
+`create_all`; orphaned pre-upgrade staged rows are discarded, matching the pre-release
+stance; the old `enricher_config_hash` ADD COLUMN block is gone. Dead helpers
+`pop_staged_rows_for_job`/`delete_staged_rows` replaced by read-only
+`list_staged_rows_for_job`. New tests: migration drop+recreate (idempotent), one-row-per-
+event `_process_batch` grain.)
+
+Previous (session 18 — Milestone 2 batch, PR 5/7: M15 per-source
+field-stats cache. New `db/field_stats.py` + Postgres `source_field_stats` (versioned
+JSON payload: top-level cols + attribute keys with distinct/coverage/3 samples; version
+mismatch = cache miss, no migrations). Computed per source in 2 ClickHouse queries at:
+ingest completion (isolated, never fails the ingest) and after every enrichment apply
+(the only attributes mutation path; on refresh failure the stale row is dropped so reads
+recompute). Read path is compute-on-read + store — pre-existing DBs self-heal. Converted
+call sites: `list_fields` (ColumnPicker, timeline wizard, mapping validation),
+`field_coverage` (timeline wizard — counts now exact instead of 20k-row samples;
+`sampled_rows_per_source` removed from response + frontend type), `field_inventory`
+(Visualize field picker, novelty recommender — `recommend_novelty_fields` accepts a
+pre-merged inventory; canonical field-mapping coalesce aggregates stay live via new
+`canonical_inventory`, since per-source counts can't dedupe multi-raw-key events). Merge
+math: coverage sums exactly, distinct = max-across-sources (documented approximation).
+Deliberately not converted: embedding wizard's `list_fields_by_artifact` (cost is the
+cohesion value-sampling, not inventory). `delete_source` drops the cache row. New
+`tests/test_field_stats.py`: live-ClickHouse parity vs the old scans, self-heal,
+version-mismatch recompute, derived keys visible after `apply_enrichments`.)
+
+Previous (session 18 — Milestone 2 batch, PR 4/7: CI container smoke test.
+New `container-smoke` job: builds the reference image, boots it with `--network host`
+against the same pg/clickhouse(glibc)/qdrant service containers the backend job uses,
+asserts `/api/health` returns `status:"ok"` (would have caught C1's broken CMD import)
+and that `/` serves the packaged frontend HTML; dumps container logs on failure.
+Dockerfile gains `ARG INSTALL_EMBEDDINGS` (default 0) so the image skips the ~2 GB local
+embedding stack once M5's `embeddings` extra lands — the smoke test then doubles as the
+"boots without the extra" regression test.)
+
+Previous (session 18 — Milestone 2 batch, PR 3/7: M17 job authz via case
+RBAC. `Job` gains `case_id` (in `to_dict()` too), threaded through every
+`job_store.create` site (ingest, embed, manual + automatic enrich, startup re-runs —
+`run.case_id`). `GET /api/jobs/{id}`: creator/admin unchanged; otherwise READ access on
+the job's case grants visibility (`resolve_case_access`), so case members can poll each
+other's jobs and system jobs (`created_by=None`) become member-visible instead of
+admin-only. Non-members still get 404 (no existence probing). Case-less jobs keep
+owner-or-admin semantics. New `tests/test_jobs_api.py` covers the four quadrants.)
+
+Previous (session 18 — Milestone 2 batch, PR 2/7: M5 dependency diet.
+Removed never-imported `torchvision`/`onnxruntime`/`jinja2`/`alembic`; `torch` +
+`sentence-transformers` moved to an optional `embeddings` extra
+(`uv sync --extra embeddings`) — base install drops ~2 GB. Sole ML import
+(`models/embeddings.py`) is now lazy inside `load()` with an actionable RuntimeError;
+new `embeddings_available()` (importability OR `TS_EMBEDDING_API_BASE_URL` — remote mode
+needs no torch) surfaces as `embeddings_available` on `/api/health` and gates embed-start
+and semantic-search with a request-time 503 instead of a job that dies on ImportError.
+Field-recommend already degraded gracefully. README quick-start/airgapped docs updated.)
+
+Previous (session 18 — Milestone 2 batch, PR 1/7: ingest throughput.
+`TS_INGEST_BATCH_SIZE` (default 20k) replaces the accidental reuse of
+`embedding_batch_size` (64) as the ClickHouse insert batch in `IngestionPipeline` —
+one HTTP insert per 20k rows instead of per 64, the dominant fix for the 100 GiB-over-LAN
+ingest goal. CLI `--batch-size` falls through to the setting; enricher read paging
+bumped to ≥1000; 413 upload rejection names `TS_MAX_UPLOAD_BYTES` and points at
+`tsig ingest` for huge files; deferred native-protocol/async_insert options recorded
+as ROADMAP M20. Remaining Milestone 2 PRs planned: M5 dependency diet, M17 job RBAC,
+CI container smoke test, M15 field-stats precompute, M16 staging redesign +
+ColumnPicker grouping.)
+
+Previous (session 17 — final PR #54 cleanup batch, M16 bulk. Four commits on
 `feat/enricher-subsystem`: **(1) micro-fixes** — GeoIP output-field names single-sourced
 (order locked, config_hash-stable), `refresh_availability(key)` single-enricher form,
 batched `count_events(source_ids=...)`, concurrent eligibility checks via `asyncio.gather`,

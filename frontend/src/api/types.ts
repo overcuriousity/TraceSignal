@@ -142,7 +142,6 @@ export interface FieldCoverageEntry {
 
 export interface FieldCoverageResponse {
   fields: FieldCoverageEntry[];
-  sampled_rows_per_source: number;
 }
 
 export interface Event {
@@ -489,6 +488,13 @@ export interface FieldsResponse {
    * enrichment-derived keys ("src_ip:geo_country") — all filterable.
    */
   attributes: string[];
+  /**
+   * Registered enrichers' output-field names (the `<field>` half of a
+   * `<attr_key>:<field>` derived key) — lets the UI tell a real
+   * enrichment-derived key apart from a raw vendor key that happens to
+   * contain a colon, instead of guessing from the key name alone.
+   */
+  derived_suffixes: string[];
 }
 
 export interface HistogramBucket {

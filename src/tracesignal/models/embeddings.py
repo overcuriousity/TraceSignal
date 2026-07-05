@@ -2,14 +2,31 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
-from sentence_transformers import SentenceTransformer
 
 from tracesignal.core.config import get_settings
 from tracesignal.models.event import EmbeddingConfig
+
+if TYPE_CHECKING:
+    from sentence_transformers import SentenceTransformer
+
+
+def embeddings_available() -> bool:
+    """Whether embedding features can run in this installation.
+
+    True when the local sentence-transformers stack is importable (the
+    ``embeddings`` extra is installed) OR a remote OpenAI-compatible endpoint
+    is configured via ``TS_EMBEDDING_API_BASE_URL`` — the remote path needs
+    no local ML dependencies. Cheap: checks importability, never loads the
+    model.
+    """
+    if get_settings().embedding_api_base_url:
+        return True
+    return importlib.util.find_spec("sentence_transformers") is not None
 
 
 class EmbeddingModel:
@@ -74,6 +91,14 @@ class EmbeddingModel:
         if self.is_remote:
             raise RuntimeError("load() is not available when using a remote embedding endpoint")
         if self._model is None:
+            try:
+                from sentence_transformers import SentenceTransformer
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Local embedding support is not installed. Install the 'embeddings' "
+                    "extra (uv sync --extra embeddings) or configure "
+                    "TS_EMBEDDING_API_BASE_URL to use a remote embedding endpoint."
+                ) from exc
             offline = not get_settings().allow_online
             offline_vars = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
             # Scoped to this call (save/restore) rather than setdefault(), which

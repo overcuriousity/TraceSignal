@@ -328,24 +328,24 @@ class EnrichmentResultStaging(Base):
 
     Rows accumulate here as an enrichment job processes batches; at job end
     they are merged into the ClickHouse ``events.attributes`` map via an
-    atomic per-source partition rewrite (``ClickHouseStore.apply_enrichments``)
+    atomic per-source partition rewrite (``ClickHouseStore.finalize_enrichment_apply``)
     and deleted only after the swap succeeds. If the process dies mid-run,
     rows survive here (Postgres is transactional) even though the in-memory
     JobStore does not — see ``list_orphaned_enrichment_job_runs``, which
     mirrors ``list_ingesting_sources`` for reconciliation on restart.
+
+    One row per ``(job, event)``: everything an enricher derived for one
+    event is a single ``fields`` JSON map (``field_key -> value``, keys
+    already attr-prefixed via ``derived_field_key``). Replaces the original
+    row-per-(event, attr, output_field) grain — ~3-6x fewer rows for
+    multi-output enrichers, and the apply loop expands the map back into
+    triples for ``stage_enrichment_rows`` without any ClickHouse-side change.
     """
 
     __tablename__ = "enrichment_results_staging"
     __table_args__ = (
         Index("ix_staging_job_id", "job_id"),
-        Index(
-            "ix_staging_unique_row",
-            "job_id",
-            "event_id",
-            "enricher_key",
-            "field_key",
-            unique=True,
-        ),
+        Index("ix_staging_unique_row", "job_id", "event_id", unique=True),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -355,8 +355,7 @@ class EnrichmentResultStaging(Base):
     timeline_id: Mapped[str] = mapped_column(String(64), nullable=False)
     event_id: Mapped[str] = mapped_column(String(64), nullable=False)
     enricher_key: Mapped[str] = mapped_column(String(128), nullable=False)
-    field_key: Mapped[str] = mapped_column(String(128), nullable=False)
-    value: Mapped[str] = mapped_column(String(1024), nullable=False)
+    fields: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     enricher_config_hash: Mapped[str] = mapped_column(
         String(64), nullable=False, default="", server_default=""
@@ -435,6 +434,32 @@ class SourceEnrichment(Base):
             "rows_applied": self.rows_applied,
             "applied_at": self.applied_at.isoformat() if self.applied_at else None,
         }
+
+
+class SourceFieldStats(Base):
+    """Cached per-source field statistics (roadmap M15).
+
+    Derived, recomputable data — computed from the immutable ClickHouse
+    events of one source after ingestion and refreshed after each enrichment
+    apply (the only mutation path for ``events.attributes``). ``payload``
+    shape is versioned via ``stats_version``: a mismatch is treated as a
+    cache miss and recomputed, never migrated. See ``db/field_stats.py``.
+    """
+
+    __tablename__ = "source_field_stats"
+    __table_args__ = (Index("ix_source_field_stats_source", "source_id", unique=True),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    stats_version: Mapped[int] = mapped_column(nullable=False, default=1)
+    events_total: Mapped[int] = mapped_column(nullable=False, default=0)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    computed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
 
 
 class View(Base):
@@ -855,6 +880,25 @@ class PostgresStore:
         support that clause.
         """
         async with self.engine.begin() as conn:
+            # Destructive staging-format migration (roadmap M16): the legacy
+            # row-per-(event, attr, output_field) staging table (recognized by
+            # its `field_key` column) is replaced by row-per-(job, event) with
+            # a `fields` JSON map. Staged rows are transient in-flight state;
+            # any orphaned rows from a crashed pre-upgrade run are discarded —
+            # pre-release databases are documented as deprecated (same stance
+            # as the `event_enrichments` drop on the ClickHouse side), and a
+            # re-run of the enricher regenerates the data.
+            legacy_staging = await conn.run_sync(
+                lambda sync_conn: (
+                    "enrichment_results_staging" in inspect(sync_conn).get_table_names()
+                    and any(
+                        col["name"] == "field_key"
+                        for col in inspect(sync_conn).get_columns("enrichment_results_staging")
+                    )
+                )
+            )
+            if legacy_staging:
+                await conn.execute(text("DROP TABLE enrichment_results_staging"))
             await conn.run_sync(Base.metadata.create_all)
             existing_columns = await conn.run_sync(
                 lambda sync_conn: {
@@ -888,19 +932,9 @@ class PostgresStore:
                         "ALTER TABLE sources ADD COLUMN status VARCHAR(16) NOT NULL DEFAULT 'ready'"
                     )
                 )
-            staging_columns = await conn.run_sync(
-                lambda sync_conn: {
-                    col["name"]
-                    for col in inspect(sync_conn).get_columns("enrichment_results_staging")
-                }
-            )
-            if "enricher_config_hash" not in staging_columns:
-                await conn.execute(
-                    text(
-                        "ALTER TABLE enrichment_results_staging "
-                        "ADD COLUMN enricher_config_hash VARCHAR(64) NOT NULL DEFAULT ''"
-                    )
-                )
+            # (The former enricher_config_hash ADD COLUMN for the staging
+            # table is gone: the M16 drop-and-recreate above guarantees the
+            # current shape.)
             # No migration for the earlier `annotation_type="outlier"` rows
             # (renamed to "anomaly" when the statistical anomaly engine
             # landed): no releases exist yet and pre-this-branch databases
@@ -1252,7 +1286,7 @@ class PostgresStore:
             await session.execute(insert(EnrichmentResultStaging), rows)
             await session.commit()
 
-    async def pop_staged_rows_for_job(
+    async def list_staged_rows_for_job(
         self, job_id: str, limit: int
     ) -> list[EnrichmentResultStaging]:
         """Return up to ``limit`` staged rows for a job, oldest first (does not delete them)."""
@@ -1264,16 +1298,6 @@ class PostgresStore:
                 .limit(limit)
             )
             return list(result.scalars().all())
-
-    async def delete_staged_rows(self, ids: list[int]) -> None:
-        """Delete staged rows by primary key, after they've been flushed to ClickHouse."""
-        if not ids:
-            return
-        async with self.session_factory() as session:
-            await session.execute(
-                delete(EnrichmentResultStaging).where(EnrichmentResultStaging.id.in_(ids))
-            )
-            await session.commit()
 
     async def delete_staged_rows_for_job(self, job_id: str) -> None:
         """Delete every staged row for a job — used to discard an orphaned/unflushed run."""
@@ -1299,9 +1323,9 @@ class PostgresStore:
     ) -> list[EnrichmentResultStaging]:
         """Keyset-paged staged rows for one source of a job (does not delete).
 
-        Unlike ``pop_staged_rows_for_job``'s pop-after-insert pattern, apply
-        needs the rows to survive until the partition ``REPLACE`` succeeds —
-        deletion happens separately via ``delete_staged_rows_for_source``.
+        Apply needs the rows to survive until the partition ``REPLACE``
+        succeeds — deletion happens separately via
+        ``delete_staged_rows_for_source``.
         """
         async with self.session_factory() as session:
             result = await session.execute(
@@ -1459,9 +1483,93 @@ class PostgresStore:
                     EnrichmentResultStaging.source_id == source_id,
                 )
             )
+            await session.execute(
+                delete(SourceFieldStats).where(
+                    SourceFieldStats.case_id == case_id,
+                    SourceFieldStats.source_id == source_id,
+                )
+            )
             await session.delete(source)
             await session.commit()
             return True
+
+    # ------------------------------------------------------------------
+    # Source field stats (M15 cache — see db/field_stats.py)
+    # ------------------------------------------------------------------
+
+    async def upsert_source_field_stats(
+        self,
+        *,
+        case_id: str,
+        source_id: str,
+        stats_version: int,
+        events_total: int,
+        payload: dict,
+    ) -> SourceFieldStats:
+        """Insert or replace the cached field stats for one source.
+
+        Concurrency-safe: the read path is self-healing, so several requests
+        can miss the cache for the same source at once (e.g. ColumnPicker,
+        viz, and anomaly field listings all firing on one page load) and race
+        to insert. ``source_id`` is uniquely indexed, so the losing insert
+        raises ``IntegrityError``; we roll back and retry, on which pass the
+        now-present row is updated instead.
+        """
+        from sqlalchemy import select
+        from sqlalchemy.exc import IntegrityError
+
+        for attempt in range(2):
+            async with self.session_factory() as session:
+                result = await session.execute(
+                    select(SourceFieldStats).where(SourceFieldStats.source_id == source_id)
+                )
+                row = result.scalar_one_or_none()
+                if row is None:
+                    row = SourceFieldStats(
+                        id=generate_id(f"fieldstats_{source_id}"),
+                        case_id=case_id,
+                        source_id=source_id,
+                    )
+                    session.add(row)
+                row.case_id = case_id
+                row.stats_version = stats_version
+                row.events_total = events_total
+                row.payload = payload
+                row.computed_at = datetime.now(UTC)
+                try:
+                    await session.commit()
+                except IntegrityError:
+                    # A concurrent insert won the race; retry so this call
+                    # updates the row it just observed as missing.
+                    await session.rollback()
+                    if attempt == 0:
+                        continue
+                    raise
+                await session.refresh(row)
+                return row
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    async def delete_source_field_stats(self, source_id: str) -> None:
+        """Drop one source's cached stats so the next read recomputes them."""
+        from sqlalchemy import delete
+
+        async with self.session_factory() as session:
+            await session.execute(
+                delete(SourceFieldStats).where(SourceFieldStats.source_id == source_id)
+            )
+            await session.commit()
+
+    async def get_source_field_stats(self, source_ids: list[str]) -> list[SourceFieldStats]:
+        """Return cached field-stats rows for the given sources (missing ones absent)."""
+        from sqlalchemy import select
+
+        if not source_ids:
+            return []
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(SourceFieldStats).where(SourceFieldStats.source_id.in_(source_ids))
+            )
+            return list(result.scalars().all())
 
     # ------------------------------------------------------------------
     # Timelines

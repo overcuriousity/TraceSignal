@@ -28,11 +28,17 @@ from tracesignal.core.events_bus import publish_annotation_change
 from tracesignal.core.jobs import JobStore, get_job_store
 from tracesignal.db.clickhouse import ClickHouseStore
 from tracesignal.db.field_mappings import validate_field_mappings
+from tracesignal.db.field_stats import (
+    ensure_source_field_stats,
+    merged_field_coverage,
+    merged_list_fields,
+    refresh_source_field_stats,
+)
 from tracesignal.db.postgres import Case, PostgresStore, User, generate_id
 from tracesignal.db.qdrant import QdrantStore
-from tracesignal.db.queries import EventQueryService
 from tracesignal.ingestion.parser import detect_format
 from tracesignal.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
+from tracesignal.models.embeddings import embeddings_available
 
 
 class CaseCreate(BaseModel):
@@ -323,9 +329,10 @@ async def _revalidate_stale_field_mappings(
         ready_ids = [s.id for s in sources if s.is_ready]
         if not ready_ids:
             continue
-        service = EventQueryService()
-        inventory = await run_in_threadpool(service.list_fields, case_id, ready_ids)
-        problems = validate_field_mappings(timeline.field_mappings, set(inventory["attributes"]))
+        keys = await _resolve_mapping_validation_keys(
+            ClickHouseStore(), case_id, ready_ids, timeline.field_mappings
+        )
+        problems = validate_field_mappings(timeline.field_mappings, keys)
         if problems:
             logger.warning(
                 "Timeline %r field_mappings are invalid against its now-ready sources: %s",
@@ -386,7 +393,7 @@ async def _trigger_automatic_enrichments(
             )
             continue
         job = job_store.create(
-            kind="enrich", progress={"processed": 0, "total": 0}, created_by=None
+            kind="enrich", progress={"processed": 0, "total": 0}, created_by=None, case_id=case_id
         )
         try_claim_enricher_run(timeline_id, enricher_key, job.id)
         # create_task (not FastAPI BackgroundTasks) is deliberate: this runs
@@ -443,7 +450,6 @@ async def _run_ingestion_job(
             case_id=case_id,
             source_id=source_id,
             clickhouse=clickhouse,
-            batch_size=get_settings().embedding_batch_size,
             file_hash=file_hash,
             source_name=source_name,
             progress_callback=progress_callback,
@@ -460,6 +466,18 @@ async def _run_ingestion_job(
         # Only now does the source become visible to timeline queries,
         # detectors, and embedding (see events._resolve_timeline_scope).
         await store.set_source_status(case_id, source_id, "ready")
+        # Precompute the per-source field-stats cache (M15). Isolated like the
+        # auto-enrichment trigger below: a failure must never roll back a
+        # successful ingest, and the read path self-heals on a cache miss.
+        try:
+            await refresh_source_field_stats(store, clickhouse, case_id, source_id)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Field-stats precompute failed for source %s (case %s); "
+                "reads fall back to compute-on-demand",
+                source_id,
+                case_id,
+            )
         await _revalidate_stale_field_mappings(store, case_id, source_id)
         # Auto-enrichment scheduling runs *after* the source is committed
         # "ready"; a failure here must never fall through to the ingest
@@ -650,6 +668,7 @@ async def upload_source(
             kind="ingest",
             progress={"total": size_bytes, "processed": 0},
             created_by=user.id,
+            case_id=case_id,
         )
         background_tasks.add_task(
             _run_ingestion_job,
@@ -777,6 +796,30 @@ async def get_timeline(timeline_id: str, case: Case = Depends(require_case_read)
     return {"timeline": timeline.to_dict()}
 
 
+async def _resolve_mapping_validation_keys(
+    clickhouse: ClickHouseStore, case_id: str, source_ids: list[str], mappings: dict[str, list[str]]
+) -> set[str]:
+    """Return the attribute keys to validate *mappings* against.
+
+    Starts from the cached, per-source-capped inventory (cheap, the common
+    case) and only falls back to a live existence check for the mapping's raw
+    keys that aren't in it — the cache caps attribute keys per source
+    (``_MAX_ATTR_KEYS_PER_SOURCE`` in ``field_stats.py``) to bound its
+    payload, so a real but low-coverage raw key can rank outside the cap and
+    would otherwise be rejected as nonexistent.
+    """
+    stats = await ensure_source_field_stats(get_store(), clickhouse, case_id, source_ids)
+    inventory = merged_list_fields(stats)
+    keys = set(inventory["attributes"])
+    missing_raw = {r for raws in mappings.values() for r in raws} - keys
+    if missing_raw:
+        present = await asyncio.to_thread(
+            clickhouse.attribute_keys_present, case_id, source_ids, sorted(missing_raw)
+        )
+        keys |= present
+    return keys
+
+
 async def _check_field_mappings(
     case_id: str, source_ids: list[str], mappings: dict[str, list[str]]
 ) -> None:
@@ -789,9 +832,9 @@ async def _check_field_mappings(
     ``validate_field_mappings``).
     """
     if source_ids:
-        service = EventQueryService()
-        inventory = await run_in_threadpool(service.list_fields, case_id, source_ids)
-        keys: set[str] | None = set(inventory["attributes"])
+        keys: set[str] | None = await _resolve_mapping_validation_keys(
+            ClickHouseStore(), case_id, source_ids, mappings
+        )
     else:
         keys = None
     problems = validate_field_mappings(mappings, keys)
@@ -886,13 +929,15 @@ async def get_field_coverage(
 
     ``source_ids`` is comma-separated. Returns, per raw field, which sources
     carry it (with non-empty counts and sample values) so the wizard can show
-    merge candidates with real data next to them.
+    merge candidates with real data next to them. Served from the per-source
+    field-stats cache (M15) — counts are exact full-source totals, no longer
+    a 20k-rows-per-source sample.
     """
     ids = [sid.strip() for sid in source_ids.split(",") if sid.strip()]
     if not ids:
         raise HTTPException(status_code=422, detail="source_ids must not be empty")
-    service = EventQueryService()
-    return await run_in_threadpool(service.field_coverage, case.id, ids)
+    stats = await ensure_source_field_stats(get_store(), ClickHouseStore(), case.id, ids)
+    return merged_field_coverage(stats)
 
 
 @router.delete("/{case_id}/timelines/{timeline_id}")
@@ -1289,6 +1334,17 @@ async def start_timeline_embedding(
     current source set.  If sources are later added the timeline becomes
     *stale* (``is_stale=True`` in ``to_dict()``), prompting a re-embed.
     """
+    if not embeddings_available():
+        # Fail at request time instead of creating a job that instantly dies
+        # with an ImportError in the background worker.
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Embedding support is not installed. Install the 'embeddings' extra "
+                "(uv sync --extra embeddings) or configure TS_EMBEDDING_API_BASE_URL "
+                "to use a remote embedding endpoint."
+            ),
+        )
     store = get_store()
     case_id = case.id
     timeline = await store.get_timeline(case_id, timeline_id)
@@ -1329,6 +1385,7 @@ async def start_timeline_embedding(
         kind="embed",
         progress={"total": 0, "processed": 0},
         created_by=user.id,
+        case_id=case_id,
     )
     background_tasks.add_task(
         _run_timeline_embedding_job,
@@ -1522,6 +1579,7 @@ async def run_timeline_enricher(
         kind="enrich",
         progress={"processed": 0, "total": 0},
         created_by=user.id,
+        case_id=case_id,
     )
     # Claim now (before the response) so a double-click is rejected with 409
     # even though the job itself only starts after the response is sent.

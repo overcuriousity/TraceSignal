@@ -235,7 +235,7 @@ async def test_upsert_enricher_global_config_creates_then_updates(store):
 
 
 @pytest.mark.asyncio
-async def test_stage_flush_and_delete_staged_rows(store):
+async def test_stage_and_delete_staged_rows_for_source(store):
     now = datetime.now(UTC)
     rows = [
         {
@@ -245,8 +245,7 @@ async def test_stage_flush_and_delete_staged_rows(store):
             "timeline_id": "t1",
             "event_id": "e1",
             "enricher_key": "geoip",
-            "field_key": "geoip_country__ip",
-            "value": "DE",
+            "fields": {"ip:geo_country": "DE", "ip:geo_city": "Berlin"},
             "computed_at": now,
         },
         {
@@ -256,19 +255,19 @@ async def test_stage_flush_and_delete_staged_rows(store):
             "timeline_id": "t1",
             "event_id": "e2",
             "enricher_key": "geoip",
-            "field_key": "geoip_country__ip",
-            "value": "US",
+            "fields": {"ip:geo_country": "US"},
             "computed_at": now,
         },
     ]
     await store.stage_enrichment_results(rows)
 
-    staged = await store.pop_staged_rows_for_job("job1", limit=10)
+    staged = await store.list_staged_rows_for_job("job1", limit=10)
     assert len(staged) == 2
-    assert {r.value for r in staged} == {"DE", "US"}
+    assert {r.fields["ip:geo_country"] for r in staged} == {"DE", "US"}
+    assert staged[0].fields["ip:geo_city"] == "Berlin"
 
-    await store.delete_staged_rows([r.id for r in staged])
-    assert await store.pop_staged_rows_for_job("job1", limit=10) == []
+    await store.delete_staged_rows_for_source("job1", "s1")
+    assert await store.list_staged_rows_for_job("job1", limit=10) == []
 
 
 @pytest.mark.asyncio
@@ -283,8 +282,7 @@ async def test_delete_staged_rows_for_job_discards_only_that_job(store):
                 "timeline_id": "t1",
                 "event_id": "e1",
                 "enricher_key": "geoip",
-                "field_key": "geoip_country__ip",
-                "value": "DE",
+                "fields": {"ip:geo_country": "DE"},
                 "computed_at": now,
             }
         ]
@@ -298,16 +296,110 @@ async def test_delete_staged_rows_for_job_discards_only_that_job(store):
                 "timeline_id": "t1",
                 "event_id": "e2",
                 "enricher_key": "geoip",
-                "field_key": "geoip_country__ip",
-                "value": "US",
+                "fields": {"ip:geo_country": "US"},
                 "computed_at": now,
             }
         ]
     )
 
     await store.delete_staged_rows_for_job("job1")
-    assert await store.pop_staged_rows_for_job("job1", limit=10) == []
-    assert len(await store.pop_staged_rows_for_job("job2", limit=10)) == 1
+    assert await store.list_staged_rows_for_job("job1", limit=10) == []
+    assert len(await store.list_staged_rows_for_job("job2", limit=10)) == 1
+
+
+def test_process_batch_emits_one_row_per_event_with_field_map():
+    """M16 staging grain: multi-attribute, multi-output events collapse into
+    a single staging row whose ``fields`` map carries every derived key."""
+    from tracesignal.enrichers.base import Enricher
+    from tracesignal.enrichers.jobs import _process_batch
+
+    class StubEnricher(Enricher):
+        key = "stub"
+        display_name = "Stub"
+        description = ""
+        eligibility_regex = r"^10\..*"
+        output_fields = ("geo_country", "geo_city")
+
+        def check_availability(self):
+            return AvailabilityResult(True)
+
+        def enrich_value(self, raw_value):
+            return {"geo_country": "DE", "geo_city": "Berlin"}
+
+    batch = [
+        {
+            "event_id": "e1",
+            "attributes": {"src_ip": "10.0.0.1", "dst_ip": "10.0.0.2", "note": "x"},
+        },
+        {"event_id": "e2", "attributes": {"note": "no match"}},
+        # Derived keys from a previous run must not be re-enriched.
+        {"event_id": "e3", "attributes": {"src_ip:geo_country": "10.9.9.9"}},
+    ]
+    rows = _process_batch(StubEnricher(), batch, "c1", "s1", "t1", "job1", "stub", "hash1")
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["event_id"] == "e1"
+    assert row["fields"] == {
+        "src_ip:geo_country": "DE",
+        "src_ip:geo_city": "Berlin",
+        "dst_ip:geo_country": "DE",
+        "dst_ip:geo_city": "Berlin",
+    }
+
+
+@pytest.mark.asyncio
+async def test_init_schema_drops_legacy_staging_table(tmp_path):
+    """M16 destructive migration: a legacy row-per-field staging table
+    (recognized by its field_key column) is dropped and recreated in the
+    row-per-(job, event) shape; orphaned pre-upgrade rows are discarded."""
+    from sqlalchemy import text
+
+    db_path = tmp_path / "legacy_staging.db"
+    s = PostgresStore(url=f"sqlite+aiosqlite:///{db_path}")
+    async with s.engine.begin() as conn:
+        await conn.execute(
+            text(
+                "CREATE TABLE enrichment_results_staging ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, job_id VARCHAR(64), "
+                "case_id VARCHAR(64), source_id VARCHAR(64), timeline_id VARCHAR(64), "
+                "event_id VARCHAR(64), enricher_key VARCHAR(128), "
+                "field_key VARCHAR(128), value VARCHAR(1024), computed_at TIMESTAMP)"
+            )
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO enrichment_results_staging "
+                "(job_id, case_id, source_id, timeline_id, event_id, enricher_key, "
+                "field_key, value, computed_at) VALUES "
+                "('j', 'c', 's', 't', 'e', 'geoip', 'ip:geo_country', 'DE', CURRENT_TIMESTAMP)"
+            )
+        )
+    await s.init_schema()
+    try:
+        # New shape: fields JSON column present, legacy rows discarded.
+        await s.stage_enrichment_results(
+            [
+                {
+                    "job_id": "j2",
+                    "case_id": "c",
+                    "source_id": "s",
+                    "timeline_id": "t",
+                    "event_id": "e",
+                    "enricher_key": "geoip",
+                    "fields": {"ip:geo_country": "US"},
+                    "computed_at": datetime.now(UTC),
+                }
+            ]
+        )
+        assert await s.list_staged_rows_for_job("j", limit=10) == []
+        rows = await s.list_staged_rows_for_job("j2", limit=10)
+        assert rows[0].fields == {"ip:geo_country": "US"}
+        # Idempotent: a second init_schema must not drop the new table.
+        await s.init_schema()
+        assert len(await s.list_staged_rows_for_job("j2", limit=10)) == 1
+    finally:
+        await s.engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -324,24 +416,38 @@ async def test_orphaned_enrichment_job_run_lifecycle(store):
 
 
 class _RecordingClickHouse:
-    """Fake ClickHouseStore capturing apply_enrichments calls."""
+    """Fake ClickHouseStore capturing the stage/finalize enrichment-apply calls."""
 
     def __init__(self) -> None:
+        self._staged_by_suffix: dict[str, list[list]] = {}
         self.applied: list[tuple[str, str, str, list]] = []
 
-    def apply_enrichments(
-        self, case_id, source_id, scratch_suffix, row_chunks, owned_suffixes=None
-    ) -> int:
-        chunks = [list(chunk) for chunk in row_chunks]
+    def create_enrichment_scratch(self, scratch_suffix) -> None:
+        self._staged_by_suffix[scratch_suffix] = []
+
+    def stage_enrichment_rows(self, scratch_suffix, chunk) -> int:
+        self._staged_by_suffix.setdefault(scratch_suffix, []).append(list(chunk))
+        return len(chunk)
+
+    def finalize_enrichment_apply(
+        self, case_id, source_id, scratch_suffix, owned_suffixes=None
+    ) -> None:
+        chunks = self._staged_by_suffix.get(scratch_suffix, [])
         self.applied.append((case_id, source_id, scratch_suffix, chunks))
-        return sum(len(chunk) for chunk in chunks)
+
+    def drop_enrichment_scratch(self, scratch_suffix) -> None:
+        self._staged_by_suffix.pop(scratch_suffix, None)
 
 
 class _BrokenClickHouse:
-    def apply_enrichments(
-        self, case_id, source_id, scratch_suffix, row_chunks, owned_suffixes=None
-    ) -> int:
+    def create_enrichment_scratch(self, scratch_suffix) -> None:
+        pass
+
+    def stage_enrichment_rows(self, scratch_suffix, chunk) -> int:
         raise ConnectionError("clickhouse down")
+
+    def drop_enrichment_scratch(self, scratch_suffix) -> None:
+        pass
 
 
 async def _stage_one_row(store, job_id="job1", value="DE", config_hash="hash1"):
@@ -354,8 +460,7 @@ async def _stage_one_row(store, job_id="job1", value="DE", config_hash="hash1"):
                 "timeline_id": "t1",
                 "event_id": "e1",
                 "enricher_key": "geoip",
-                "field_key": "ip:geo_country",
-                "value": value,
+                "fields": {"ip:geo_country": value},
                 "computed_at": datetime.now(UTC),
                 "enricher_config_hash": config_hash,
             }
@@ -382,7 +487,7 @@ async def test_reconcile_orphaned_enrichment_jobs_applies_and_returns_reruns(sto
     case_id, source_id, suffix, chunks = ch.applied[0]
     assert (case_id, source_id, suffix) == ("c1", "s1", "job1")
     assert chunks == [[("e1", "ip:geo_country", "DE")]]
-    assert await store.pop_staged_rows_for_job("job1", limit=10) == []
+    assert await store.list_staged_rows_for_job("job1", limit=10) == []
     assert await store.list_orphaned_enrichment_job_runs() == []
     # Provenance recorded with the staged config hash.
     provenance = await store.list_source_enrichments("s1")
@@ -408,7 +513,7 @@ async def test_reconcile_leaves_marker_and_rows_when_apply_fails(store):
 
     assert recovered == []
     assert [o.job_id for o in await store.list_orphaned_enrichment_job_runs()] == ["job1"]
-    assert len(await store.pop_staged_rows_for_job("job1", limit=10)) == 1
+    assert len(await store.list_staged_rows_for_job("job1", limit=10)) == 1
     assert await store.list_source_enrichments("s1") == []
 
 
@@ -425,7 +530,7 @@ async def test_apply_skips_and_discards_rows_for_deleted_source(store):
 
     assert applied == 0
     assert ch.applied == []
-    assert await store.pop_staged_rows_for_job("job1", limit=10) == []
+    assert await store.list_staged_rows_for_job("job1", limit=10) == []
     assert await store.list_source_enrichments("s1") == []
 
 
@@ -465,10 +570,13 @@ def _fake_ch_store():
 
 def test_apply_enrichments_runs_atomic_partition_rewrite():
     store = _fake_ch_store()
-    applied = store.apply_enrichments(
-        "c1", "s1", "job1", [[("e1", "ip:geo_country", "DE"), ("e1", "ip:geo_city", "X")]]
+    store.create_enrichment_scratch("job1")
+    applied = store.stage_enrichment_rows(
+        "job1", [("e1", "ip:geo_country", "DE"), ("e1", "ip:geo_city", "X")]
     )
     assert applied == 2
+    store.finalize_enrichment_apply("c1", "s1", "job1")
+    store.drop_enrichment_scratch("job1")
 
     client = store.client
     # Triples inserted into the scratch rows table.
@@ -498,7 +606,9 @@ def test_apply_enrichments_runs_atomic_partition_rewrite():
 
 def test_apply_enrichments_no_rows_is_a_noop_swap():
     store = _fake_ch_store()
-    assert store.apply_enrichments("c1", "s1", "job1", [[]]) == 0
+    store.create_enrichment_scratch("job1")
+    assert store.stage_enrichment_rows("job1", []) == 0
+    store.drop_enrichment_scratch("job1")
     assert not any("REPLACE PARTITION" in c for c in store.client.commands)
 
 

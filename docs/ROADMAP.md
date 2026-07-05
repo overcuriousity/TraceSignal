@@ -31,43 +31,20 @@ resolved — this file holds only the condensed, still-open action items.
 
 ## Milestone 2 — high-leverage improvements
 
-- [ ] **M5 — Dependency diet.** `torchvision`, `onnxruntime`, `jinja2` are declared but never
-  imported; `alembic` is unused (migrations are hand-rolled additive ALTERs in
-  `postgres.py::init_schema`). Remove them. Then consider moving `torch`/
-  `sentence-transformers` to an optional `embeddings` extra with graceful capability
-  degradation (health endpoint flag, clear error on embed endpoints) so the base install
-  drops ~2 GB.
-- [ ] **Container smoke test in CI.** Build the image, `docker compose up`, curl
-  `/api/health`. Would have caught C1 before it shipped.
-- [ ] **M15 — Precompute per-source field stats at ingest time.** Four call sites do a live
-  full-scan ClickHouse aggregation over `events` on every read — `db/anomaly_stats.py`'s
-  `field_inventory` (backs both the Visualize page's field dropdown and the anomaly wizard's
-  field recommender), `db/queries.py::list_fields` (Explorer ColumnPicker),
-  `db/queries.py::field_coverage` (timeline-creation wizard, scans up to 20k rows/source with
-  sample values every time the wizard opens), and `db/queries.py::list_fields_by_artifact`.
-  Since sources are immutable once ingested, none of this needs to be live: compute once per
-  source right after ingestion (same trigger point `_trigger_automatic_enrichments` uses),
-  cache in Postgres keyed by `source_id`, and merge cheaply per timeline. `coverage` merges
-  exactly via addition; exact `distinct` needs a sketch (HyperLogLog) or a cheap approximation
-  (e.g. max-across-sources) since it only feeds a UI hint. Short-term mitigation already
-  shipped: `VisualizePage` shows a "can take a while" hint under the spinner and the field
-  dropdown scrolls instead of overflowing (`ui/Select.tsx`).
-- [ ] **M16 — Enricher follow-ups (fresh branch after PR #54 merges).** The 2026-07-04
-  cleanup batch on `feat/enricher-subsystem` resolved the bulk of the PR #54 review residue
-  (#9–#13 generic asset abstraction + de-GeoIP'd frontend, #15–#19 reuse, #24–#26
-  simplification, #28/#30/#31 efficiency, #32/#33 minors; #20 documented won't-fix). Full
-  finding set + status in `docs/archive/PR54_REVIEW_FINDINGS.md`. Deliberately deferred:
-  - Staging-format redesign: staging is one Postgres row per (event, attr, output_field) —
-    a row-per-event JSON-map format would shrink staging ~3x and simplify the apply join.
-  - #34: derived-key cardinality can balloon the ColumnPicker on wide/vendor-inconsistent
-    datasets (`src_ip:geo_country`, `source_ip:geo_country`, ...) — needs a grouping/limit
-    design in the ColumnPicker.
+- [ ] **M15 residue — `list_fields_by_artifact` stays live (deliberate).** The per-source
+  field-stats cache (`db/field_stats.py`, shipped) converted `field_inventory`,
+  `list_fields`, and `field_coverage`; the embedding wizard's `list_fields_by_artifact`
+  keeps its live scan because its cost is the randomized per-artifact value sampling that
+  feeds content-aware cohesion scoring — caching only its inventory would save little.
+  Revisit only if the wizard's latency becomes a complaint. HyperLogLog sketches for exact
+  merged `distinct` likewise deferred (max-across-sources approximation documented in the
+  module).
 
-- [ ] **M17 — Job authorization via case RBAC.** PR #7 review #9 follow-up (guard itself was
-  fixed): jobs are only guarded by `created_by == user.id or is_admin`; a `Job.case_id` +
-  `resolve_case_access` check would let case members see each other's jobs and align job
-  visibility with the rest of the RBAC model. Flagged in `docs/PROGRESS.md` at the time;
-  full context in `docs/archive/PR7_REVIEW_FINDINGS.md` #9.
+- [ ] **M20 — Ingest-throughput follow-ups (only if needed).** `TS_INGEST_BATCH_SIZE`
+  (default 20k, one HTTP insert per batch) should carry a 100 GiB ingest fine (~5k inserts
+  for ~100M rows). Revisit only if measured insufficient: ClickHouse native protocol
+  (clickhouse-driver, port 9000), `async_insert`, parse/insert pipelining (parser thread
+  feeding an insert thread).
 
 ## Milestone 3 — polish
 

@@ -59,3 +59,25 @@ describe("getAttributeDecoration", () => {
     });
   });
 });
+
+describe("splitDerivedKey", () => {
+  it("splits a derived key into parent and output field", async () => {
+    const { splitDerivedKey } = await import("@/lib/enrichment");
+    expect(splitDerivedKey("src_ip:geo_country")).toEqual({
+      parent: "src_ip",
+      field: "geo_country",
+    });
+  });
+
+  it("splits on the last separator for multi-separator keys", async () => {
+    const { splitDerivedKey } = await import("@/lib/enrichment");
+    expect(splitDerivedKey("a:b:c")).toEqual({ parent: "a:b", field: "c" });
+  });
+
+  it("returns null for plain keys and degenerate forms", async () => {
+    const { splitDerivedKey } = await import("@/lib/enrichment");
+    expect(splitDerivedKey("src_ip")).toBeNull();
+    expect(splitDerivedKey(":x")).toBeNull();
+    expect(splitDerivedKey("x:")).toBeNull();
+  });
+});

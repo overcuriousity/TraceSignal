@@ -17,6 +17,35 @@ export function derivedFieldKey(attrKey: string, outputField: string): string {
   return `${attrKey}${FIELD_KEY_SEPARATOR}${outputField}`;
 }
 
+export interface DerivedKeyParts {
+  parent: string;
+  field: string;
+}
+
+/**
+ * Split a derived attribute key into its parent attribute and output field,
+ * or null when the key isn't a real enrichment-derived key.
+ *
+ * Splits on the *last* separator so a parent that itself contains one (rare,
+ * but raw keys are vendor-controlled) resolves correctly. When
+ * `knownSuffixes` is given, the segment after the split must be a registered
+ * enricher output field (see `/fields`'s `derived_suffixes`) — otherwise a
+ * raw vendor key that merely contains a colon (e.g. Windows Event Log /
+ * Sysmon field names) would be misdetected as derived. Without
+ * `knownSuffixes` the split is name-only and callers should treat the result
+ * as a guess.
+ */
+export function splitDerivedKey(
+  key: string,
+  knownSuffixes?: ReadonlySet<string>,
+): DerivedKeyParts | null {
+  const idx = key.lastIndexOf(FIELD_KEY_SEPARATOR);
+  if (idx <= 0 || idx === key.length - 1) return null;
+  const field = key.slice(idx + 1);
+  if (knownSuffixes && !knownSuffixes.has(field)) return null;
+  return { parent: key.slice(0, idx), field };
+}
+
 type Attributes = Record<string, string | null | undefined>;
 
 /**

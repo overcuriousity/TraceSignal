@@ -31,9 +31,21 @@ from tracesignal.db.anomaly_stats import (
     StatisticalAnomalyService,
     ValueFinding,
 )
+from tracesignal.db.field_stats import (
+    ensure_source_field_stats,
+    merged_inventory,
+    merged_list_fields,
+)
 from tracesignal.db.postgres import Case, User, generate_id
 from tracesignal.db.queries import EventQuery, EventQueryService, TagFilter
 from tracesignal.db.similarity import SimilarityService
+from tracesignal.models.embeddings import embeddings_available
+
+_EMBEDDINGS_UNAVAILABLE_DETAIL = (
+    "Embedding support is not installed. Install the 'embeddings' extra "
+    "(uv sync --extra embeddings) or configure TS_EMBEDDING_API_BASE_URL "
+    "to use a remote embedding endpoint."
+)
 
 _query_service: EventQueryService | None = None
 
@@ -765,13 +777,24 @@ async def list_fields(
     """Return the displayable field names for a timeline.
 
     ``top_level`` contains the fixed columns common to every event.
-    ``attributes`` contains the dynamic keys aggregated from the ``attributes``
-    Map across a sample of up to 50 000 events.  Useful for building a column
-    picker in the UI.
+    ``attributes`` contains the dynamic keys aggregated from the per-source
+    field-stats cache (see ``db/field_stats.py``). ``derived_suffixes`` lists
+    the registered enrichers' output-field names — the UI uses it to tell a
+    real ``<attr_key>:<output_field>`` enrichment-derived key apart from a
+    raw vendor key that happens to contain a colon, instead of guessing from
+    the key name alone. Useful for building a column picker in the UI.
     """
+    from tracesignal.enrichers.registry import list_enrichers
+
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
-    service = _get_query_service()
-    return await run_in_threadpool(service.list_fields, case_id, source_ids, field_mappings)
+    stats = await ensure_source_field_stats(
+        get_store(), _get_query_service().store, case_id, source_ids
+    )
+    result = merged_list_fields(stats, field_mappings)
+    result["derived_suffixes"] = sorted(
+        {field for enricher in list_enrichers() for field in enricher.output_fields}
+    )
+    return result
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/artifacts")
@@ -1279,6 +1302,11 @@ async def semantic_search_events(
     to one timeline's sources. Returns ``status="not_embedded"`` when no
     vectors exist for the searched sources.
     """
+    if not embeddings_available():
+        # find_similar_by_text encodes the query text at request time, which
+        # needs the local model (or a remote endpoint) — fail clearly instead
+        # of surfacing an ImportError from the worker thread.
+        raise HTTPException(status_code=503, detail=_EMBEDDINGS_UNAVAILABLE_DETAIL)
     source_ids = await _resolve_similarity_source_ids(case_id, timeline_id)
     svc = _get_similarity_service()
     result = await run_in_threadpool(svc.find_similar_by_text, case_id, source_ids, q, limit=limit)
@@ -1338,8 +1366,16 @@ async def list_anomaly_fields(
     """
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
     svc = _get_stat_anomaly_service()
+    # Candidate inventory from the per-source stats cache; only the exact
+    # canonical-mapping aggregates stay a live query (see db/field_stats.py).
+    stats = await ensure_source_field_stats(get_store(), svc.ch, case_id, source_ids)
+    inventory, total = merged_inventory(stats, field_mappings)
+    if field_mappings and total:
+        inventory = inventory + await run_in_threadpool(
+            svc.canonical_inventory, case_id, source_ids, field_mappings
+        )
     fields: list[NoveltyFieldInfo] = await run_in_threadpool(
-        svc.recommend_novelty_fields, case_id, source_ids, None, field_mappings
+        svc.recommend_novelty_fields, case_id, source_ids, total, field_mappings, inventory
     )
     return {
         "fields": [
