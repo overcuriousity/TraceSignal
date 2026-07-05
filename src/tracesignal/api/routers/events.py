@@ -784,7 +784,7 @@ async def list_fields(
     raw vendor key that happens to contain a colon, instead of guessing from
     the key name alone. Useful for building a column picker in the UI.
     """
-    from tracesignal.enrichers.registry import list_enrichers
+    from tracesignal.enrichers.registry import all_enrichers
 
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
     stats = await ensure_source_field_stats(
@@ -792,7 +792,7 @@ async def list_fields(
     )
     result = merged_list_fields(stats, field_mappings)
     result["derived_suffixes"] = sorted(
-        {field for enricher in list_enrichers() for field in enricher.output_fields}
+        {field for enricher in all_enrichers() for field in enricher.output_fields}
     )
     return result
 
