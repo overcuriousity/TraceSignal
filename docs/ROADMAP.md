@@ -43,9 +43,7 @@ resolved — this file holds only the condensed, still-open action items.
   cleanup batch on `feat/enricher-subsystem` resolved the bulk of the PR #54 review residue
   (#9–#13 generic asset abstraction + de-GeoIP'd frontend, #15–#19 reuse, #24–#26
   simplification, #28/#30/#31 efficiency, #32/#33 minors; #20 documented won't-fix). Full
-  finding set + status in `docs/archive/PR54_REVIEW_FINDINGS.md`. Deliberately deferred:
-  - Staging-format redesign: staging is one Postgres row per (event, attr, output_field) —
-    a row-per-event JSON-map format would shrink staging ~3x and simplify the apply join.
+  finding set + status in `docs/archive/PR54_REVIEW_FINDINGS.md`. Remaining:
   - #34: derived-key cardinality can balloon the ColumnPicker on wide/vendor-inconsistent
     datasets (`src_ip:geo_country`, `source_ip:geo_country`, ...) — needs a grouping/limit
     design in the ColumnPicker.

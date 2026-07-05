@@ -333,19 +333,19 @@ class EnrichmentResultStaging(Base):
     rows survive here (Postgres is transactional) even though the in-memory
     JobStore does not — see ``list_orphaned_enrichment_job_runs``, which
     mirrors ``list_ingesting_sources`` for reconciliation on restart.
+
+    One row per ``(job, event)``: everything an enricher derived for one
+    event is a single ``fields`` JSON map (``field_key -> value``, keys
+    already attr-prefixed via ``derived_field_key``). Replaces the original
+    row-per-(event, attr, output_field) grain — ~3-6x fewer rows for
+    multi-output enrichers, and the apply loop expands the map back into
+    triples for ``apply_enrichments`` without any ClickHouse-side change.
     """
 
     __tablename__ = "enrichment_results_staging"
     __table_args__ = (
         Index("ix_staging_job_id", "job_id"),
-        Index(
-            "ix_staging_unique_row",
-            "job_id",
-            "event_id",
-            "enricher_key",
-            "field_key",
-            unique=True,
-        ),
+        Index("ix_staging_unique_row", "job_id", "event_id", unique=True),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -355,8 +355,7 @@ class EnrichmentResultStaging(Base):
     timeline_id: Mapped[str] = mapped_column(String(64), nullable=False)
     event_id: Mapped[str] = mapped_column(String(64), nullable=False)
     enricher_key: Mapped[str] = mapped_column(String(128), nullable=False)
-    field_key: Mapped[str] = mapped_column(String(128), nullable=False)
-    value: Mapped[str] = mapped_column(String(1024), nullable=False)
+    fields: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     enricher_config_hash: Mapped[str] = mapped_column(
         String(64), nullable=False, default="", server_default=""
@@ -881,6 +880,24 @@ class PostgresStore:
         support that clause.
         """
         async with self.engine.begin() as conn:
+            # Destructive staging-format migration (roadmap M16): the legacy
+            # row-per-(event, attr, output_field) staging table (recognized by
+            # its `field_key` column) is replaced by row-per-(job, event) with
+            # a `fields` JSON map. Staged rows are transient in-flight state;
+            # any orphaned rows from a crashed pre-upgrade run are discarded —
+            # pre-release databases are documented as deprecated (same stance
+            # as the `event_enrichments` drop on the ClickHouse side), and a
+            # re-run of the enricher regenerates the data.
+            legacy_staging = await conn.run_sync(
+                lambda sync_conn: "enrichment_results_staging"
+                in inspect(sync_conn).get_table_names()
+                and any(
+                    col["name"] == "field_key"
+                    for col in inspect(sync_conn).get_columns("enrichment_results_staging")
+                )
+            )
+            if legacy_staging:
+                await conn.execute(text("DROP TABLE enrichment_results_staging"))
             await conn.run_sync(Base.metadata.create_all)
             existing_columns = await conn.run_sync(
                 lambda sync_conn: {
@@ -914,19 +931,9 @@ class PostgresStore:
                         "ALTER TABLE sources ADD COLUMN status VARCHAR(16) NOT NULL DEFAULT 'ready'"
                     )
                 )
-            staging_columns = await conn.run_sync(
-                lambda sync_conn: {
-                    col["name"]
-                    for col in inspect(sync_conn).get_columns("enrichment_results_staging")
-                }
-            )
-            if "enricher_config_hash" not in staging_columns:
-                await conn.execute(
-                    text(
-                        "ALTER TABLE enrichment_results_staging "
-                        "ADD COLUMN enricher_config_hash VARCHAR(64) NOT NULL DEFAULT ''"
-                    )
-                )
+            # (The former enricher_config_hash ADD COLUMN for the staging
+            # table is gone: the M16 drop-and-recreate above guarantees the
+            # current shape.)
             # No migration for the earlier `annotation_type="outlier"` rows
             # (renamed to "anomaly" when the statistical anomaly engine
             # landed): no releases exist yet and pre-this-branch databases
@@ -1278,7 +1285,7 @@ class PostgresStore:
             await session.execute(insert(EnrichmentResultStaging), rows)
             await session.commit()
 
-    async def pop_staged_rows_for_job(
+    async def list_staged_rows_for_job(
         self, job_id: str, limit: int
     ) -> list[EnrichmentResultStaging]:
         """Return up to ``limit`` staged rows for a job, oldest first (does not delete them)."""
@@ -1290,16 +1297,6 @@ class PostgresStore:
                 .limit(limit)
             )
             return list(result.scalars().all())
-
-    async def delete_staged_rows(self, ids: list[int]) -> None:
-        """Delete staged rows by primary key, after they've been flushed to ClickHouse."""
-        if not ids:
-            return
-        async with self.session_factory() as session:
-            await session.execute(
-                delete(EnrichmentResultStaging).where(EnrichmentResultStaging.id.in_(ids))
-            )
-            await session.commit()
 
     async def delete_staged_rows_for_job(self, job_id: str) -> None:
         """Delete every staged row for a job — used to discard an orphaned/unflushed run."""
@@ -1325,9 +1322,9 @@ class PostgresStore:
     ) -> list[EnrichmentResultStaging]:
         """Keyset-paged staged rows for one source of a job (does not delete).
 
-        Unlike ``pop_staged_rows_for_job``'s pop-after-insert pattern, apply
-        needs the rows to survive until the partition ``REPLACE`` succeeds —
-        deletion happens separately via ``delete_staged_rows_for_source``.
+        Apply needs the rows to survive until the partition ``REPLACE``
+        succeeds — deletion happens separately via
+        ``delete_staged_rows_for_source``.
         """
         async with self.session_factory() as session:
             result = await session.execute(
