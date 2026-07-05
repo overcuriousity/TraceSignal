@@ -33,6 +33,7 @@ from tracesignal.db.qdrant import QdrantStore
 from tracesignal.db.queries import EventQueryService
 from tracesignal.ingestion.parser import detect_format
 from tracesignal.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
+from tracesignal.models.embeddings import embeddings_available
 
 
 class CaseCreate(BaseModel):
@@ -1288,6 +1289,17 @@ async def start_timeline_embedding(
     current source set.  If sources are later added the timeline becomes
     *stale* (``is_stale=True`` in ``to_dict()``), prompting a re-embed.
     """
+    if not embeddings_available():
+        # Fail at request time instead of creating a job that instantly dies
+        # with an ImportError in the background worker.
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Embedding support is not installed. Install the 'embeddings' extra "
+                "(uv sync --extra embeddings) or configure TS_EMBEDDING_API_BASE_URL "
+                "to use a remote embedding endpoint."
+            ),
+        )
     store = get_store()
     case_id = case.id
     timeline = await store.get_timeline(case_id, timeline_id)

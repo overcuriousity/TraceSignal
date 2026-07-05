@@ -1,6 +1,16 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-05 (session 18 — Milestone 2 batch, PR 1/7: ingest throughput.
+Last updated: 2026-07-05 (session 18 — Milestone 2 batch, PR 2/7: M5 dependency diet.
+Removed never-imported `torchvision`/`onnxruntime`/`jinja2`/`alembic`; `torch` +
+`sentence-transformers` moved to an optional `embeddings` extra
+(`uv sync --extra embeddings`) — base install drops ~2 GB. Sole ML import
+(`models/embeddings.py`) is now lazy inside `load()` with an actionable RuntimeError;
+new `embeddings_available()` (importability OR `TS_EMBEDDING_API_BASE_URL` — remote mode
+needs no torch) surfaces as `embeddings_available` on `/api/health` and gates embed-start
+and semantic-search with a request-time 503 instead of a job that dies on ImportError.
+Field-recommend already degraded gracefully. README quick-start/airgapped docs updated.)
+
+Previous (session 18 — Milestone 2 batch, PR 1/7: ingest throughput.
 `TS_INGEST_BATCH_SIZE` (default 20k) replaces the accidental reuse of
 `embedding_batch_size` (64) as the ClickHouse insert batch in `IngestionPipeline` —
 one HTTP insert per 20k rows instead of per 64, the dominant fix for the 100 GiB-over-LAN

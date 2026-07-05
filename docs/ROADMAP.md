@@ -31,12 +31,6 @@ resolved — this file holds only the condensed, still-open action items.
 
 ## Milestone 2 — high-leverage improvements
 
-- [ ] **M5 — Dependency diet.** `torchvision`, `onnxruntime`, `jinja2` are declared but never
-  imported; `alembic` is unused (migrations are hand-rolled additive ALTERs in
-  `postgres.py::init_schema`). Remove them. Then consider moving `torch`/
-  `sentence-transformers` to an optional `embeddings` extra with graceful capability
-  degradation (health endpoint flag, clear error on embed endpoints) so the base install
-  drops ~2 GB.
 - [ ] **Container smoke test in CI.** Build the image, `docker compose up`, curl
   `/api/health`. Would have caught C1 before it shipped.
 - [ ] **M15 — Precompute per-source field stats at ingest time.** Four call sites do a live

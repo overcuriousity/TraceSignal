@@ -28,6 +28,7 @@ from tracesignal.api.routers import (
 from tracesignal.core.config import get_settings
 from tracesignal.core.security import hash_password
 from tracesignal.db.postgres import EnrichmentJobRun, generate_id
+from tracesignal.models.embeddings import embeddings_available
 
 logger = logging.getLogger(__name__)
 
@@ -361,6 +362,10 @@ def create_app() -> FastAPI:
             "status": "ok",
             "version": __version__,
             "oidc_enabled": get_settings().oidc_enabled,
+            # False when the 'embeddings' extra is not installed and no
+            # remote embedding endpoint is configured — embed jobs and
+            # semantic search return 503 in that state.
+            "embeddings_available": embeddings_available(),
         }
 
     app.include_router(auth.router)

@@ -34,6 +34,13 @@ from tracesignal.db.anomaly_stats import (
 from tracesignal.db.postgres import Case, User, generate_id
 from tracesignal.db.queries import EventQuery, EventQueryService, TagFilter
 from tracesignal.db.similarity import SimilarityService
+from tracesignal.models.embeddings import embeddings_available
+
+_EMBEDDINGS_UNAVAILABLE_DETAIL = (
+    "Embedding support is not installed. Install the 'embeddings' extra "
+    "(uv sync --extra embeddings) or configure TS_EMBEDDING_API_BASE_URL "
+    "to use a remote embedding endpoint."
+)
 
 _query_service: EventQueryService | None = None
 
@@ -1279,6 +1286,11 @@ async def semantic_search_events(
     to one timeline's sources. Returns ``status="not_embedded"`` when no
     vectors exist for the searched sources.
     """
+    if not embeddings_available():
+        # find_similar_by_text encodes the query text at request time, which
+        # needs the local model (or a remote endpoint) — fail clearly instead
+        # of surfacing an ImportError from the worker thread.
+        raise HTTPException(status_code=503, detail=_EMBEDDINGS_UNAVAILABLE_DETAIL)
     source_ids = await _resolve_similarity_source_ids(case_id, timeline_id)
     svc = _get_similarity_service()
     result = await run_in_threadpool(svc.find_similar_by_text, case_id, source_ids, q, limit=limit)

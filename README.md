@@ -108,6 +108,13 @@ uv sync
 uv run tsig-web
 ```
 
+The base install ships without the local embedding stack (~2 GB of torch +
+sentence-transformers). To use local embeddings (`tsig embed`, semantic search), install the
+extra: `uv sync --extra embeddings`. Alternatively point `TS_EMBEDDING_API_BASE_URL` at a
+remote OpenAI-compatible endpoint — no extra needed. Without either, embedding endpoints
+return a clear 503 and `/api/health` reports `embeddings_available: false`; everything else
+works normally.
+
 The API is available at `http://localhost:8080` (OpenAPI docs at `/api/docs`), serving the
 built frontend from `frontend/dist` (auto-built on first run).
 
@@ -134,10 +141,11 @@ On a machine **with internet access**:
 1. Clone or copy the repository.
 2. Install and build everything, so all dependencies are resolved and cached locally:
    ```bash
-   uv sync
+   uv sync --extra embeddings
    cd frontend && npm install && npm run build && cd ..
    ```
-   This populates `.venv/` (all Python dependencies, including the CPU PyTorch wheels) and
+   This populates `.venv/` (all Python dependencies, including the CPU PyTorch wheels for
+   local embeddings — drop `--extra embeddings` if the deployment won't embed locally) and
    `frontend/dist/` (the built static frontend).
 3. Copy the whole repository — including `.venv/`, `uv.lock`, and `frontend/dist/` — to a
    portable drive.
