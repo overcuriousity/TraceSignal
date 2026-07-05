@@ -1,6 +1,15 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-05 (session 18 — Milestone 2 batch, PR 3/7: M17 job authz via case
+Last updated: 2026-07-05 (session 18 — Milestone 2 batch, PR 4/7: CI container smoke test.
+New `container-smoke` job: builds the reference image, boots it with `--network host`
+against the same pg/clickhouse(glibc)/qdrant service containers the backend job uses,
+asserts `/api/health` returns `status:"ok"` (would have caught C1's broken CMD import)
+and that `/` serves the packaged frontend HTML; dumps container logs on failure.
+Dockerfile gains `ARG INSTALL_EMBEDDINGS` (default 0) so the image skips the ~2 GB local
+embedding stack once M5's `embeddings` extra lands — the smoke test then doubles as the
+"boots without the extra" regression test.)
+
+Previous (session 18 — Milestone 2 batch, PR 3/7: M17 job authz via case
 RBAC. `Job` gains `case_id` (in `to_dict()` too), threaded through every
 `job_store.create` site (ingest, embed, manual + automatic enrich, startup re-runs —
 `run.case_id`). `GET /api/jobs/{id}`: creator/admin unchanged; otherwise READ access on

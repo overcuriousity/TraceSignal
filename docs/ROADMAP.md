@@ -31,8 +31,6 @@ resolved — this file holds only the condensed, still-open action items.
 
 ## Milestone 2 — high-leverage improvements
 
-- [ ] **Container smoke test in CI.** Build the image, `docker compose up`, curl
-  `/api/health`. Would have caught C1 before it shipped.
 - [ ] **M15 — Precompute per-source field stats at ingest time.** Four call sites do a live
   full-scan ClickHouse aggregation over `events` on every read — `db/anomaly_stats.py`'s
   `field_inventory` (backs both the Visualize page's field dropdown and the anomaly wizard's
