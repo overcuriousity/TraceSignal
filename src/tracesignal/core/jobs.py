@@ -24,10 +24,14 @@ class Job:
     progress: dict[str, Any] = field(default_factory=dict)
     result: dict[str, Any] | None = None
     error: str | None = None
-    # ID of the user who started this job, or None for jobs created before
-    # auth existed. Used to scope job-status reads so one analyst can't poll
-    # another's job by guessing its ID.
+    # ID of the user who started this job, or None for system-triggered jobs
+    # (e.g. automatic enrichment). Used to scope job-status reads so one
+    # analyst can't poll another's job by guessing its ID.
     created_by: str | None = None
+    # Case this job operates on. When set, any user with READ access to the
+    # case may poll the job — job visibility follows case RBAC, matching the
+    # rest of the access model.
+    case_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a serializable representation."""
@@ -38,6 +42,7 @@ class Job:
             "progress": self.progress,
             "result": self.result,
             "error": self.error,
+            "case_id": self.case_id,
         }
 
 
@@ -61,11 +66,17 @@ class JobStore:
         self._lock = threading.Lock()
 
     def create(
-        self, kind: str, progress: dict[str, Any] | None = None, created_by: str | None = None
+        self,
+        kind: str,
+        progress: dict[str, Any] | None = None,
+        created_by: str | None = None,
+        case_id: str | None = None,
     ) -> Job:
         """Create a new job and return it."""
         job_id = uuid.uuid4().hex[:16]
-        job = Job(id=job_id, kind=kind, progress=progress or {}, created_by=created_by)
+        job = Job(
+            id=job_id, kind=kind, progress=progress or {}, created_by=created_by, case_id=case_id
+        )
         with self._lock:
             self._jobs[job_id] = job
         return job

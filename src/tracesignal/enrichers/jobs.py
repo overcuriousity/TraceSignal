@@ -526,7 +526,9 @@ async def schedule_enrichment_reruns(
                 run.timeline_id,
             )
             continue
-        job = job_store.create(kind="enrich", progress={"processed": 0, "total": 0})
+        job = job_store.create(
+            kind="enrich", progress={"processed": 0, "total": 0}, case_id=run.case_id
+        )
         if try_claim_enricher_run(run.timeline_id, run.enricher_key, job.id) is not None:
             job_store.update(job.id, status="failed", error="Enrichment already running")
             continue
