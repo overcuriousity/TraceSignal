@@ -554,6 +554,8 @@ class StatisticalAnomalyService:
         per_field_limit: int = 25,
         exclude_event_ids: set[str] | None = None,
         field_mappings: dict[str, list[str]] | None = None,
+        inventory: list[tuple[str, int, int]] | None = None,
+        inventory_total: int | None = None,
     ) -> StatAnomalyResult:
         """Return rare or first-seen values per field, ranked by surprise score.
 
@@ -561,6 +563,15 @@ class StatisticalAnomalyService:
         ``"attr:user_agent"``).  When ``None``, the cardinality-based recommender
         selects useful attribute fields automatically (falls back to
         ``_DEFAULT_NOVELTY_FIELDS`` only if recommendation yields nothing).
+
+        *inventory* / *inventory_total* let async callers pass a pre-merged
+        field candidate list from the per-source stats cache
+        (``db/field_stats.py::merged_inventory``) so the ``fields is None``
+        path skips the live :py:meth:`field_inventory` scan — the map-scanning
+        query family that can be very expensive on wide sources. The cache
+        approximates merged ``distinct`` as max-across-sources, which is fine
+        for the recommender's coarse cardinality classification. Ignored when
+        *fields* is given.
 
         In *self-baseline* mode values appearing ≤ *rarity_floor* times are
         flagged.  In *temporal* mode (``baseline_end`` provided) any value absent
@@ -579,10 +590,21 @@ class StatisticalAnomalyService:
         else:
             # Auto-discover useful fields for this specific timeseries. Pass
             # the total we already have — recommend_novelty_fields would
-            # otherwise re-run the exact same count() query.
-            rec = self.recommend_novelty_fields(
-                case_id, source_ids, total=total_events, field_mappings=field_mappings
-            )
+            # otherwise re-run the exact same count() query. A supplied cache
+            # inventory keeps its own total: coverage counts in it were
+            # computed against the cache's event totals, not _count_events.
+            if inventory is not None:
+                rec = self.recommend_novelty_fields(
+                    case_id,
+                    source_ids,
+                    total=inventory_total,
+                    field_mappings=field_mappings,
+                    inventory=inventory,
+                )
+            else:
+                rec = self.recommend_novelty_fields(
+                    case_id, source_ids, total=total_events, field_mappings=field_mappings
+                )
             scan_fields = [f.token for f in rec if f.recommended] or _DEFAULT_NOVELTY_FIELDS
             # Each field below is a separate sequential ClickHouse round-trip
             # (no cross-field batching); cap how many an auto-selected set can

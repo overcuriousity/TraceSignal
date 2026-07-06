@@ -541,6 +541,8 @@ def test_get_field_encoder_does_not_eagerly_load_in_remote_mode(monkeypatch):
 class _FakeStatAnomalyService:
     """Captures the kwargs passed to each detector method."""
 
+    ch = None  # accessed by the router's field-stats cache resolution
+
     def __init__(self, midpoint=None):
         self._midpoint = midpoint
         self.frequency_calls: list[dict] = []
@@ -556,6 +558,21 @@ class _FakeStatAnomalyService:
     def find_value_novelty(self, **kwargs):
         self.value_novelty_calls.append(kwargs)
         return "value-novelty-result"
+
+
+@pytest.fixture()
+def stub_field_stats_cache(monkeypatch):
+    """Stub the per-source field-stats cache the router resolves for
+    auto-field novelty runs (fields=None), so tests don't need a live
+    ClickHouse or a real store schema behind ensure_source_field_stats."""
+
+    async def _fake_ensure(store, ch, case_id, source_ids):
+        return {}
+
+    monkeypatch.setattr(events, "ensure_source_field_stats", _fake_ensure)
+    monkeypatch.setattr(
+        events, "merged_inventory", lambda stats, field_mappings=None: ([("artifact", 2, 10)], 10)
+    )
 
 
 @pytest.mark.asyncio
@@ -600,7 +617,37 @@ async def test_run_stat_detector_dispatches_to_value_novelty(patched_store, monk
     assert result == "value-novelty-result"
     assert len(fake_svc.value_novelty_calls) == 1
     assert fake_svc.value_novelty_calls[0]["fields"] == ["artifact", "attr:user_agent"]
+    # Explicit fields: the router must not resolve the field-stats cache.
+    assert fake_svc.value_novelty_calls[0]["inventory"] is None
+    assert fake_svc.value_novelty_calls[0]["inventory_total"] is None
     assert not fake_svc.frequency_calls
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_auto_fields_resolves_cache_inventory(
+    patched_store, monkeypatch, stub_field_stats_cache
+):
+    """M22(d): fields=None must resolve the candidate inventory from the
+    per-source field-stats cache in the router and pass it to the detector,
+    instead of letting the detector run the live field_inventory map scan."""
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    await events._run_stat_detector(
+        "c1",
+        ["s1"],
+        detector="value_novelty",
+        fields=None,
+        series_field="artifact",
+        z_threshold=None,
+        baseline_end=None,
+        temporal=False,
+        limit=50,
+    )
+    call = fake_svc.value_novelty_calls[0]
+    assert call["fields"] is None
+    assert call["inventory"] == [("artifact", 2, 10)]
+    assert call["inventory_total"] == 10
 
 
 @pytest.mark.asyncio
@@ -651,7 +698,9 @@ async def test_run_stat_detector_explicit_baseline_end_wins_over_midpoint(
 
 
 @pytest.mark.asyncio
-async def test_run_stat_detector_excludes_normal_annotated_events(patched_store, monkeypatch):
+async def test_run_stat_detector_excludes_normal_annotated_events(
+    patched_store, monkeypatch, stub_field_stats_cache
+):
     await patched_store.create_annotation(
         case_id="c1",
         source_id="s1",
@@ -709,6 +758,8 @@ def _make_stat_result(status="ok", event_id="evt-1"):
 class _FakeStatAnomalyServiceWithResult:
     """Returns a real StatAnomalyResult, for exercising the persist path."""
 
+    ch = None  # accessed by the router's field-stats cache resolution
+
     def __init__(self, result):
         self._result = result
 
@@ -747,7 +798,9 @@ def _call_list_anomalies(persist: bool = True):
 
 
 @pytest.mark.asyncio
-async def test_list_anomalies_persists_run_by_default(timeline_setup, monkeypatch):
+async def test_list_anomalies_persists_run_by_default(
+    timeline_setup, monkeypatch, stub_field_stats_cache
+):
     fake_svc = _FakeStatAnomalyServiceWithResult(_make_stat_result())
     monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
 
@@ -760,7 +813,9 @@ async def test_list_anomalies_persists_run_by_default(timeline_setup, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_list_anomalies_persist_false_does_not_write_a_run(timeline_setup, monkeypatch):
+async def test_list_anomalies_persist_false_does_not_write_a_run(
+    timeline_setup, monkeypatch, stub_field_stats_cache
+):
     fake_svc = _FakeStatAnomalyServiceWithResult(_make_stat_result())
     monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
 
@@ -770,7 +825,9 @@ async def test_list_anomalies_persist_false_does_not_write_a_run(timeline_setup,
 
 
 @pytest.mark.asyncio
-async def test_list_anomalies_does_not_persist_when_status_not_ok(timeline_setup, monkeypatch):
+async def test_list_anomalies_does_not_persist_when_status_not_ok(
+    timeline_setup, monkeypatch, stub_field_stats_cache
+):
     fake_svc = _FakeStatAnomalyServiceWithResult(_make_stat_result(status="no_data"))
     monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
 
@@ -780,7 +837,9 @@ async def test_list_anomalies_does_not_persist_when_status_not_ok(timeline_setup
 
 
 @pytest.mark.asyncio
-async def test_tag_anomalies_always_persists_a_run(timeline_setup, monkeypatch):
+async def test_tag_anomalies_always_persists_a_run(
+    timeline_setup, monkeypatch, stub_field_stats_cache
+):
     fake_svc = _FakeStatAnomalyServiceWithResult(_make_stat_result())
     monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
 
@@ -793,7 +852,9 @@ async def test_tag_anomalies_always_persists_a_run(timeline_setup, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_get_detector_run_endpoint_returns_persisted_run(timeline_setup, monkeypatch):
+async def test_get_detector_run_endpoint_returns_persisted_run(
+    timeline_setup, monkeypatch, stub_field_stats_cache
+):
     fake_svc = _FakeStatAnomalyServiceWithResult(_make_stat_result())
     monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
 

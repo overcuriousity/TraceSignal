@@ -1232,6 +1232,22 @@ async def _run_stat_detector(
             field_mappings=field_mappings,
         )
     parsed_fields = _parse_novelty_fields(fields)
+
+    # Auto-field selection (no explicit fields): resolve the candidate
+    # inventory from the per-source field-stats cache here — the detector
+    # runs sync in a worker thread and can't await the cache itself. This
+    # mirrors list_anomaly_fields and keeps find_value_novelty off the live
+    # map-scanning field_inventory query, which is expensive on wide sources.
+    inventory: list[tuple[str, int, int]] | None = None
+    inventory_total: int | None = None
+    if parsed_fields is None:
+        stats = await ensure_source_field_stats(store, svc.ch, case_id, source_ids)
+        inventory, inventory_total = merged_inventory(stats, field_mappings)
+        if field_mappings and inventory_total:
+            inventory = inventory + await run_in_threadpool(
+                svc.canonical_inventory, case_id, source_ids, field_mappings
+            )
+
     return await run_in_threadpool(
         svc.find_value_novelty,
         case_id=case_id,
@@ -1243,6 +1259,8 @@ async def _run_stat_detector(
         per_field_limit=cfg.stat_per_field_limit,
         exclude_event_ids=exclude_ids,
         field_mappings=field_mappings,
+        inventory=inventory,
+        inventory_total=inventory_total,
     )
 
 
