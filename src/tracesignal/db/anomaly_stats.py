@@ -244,20 +244,23 @@ def _row_to_event(columns: tuple[str, ...], row: tuple) -> dict[str, Any]:
     UTC offset.
 
     `content_hash`/`file_hash`/`embedding_config_hash` are `FixedString(64)`,
-    which clickhouse-connect returns as raw `bytes`. Left as-is they crash the
-    router's JSON serialization ("Object of type bytes is not JSON
-    serializable") — a 500 that only the frequency detector hits, because it's
-    the one path that serializes a fully-hydrated event dict (value_novelty
-    builds its stub with string literals). Decode them to str here.
+    which clickhouse-connect returns as raw `bytes`, NUL-padded to the fixed
+    width. Left as-is they crash the router's JSON serialization ("Object of
+    type bytes is not JSON serializable") — a 500 that only the frequency
+    detector hits, because it's the one path that serializes a fully-hydrated
+    event dict (value_novelty builds its stub with string literals). Decode
+    and strip the NUL padding here, otherwise an empty `embedding_config_hash`
+    becomes a non-empty string of "\x00" chars — truthy and wrong.
     """
     d: dict[str, Any] = dict(zip(columns, row, strict=False))
     for key in ("timestamp", "ingest_time"):
         v = d.get(key)
         if v is not None and not isinstance(v, str):
             d[key] = ensure_utc_iso(v)
-    for key, v in d.items():
+    for key in ("content_hash", "file_hash", "embedding_config_hash"):
+        v = d.get(key)
         if isinstance(v, bytes):
-            d[key] = v.decode("utf-8", "replace")
+            d[key] = v.decode("utf-8", "replace").rstrip("\x00")
     if "event_id" in d:
         d["event_id"] = str(d["event_id"])
     return d
