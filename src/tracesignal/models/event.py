@@ -231,9 +231,7 @@ class Event:
             # event, bloating the attributes column ~20x and making every
             # map-scanning query (broad search, field inventory) explode.
             "attributes": {
-                str(k): str(v)
-                for k, v in self.attributes.items()
-                if v is not None and str(v) != ""
+                str(k): str(v) for k, v in self.attributes.items() if v is not None and str(v) != ""
             },
             "embedding_model": self.embedding_model or "",
             "embedding_config_hash": self.embedding_config_hash or "",
