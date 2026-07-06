@@ -79,7 +79,7 @@ function FieldChip({
 
 export function AnomalyFieldPicker({ caseId, timelineId, selected, onChange }: Props) {
   const { data, isLoading } = useQuery({
-    queryKey: ["anomaly-fields", caseId, timelineId],
+    queryKey: ["anomalies", caseId, timelineId, "fields"],
     queryFn: () => anomaliesApi.fields(caseId, timelineId),
     staleTime: 5 * 60 * 1000,
   });

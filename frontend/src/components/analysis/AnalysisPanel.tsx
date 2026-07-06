@@ -2,6 +2,13 @@ import { useState, useEffect } from "react";
 import { X, AlertTriangle, Search, BookOpen, Hash, Activity } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/Button";
+import {
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from "@/components/ui/Select";
 import { ValueNoveltyView } from "./ValueNoveltyView";
 import { FrequencyView } from "./FrequencyView";
 import { SimilarEvents } from "./SimilarEvents";
@@ -14,6 +21,31 @@ import type { AnomalyMarker, Event } from "@/api/types";
 
 type Tab = "anomalies" | "similar" | "methodology";
 type AnomalySubTab = "novelty" | "frequency";
+
+/**
+ * Detector registry for the anomaly dropdown. Flat sub-tab buttons stopped
+ * scaling past two detectors in the 320px panel — new detectors register
+ * here (id, icon, name, one-line description) and add a render branch below.
+ */
+const DETECTORS: {
+  id: AnomalySubTab;
+  icon: React.ElementType;
+  label: string;
+  description: string;
+}[] = [
+  {
+    id: "novelty",
+    icon: Hash,
+    label: "Rare values",
+    description: "Rare or first-seen field values",
+  },
+  {
+    id: "frequency",
+    icon: Activity,
+    label: "Frequency",
+    description: "Event-count spikes and silences per series",
+  },
+];
 
 interface Props {
   caseId: string;
@@ -107,33 +139,32 @@ export function AnalysisPanel({
         ))}
       </div>
 
-      {/* Anomaly sub-tabs (only visible on the anomalies tab) */}
+      {/* Detector selector (only visible on the anomalies tab) */}
       {tab === "anomalies" && (
-        <div className="flex gap-px border-b border-[var(--color-border)] bg-[var(--color-bg-base)] px-2 py-1.5">
-          <button
-            className={cn(
-              "flex flex-1 items-center justify-center gap-1 rounded py-1 text-xs font-medium transition-colors",
-              anomalySubTab === "novelty"
-                ? "bg-[var(--color-bg-elevated)] text-[var(--color-fg-primary)]"
-                : "text-[var(--color-fg-muted)] hover:text-[var(--color-fg-secondary)]",
-            )}
-            onClick={() => setAnomalySubTab("novelty")}
+        <div className="border-b border-[var(--color-border)] bg-[var(--color-bg-base)] px-2 py-1.5">
+          <Select
+            value={anomalySubTab}
+            onValueChange={(v) => setAnomalySubTab(v as AnomalySubTab)}
           >
-            <Hash size={11} />
-            Rare values
-          </button>
-          <button
-            className={cn(
-              "flex flex-1 items-center justify-center gap-1 rounded py-1 text-xs font-medium transition-colors",
-              anomalySubTab === "frequency"
-                ? "bg-[var(--color-bg-elevated)] text-[var(--color-fg-primary)]"
-                : "text-[var(--color-fg-muted)] hover:text-[var(--color-fg-secondary)]",
-            )}
-            onClick={() => setAnomalySubTab("frequency")}
-          >
-            <Activity size={11} />
-            Frequency
-          </button>
+            <SelectTrigger className="h-7 px-2 text-xs" aria-label="Detector">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {DETECTORS.map((d) => (
+                <SelectItem key={d.id} value={d.id} className="h-auto py-1.5">
+                  <span className="flex items-center gap-1.5">
+                    <d.icon size={11} className="shrink-0 text-[var(--color-fg-muted)]" />
+                    <span className="flex flex-col items-start leading-tight">
+                      <span className="text-xs font-medium">{d.label}</span>
+                      <span className="text-[10px] text-[var(--color-fg-muted)]">
+                        {d.description}
+                      </span>
+                    </span>
+                  </span>
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
       )}
 

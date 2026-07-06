@@ -167,6 +167,7 @@ def _col_expr(
     field_token: str,
     params: dict[str, Any],
     field_mappings: dict[str, list[str]] | None = None,
+    prefix: str = "fk",
 ) -> str:
     """Return a ClickHouse SQL expression for a field token.
 
@@ -177,22 +178,23 @@ def _col_expr(
     score against an always-empty attribute lookup instead of the values the
     events view shows for that field. Attribute keys prefixed with
     ``"attr:"`` (``"attr:user_agent"``) or any other non-top-level token are
-    returned as ``attributes[{fk:String}]`` with the key injected into
-    *params*. Every call site uses a fresh *params* dict for a single field
-    token, so a fixed parameter name is safe — no counter needed.
+    returned as ``attributes[{prefix:String}]`` with the key injected into
+    *params*. Single-field call sites use a fresh *params* dict per token, so
+    the default ``"fk"`` name is safe; multi-field queries (value_combo) pass
+    a distinct *prefix* per field (``fk0``, ``fk1``, …) to share one dict.
 
     ``field_mappings`` (issue #10): a token naming a canonical mapped field
     resolves to a coalesce over its raw attribute keys (parameter names
-    ``fk_m0..fk_mN`` — same single-field-per-params-dict assumption).
+    ``{prefix}_m0..{prefix}_mN`` — same params-dict-uniqueness assumption).
     """
     mapped_raws = resolve_mapping(field_token, field_mappings)
     if mapped_raws:
-        return mapping_coalesce_expr(mapped_raws, params, "fk")
+        return mapping_coalesce_expr(mapped_raws, params, prefix)
     column, attr_key = resolve_column_token(field_token)
     if column is not None:
         return column
-    params["fk"] = attr_key
-    return "attributes[{fk:String}]"
+    params[prefix] = attr_key
+    return f"attributes[{{{prefix}:String}}]"
 
 
 def _freq_finding(
