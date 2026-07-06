@@ -712,6 +712,19 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
     reportVisibleTimestamp();
   }, [isFetching, onLoadMore, hasPreviousPage, handleLoadEarlier, reportVisibleTimestamp]);
 
+  // The scroll handler alone can strand the grid: reaching the bottom while a
+  // page fetch is already in flight skips onLoadMore, and with the scrollbar
+  // pinned at the bottom no further scroll event ever fires — "scrolled to
+  // bottom, nothing happens". Re-check whenever a fetch settles (isFetching
+  // flips) or the rendered window changes: if the tail rows are still in view
+  // and more pages exist, keep loading.
+  const lastVisibleIndex = virtualItems.length ? virtualItems[virtualItems.length - 1].index : -1;
+  useEffect(() => {
+    if (!isFetching && hasNextPage && lastVisibleIndex >= 0 && lastVisibleIndex >= rows.length - 5) {
+      onLoadMore();
+    }
+  }, [isFetching, hasNextPage, lastVisibleIndex, rows.length, onLoadMore]);
+
   useImperativeHandle(
     ref,
     () => ({
