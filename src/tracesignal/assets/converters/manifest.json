@@ -1,6 +1,6 @@
 {
   "upstream": "https://github.com/overcuriousity/2timesketch",
-  "commit": "00eee4b82a445400f3ea7e33fefded55f11ebb77",
+  "commit": "cb5ce0e435494ea8be4765473ded7a01360d3b88",
   "version": "1.0.0",
   "license": "MIT License",
   "converters": [
@@ -13,7 +13,7 @@
         "History (Chromium SQLite)"
       ],
       "size_bytes": 98831,
-      "sha256": "ca991ea60607e518ee2cafa749aa2797110ce2ae0aac98ec1ca8fe93d305a01e"
+      "sha256": "e768429f30f485a10a341999e817e464bdd5ef7bc19d2d2f3bb497abf014c237"
     },
     {
       "name": "cloudtrail2timesketch",
@@ -23,7 +23,7 @@
         "CloudTrail .json / .json.gz"
       ],
       "size_bytes": 40280,
-      "sha256": "264a4b7ff3aa5947c01f2f0ccca15506ebd3c35984561ebdf224d822c6b84297"
+      "sha256": "276242e4f192fd03bfbc11f86e72de2def492056252aac2f7ccbd6217dbe1db0"
     },
     {
       "name": "filterlog2timesketch",
@@ -33,7 +33,7 @@
         "filter.log (syslog filterlog lines)"
       ],
       "size_bytes": 48783,
-      "sha256": "2c1baa50cd38d8a0bf6d5aa1800ed20000db7bcdcdb2e2b2fa083499e7b9589b"
+      "sha256": "6cee8f89c0e32e3572d47d84efeab721d8c043398149af27df019b3d273e4167"
     },
     {
       "name": "journal2timesketch",
@@ -43,7 +43,7 @@
         "journal directory / journalctl -o json"
       ],
       "size_bytes": 36572,
-      "sha256": "6511548de8ea45ddbe0ce740f89387342658659617e7e2553f413074efbca93d"
+      "sha256": "3868d829cb92e06cd51830a257d62f7ed3cb8919932be82f97d9fa3b9c237949"
     },
     {
       "name": "nginx2timesketch",
@@ -54,7 +54,7 @@
         "error.log*"
       ],
       "size_bytes": 41334,
-      "sha256": "add71c56d15ce91a9174c1180ae5feb011d87d75222fe437a7225b8faa231359"
+      "sha256": "da8cc90c0c334b51e4716932b942ff4b8ef9bc05834b255d0f314492071603bb"
     },
     {
       "name": "suricata2timesketch",
@@ -66,7 +66,7 @@
         "OPNsense suricata syslog export"
       ],
       "size_bytes": 51186,
-      "sha256": "d34176fdc6c28a7119698d03d51fba3f7b9ab5032e296c21587f41a59c114da9"
+      "sha256": "d1bb31830a31be6a2b4702e74bc483f196901f53c93c16285ebfd03ebd2f2260"
     }
   ]
 }
