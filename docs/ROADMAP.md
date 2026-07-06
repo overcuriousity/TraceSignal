@@ -82,14 +82,10 @@ each detector.
 Prep landed: shared frontend detector scaffolding (`components/analysis/detector-shared.tsx`),
 a Radix `Select` detector switcher replacing the flat sub-tab strip, standardized
 `["anomalies", caseId, timelineId, ...]` query keys, and an `_col_expr(prefix=...)` param for
-multi-field queries. **D2 (timestamp-order) shipped.**
+multi-field queries. **D1 (value-combo) and D2 (timestamp-order) shipped.**
 
 High value first:
 
-- [ ] **D1 — Value-combo novelty** (AMiner `NewMatchPathValueComboDetector`): extend
-  `value_novelty` from single fields to field *tuples* (e.g. any two selected fields) — flag
-  combinations first seen in the detect window. ClickHouse `GROUP BY tuple(...)`; exact-match,
-  fully explainable.
 - [ ] **D3 — Charset novelty** (AMiner `CharsetDetector`): per field, learn the baseline
   character set of values; flag values in the detect window containing never-seen characters
   (null bytes, unicode homoglyphs, injection metacharacters — detected syntactically, not by

@@ -1,6 +1,25 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-06 (session 26 — Milestone 4 kickoff: detector-expansion prep +
+Last updated: 2026-07-06 (session 26 — Milestone 4: detector-expansion prep + D1 value-combo +
+D2 timestamp-order detectors.
+
+D1 (`find_value_combos`, AMiner `NewMatchPathValueComboDetector`): the multi-field extension
+of value_novelty. Groups by two or more field expressions together (`GROUP BY v0, v1, …`) and
+scores each surviving combination by the same surprise `−log(count/total)`. Catches
+combinations rare even when each field's values are common — verified live: a source of 50
+`(login_ok, day)` events + 1 `(login_ok, night)` flagged only the night combo (surprise 3.93),
+though `login_ok` alone is common. Both modes carry over (self-baseline rarity floor / temporal
+baseline_cnt=0). Requires ≥2 fields; router returns 422 on a single explicit field, service
+raises ValueError. Auto mode combines exactly the top-2 highest-coverage recommended fields —
+no pair enumeration (105 pairs from 15 fields would be untriageable). Field expressions share
+one params dict via the new `_col_expr(prefix=fk0/fk1/…)`. New `ComboNoveltyView.tsx` (2–4
+field picker via `AnomalyFieldPicker`'s new min/max-selected props; query gated below 2 fields);
+combo drill applies every (field,value) pair as a conjunction in one `setFilters` fold
+(ExplorerPage `handleComboDrill`) rather than looping `handleDrillField`, which would clobber
+against the same stale `filters` closure. Docs: ANOMALY_DETECTION.md §1 "Value combinations"
+subsection (kept under value novelty rather than renumbering); MethodologyPanel block. Tests: 7
+detector-unit + 2 router (dispatch + 422).
+
 D2 timestamp-order detector. Prep (no behavior change): extracted the shared
 analysis-view chrome into `frontend/src/components/analysis/detector-shared.tsx`
 (ModeToggle, RefreshButton, DetectorStatusLine, FindingShell, TagFindingsBar, and the

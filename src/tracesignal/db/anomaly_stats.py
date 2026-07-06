@@ -33,6 +33,17 @@ already-ingested data.
     * *temporal-z-score* — baseline = buckets before ``baseline_end``; detect =
       buckets after.  Mean/std computed from the baseline window only.
 
+**value_combo** (``detector="value_combo"``)
+    The multi-field extension of ``value_novelty`` (AMiner
+    ``NewMatchPathValueComboDetector``): instead of scoring a single field's
+    values, score *combinations* of two or more fields (``GROUP BY`` over the
+    field expressions). A combination rare or absent in the baseline is
+    flagged even when each field's individual values are common — an
+    ``(action, hour)`` pair like ``(login_ok, 03:00)`` can be novel while
+    ``login_ok`` and ``03:00`` are each unremarkable. Same two modes and same
+    surprise score as ``value_novelty``; auto mode picks a single tuple from
+    the two highest-coverage recommended fields (no pair enumeration).
+
 **timestamp_order** (``detector="timestamp_order"``)
     Flag events whose parsed timestamp jumps *backwards* relative to the
     previous record in the source file (record order = ``byte_offset``, then
@@ -143,6 +154,21 @@ class FreqFinding:
 
 
 @dataclass
+class ComboFinding:
+    """One rare/novel field *combination* from the value-combo detector."""
+
+    fields: list[str]
+    values: list[str]
+    count: int
+    # -log(count / total_events); higher = rarer.
+    score: float
+    first_seen: str | None
+    event_id: str | None
+    event: dict[str, Any] | None
+    details: dict[str, Any]
+
+
+@dataclass
 class OrderFinding:
     """One out-of-order timestamp returned by the timestamp-order detector."""
 
@@ -167,10 +193,12 @@ class StatAnomalyResult:
     """Return value of statistical anomaly detection."""
 
     status: str  # "ok" | "no_data" | "insufficient_data"
-    detector: str  # "value_novelty" | "frequency" | "timestamp_order"
+    detector: str  # "value_novelty" | "value_combo" | "frequency" | "timestamp_order"
     method: str  # "self-baseline" | "temporal" | "z-score" | "temporal-z-score" | "sequential"
     baseline_size: int  # total events (value_novelty) or event-count used for z-score
-    results: list[ValueFinding | FreqFinding | OrderFinding] = field(default_factory=list)
+    results: list[ValueFinding | FreqFinding | OrderFinding | ComboFinding] = field(
+        default_factory=list
+    )
     # Effective |z| cutoff used by the frequency detector; None for value_novelty.
     z_threshold: float | None = None
 
@@ -801,6 +829,224 @@ class StatisticalAnomalyService:
         return StatAnomalyResult(
             status="ok",
             detector="value_novelty",
+            method=method,
+            baseline_size=baseline_size,
+            results=all_findings[:limit],
+        )
+
+    def find_value_combos(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        fields: list[str] | None = None,
+        limit: int = 50,
+        rarity_floor: int = 3,
+        baseline_end: datetime | None = None,
+        exclude_event_ids: set[str] | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
+    ) -> StatAnomalyResult:
+        """Return rare or first-seen *combinations* of field values.
+
+        The multi-field extension of :meth:`find_value_novelty`: instead of
+        grouping by a single field, group by two or more field expressions
+        together (``GROUP BY expr0, expr1, ...``) and score each surviving
+        combination by the same surprise formula.
+
+        *fields* must name at least two field tokens. When ``None``, the top
+        two highest-coverage recommended fields are used as a single tuple —
+        no pairwise enumeration (that would be one ClickHouse round-trip per
+        pair and a result set no analyst can triage).
+
+        Modes mirror :meth:`find_value_novelty`: *self-baseline* flags
+        combinations appearing ≤ *rarity_floor* times in the whole corpus;
+        *temporal* flags combinations absent from the baseline window but
+        present after ``baseline_end``.
+
+        Raises:
+            ValueError: if fewer than two fields are resolved.
+        """
+        self.ch.init_schema()
+        db = self.ch.database
+        base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        method = "self-baseline" if baseline_end is None else "temporal"
+
+        total_events = self._count_events(case_id, source_ids)
+
+        if fields is not None:
+            combo_fields = fields
+        else:
+            rec = self.recommend_novelty_fields(
+                case_id, source_ids, total=total_events, field_mappings=field_mappings
+            )
+            combo_fields = [f.token for f in rec if f.recommended][:2]
+
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data",
+                detector="value_combo",
+                method=method,
+                baseline_size=0,
+            )
+
+        if len(combo_fields) < 2:
+            if fields is not None:
+                raise ValueError("value_combo requires at least two fields")
+            # Auto mode couldn't find two useful fields to combine.
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector="value_combo",
+                method=method,
+                baseline_size=total_events,
+            )
+
+        # Build one expression per field into a single shared params dict —
+        # distinct prefixes (fk0, fk1, …) keep the attribute-key bind params
+        # from colliding (see _col_expr's `prefix`).
+        params: dict[str, Any] = {**base_params}
+        exprs = [
+            _col_expr(tok, params, field_mappings, prefix=f"fk{i}")
+            for i, tok in enumerate(combo_fields)
+        ]
+        val_cols = ", ".join(f"{expr} AS v{i}" for i, expr in enumerate(exprs))
+        group_by = ", ".join(f"v{i}" for i in range(len(exprs)))
+        non_empty = " AND ".join(f"{expr} != ''" for expr in exprs)
+
+        # Baseline size (temporal only).
+        baseline_size = total_events
+        if baseline_end is not None:
+            bl_res = self.ch.client.query(
+                f"SELECT count() FROM {db}.events"
+                f" WHERE case_id = {{cid:String}}"
+                f" AND has({{src:Array(String)}}, source_id)"
+                f" AND timestamp < {{bl:String}}",
+                parameters={**base_params, "bl": to_clickhouse_utc(baseline_end)},
+            )
+            baseline_size = int(bl_res.result_rows[0][0]) if bl_res.result_rows else 0
+
+        if baseline_end is None:
+            params["floor"] = rarity_floor
+            params["lim"] = limit
+            sql = f"""
+                SELECT
+                    {val_cols},
+                    count() AS cnt,
+                    min(timestamp) AS first_seen,
+                    toString(argMin(event_id, timestamp)) AS evt_id,
+                    argMin(source_id, timestamp) AS src_id,
+                    argMin(message, timestamp) AS msg
+                FROM {db}.events
+                WHERE case_id = {{cid:String}}
+                  AND has({{src:Array(String)}}, source_id)
+                  AND {non_empty}
+                GROUP BY {group_by}
+                HAVING cnt <= {{floor:UInt32}}
+                ORDER BY cnt ASC, first_seen ASC
+                LIMIT {{lim:UInt32}}
+            """
+        else:
+            params["bl"] = to_clickhouse_utc(baseline_end)
+            params["lim"] = limit
+            sql = f"""
+                SELECT
+                    {val_cols},
+                    countIf(timestamp >= {{bl:String}}) AS detect_cnt,
+                    countIf(timestamp < {{bl:String}}) AS baseline_cnt,
+                    minIf(timestamp, timestamp >= {{bl:String}}) AS first_seen,
+                    toString(argMinIf(event_id, timestamp, timestamp >= {{bl:String}})) AS evt_id,
+                    argMinIf(source_id, timestamp, timestamp >= {{bl:String}}) AS src_id,
+                    argMinIf(message, timestamp, timestamp >= {{bl:String}}) AS msg
+                FROM {db}.events
+                WHERE case_id = {{cid:String}}
+                  AND has({{src:Array(String)}}, source_id)
+                  AND {non_empty}
+                  AND timestamp IS NOT NULL
+                GROUP BY {group_by}
+                HAVING baseline_cnt = 0 AND detect_cnt > 0
+                ORDER BY detect_cnt ASC, first_seen ASC
+                LIMIT {{lim:UInt32}}
+            """
+
+        rows = self.ch.client.query(sql, parameters=params).result_rows
+        n_fields = len(exprs)
+
+        all_findings: list[ComboFinding] = []
+        for row in rows:
+            values = [str(v) for v in row[:n_fields]]
+            if baseline_end is None:
+                cnt = int(row[n_fields])
+                first_seen, evt_id, src_id, msg = row[n_fields + 1 : n_fields + 5]
+            else:
+                cnt = int(row[n_fields])  # detect_cnt
+                first_seen, evt_id, src_id, msg = row[n_fields + 2 : n_fields + 6]
+
+            if any(v == "" for v in values):
+                continue
+
+            score = (
+                -math.log(cnt / total_events) if cnt > 0 and total_events > 0 else 0.0
+            )
+            first_seen_str = ensure_utc(first_seen).isoformat() if first_seen else None
+            evt_id_str = str(evt_id) if evt_id else None
+            mini_event: dict[str, Any] | None = None
+            if evt_id:
+                mini_event = {
+                    "event_id": evt_id_str,
+                    "case_id": case_id,
+                    "source_id": str(src_id) if src_id else "",
+                    "message": str(msg) if msg else "",
+                    "timestamp": first_seen_str,
+                    "timestamp_desc": None,
+                    "artifact": None,
+                    "artifact_long": None,
+                    "display_name": None,
+                    "tags": [],
+                    "attributes": {},
+                    "content_hash": "",
+                    "file_hash": "",
+                    "parser_name": "",
+                    "parser_version": "",
+                    "source_file": "",
+                    "byte_offset": None,
+                    "line_number": None,
+                    "embedding_model": None,
+                    "embedding_config_hash": None,
+                    "ingest_time": None,
+                }
+
+            details: dict[str, Any] = {
+                "detector": "value_combo",
+                "method": method,
+                "fields": combo_fields,
+                "values": values,
+                "count": cnt,
+                "total_events": total_events,
+                "surprise": round(score, 4),
+            }
+            if baseline_end is not None:
+                details["baseline_size"] = baseline_size
+
+            all_findings.append(
+                ComboFinding(
+                    fields=list(combo_fields),
+                    values=values,
+                    count=cnt,
+                    score=round(score, 4),
+                    first_seen=first_seen_str,
+                    event_id=evt_id_str,
+                    event=mini_event,
+                    details=details,
+                )
+            )
+
+        if exclude_event_ids:
+            all_findings = [
+                f for f in all_findings if not f.event_id or f.event_id not in exclude_event_ids
+            ]
+
+        all_findings.sort(key=lambda f: f.score, reverse=True)
+        return StatAnomalyResult(
+            status="ok",
+            detector="value_combo",
             method=method,
             baseline_size=baseline_size,
             results=all_findings[:limit],

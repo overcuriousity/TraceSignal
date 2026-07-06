@@ -1322,3 +1322,154 @@ def test_order_excludes_normal_marked_events():
     )
     result = svc.find_order_violations("c1", ["s1"], exclude_event_ids={"evt-a"})
     assert [f.event_id for f in result.results] == ["evt-b"]
+
+
+# ---------------------------------------------------------------------------
+# find_value_combos — value-combo detector (D1)
+# ---------------------------------------------------------------------------
+
+
+def test_value_combo_requires_two_explicit_fields():
+    """Explicit single-field selection is rejected."""
+    import pytest
+
+    svc = _svc([FakeQueryResult(result_rows=[(100,)], column_names=["count()"])])
+    with pytest.raises(ValueError):
+        svc.find_value_combos("c1", ["s1"], fields=["artifact"])
+
+
+def test_value_combo_no_data():
+    svc = _svc([FakeQueryResult(result_rows=[(0,)], column_names=["count()"])])
+    result = svc.find_value_combos("c1", ["s1"], fields=["artifact", "display_name"])
+    assert result.status == "no_data"
+    assert result.detector == "value_combo"
+
+
+def test_value_combo_self_baseline_returns_rare_combos():
+    """Rare (field-a, field-b) combinations, rarest first, with surprise score."""
+    import math
+
+    total = 1000
+    fs = datetime(2024, 1, 1, 8, 0, tzinfo=UTC)
+    responses = [
+        FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
+        FakeQueryResult(
+            result_rows=[
+                ("login_ok", "03:00", 1, fs, "evt-a", "s1", "rare combo"),
+                ("login_ok", "09:00", 3, fs, "evt-b", "s1", "common-ish"),
+            ],
+            column_names=["v0", "v1", "cnt", "first_seen", "evt_id", "src_id", "msg"],
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_value_combos(
+        "c1", ["s1"], fields=["attr:action", "attr:hour"], rarity_floor=3
+    )
+    assert result.status == "ok"
+    assert result.detector == "value_combo"
+    # Rarest (count 1) first.
+    assert result.results[0].values == ["login_ok", "03:00"]
+    assert result.results[0].count == 1
+    assert result.results[0].fields == ["attr:action", "attr:hour"]
+    assert result.results[0].score == round(-math.log(1 / total), 4)
+    assert result.results[0].event_id == "evt-a"
+    assert result.results[0].details["detector"] == "value_combo"
+
+
+def test_value_combo_binds_distinct_prefixes_for_attr_fields():
+    """Two attribute-key fields bind to fk0 / fk1 without colliding."""
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(10,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[("a", "b", 1, datetime(2024, 1, 1, tzinfo=UTC), "e", "s1", "m")],
+                column_names=["v0", "v1", "cnt", "first_seen", "evt_id", "src_id", "msg"],
+            ),
+        ]
+    )
+    svc.find_value_combos("c1", ["s1"], fields=["attr:action", "attr:hour"])
+    combo_params = svc.ch.client._all_parameters[1]
+    assert combo_params["fk0"] == "action"
+    assert combo_params["fk1"] == "hour"
+
+
+def test_value_combo_temporal_flags_new_combos():
+    """Temporal mode flags combos absent from baseline, present after split."""
+    total = 500
+    bl = datetime(2024, 1, 2, tzinfo=UTC)
+    fs = datetime(2024, 1, 3, tzinfo=UTC)
+    responses = [
+        FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(300,)], column_names=["count()"]),  # baseline size
+        FakeQueryResult(
+            result_rows=[
+                # v0, v1, detect_cnt, baseline_cnt, first_seen, evt_id, src_id, msg
+                ("admin", "10.0.0.9", 2, 0, fs, "evt-x", "s1", "new combo"),
+            ],
+            column_names=[
+                "v0",
+                "v1",
+                "detect_cnt",
+                "baseline_cnt",
+                "first_seen",
+                "evt_id",
+                "src_id",
+                "msg",
+            ],
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_value_combos(
+        "c1", ["s1"], fields=["attr:user", "attr:ip"], baseline_end=bl
+    )
+    assert result.method == "temporal"
+    assert result.baseline_size == 300
+    assert result.results[0].values == ["admin", "10.0.0.9"]
+    assert result.results[0].count == 2
+    assert result.results[0].details["baseline_size"] == 300
+
+
+def test_value_combo_auto_insufficient_when_fewer_than_two_recommended():
+    """Auto mode with <2 recommended fields returns insufficient_data, not an error."""
+    responses = [
+        FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
+        # field_inventory: top-level agg (4 candidate cols → all constant/identifier)
+        FakeQueryResult(
+            result_rows=[(1, 100, 1, 100, 1, 100, 1, 100)],
+            column_names=[
+                "artifact_dist",
+                "artifact_cov",
+                "timestamp_desc_dist",
+                "timestamp_desc_cov",
+                "display_name_dist",
+                "display_name_cov",
+                "parser_name_dist",
+                "parser_name_cov",
+            ],
+        ),
+        # attr keys: none
+        FakeQueryResult(result_rows=[], column_names=["key", "dist", "cov_count"]),
+    ]
+    svc = _svc(responses)
+    result = svc.find_value_combos("c1", ["s1"], fields=None)
+    assert result.status == "insufficient_data"
+
+
+def test_value_combo_excludes_normal_marked_events():
+    total = 1000
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    responses = [
+        FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
+        FakeQueryResult(
+            result_rows=[
+                ("a", "1", 1, fs, "evt-keep", "s1", "m"),
+                ("b", "2", 1, fs, "evt-drop", "s1", "m"),
+            ],
+            column_names=["v0", "v1", "cnt", "first_seen", "evt_id", "src_id", "msg"],
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_value_combos(
+        "c1", ["s1"], fields=["attr:x", "attr:y"], exclude_event_ids={"evt-drop"}
+    )
+    assert [f.event_id for f in result.results] == ["evt-keep"]

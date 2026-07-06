@@ -2,7 +2,7 @@ import { get, post } from "./client";
 import type { AnomaliesResponse, Annotation, NoveltyFieldsResponse, TagAnomaliesResponse } from "./types";
 
 export interface AnomalyParams {
-  detector?: "value_novelty" | "frequency" | "timestamp_order";
+  detector?: "value_novelty" | "value_combo" | "frequency" | "timestamp_order";
   /** Comma-separated field tokens for value_novelty, e.g. "artifact,display_name,attr:user_agent" */
   fields?: string;
   /** Field to group frequency series by */
@@ -54,7 +54,7 @@ export const anomaliesApi = {
     sourceId: string,
     eventId: string,
     body: {
-      detector: "value_novelty" | "frequency" | "timestamp_order";
+      detector: "value_novelty" | "value_combo" | "frequency" | "timestamp_order";
       content: string;
       details: Record<string, unknown>;
     },

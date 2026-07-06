@@ -12,6 +12,7 @@
 import {
   Info,
   Hash,
+  Layers,
   Cpu,
   Activity,
   Rewind,
@@ -86,6 +87,38 @@ export function MethodologyPanel({
             <Row label="Backend">
               Pure ClickHouse GROUP BY aggregations — no embeddings or ML.
               Works immediately after ingestion.
+            </Row>
+          </div>
+        </div>
+
+        {/* Value combo */}
+        <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3 space-y-2">
+          <p className="flex items-center gap-1.5 font-medium text-[var(--color-fg-primary)]">
+            <Layers size={11} /> Value combos (value_combo)
+          </p>
+          <div className="space-y-1.5 text-[var(--color-fg-muted)]">
+            <Row label="Method">
+              The multi-field extension of rare values — group by two or more
+              fields together and score each surviving combination by the same
+              surprise formula. Self-baseline or temporal, same as rare values.
+            </Row>
+            <Row label="Signal">
+              Combinations that are rare (self-baseline) or first-seen in the
+              detect window (temporal) — even when each field's individual
+              values are common. E.g. (action, hour) = (login_ok, 03:00).
+            </Row>
+            <Row label="Score">
+              −log(count / total events), over the combination's count. Carried
+              in <code className="font-mono text-xs">details.surprise</code>.
+            </Row>
+            <Row label="Fields">
+              Auto mode combines the two highest-coverage recommended fields
+              (no pairwise enumeration — that would be one query per pair).
+              Analyst can pick 2–4 explicit fields.
+            </Row>
+            <Row label="Backend">
+              ClickHouse GROUP BY over the field expressions — exact match, no
+              ML.
             </Row>
           </div>
         </div>

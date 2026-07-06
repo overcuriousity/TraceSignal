@@ -282,6 +282,22 @@ export interface FrequencyFinding {
   details: Record<string, unknown>;
 }
 
+/** One rare / first-seen field *combination* from the value_combo detector. */
+export interface ValueComboFinding {
+  type: "value_combo";
+  /** The combined field tokens, in order. */
+  fields: string[];
+  /** The combination's values, aligned with `fields`. */
+  values: string[];
+  count: number;
+  /** -log(count/total) — higher is rarer. */
+  score: number;
+  first_seen: string | null;
+  event_id: string | null;
+  event: Event | null;
+  details: Record<string, unknown>;
+}
+
 /** One out-of-order timestamp finding from the timestamp_order detector. */
 export interface TimestampOrderFinding {
   type: "timestamp_order";
@@ -303,6 +319,7 @@ export interface TimestampOrderFinding {
 
 export type AnomalyFinding =
   | ValueNoveltyFinding
+  | ValueComboFinding
   | FrequencyFinding
   | TimestampOrderFinding;
 
@@ -343,7 +360,7 @@ export interface AnomalyMarker {
   /** Source id of the representative event — required to persist this finding. */
   sourceId?: string | null;
   /** Which detector produced this finding — required to persist this finding. */
-  detector: "value_novelty" | "frequency" | "timestamp_order";
+  detector: "value_novelty" | "value_combo" | "frequency" | "timestamp_order";
   /** Raw structured finding data — stored verbatim on the persisted annotation. */
   rawDetails: Record<string, unknown>;
   /** End of the anomalous window, for frequency findings — enables a range highlight. */

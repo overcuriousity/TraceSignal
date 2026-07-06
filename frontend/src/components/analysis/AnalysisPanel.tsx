@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { X, AlertTriangle, Search, BookOpen, Hash, Activity, Rewind } from "lucide-react";
+import { X, AlertTriangle, Search, BookOpen, Hash, Activity, Rewind, Layers } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/Button";
 import {
@@ -10,6 +10,7 @@ import {
   SelectItem,
 } from "@/components/ui/Select";
 import { ValueNoveltyView } from "./ValueNoveltyView";
+import { ComboNoveltyView } from "./ComboNoveltyView";
 import { FrequencyView } from "./FrequencyView";
 import { OrderViolationsView } from "./OrderViolationsView";
 import { SimilarEvents } from "./SimilarEvents";
@@ -21,7 +22,7 @@ import { cn } from "@/lib/cn";
 import type { AnomalyMarker, Event } from "@/api/types";
 
 type Tab = "anomalies" | "similar" | "methodology";
-type AnomalySubTab = "novelty" | "frequency" | "order";
+type AnomalySubTab = "novelty" | "combo" | "frequency" | "order";
 
 /**
  * Detector registry for the anomaly dropdown. Flat sub-tab buttons stopped
@@ -39,6 +40,12 @@ const DETECTORS: {
     icon: Hash,
     label: "Rare values",
     description: "Rare or first-seen field values",
+  },
+  {
+    id: "combo",
+    icon: Layers,
+    label: "Value combos",
+    description: "Rare combinations of two or more fields",
   },
   {
     id: "frequency",
@@ -64,6 +71,8 @@ interface Props {
   onSimilarClose: () => void;
   /** Passed to ValueNoveltyView so clicking a field drills into filtered events. */
   onDrillField?: (field: string, value: string) => void;
+  /** Passed to ComboNoveltyView — applies every (field, value) pair as a conjunction. */
+  onComboDrill?: (pairs: [string, string][]) => void;
   /** Passed to FrequencyView — narrows the time range and the series field=value. */
   onFrequencyDrill?: (field: string, value: string, start: string, end: string) => void;
   /** Called with the active anomaly tab's findings — feeds the histogram overlay and event grid. */
@@ -83,6 +92,7 @@ export function AnalysisPanel({
   onSelectEvent,
   onSimilarClose,
   onDrillField,
+  onComboDrill,
   onFrequencyDrill,
   onAnomalyMarkers,
   onAnomalyRunId,
@@ -193,6 +203,18 @@ export function AnalysisPanel({
             timelineId={timelineId}
             onSelectEvent={onSelectEvent}
             onDrillField={onDrillField}
+            onFindingsChange={onAnomalyMarkers}
+            onRunIdChange={onAnomalyRunId}
+            onJumpToTime={onJumpToTime}
+          />
+        )}
+
+        {tab === "anomalies" && anomalySubTab === "combo" && (
+          <ComboNoveltyView
+            caseId={caseId}
+            timelineId={timelineId}
+            onSelectEvent={onSelectEvent}
+            onComboDrill={onComboDrill}
             onFindingsChange={onAnomalyMarkers}
             onRunIdChange={onAnomalyRunId}
             onJumpToTime={onJumpToTime}

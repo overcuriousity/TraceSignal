@@ -547,6 +547,7 @@ class _FakeStatAnomalyService:
         self._midpoint = midpoint
         self.frequency_calls: list[dict] = []
         self.value_novelty_calls: list[dict] = []
+        self.combo_calls: list[dict] = []
         self.order_calls: list[dict] = []
 
     def get_timeline_midpoint(self, case_id, source_ids):
@@ -559,6 +560,10 @@ class _FakeStatAnomalyService:
     def find_value_novelty(self, **kwargs):
         self.value_novelty_calls.append(kwargs)
         return "value-novelty-result"
+
+    def find_value_combos(self, **kwargs):
+        self.combo_calls.append(kwargs)
+        return "value-combo-result"
 
     def find_order_violations(self, **kwargs):
         self.order_calls.append(kwargs)
@@ -653,6 +658,48 @@ async def test_run_stat_detector_auto_fields_resolves_cache_inventory(
     assert call["fields"] is None
     assert call["inventory"] == [("artifact", 2, 10)]
     assert call["inventory_total"] == 10
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_dispatches_to_value_combo(patched_store, monkeypatch):
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    result = await events._run_stat_detector(
+        "c1",
+        ["s1"],
+        detector="value_combo",
+        fields="attr:action,attr:hour",
+        series_field="artifact",
+        z_threshold=None,
+        baseline_end=None,
+        temporal=False,
+        limit=50,
+    )
+    assert result == "value-combo-result"
+    assert fake_svc.combo_calls[0]["fields"] == ["attr:action", "attr:hour"]
+    assert not fake_svc.value_novelty_calls
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_value_combo_rejects_single_field(patched_store, monkeypatch):
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    with pytest.raises(HTTPException) as exc:
+        await events._run_stat_detector(
+            "c1",
+            ["s1"],
+            detector="value_combo",
+            fields="artifact",
+            series_field="artifact",
+            z_threshold=None,
+            baseline_end=None,
+            temporal=False,
+            limit=50,
+        )
+    assert exc.value.status_code == 422
+    assert not fake_svc.combo_calls
 
 
 @pytest.mark.asyncio

@@ -27,6 +27,7 @@ from tracesignal.api.deps import (
 from tracesignal.core.config import get_settings
 from tracesignal.core.events_bus import publish_annotation_change
 from tracesignal.db.anomaly_stats import (
+    ComboFinding,
     FreqFinding,
     NoveltyFieldInfo,
     OrderFinding,
@@ -1275,6 +1276,27 @@ async def _run_stat_detector(
         )
     parsed_fields = _parse_novelty_fields(fields)
 
+    if detector == "value_combo":
+        if parsed_fields is not None and len(parsed_fields) < 2:
+            raise HTTPException(
+                status_code=422,
+                detail="value_combo requires at least two fields.",
+            )
+        try:
+            return await run_in_threadpool(
+                svc.find_value_combos,
+                case_id=case_id,
+                source_ids=source_ids,
+                fields=parsed_fields,
+                limit=limit,
+                rarity_floor=cfg.stat_rarity_floor,
+                baseline_end=effective_baseline_end,
+                exclude_event_ids=exclude_ids,
+                field_mappings=field_mappings,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     # Auto-field selection (no explicit fields): resolve the candidate
     # inventory from the per-source field-stats cache here — the detector
     # runs sync in a worker thread and can't await the cache itself. This
@@ -1380,13 +1402,27 @@ async def semantic_search_events(
     }
 
 
-def _serialize_finding(r: ValueFinding | FreqFinding | OrderFinding) -> dict[str, Any]:
-    """Serialise a ValueFinding / FreqFinding / OrderFinding to a JSON-safe dict."""
+def _serialize_finding(
+    r: ValueFinding | FreqFinding | OrderFinding | ComboFinding,
+) -> dict[str, Any]:
+    """Serialise a Value/Freq/Order/Combo finding to a JSON-safe dict."""
     if isinstance(r, ValueFinding):
         return {
             "type": "value_novelty",
             "field": r.field,
             "value": r.value,
+            "count": r.count,
+            "score": r.score,
+            "first_seen": r.first_seen,
+            "event_id": r.event_id,
+            "event": r.event,
+            "details": r.details,
+        }
+    if isinstance(r, ComboFinding):
+        return {
+            "type": "value_combo",
+            "fields": r.fields,
+            "values": r.values,
             "count": r.count,
             "score": r.score,
             "first_seen": r.first_seen,
@@ -1532,7 +1568,7 @@ async def list_anomalies(
     timeline_id: str,
     detector: str = Query(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'frequency', or 'timestamp_order'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', or 'timestamp_order'.",
     ),
     fields: str | None = Query(
         default=None,
@@ -1588,6 +1624,10 @@ async def list_anomalies(
     **value_novelty**: flags rare or first-seen field values, ranked by surprise
     score (-log frequency).  Works immediately after ingestion.
 
+    **value_combo**: the multi-field extension of value_novelty — flags rare or
+    first-seen *combinations* of two or more fields (requires ≥ 2 `fields`, or
+    auto-picks the top two recommended).
+
     **frequency**: flags time windows with anomalous event-count z-scores per
     field-value series.
 
@@ -1634,7 +1674,7 @@ class TagAnomaliesRequest(BaseModel):
 
     detector: str = Field(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'frequency', or 'timestamp_order'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', or 'timestamp_order'.",
     )
     fields: str | None = Field(
         default=None,
@@ -1750,6 +1790,23 @@ async def tag_anomalies(
                     f"Rare value — {r.field}={r.value!r}: appears {r.count} "
                     f"time(s) of {result.baseline_size:,} events in the "
                     f"corpus (surprise {r.score:.2f})"
+                )
+        elif isinstance(r, ComboFinding):
+            event_id = r.event_id or ""
+            src_id = r.event.get("source_id", "") if r.event else ""
+            combo = ", ".join(f"{f}={v!r}" for f, v in zip(r.fields, r.values, strict=False))
+            if result.method == "temporal":
+                content = (
+                    f"New combination — ({combo}): absent from the "
+                    f"{result.baseline_size:,}-event baseline window; first "
+                    f"appears in the detect window at {r.first_seen} "
+                    f"({r.count} occurrence(s) there; surprise {r.score:.2f})"
+                )
+            else:
+                content = (
+                    f"Rare combination — ({combo}): appears {r.count} time(s) "
+                    f"of {result.baseline_size:,} events in the corpus "
+                    f"(surprise {r.score:.2f})"
                 )
         elif isinstance(r, OrderFinding):
             event_id = r.event_id or ""

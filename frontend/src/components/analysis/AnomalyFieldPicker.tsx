@@ -32,6 +32,15 @@ interface Props {
   /** Currently selected field tokens. null = "use backend smart default". */
   selected: string[] | null;
   onChange: (tokens: string[] | null) => void;
+  /**
+   * Minimum number of fields an explicit selection must keep (value_combo
+   * needs ≥ 2). Below this, unchecking is blocked and the picker warns.
+   */
+  minSelected?: number;
+  /** Maximum number of fields an explicit selection may hold (value_combo caps at 4). */
+  maxSelected?: number;
+  /** Label for the "reset to backend default" action ("auto" by default). */
+  autoLabel?: string;
 }
 
 const KIND_HINT: Record<string, string> = {
@@ -44,10 +53,12 @@ function FieldChip({
   info,
   checked,
   onToggle,
+  disabled = false,
 }: {
   info: NoveltyFieldInfo;
   checked: boolean;
   onToggle: () => void;
+  disabled?: boolean;
 }) {
   const skippedHint = !info.recommended ? KIND_HINT[info.kind] : null;
 
@@ -55,11 +66,14 @@ function FieldChip({
     <button
       type="button"
       onClick={onToggle}
+      disabled={disabled}
       className={cn(
         "flex items-center gap-1 rounded border px-2 py-0.5 text-xs transition-colors",
         checked
           ? "border-[var(--color-accent)] bg-[var(--color-accent)]/15 text-[var(--color-fg-primary)]"
-          : "border-[var(--color-border)] text-[var(--color-fg-muted)] hover:border-[var(--color-fg-muted)]",
+          : disabled
+            ? "border-[var(--color-border)] text-[var(--color-fg-muted)] opacity-40 cursor-not-allowed"
+            : "border-[var(--color-border)] text-[var(--color-fg-muted)] hover:border-[var(--color-fg-muted)]",
       )}
     >
       {checked && <Check size={9} />}
@@ -77,7 +91,15 @@ function FieldChip({
   return <Tooltip content={hint}>{chip}</Tooltip>;
 }
 
-export function AnomalyFieldPicker({ caseId, timelineId, selected, onChange }: Props) {
+export function AnomalyFieldPicker({
+  caseId,
+  timelineId,
+  selected,
+  onChange,
+  minSelected,
+  maxSelected,
+  autoLabel = "auto",
+}: Props) {
   const { data, isLoading } = useQuery({
     queryKey: ["anomalies", caseId, timelineId, "fields"],
     queryFn: () => anomaliesApi.fields(caseId, timelineId),
@@ -104,8 +126,13 @@ export function AnomalyFieldPicker({ caseId, timelineId, selected, onChange }: P
   const toggle = (token: string) => {
     // Materialise the current effective set and toggle one token.
     const next = new Set(effectiveSelected);
-    if (next.has(token)) next.delete(token);
-    else next.add(token);
+    if (next.has(token)) {
+      if (minSelected !== undefined && next.size <= minSelected) return; // floor
+      next.delete(token);
+    } else {
+      if (maxSelected !== undefined && next.size >= maxSelected) return; // ceiling
+      next.add(token);
+    }
     onChange(Array.from(next));
   };
 
@@ -113,6 +140,8 @@ export function AnomalyFieldPicker({ caseId, timelineId, selected, onChange }: P
 
   const isAuto = selected === null;
   const activeCount = effectiveSelected.size;
+  const belowMin = minSelected !== undefined && !isAuto && activeCount < minSelected;
+  const atMax = maxSelected !== undefined && activeCount >= maxSelected;
 
   return (
     <Popover>
@@ -122,7 +151,7 @@ export function AnomalyFieldPicker({ caseId, timelineId, selected, onChange }: P
           Fields
           {activeCount > 0 && (
             <span className="ml-0.5 rounded bg-[var(--color-accent-dim)] px-1 text-xs font-semibold text-[var(--color-accent)]">
-              {isAuto ? "auto" : activeCount}
+              {isAuto ? autoLabel : activeCount}
             </span>
           )}
         </Button>
@@ -134,7 +163,9 @@ export function AnomalyFieldPicker({ caseId, timelineId, selected, onChange }: P
             Fields to scan
           </p>
           <p className="text-xs text-[var(--color-fg-muted)] mt-0.5">
-            Recommended fields are pre-selected based on cardinality.
+            {minSelected !== undefined
+              ? `Pick ${minSelected}${maxSelected ? `–${maxSelected}` : "+"} fields to combine.`
+              : "Recommended fields are pre-selected based on cardinality."}
           </p>
         </div>
 
@@ -158,6 +189,7 @@ export function AnomalyFieldPicker({ caseId, timelineId, selected, onChange }: P
                         key={f.token}
                         info={f}
                         checked={effectiveSelected.has(f.token)}
+                        disabled={atMax && !effectiveSelected.has(f.token)}
                         onToggle={() => toggle(f.token)}
                       />
                     ))}
@@ -175,6 +207,7 @@ export function AnomalyFieldPicker({ caseId, timelineId, selected, onChange }: P
                         key={f.token}
                         info={f}
                         checked={effectiveSelected.has(f.token)}
+                        disabled={atMax && !effectiveSelected.has(f.token)}
                         onToggle={() => toggle(f.token)}
                       />
                     ))}
@@ -198,10 +231,17 @@ export function AnomalyFieldPicker({ caseId, timelineId, selected, onChange }: P
             )}
           >
             <Settings2 size={10} />
-            {isAuto ? "Auto (active)" : "Reset to auto"}
+            {isAuto ? `Auto (${autoLabel})` : `Reset to ${autoLabel}`}
           </button>
-          <span className="text-xs text-[var(--color-fg-muted)]">
-            {activeCount} field{activeCount !== 1 ? "s" : ""} selected
+          <span
+            className={cn(
+              "text-xs",
+              belowMin ? "text-[var(--color-warning)]" : "text-[var(--color-fg-muted)]",
+            )}
+          >
+            {belowMin
+              ? `Pick at least ${minSelected}`
+              : `${activeCount} field${activeCount !== 1 ? "s" : ""} selected`}
           </span>
         </div>
       </PopoverContent>

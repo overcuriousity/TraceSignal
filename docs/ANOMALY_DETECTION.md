@@ -11,7 +11,7 @@ produced this file and what was fixed as part of it.
 
 There are four independent analysis tools in TraceSignal:
 
-1. [Value novelty](#1-value-novelty-rare--first-seen-values) — rare/new field values (ClickHouse, no ML)
+1. [Value novelty](#1-value-novelty-rare--first-seen-values) — rare/new field values, single field or [combinations](#value-combinations-the-value_combo-variant) (ClickHouse, no ML)
 2. [Frequency anomalies](#2-frequency-anomalies-volume-spikes--silences) — volume spikes/silences (ClickHouse, no ML)
 3. [Timestamp order](#3-timestamp-order-out-of-order-records) — timestamps running backwards in record order (ClickHouse, no ML)
 4. [Semantic similarity search](#4-semantic-similarity-search) — "find events like this one" (embeddings + Qdrant)
@@ -142,6 +142,32 @@ recommendation set (up to ~54 candidate fields) could turn one panel-open
 into dozens of round-trips. The highest-coverage recommended fields win the
 cap; you can always override with an explicit field list via the Fields
 picker to scan something the auto-selector skipped.
+
+### Value combinations (the `value_combo` variant)
+
+The **Value combos** detector (AMiner `NewMatchPathValueComboDetector`) is the
+multi-field extension of rare values: instead of scoring one field's values, it
+scores *combinations* of two or more fields together.
+
+**Why a separate detector:** a combination can be rare even when each field's
+individual values are common. `login_ok` is a common action; `03:00` is a common
+hour; but `(login_ok, 03:00)` — a successful login at 3am — may be a combination
+that has never occurred before. Single-field novelty can't see this; it only
+knows each value in isolation.
+
+**How it works:** exactly like rare values, but the ClickHouse `GROUP BY` spans
+every selected field expression instead of one, and the count/first-seen and
+surprise score are computed per *combination*. Both modes carry over unchanged —
+self-baseline flags combinations appearing ≤ the rarity floor; temporal flags
+combinations absent from the baseline window but present after the split. The
+score is the same `−log(count / total events)`.
+
+**Field selection differs in one way:** you must give it at least two fields (the
+picker enforces 2–4). Auto mode does **not** enumerate every pair — with 15
+candidate fields that would be 105 combinations, 105 queries, and a result set no
+analyst can triage. Instead auto mode combines exactly the two highest-coverage
+recommended fields into a single tuple. Pick fields explicitly for any other
+combination.
 
 ---
 
