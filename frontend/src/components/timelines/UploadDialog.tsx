@@ -4,6 +4,7 @@ import { Upload, FileText, ChevronDown, ChevronRight } from "lucide-react";
 import { sourcesApi } from "@/api/sources";
 import { ConverterPanel } from "@/components/sources/ConverterPanel";
 import { useJobsStore } from "@/stores/jobs";
+import { tourEvent } from "@/stores/tour";
 import { Dialog, DialogContent, DialogTrigger, DialogClose } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -23,7 +24,7 @@ export function UploadDialog({ caseId }: Props) {
   const qc = useQueryClient();
   const addJob = useJobsStore((s) => s.addJob);
 
-  const { mutate, isPending, error, data } = useMutation({
+  const { mutate, isPending, error, data, reset } = useMutation({
     mutationFn: () =>
       sourcesApi.upload(
         caseId,
@@ -43,6 +44,7 @@ export function UploadDialog({ caseId }: Props) {
           ["sources", caseId],
           ["timelines", caseId],
         ]);
+        tourEvent("source-uploaded");
         setOpen(false);
         setFile(null);
         setParser("");
@@ -55,19 +57,21 @@ export function UploadDialog({ caseId }: Props) {
 
   const handleFile = (f: File) => setFile(f);
 
-  // Reset selection whenever the dialog is reopened so a previous upload does
-  // not linger.
+  // Reset selection and the previous upload's result/error whenever the
+  // dialog is reopened, so a stale duplicate warning or error doesn't linger.
   useEffect(() => {
     if (open) {
       setFile(null);
       setParser("");
+      reset();
+      tourEvent("upload-dialog-opened");
     }
-  }, [open]);
+  }, [open, reset]);
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
-        <Button variant="outline" size="sm">
+        <Button variant="outline" size="sm" data-tour="upload-log">
           <Upload size={13} /> Upload Log File
         </Button>
       </DialogTrigger>
@@ -78,6 +82,7 @@ export function UploadDialog({ caseId }: Props) {
         <div className="space-y-4">
           {/* Drop zone */}
           <div
+            data-tour="upload-dropzone"
             onDragOver={(e) => {
               e.preventDefault();
               setDragging(true);
@@ -146,6 +151,7 @@ export function UploadDialog({ caseId }: Props) {
           <div>
             <button
               type="button"
+              data-tour="converter-hint"
               onClick={() => setShowConverters((s) => !s)}
               aria-expanded={showConverters}
               className="flex w-full items-center gap-1.5 text-left text-xs text-[var(--color-fg-muted)] hover:text-[var(--color-fg-secondary)] transition-base"

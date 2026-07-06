@@ -668,6 +668,9 @@ class User(Base):
     # "local" (username+password) or "oidc" (provisioned via an external IdP).
     auth_provider: Mapped[str] = mapped_column(String(16), nullable=False, default="local")
     oidc_subject: Mapped[str | None] = mapped_column(String(255), nullable=True, unique=True)
+    onboarding_completed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
@@ -692,6 +695,7 @@ class User(Base):
             "is_active": self.is_active,
             "must_change_password": self.must_change_password,
             "auth_provider": self.auth_provider,
+            "onboarding_completed": self.onboarding_completed,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "last_login_at": self.last_login_at.isoformat() if self.last_login_at else None,
@@ -918,6 +922,17 @@ class PostgresStore:
             source_columns = await conn.run_sync(
                 lambda sync_conn: {col["name"] for col in inspect(sync_conn).get_columns("sources")}
             )
+            user_columns = await conn.run_sync(
+                lambda sync_conn: {col["name"] for col in inspect(sync_conn).get_columns("users")}
+            )
+            if "onboarding_completed" not in user_columns:
+                # Existing users backfill to false: everyone sees the (skippable)
+                # onboarding tour once after this feature lands.
+                await conn.execute(
+                    text(
+                        "ALTER TABLE users ADD COLUMN onboarding_completed BOOLEAN NOT NULL DEFAULT false"
+                    )
+                )
             if "status" not in source_columns:
                 # Existing rows predate the ingest-status lifecycle and are by
                 # definition fully ingested, so they backfill to 'ready'.
@@ -2420,6 +2435,7 @@ class PostgresStore:
         is_admin: bool | None = None,
         is_active: bool | None = None,
         must_change_password: bool | None = None,
+        onboarding_completed: bool | None = None,
     ) -> User | None:
         """Patch mutable fields on a user. Returns the updated row, or None if missing."""
         values: dict[str, Any] = {"updated_at": datetime.now(UTC)}
@@ -2433,6 +2449,8 @@ class PostgresStore:
             values["is_active"] = is_active
         if must_change_password is not None:
             values["must_change_password"] = must_change_password
+        if onboarding_completed is not None:
+            values["onboarding_completed"] = onboarding_completed
         async with self.session_factory() as session:
             result = await session.execute(
                 update(User).where(User.id == user_id).values(**values).returning(User)

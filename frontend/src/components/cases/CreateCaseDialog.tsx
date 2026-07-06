@@ -9,6 +9,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Plus } from "lucide-react";
 import { manageableTeams } from "@/lib/caseAccess";
 import { useAuthStore } from "@/stores/auth";
+import { tourEvent } from "@/stores/tour";
 
 const PERSONAL = "__personal__";
 
@@ -41,6 +42,7 @@ export function CreateCaseDialog() {
       ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["cases"] });
+      tourEvent("case-created");
       setOpen(false);
       setName("");
       setDesc("");
@@ -51,7 +53,7 @@ export function CreateCaseDialog() {
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
-        <Button variant="accent" size="sm">
+        <Button variant="accent" size="sm" data-tour="new-case">
           <Plus size={14} /> New Case
         </Button>
       </DialogTrigger>

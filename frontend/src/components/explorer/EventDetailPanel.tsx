@@ -68,6 +68,7 @@ function FieldRow({
   onAddFilter,
   onShowHistogram,
   flag,
+  dataTour,
 }: {
   label: string;
   value: string | null | undefined;
@@ -78,6 +79,8 @@ function FieldRow({
   onAddFilter?: (fieldKey: string, value: string, include: boolean) => void;
   onShowHistogram?: (fieldKey: string, value: string) => void;
   flag?: { flag: string; label: string } | null;
+  /** Onboarding-tour anchor on the action-buttons cluster. */
+  dataTour?: string;
 }) {
   if (!value) return null;
   const canFilter = !!filterKey && !!onAddFilter;
@@ -108,7 +111,10 @@ function FieldRow({
       )}
 
       {/* Action buttons — visible on row hover */}
-      <div className="flex items-center gap-0.5 shrink-0 opacity-0 group-hover:opacity-100 transition-base">
+      <div
+        data-tour={dataTour}
+        className="flex items-center gap-0.5 shrink-0 opacity-0 group-hover:opacity-100 transition-base"
+      >
         {canFilter && (
           <>
             <Tooltip content={`Filter IN: ${label} = ${value}`} side="top">
@@ -502,6 +508,7 @@ export function EventDetailPanel({
             filterKey="timestamp_desc"
             onAddFilter={onAddFilter}
             onShowHistogram={onShowFieldHistogram}
+            dataTour="detail-filter-actions"
           />
           <FieldRow
             label="ingest_time"

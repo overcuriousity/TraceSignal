@@ -33,6 +33,8 @@ export interface User {
   is_active: boolean;
   must_change_password: boolean;
   auth_provider: AuthProvider;
+  /** False until the user finishes (or skips) the onboarding tour. */
+  onboarding_completed: boolean;
   created_at: string;
   updated_at: string;
   last_login_at: string | null;

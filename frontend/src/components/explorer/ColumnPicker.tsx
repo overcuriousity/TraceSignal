@@ -195,7 +195,7 @@ export function ColumnPicker({ caseId, timelineId }: Props) {
   return (
     <Popover>
       <PopoverTrigger asChild>
-        <Button variant="outline" size="sm">
+        <Button variant="outline" size="sm" data-tour="column-picker">
           <Columns3 size={13} />
           Columns
           {activeCount > 0 && (

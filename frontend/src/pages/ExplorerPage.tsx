@@ -27,6 +27,7 @@ import { similarityApi } from "@/api/similarity";
 import { viewsApi } from "@/api/views";
 import { timelinesApi } from "@/api/timelines";
 import { useUiStore, DEFAULT_COLUMNS } from "@/stores/ui";
+import { tourEvent } from "@/stores/tour";
 import { useScrollPositionStore } from "@/stores/scrollPosition";
 import { paramsToFilters, filtersToParams } from "@/lib/queryParams";
 import { useCaseStream } from "@/hooks/useCaseStream";
@@ -293,6 +294,7 @@ export function ExplorerPage() {
   const handleAddFilter = useCallback(
     (fieldKey: string, value: string, include: boolean) => {
       setFilters(applyFieldFilter(filters, fieldKey, value, include));
+      tourEvent("filter-added");
     },
     [filters, setFilters, applyFieldFilter],
   );
@@ -341,6 +343,10 @@ export function ExplorerPage() {
   const analysisPanelOpen = useUiStore((s) => s.analysisPanelOpen);
   const setAnalysisPanelOpen = useUiStore((s) => s.setAnalysisPanelOpen);
   const [expandedEvent, setExpandedEvent] = useState<Event | null>(null);
+  const handleExpandEvent = useCallback((event: Event | null) => {
+    if (event) tourEvent("event-expanded");
+    setExpandedEvent(event);
+  }, []);
   const [selection, setSelection] = useState<SelectionState>({ mode: "ids", ids: new Set() });
   const [similarAnchor, setSimilarAnchor] = useState<Event | null>(null);
   const [anomalyMarkers, setAnomalyMarkers] = useState<AnomalyMarker[]>([]);
@@ -932,7 +938,7 @@ export function ExplorerPage() {
             <ColumnPicker caseId={caseId!} timelineId={timelineId!} />
 
             <Tooltip content="Open the full visualization page">
-              <Button variant="outline" size="sm" asChild>
+              <Button variant="outline" size="sm" asChild data-tour="visualize-link">
                 <Link to={`visualize?${searchParams.toString()}`}>
                   <AreaChart size={13} />
                   Visualize
@@ -1035,7 +1041,7 @@ export function ExplorerPage() {
                   onToggleSelect={handleToggleSelect}
                   onToggleSelectAll={handleToggleSelectAll}
                   expandedId={expandedEvent?.event_id ?? null}
-                  onExpand={setExpandedEvent}
+                  onExpand={handleExpandEvent}
                   onLoadMore={handleLoadMore}
                   onLoadEarlier={handleLoadEarlier}
                   hasPreviousPage={!!hasPreviousPage}

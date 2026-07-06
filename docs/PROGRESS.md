@@ -1,6 +1,28 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-05 (session 21 — M21 storage redundancy cleanup, all three items from
+Last updated: 2026-07-06 (session 22 — onboarding tour. First-login guided overlay walking
+the core workflow in 11 action-driven steps: create case → open it → upload dialog →
+converter-script hint → upload → default "All sources" timeline → Explorer column picker →
+open event details → filter in/out buttons → Visualize link → done. Custom spotlight
+implementation (no tour library): `frontend/src/lib/tourSteps.ts` (step schema:
+route-gated, `[data-tour]` selector anchors, advance = manual Next | app event | route
+change), `stores/tour.ts` (non-persisted state machine + `tourEvent()` fire-and-forget
+helper), `components/tour/TourOverlay.tsx` (box-shadow spotlight, `pointer-events: none` so
+the highlighted control stays clickable; card needs explicit `pointer-events: auto` +
+pointerdown stopPropagation because an open Radix modal Dialog sets `pointer-events: none`
+on body and dismisses on outside-pointerdown) and `TourProvider.tsx` (auto-start, completion
+PATCH; uses `qc.setQueryData` instead of invalidate — an invalidate lets `useCurrentUser`
+re-sync the stale cached user mid-refetch and instantly restart the tour). Persistence is a
+new server-side `users.onboarding_completed` bool (guarded ALTER migration, `to_dict`,
+`update_user`, PATCH /me) — refresh mid-tour restarts from step 1 by design; existing users
+backfill to false and see the (always skippable) tour once. Settings page gained a "Restart
+onboarding tour" section. Verified end-to-end with a headless-Playwright drive of all 11
+steps including a real CSV ingest, finish/skip persistence across reloads, and the
+settings restart path. Bug fixes on the way: UploadDialog kept a stale duplicate-warning /
+error across close/reopen (missing `mutation.reset()`); Settings audit-trail download had
+no error handling (silent unhandled rejection).)
+
+Previous (session 21 — M21 storage redundancy cleanup, all three items from
 the 2026-07-05 storage placement audit. (1) `Event.vector_id` removed everywhere (dataclass,
 ClickHouse DDL/column lists/SELECTs, `_columns.py`, API/frontend event shape) — it was
 unconditionally `str(event_id)`; Qdrant point IDs now use `event_id` directly. Existing

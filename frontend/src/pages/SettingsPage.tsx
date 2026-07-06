@@ -1,18 +1,22 @@
 import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
-import { Download, Settings as SettingsIcon } from "lucide-react";
+import { Download, Compass, Settings as SettingsIcon } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 import { authApi } from "@/api/auth";
 import { ApiError } from "@/api/client";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { usePasswordChangeForm } from "@/hooks/usePasswordChangeForm";
 import { useAuthStore } from "@/stores/auth";
+import { useTourStore } from "@/stores/tour";
 import { useInvalidateCurrentUser } from "@/hooks/useCurrentUser";
 
 export function SettingsPage() {
   const user = useAuthStore((s) => s.user);
   const setUser = useAuthStore((s) => s.setUser);
   const invalidate = useInvalidateCurrentUser();
+  const navigate = useNavigate();
+  const [auditError, setAuditError] = useState<string | null>(null);
 
   const [username, setUsername] = useState(user?.username ?? "");
   const [displayName, setDisplayName] = useState(user?.display_name ?? "");
@@ -33,6 +37,16 @@ export function SettingsPage() {
     onSuccess: (u) => {
       setUser(u);
       invalidate();
+    },
+  });
+
+  const restartTour = useMutation({
+    mutationFn: () => authApi.updateProfile({ onboarding_completed: false }),
+    onSuccess: (u) => {
+      setUser(u);
+      invalidate();
+      useTourStore.getState().start();
+      navigate("/");
     },
   });
 
@@ -157,6 +171,31 @@ export function SettingsPage() {
           </section>
         )}
 
+        {/* Onboarding */}
+        <section className="mb-8 rounded-lg border border-[var(--color-border-strong)] bg-[var(--color-bg-elevated)] p-5">
+          <h2 className="mb-2 text-sm font-semibold text-[var(--color-fg-primary)]">Onboarding</h2>
+          <p className="mb-4 text-sm text-[var(--color-fg-muted)]">
+            Replay the guided tour through the core workflow — creating a case, ingesting logs,
+            and exploring events. It starts on the Cases page.
+          </p>
+          {restartTour.error && (
+            <p className="mb-2 text-xs text-[var(--color-danger)]">
+              {restartTour.error instanceof ApiError
+                ? restartTour.error.message
+                : "Something went wrong."}
+            </p>
+          )}
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={restartTour.isPending}
+            onClick={() => restartTour.mutate()}
+          >
+            <Compass size={14} />
+            {restartTour.isPending ? "Restarting…" : "Restart onboarding tour"}
+          </Button>
+        </section>
+
         {/* Audit trail */}
         <section className="rounded-lg border border-[var(--color-border-strong)] bg-[var(--color-bg-elevated)] p-5">
           <h2 className="mb-2 text-sm font-semibold text-[var(--color-fg-primary)]">
@@ -166,17 +205,25 @@ export function SettingsPage() {
             Download a record of everything you've done in TraceSignal — useful for reproducing
             or documenting your own investigative steps.
           </p>
+          {auditError && <p className="mb-2 text-xs text-[var(--color-danger)]">{auditError}</p>}
           <Button
             variant="outline"
             size="sm"
             onClick={async () => {
-              const blob = await authApi.downloadMyAudit("csv");
-              const url = URL.createObjectURL(blob);
-              const a = document.createElement("a");
-              a.href = url;
-              a.download = `audit-${user.username}.csv`;
-              a.click();
-              URL.revokeObjectURL(url);
+              setAuditError(null);
+              try {
+                const blob = await authApi.downloadMyAudit("csv");
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url;
+                a.download = `audit-${user.username}.csv`;
+                a.click();
+                URL.revokeObjectURL(url);
+              } catch (err) {
+                setAuditError(
+                  err instanceof ApiError ? err.message : "Download failed — please try again.",
+                );
+              }
             }}
           >
             <Download size={14} /> Download my audit trail (CSV)
