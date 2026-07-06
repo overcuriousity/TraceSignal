@@ -1034,9 +1034,7 @@ class StatisticalAnomalyService:
             if any(v == "" for v in values):
                 continue
 
-            score = (
-                -math.log(cnt / total_events) if cnt > 0 and total_events > 0 else 0.0
-            )
+            score = -math.log(cnt / total_events) if cnt > 0 and total_events > 0 else 0.0
             first_seen_str = ensure_utc(first_seen).isoformat() if first_seen else None
             evt_id_str = str(evt_id) if evt_id else None
             mini_event: dict[str, Any] | None = None
@@ -1137,9 +1135,7 @@ class StatisticalAnomalyService:
 
         # Keep fields with ≥5% coverage and more than one distinct value, cap 15.
         candidates = [
-            (tok, dist, cov)
-            for tok, dist, cov in inventory
-            if cov / total >= 0.05 and dist > 1
+            (tok, dist, cov) for tok, dist, cov in inventory if cov / total >= 0.05 and dist > 1
         ][:_MAX_AUTO_SCAN_FIELDS]
         if not candidates:
             return []
@@ -1266,8 +1262,11 @@ class StatisticalAnomalyService:
                 iqr = q3 - q1
                 lower = q1 - 1.5 * iqr
                 upper = q3 + 1.5 * iqr
-                band_extra: dict[str, Any] = {"q1": round(q1, 4), "q3": round(q3, 4),
-                                              "iqr": round(iqr, 4)}
+                band_extra: dict[str, Any] = {
+                    "q1": round(q1, 4),
+                    "q3": round(q3, 4),
+                    "iqr": round(iqr, 4),
+                }
             else:
                 lower, upper = float(a), float(b)
                 band_extra = {"baseline_min": round(lower, 4), "baseline_max": round(upper, 4)}
@@ -1783,8 +1782,7 @@ class StatisticalAnomalyService:
         """
         summary_rows = self.ch.client.query(summary_sql, parameters=summary_params).result_rows
         source_summary: dict[str, tuple[int, float]] = {
-            str(r[0]): (int(r[1]), float(r[2]) if r[2] is not None else 0.0)
-            for r in summary_rows
+            str(r[0]): (int(r[1]), float(r[2]) if r[2] is not None else 0.0) for r in summary_rows
         }
         total_violations = sum(n for n, _ in source_summary.values())
 

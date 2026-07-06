@@ -1863,9 +1863,7 @@ async def tag_anomalies(
         elif isinstance(r, RangeFinding):
             event_id = r.event_id or ""
             src_id = r.event.get("source_id", "") if r.event else ""
-            band_desc = (
-                "baseline min/max" if result.method == "temporal-range" else "IQR fence"
-            )
+            band_desc = "baseline min/max" if result.method == "temporal-range" else "IQR fence"
             content = (
                 f"Out-of-range value — {r.field}={r.value:g}: {r.direction} the "
                 f"learned band [{r.lower:g}, {r.upper:g}] ({band_desc})"

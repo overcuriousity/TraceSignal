@@ -1419,9 +1419,7 @@ def test_value_combo_temporal_flags_new_combos():
         ),
     ]
     svc = _svc(responses)
-    result = svc.find_value_combos(
-        "c1", ["s1"], fields=["attr:user", "attr:ip"], baseline_end=bl
-    )
+    result = svc.find_value_combos("c1", ["s1"], fields=["attr:user", "attr:ip"], baseline_end=bl)
     assert result.method == "temporal"
     assert result.baseline_size == 300
     assert result.results[0].values == ["admin", "10.0.0.9"]
@@ -1582,9 +1580,7 @@ def test_recommend_numeric_fields_filters_by_ratio():
         ),
     ]
     svc = _svc(responses)
-    fields = svc.recommend_numeric_fields(
-        "c1", ["s1"], total=100, inventory=inventory
-    )
+    fields = svc.recommend_numeric_fields("c1", ["s1"], total=100, inventory=inventory)
     by_token = {f.token: f for f in fields}
     assert by_token["attr:bytes"].recommended is True
     assert by_token["attr:bytes"].numeric_ratio == 0.98
