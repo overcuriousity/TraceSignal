@@ -187,9 +187,18 @@ class ClickHouseStore:
         return body, dict(zip(names, values, strict=False))
 
     def init_schema(self) -> None:
-        """Create the target database and events table if they do not exist."""
+        """Create the target database and events table if they do not exist.
+
+        Idempotent and cached per instance: called from every query-service
+        entry point, so after the first success the three DDL round-trips are
+        skipped. A dropped-and-recreated database mid-process (tests do this)
+        can reset the flag via ``_schema_ready = False``.
+        """
+        if getattr(self, "_schema_ready", False):
+            return
         self.client.command(f"CREATE DATABASE IF NOT EXISTS {self.database}")
         self.client.command(_EVENTS_TABLE_DDL.format(database=self.database))
+        self._schema_ready = True
         # Enrichment output moved into events.attributes (stage_enrichment_rows / finalize_enrichment_apply);
         # the former side table is dead. Destructive, but pre-release
         # databases are documented as deprecated and the data is derived —

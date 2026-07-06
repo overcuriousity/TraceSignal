@@ -1,6 +1,30 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-06 (session 22 — onboarding tour. First-login guided overlay walking
+Last updated: 2026-07-06 (session 23 — large-source performance + value-novelty OOM fix.
+Root cause of the unresponsive Explorer on a 5.5 GiB CloudTrail ingest: wide flattened
+sources store every unioned column on every event, so each of 2.8M events carried 672
+attribute map entries of which ~639 were empty strings — 73 GiB uncompressed in the
+`attributes` column. Every map-scanning query paid for it: broad text search 3.3s/scan
+(×4 scans per filter interaction), and the value-novelty field inventory's
+`ARRAY JOIN mapKeys` + `attributes[key]` re-lookup exploded to ~2 billion rows and
+OOM-killed ClickHouse at 56 GiB (the 500s on GET /anomalies). Fixes: (1)
+`Event.to_clickhouse_row` drops empty attribute values at ingest — semantically
+transparent since a ClickHouse Map returns '' for absent keys; (2) the inventory query
+uses a paired keys/values ARRAY JOIN, pre-filters `val != ''`, approximate `uniq()`
+instead of `uniqExact`, and external-GROUP-BY spill + a 12 GB query memory cap; (3)
+`EventQueryService.query` runs the first-page COUNT and page fetch concurrently; (4)
+`ClickHouseStore.init_schema` is cached per instance (was 3 DDL round-trips on every
+query). Existing data cleaned via a one-off `ALTER TABLE events UPDATE attributes =
+mapFilter((k,v) -> v != '', attributes)` mutation on the running deployment — attributes
+went 73.3→5.05 GiB uncompressed, broad search 3.3s→0.37s, field inventory OOM→0.87s,
+match counts verified identical. Also fixed the stranded infinite scroll: EventGrid's
+load-more only fired from the onScroll handler and was gated on `!isFetching`, so
+reaching the bottom while a page fetch was in flight skipped it — with the scrollbar
+already pinned, no further scroll event ever came ("scrolled to bottom, nothing
+happens"). A virtualizer-driven effect now re-checks when a fetch settles and keeps
+loading while the tail rows are in view.)
+
+Previous (session 22 — onboarding tour. First-login guided overlay walking
 the core workflow in 11 action-driven steps: create case → open it → upload dialog →
 converter-script hint → upload → default "All sources" timeline → Explorer column picker →
 open event details → filter in/out buttons → Visualize link → done. Custom spotlight

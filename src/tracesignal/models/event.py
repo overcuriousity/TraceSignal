@@ -224,7 +224,17 @@ class Event:
             "artifact_long": self.artifact_long or "",
             "display_name": self.display_name or "",
             "tags": self.tags,
-            "attributes": {str(k): str(v) for k, v in self.attributes.items()},
+            # Empty values are dropped, not stored: a ClickHouse Map returns ''
+            # for absent keys, so lookups/filters behave identically — but
+            # wide flattened sources (e.g. CloudTrail CSV/JSONL with unioned
+            # headers) would otherwise store hundreds of empty entries per
+            # event, bloating the attributes column ~20x and making every
+            # map-scanning query (broad search, field inventory) explode.
+            "attributes": {
+                str(k): str(v)
+                for k, v in self.attributes.items()
+                if v is not None and str(v) != ""
+            },
             "embedding_model": self.embedding_model or "",
             "embedding_config_hash": self.embedding_config_hash or "",
         }

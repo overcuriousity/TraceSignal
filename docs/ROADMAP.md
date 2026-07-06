@@ -46,6 +46,20 @@ resolved — this file holds only the condensed, still-open action items.
   (clickhouse-driver, port 9000), `async_insert`, parse/insert pipelining (parser thread
   feeding an insert thread).
 
+- [ ] **M22 — Explorer query-path follow-ups (post large-source fix).** Session-23 fixes
+  (empty-attribute drop at ingest, memory-safe field inventory, parallel first-page
+  COUNT+fetch, cached `init_schema`) resolved the 5.5 GiB-source unresponsiveness; still
+  open, in impact order: (a) `_ParameterizedQueryBuilder.add_in_list` wraps the column in
+  `toString()`, which defeats primary-index/partition pruning for `source_id` — use a typed
+  `IN {p:Array(String)}` for String columns (keep `has(...)` only for the UUID `event_id`);
+  (b) broad text search is still a full scan per query (~0.4 s/2.8M rows after cleanup) ×
+  histogram+count+page per interaction — consider a `tokenbf_v1`-indexed fast path via
+  `hasTokenCaseInsensitive` when `q` is a plain token; (c) `histogram` runs its min/max
+  range scan and bucket scan serially with the same WHERE; (d) `find_value_novelty`'s
+  auto-field-selection calls `field_inventory` live instead of the per-source field-stats
+  cache (`db/field_stats.py`) — the cache converted the `/anomalies/fields` endpoint but
+  not the detector's internal path.
+
 ## Milestone 3 — polish
 
 - [ ] Split `api/routers/events.py` (1500+ lines: query parsing, export streaming, anomaly

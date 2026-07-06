@@ -380,18 +380,34 @@ class StatisticalAnomalyService:
                 inventory.append((col, int(row[i * 2]), int(row[i * 2 + 1])))
 
         # -- Attribute keys (ARRAY JOIN to enumerate + aggregate in one pass) --
+        #
+        # Memory-safety is deliberate here: the paired keys/values ARRAY JOIN
+        # avoids re-materializing the whole map per expanded row (the former
+        # ``attributes[key]`` lookup kept the full map column alive in every
+        # expanded row and OOM-killed the server on wide sources), the
+        # ``val != ''`` pre-filter shrinks the expansion before GROUP BY
+        # (empties count as absent everywhere in novelty scoring anyway), and
+        # ``uniq`` (approximate, ~1% error) replaces ``uniqExact`` — the
+        # cardinality classification thresholds don't need exactness, and
+        # exact per-key hash sets over near-unique values are the other
+        # memory blowup. External GROUP BY spill + a query memory cap bound
+        # the worst case instead of trusting the server-wide limit.
         attr_sql = f"""
             SELECT
                 key,
-                uniqExact(attributes[key])        AS dist,
-                countIf(notEmpty(attributes[key])) AS cov_count
+                uniq(val)  AS dist,
+                count()    AS cov_count
             FROM {db}.events
-            ARRAY JOIN mapKeys(attributes) AS key
+            ARRAY JOIN mapKeys(attributes) AS key, mapValues(attributes) AS val
             WHERE case_id = {{cid:String}}
               AND has({{src:Array(String)}}, source_id)
+              AND val != ''
             GROUP BY key
             ORDER BY cov_count DESC
             LIMIT {{max_keys:UInt32}}
+            SETTINGS max_threads = 8,
+                     max_bytes_before_external_group_by = 4000000000,
+                     max_memory_usage = 12000000000
         """
         attr_res = self.ch.client.query(
             attr_sql, parameters={**params, "max_keys": _RECOMMENDER_MAX_ATTR_KEYS}

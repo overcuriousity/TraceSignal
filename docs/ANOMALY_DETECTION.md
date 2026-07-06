@@ -111,6 +111,14 @@ type:
 | `identifier` | distinct values ÷ non-empty events ≥ 0.9 (hashes, UUIDs, free-text messages — nearly every value is unique) | No — nothing repeats, so nothing can be "rare" relative to a peer group |
 | `categorical` | everything else — moderate cardinality, decent coverage | Yes |
 
+The attribute-key inventory behind this classification counts distinct values
+with ClickHouse's approximate `uniq()` (~1% error), not `uniqExact` — the
+thresholds above are coarse ratios, and exact per-key hash sets over
+near-unique values on multi-million-event sources were a server-killing
+memory blowup. The scan also ignores empty attribute values entirely (they
+are treated as "field absent", matching the coverage semantics everywhere
+else).
+
 This is a real, useful filter: scanning an `identifier`-classified field like
 a raw message string for "rare values" would flag almost every row (each
 message is close to unique) and bury real signal in noise. Restricting to

@@ -671,14 +671,6 @@ class EventQueryService:
         cursor_mode = query.after is not None or query.before is not None
         display_dir = query.order.upper()
 
-        total: int | None = None
-        if not cursor_mode:
-            count_result = self.store.client.query(
-                f"SELECT count() FROM {database}.events WHERE {where}",
-                parameters=parameters,
-            )
-            total = count_result.result_rows[0][0] if count_result.result_rows else 0
-
         # A `before` seek wants the rows nearest the cursor, which means
         # scanning toward it — the opposite of the page's display order —
         # then reversing the result back into display order.
@@ -698,7 +690,25 @@ class EventQueryService:
         if not cursor_mode:
             sql += f" OFFSET {query.offset}"
 
-        event_result = self.store.client.query(sql, parameters=parameters)
+        total: int | None = None
+        if not cursor_mode:
+            # COUNT and page fetch share the WHERE but are independent scans —
+            # with an expensive predicate (broad text search over the
+            # attributes map) running them serially doubles first-page
+            # latency, so run them concurrently.
+            def _count() -> int:
+                count_result = self.store.client.query(
+                    f"SELECT count() FROM {database}.events WHERE {where}",
+                    parameters=parameters,
+                )
+                return count_result.result_rows[0][0] if count_result.result_rows else 0
+
+            total, event_result = self._run_parallel(
+                _count,
+                lambda: self.store.client.query(sql, parameters=parameters),
+            )
+        else:
+            event_result = self.store.client.query(sql, parameters=parameters)
         columns = event_result.column_names
         rows = event_result.result_rows
 
