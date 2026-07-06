@@ -365,7 +365,13 @@ export function EmbedWizard({ caseId, timeline, onJobStarted }: Props) {
         {isLoading || !data ? (
           <div className="flex flex-col items-center justify-center gap-2 py-12">
             <Spinner />
-            <span className="text-[11px] text-[var(--color-fg-muted)]">{loadingLabel}</span>
+            <span
+              role="status"
+              aria-live="polite"
+              className="text-[11px] text-[var(--color-fg-muted)]"
+            >
+              {loadingLabel}
+            </span>
           </div>
         ) : data.artifacts.length === 0 ? (
           <p className="py-8 text-center text-xs text-[var(--color-fg-muted)]">
