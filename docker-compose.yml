@@ -32,20 +32,14 @@ services:
       - "127.0.0.1:9000:9000"
     volumes:
       - clickhouse_data:/var/lib/clickhouse
-    # Some hosts (hardened kernels / restrictive default seccomp) deny the
-    # get_mempolicy syscall jemalloc uses to probe NUMA topology at startup,
-    # which makes ClickHouse hang forever retrying it instead of failing fast.
-    security_opt:
-      - seccomp:unconfined
-    cap_add:
-      - SYS_NICE
-      - IPC_LOCK
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      # clickhouse-client is bundled in the image and always present, unlike
+      # wget/curl which vary across the alpine base and gave false negatives.
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
       interval: 5s
       timeout: 5s
       retries: 10
-      start_period: 30s
+      start_period: 15s
 
   qdrant:
     image: docker.io/qdrant/qdrant:v1.18.2
