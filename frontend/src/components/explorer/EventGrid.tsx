@@ -777,6 +777,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
       {/* Virtualized body */}
       <div
         ref={parentRef}
+        data-tour="event-grid"
         className="flex-1 overflow-auto"
         onScroll={handleScroll}
       >

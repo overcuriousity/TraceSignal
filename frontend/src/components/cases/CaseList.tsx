@@ -38,7 +38,7 @@ export function CaseList() {
   }
 
   return (
-    <div className="space-y-2">
+    <div className="space-y-2" data-tour="case-list">
       {cases.map((c) => (
         <CaseCard key={c.id} case_={c} />
       ))}

@@ -4,6 +4,7 @@ import { Upload, FileText, ChevronDown, ChevronRight } from "lucide-react";
 import { sourcesApi } from "@/api/sources";
 import { ConverterPanel } from "@/components/sources/ConverterPanel";
 import { useJobsStore } from "@/stores/jobs";
+import { tourEvent } from "@/stores/tour";
 import { Dialog, DialogContent, DialogTrigger, DialogClose } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -23,7 +24,7 @@ export function UploadDialog({ caseId }: Props) {
   const qc = useQueryClient();
   const addJob = useJobsStore((s) => s.addJob);
 
-  const { mutate, isPending, error, data } = useMutation({
+  const { mutate, isPending, error, data, reset } = useMutation({
     mutationFn: () =>
       sourcesApi.upload(
         caseId,
@@ -34,18 +35,30 @@ export function UploadDialog({ caseId }: Props) {
     onSuccess: (result) => {
       qc.invalidateQueries({ queryKey: ["sources", caseId] });
       qc.invalidateQueries({ queryKey: ["timelines", caseId] });
+      // The upload action happened either way — tell the tour so a duplicate
+      // response doesn't strand it on this step.
+      tourEvent("source-uploaded");
       // Ingestion continues as a background job — hand it to the job tray
       // (which polls progress and refreshes the source list with the final
       // event count) and close the dialog. Keep the dialog open for
       // duplicates so the message is visible.
       if (!result.duplicate && result.job_id) {
-        addJob(result.job_id, `Ingesting "${file?.name ?? "upload"}"`, [
-          ["sources", caseId],
-          ["timelines", caseId],
-        ]);
+        addJob(
+          result.job_id,
+          `Ingesting "${file?.name ?? "upload"}"`,
+          [
+            ["sources", caseId],
+            ["timelines", caseId],
+          ],
+          true,
+        );
         setOpen(false);
         setFile(null);
         setParser("");
+      } else if (result.duplicate) {
+        // Duplicates never get a job_id, so the tour's "ingesting" step
+        // would otherwise wait forever on an event that can never fire.
+        tourEvent("ingest-complete");
       }
       // A duplicate can point at a source that lost a concurrent-upload race
       // and is still ingesting (status !== "ready") — the source list panel
@@ -55,19 +68,21 @@ export function UploadDialog({ caseId }: Props) {
 
   const handleFile = (f: File) => setFile(f);
 
-  // Reset selection whenever the dialog is reopened so a previous upload does
-  // not linger.
+  // Reset selection and the previous upload's result/error whenever the
+  // dialog is reopened, so a stale duplicate warning or error doesn't linger.
   useEffect(() => {
     if (open) {
       setFile(null);
       setParser("");
+      reset();
+      tourEvent("upload-dialog-opened");
     }
-  }, [open]);
+  }, [open, reset]);
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
-        <Button variant="outline" size="sm">
+        <Button variant="outline" size="sm" data-tour="upload-log">
           <Upload size={13} /> Upload Log File
         </Button>
       </DialogTrigger>
@@ -78,6 +93,7 @@ export function UploadDialog({ caseId }: Props) {
         <div className="space-y-4">
           {/* Drop zone */}
           <div
+            data-tour="upload-dropzone"
             onDragOver={(e) => {
               e.preventDefault();
               setDragging(true);
@@ -146,6 +162,7 @@ export function UploadDialog({ caseId }: Props) {
           <div>
             <button
               type="button"
+              data-tour="converter-hint"
               onClick={() => setShowConverters((s) => !s)}
               aria-expanded={showConverters}
               className="flex w-full items-center gap-1.5 text-left text-xs text-[var(--color-fg-muted)] hover:text-[var(--color-fg-secondary)] transition-base"
@@ -181,6 +198,7 @@ export function UploadDialog({ caseId }: Props) {
             <Button
               variant="accent"
               size="sm"
+              data-tour="upload-submit"
               disabled={!file || isPending}
               onClick={() => mutate()}
             >

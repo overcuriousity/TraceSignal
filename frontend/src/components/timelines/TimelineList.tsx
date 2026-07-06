@@ -61,7 +61,10 @@ function TimelineRow({
   sourcesById: Map<string, Source>;
 }) {
   return (
-    <div className="group flex items-center gap-4 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-surface)] px-5 py-3 hover:border-[var(--color-border-strong)] hover:bg-[var(--color-bg-elevated)] transition-base">
+    <div
+      data-tour={tl.is_default ? "all-sources-timeline" : undefined}
+      className="group flex items-center gap-4 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-surface)] px-5 py-3 hover:border-[var(--color-border-strong)] hover:bg-[var(--color-bg-elevated)] transition-base"
+    >
       <Clock size={16} className="shrink-0 text-[var(--color-info)] opacity-70" />
       <Link
         to={`/cases/${caseId}/timelines/${tl.id}`}

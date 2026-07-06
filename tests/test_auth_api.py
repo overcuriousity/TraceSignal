@@ -168,6 +168,24 @@ def test_logout_revokes_the_session(client, admin_bootstrap):
     assert resp.status_code == 401
 
 
+def test_update_me_onboarding_flag(client, admin_bootstrap):
+    """Onboarding flag: defaults false, PATCHable both ways without touching other fields."""
+    as_admin(client, admin_bootstrap)
+    me = client.get("/api/auth/me").json()["user"]
+    assert me["onboarding_completed"] is False
+
+    resp = client.patch("/api/auth/me", json={"onboarding_completed": True})
+    assert resp.status_code == 200
+    updated = resp.json()["user"]
+    assert updated["onboarding_completed"] is True
+    assert updated["username"] == me["username"]
+    assert updated["display_name"] == me["display_name"]
+
+    # Reset path (Settings → restart tour).
+    resp = client.patch("/api/auth/me", json={"onboarding_completed": False})
+    assert resp.json()["user"]["onboarding_completed"] is False
+
+
 def test_update_own_profile_rejects_duplicate_username(client, admin_bootstrap, store):
     as_admin(client, admin_bootstrap)
     resp = client.post(

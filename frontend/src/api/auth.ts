@@ -9,7 +9,11 @@ export const authApi = {
 
   me: () => get<{ user: User }>("/auth/me").then((r) => r.user),
 
-  updateProfile: (payload: { username?: string; display_name?: string }) =>
+  updateProfile: (payload: {
+    username?: string;
+    display_name?: string;
+    onboarding_completed?: boolean;
+  }) =>
     patch<{ user: User }>("/auth/me", payload).then((r) => r.user),
 
   changePassword: (newPassword: string, currentPassword?: string) =>

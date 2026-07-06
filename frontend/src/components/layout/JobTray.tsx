@@ -130,7 +130,7 @@ export function JobTray() {
   if (visible.length === 0) return null;
 
   return (
-    <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2">
+    <div data-tour="job-tray" className="fixed bottom-4 right-4 z-50 flex flex-col gap-2">
       {visible.map((j) => (
         <JobRow key={j.id} job={j} />
       ))}

@@ -3,6 +3,7 @@
  * Jobs are polled from /api/jobs/{id} until terminal.
  */
 import { create } from "zustand";
+import { tourEvent } from "@/stores/tour";
 import type { Job } from "@/api/types";
 
 export interface TrackedJob extends Job {
@@ -12,11 +13,15 @@ export interface TrackedJob extends Job {
    * `[["sources", caseId]]` for an ingest job so the source list refreshes
    * with the final event count. */
   invalidate?: unknown[][];
+  /** The onboarding tour's "ingesting" step is waiting on this specific job —
+   * set only by the upload flow the tour itself drove, so an unrelated job
+   * (another case, a second concurrent upload) can't advance the tour early. */
+  tourTracked?: boolean;
 }
 
 interface JobsState {
   jobs: Record<string, TrackedJob>;
-  addJob: (id: string, label: string, invalidate?: unknown[][]) => void;
+  addJob: (id: string, label: string, invalidate?: unknown[][], tourTracked?: boolean) => void;
   updateJob: (job: Job) => void;
   dismiss: (id: string) => void;
 }
@@ -24,7 +29,7 @@ interface JobsState {
 export const useJobsStore = create<JobsState>((set) => ({
   jobs: {},
 
-  addJob: (id, label, invalidate) =>
+  addJob: (id, label, invalidate, tourTracked) =>
     set((s) => ({
       jobs: {
         ...s.jobs,
@@ -38,6 +43,7 @@ export const useJobsStore = create<JobsState>((set) => ({
           label,
           dismissed: false,
           invalidate,
+          tourTracked,
         },
       },
     })),
@@ -46,6 +52,12 @@ export const useJobsStore = create<JobsState>((set) => ({
     set((s) => {
       const existing = s.jobs[job.id];
       if (!existing) return s;
+      const wasTerminal = existing.status === "completed" || existing.status === "failed";
+      const isTerminal = job.status === "completed" || job.status === "failed";
+      // Notify the onboarding tour when the job it's specifically waiting on
+      // finishes (the "ingesting" step waits on this; no-op otherwise).
+      // Failed counts too — the tour must not deadlock on a broken file.
+      if (!wasTerminal && isTerminal && existing.tourTracked) tourEvent("ingest-complete");
       return {
         jobs: {
           ...s.jobs,

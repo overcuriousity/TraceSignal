@@ -10,6 +10,7 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     DateTime,
     ForeignKey,
@@ -91,7 +92,7 @@ class Source(Base):
     description: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
     file_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    size_bytes: Mapped[int] = mapped_column(default=0)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     parser: Mapped[str | None] = mapped_column(String(64), nullable=True)
     parser_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     event_count: Mapped[int] = mapped_column(default=0)
@@ -668,6 +669,9 @@ class User(Base):
     # "local" (username+password) or "oidc" (provisioned via an external IdP).
     auth_provider: Mapped[str] = mapped_column(String(16), nullable=False, default="local")
     oidc_subject: Mapped[str | None] = mapped_column(String(255), nullable=True, unique=True)
+    onboarding_completed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
@@ -692,6 +696,7 @@ class User(Base):
             "is_active": self.is_active,
             "must_change_password": self.must_change_password,
             "auth_provider": self.auth_provider,
+            "onboarding_completed": self.onboarding_completed,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "last_login_at": self.last_login_at.isoformat() if self.last_login_at else None,
@@ -918,6 +923,17 @@ class PostgresStore:
             source_columns = await conn.run_sync(
                 lambda sync_conn: {col["name"] for col in inspect(sync_conn).get_columns("sources")}
             )
+            user_columns = await conn.run_sync(
+                lambda sync_conn: {col["name"] for col in inspect(sync_conn).get_columns("users")}
+            )
+            if "onboarding_completed" not in user_columns:
+                # Existing users backfill to false: everyone sees the (skippable)
+                # onboarding tour once after this feature lands.
+                await conn.execute(
+                    text(
+                        "ALTER TABLE users ADD COLUMN onboarding_completed BOOLEAN NOT NULL DEFAULT false"
+                    )
+                )
             if "status" not in source_columns:
                 # Existing rows predate the ingest-status lifecycle and are by
                 # definition fully ingested, so they backfill to 'ready'.
@@ -926,6 +942,21 @@ class PostgresStore:
                         "ALTER TABLE sources ADD COLUMN status VARCHAR(16) NOT NULL DEFAULT 'ready'"
                     )
                 )
+            if conn.dialect.name == "postgresql":
+                size_bytes_type = await conn.run_sync(
+                    lambda sync_conn: next(
+                        col["type"]
+                        for col in inspect(sync_conn).get_columns("sources")
+                        if col["name"] == "size_bytes"
+                    )
+                )
+                if str(size_bytes_type) == "INTEGER":
+                    # Files bigger than 2 GiB (int4 max) overflowed this column
+                    # on insert. Existing databases created before this fix
+                    # need the column widened to int8 in place.
+                    await conn.execute(
+                        text("ALTER TABLE sources ALTER COLUMN size_bytes TYPE BIGINT")
+                    )
             # (The former enricher_config_hash ADD COLUMN for the staging
             # table is gone: the M16 drop-and-recreate above guarantees the
             # current shape.)
@@ -2420,6 +2451,7 @@ class PostgresStore:
         is_admin: bool | None = None,
         is_active: bool | None = None,
         must_change_password: bool | None = None,
+        onboarding_completed: bool | None = None,
     ) -> User | None:
         """Patch mutable fields on a user. Returns the updated row, or None if missing."""
         values: dict[str, Any] = {"updated_at": datetime.now(UTC)}
@@ -2433,6 +2465,8 @@ class PostgresStore:
             values["is_active"] = is_active
         if must_change_password is not None:
             values["must_change_password"] = must_change_password
+        if onboarding_completed is not None:
+            values["onboarding_completed"] = onboarding_completed
         async with self.session_factory() as session:
             result = await session.execute(
                 update(User).where(User.id == user_id).values(**values).returning(User)

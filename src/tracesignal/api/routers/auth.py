@@ -51,6 +51,7 @@ class UpdateMeRequest(BaseModel):
 
     username: str | None = Field(default=None, min_length=1, max_length=255)
     display_name: str | None = Field(default=None, max_length=255)
+    onboarding_completed: bool | None = Field(default=None)
 
 
 def _user_response(user: User, teams: list[dict[str, Any]]) -> dict[str, Any]:
@@ -177,7 +178,10 @@ async def update_me(
         if existing is not None and existing.id != user.id:
             raise HTTPException(status_code=409, detail="Username already taken")
     updated = await store.update_user(
-        user.id, username=payload.username, display_name=payload.display_name
+        user.id,
+        username=payload.username,
+        display_name=payload.display_name,
+        onboarding_completed=payload.onboarding_completed,
     )
     await store.record_audit(action="auth.update_profile", actor=user)
     return {"user": _user_response(updated, await _teams_for_user(updated))}
