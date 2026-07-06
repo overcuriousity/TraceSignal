@@ -35,6 +35,10 @@ export interface TourStep {
   alsoNext?: boolean;
   /** Step targets content inside a Radix Dialog (overlay z-40 / content z-50). */
   aboveDialog?: boolean;
+  /** Target is a dialog trigger: hide the whole tour overlay while its dialog
+   * is open (Radix stamps `data-state="open"` on the trigger) so the card
+   * doesn't float over the form the user is filling in. */
+  hideWhileTriggerOpen?: boolean;
   /** Add `.tour-force-visible` to the target (for hover-only controls). */
   forceVisibleClass?: boolean;
 }
@@ -53,6 +57,7 @@ export const TOUR_STEPS: TourStep[] = [
     title: "Create your first case",
     body: "Everything in TraceSignal lives inside a case — one investigation context grouping sources and timelines. Click New Case and give it a name.",
     advance: { type: "event", name: "case-created" },
+    hideWhileTriggerOpen: true,
   },
   {
     id: "open-case",

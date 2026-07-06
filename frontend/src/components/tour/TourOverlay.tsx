@@ -34,6 +34,7 @@ export function TourOverlay() {
 
   const [target, setTarget] = useState<Element | null>(null);
   const [rect, setRect] = useState<DOMRect | null>(null);
+  const [triggerOpen, setTriggerOpen] = useState(false);
   const cardRef = useRef<HTMLDivElement>(null);
   const [cardPos, setCardPos] = useState<{ left: number; top: number } | null>(null);
   // The waiting hint only appears once the target has stayed unresolved for a
@@ -68,6 +69,7 @@ export function TourOverlay() {
         const r = el ? el.getBoundingClientRect() : null;
         return rectsEqual(prev, r) ? prev : r;
       });
+      setTriggerOpen(!!el && el.getAttribute("data-state") === "open");
     };
     const scheduled = () => {
       cancelAnimationFrame(raf);
@@ -136,6 +138,9 @@ export function TourOverlay() {
   }, [rect, step]);
 
   if (!step) return null;
+  // The user is inside the dialog this step told them to open — get out of
+  // the way until it closes (cancel) or the step advances (success).
+  if (step.hideWhileTriggerOpen && triggerOpen) return null;
 
   const z = step.aboveDialog ? 70 : 60;
   const isLast = stepIndex === TOUR_STEPS.length - 1;
