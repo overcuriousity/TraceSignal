@@ -1,6 +1,50 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-06 (session 23 — large-source performance + value-novelty OOM fix.
+Last updated: 2026-07-06 (session 25 — PR #72 review fixes, five items: (1) SSE
+invalidation now covers VisualizePage's `viz-field-terms` query key (was silently missing
+from `INVALIDATE_PREFIXES`, so a teammate's tag edit never refreshed that chart);
+(2) `_run_stat_detector`'s timeline-midpoint lookup and normal-annotation fetch now run
+concurrently via `asyncio.gather` instead of sequentially awaited; (3) the duplicated
+field-stats-cache inventory resolution in `_run_stat_detector` and `list_anomaly_fields`
+is now one shared `_resolve_field_inventory` helper; (4) `find_value_novelty`'s two
+near-identical `recommend_novelty_fields` call sites collapsed to one; (5)
+`docs/ANOMALY_DETECTION.md` updated to describe the cache-backed inventory path added in
+session 24; (6) the four frontend mutation sites (BulkActionBar, useAnnotationMutations,
+FrequencyView, ValueNoveltyView) that hand-rolled their own `invalidateQueries` key lists
+now reuse `useCaseStream`'s `shouldInvalidate` predicate, so SSE-driven and
+mutation-driven invalidation can't drift apart again. `uv run pytest` (489 passed, same
+4 pre-existing environment-dependent failures as session 24), `ruff check` clean, `npm run
+typecheck`/`lint`/`test` clean (173 passed).)
+
+Previous (session 24 — Phase-2 batch: M22 (a)(c)(d) + M19, four commits.
+(a) `_ParameterizedQueryBuilder.add_in_list`/`add_not_in_list` gained a `cast_to_string`
+flag: String columns (`source_id`, `artifact`) now emit `column IN {p:Array(String)}` so
+ClickHouse can use primary-index/partition pruning, which the previous unconditional
+`has(..., toString(col))` form defeated; only UUID `event_id` keeps the cast (error 386
+NO_COMMON_TYPE). (c) derived-range histograms collapse the serial min/max range scan +
+bucket scan into one round trip: a scalar CTE computes (min, max) and the interval
+server-side, `intDiv(toUnixTimestamp(ts), iv) * iv` reproduces toStartOfInterval's epoch
+alignment; payload interval/min/max come from the query result, never a Python
+recomputation (toUnixTimestamp truncates DateTime64(3) to seconds). Verified live against
+ClickHouse 24-alpine incl. empty-match and min==max edges; explicit start/end path
+unchanged. (d) `find_value_novelty`'s fields=None path no longer runs the live
+`field_inventory` map scan (the ARRAY-JOIN family that OOM'd ClickHouse pre-session-23):
+the novelty router branch resolves the candidate inventory from the per-source
+field-stats cache (`ensure_source_field_stats` + `merged_inventory`, same template as
+`/anomalies/fields`) and passes it via new optional `inventory`/`inventory_total` params;
+canonical-mapping aggregates stay live, surprise-score denominator unchanged. (M19)
+`useCaseStream`'s `INVALIDATE_PREFIXES` now covers histogram, anomalies-novelty/-frequency,
+and the viz-modal keys (field-histogram/-total, field-terms) so a teammate's bulk
+anomaly-tagging refreshes those panels over SSE; predicate extracted as exported
+`shouldInvalidate` with new vitest coverage. Also fixed dead local invalidations:
+BulkActionBar/useAnnotationMutations invalidated `["anomalies", caseId]` which matches no
+query (real prefixes are anomalies-novelty/-frequency), and the anomaly views' tag
+mutations only invalidated `annotations` — even the analyst's own bulk actions left
+panels stale. Note: 4 pre-existing test failures on this machine
+(test_embeddings_capability ×2, test_rbac_api, test_uploads) fail on a clean tree too —
+environment-dependent, unrelated to this batch.)
+
+Previous (session 23 — large-source performance + value-novelty OOM fix.
 Root cause of the unresponsive Explorer on a 5.5 GiB CloudTrail ingest: wide flattened
 sources store every unioned column on every event, so each of 2.8M events carried 672
 attribute map entries of which ~639 were empty strings — 73 GiB uncompressed in the

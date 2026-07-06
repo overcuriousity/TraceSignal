@@ -122,6 +122,35 @@ def test_value_novelty_no_data():
     assert result.results == []
 
 
+def test_value_novelty_supplied_inventory_skips_live_field_inventory():
+    """M22(d): when the router passes a cache-built inventory, the fields=None
+    auto-selection path must feed it to the recommender instead of running the
+    live field_inventory map scan (the expensive ARRAY JOIN query family)."""
+    responses = [
+        # _count_events
+        FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
+        # per-field novelty scans return nothing — irrelevant here
+    ]
+    svc = _svc(responses)
+    result = svc.find_value_novelty(
+        "c1",
+        ["s1"],
+        fields=None,
+        inventory=[("attr:user", 5, 90)],
+        inventory_total=100,
+    )
+    assert result.status in ("ok", "no_data")
+    # The scanned field set came from the supplied inventory — if the live
+    # field_inventory scan had run instead, it would have consumed the canned
+    # responses, yielded an empty recommendation, and fallen back to
+    # _DEFAULT_NOVELTY_FIELDS (which don't include attr:user).
+    assert any("user" in str(p.values()) for p in svc.ch.client._all_parameters)
+    # Exactly one aggregate ran before the per-field scans: _count_events.
+    # A live inventory path would add its batched top-level + ARRAY JOIN scans.
+    count_queries = [q for q in svc.ch.client._calls if q.startswith("SELECT count()")]
+    assert len(count_queries) == 1
+
+
 def test_value_novelty_self_baseline_returns_rare_values():
     """Rare values (count ≤ rarity_floor) should be returned, rarest first."""
     import math

@@ -336,28 +336,37 @@ class _ParameterizedQueryBuilder:
         self.conditions.append(sql_fragment.replace(":name", f"{{{name}:String}}"))
         self.parameters[name] = value
 
-    def add_in_list(self, column: str, values: list[str]) -> None:
+    def add_in_list(self, column: str, values: list[str], *, cast_to_string: bool = False) -> None:
         """Add a membership condition for a list of string values.
 
-        Uses ``has({arr:Array(String)}, toString(column))`` rather than
-        ``column IN ({p0}, {p1}, ...)`` because ClickHouse 24.x requires the
-        second argument of ``IN`` to be a constant or table expression — a list
-        of individual parameterized strings does not qualify.
+        Default form is ``column IN {arr:Array(String)}`` — a typed IN keeps
+        ClickHouse able to use the primary index and partition pruning on
+        String columns (``source_id``, ``artifact``), which
+        ``has(..., toString(column))`` defeats.
 
-        The column is wrapped in ``toString()`` because this is also used for
-        ``event_id``, a native ``UUID`` column — ``has()`` requires a common
-        type between the array and the column, and there is no implicit
-        common type between ``Array(String)`` and ``UUID`` (this fails with
-        ClickHouse error 386 NO_COMMON_TYPE), even when the array is empty.
+        ``cast_to_string=True`` emits ``has({arr:Array(String)},
+        toString(column))`` instead — required for ``event_id``, a native
+        ``UUID`` column: comparing it against ``Array(String)`` has no
+        implicit common type (ClickHouse error 386 NO_COMMON_TYPE), even
+        when the array is empty. Neither form prunes on ``event_id`` anyway
+        (not in the primary key), so nothing is lost there.
         """
         name = self._param_name()
-        self.conditions.append(f"has({{{name}:Array(String)}}, toString({column}))")
+        if cast_to_string:
+            self.conditions.append(f"has({{{name}:Array(String)}}, toString({column}))")
+        else:
+            self.conditions.append(f"{column} IN {{{name}:Array(String)}}")
         self.parameters[name] = values
 
-    def add_not_in_list(self, column: str, values: list[str]) -> None:
+    def add_not_in_list(
+        self, column: str, values: list[str], *, cast_to_string: bool = False
+    ) -> None:
         """Add a negated membership condition — the inverse of :py:meth:`add_in_list`."""
         name = self._param_name()
-        self.conditions.append(f"NOT has({{{name}:Array(String)}}, toString({column}))")
+        if cast_to_string:
+            self.conditions.append(f"NOT has({{{name}:Array(String)}}, toString({column}))")
+        else:
+            self.conditions.append(f"{column} NOT IN {{{name}:Array(String)}}")
         self.parameters[name] = values
 
     def add_tag_filter(self, filt: TagFilter, negate: bool) -> None:
@@ -616,10 +625,10 @@ class EventQueryService:
             )
 
         if query.event_ids is not None:
-            builder.add_in_list("event_id", query.event_ids)
+            builder.add_in_list("event_id", query.event_ids, cast_to_string=True)
 
         if query.exclude_event_ids:
-            builder.add_not_in_list("event_id", query.exclude_event_ids)
+            builder.add_not_in_list("event_id", query.exclude_event_ids, cast_to_string=True)
 
         if query.tags_include is not None:
             builder.add_tag_filter(query.tags_include, negate=False)
@@ -1189,22 +1198,57 @@ class EventQueryService:
         where, parameters = self._build_where(query)
         database = self.store.database
 
-        # Resolve time range.
         if query.start is not None and query.end is not None:
-            min_ts: datetime | None = ensure_utc(query.start)
-            max_ts: datetime | None = ensure_utc(query.end)
-        else:
-            min_ts, max_ts = query_timestamp_range(self.store.client, database, where, parameters)
+            # Explicit range: no range scan needed, single bucket query.
+            min_ts = ensure_utc(query.start)
+            max_ts = ensure_utc(query.end)
+            interval = bucket_interval_seconds(min_ts, max_ts, buckets)
+            bucket_result = self.store.client.query(
+                f"""
+                SELECT toStartOfInterval(timestamp, INTERVAL {interval} second) AS bucket,
+                       count() AS c
+                FROM {database}.events
+                WHERE {where} AND timestamp IS NOT NULL
+                GROUP BY bucket
+                ORDER BY bucket
+                """,
+                parameters=parameters,
+            )
+            bucket_list = [
+                {"start": ensure_utc_iso(row[0]), "count": row[1]}
+                for row in bucket_result.result_rows
+            ]
+            return {
+                "interval_seconds": interval,
+                "min": min_ts.isoformat(),
+                "max": max_ts.isoformat(),
+                "buckets": bucket_list,
+            }
 
-        if min_ts is None or max_ts is None:
-            return {"interval_seconds": 0, "min": None, "max": None, "buckets": []}
-
-        interval = bucket_interval_seconds(min_ts, max_ts, buckets)
-
-        bucket_result = self.store.client.query(
+        # Derived range: the bucket interval depends on min/max, which used to
+        # cost a separate serial range scan before the bucket scan. Fold both
+        # into one round trip — a scalar CTE computes (min, max) and the
+        # interval server-side; `intDiv(toUnixTimestamp(ts), iv) * iv`
+        # reproduces toStartOfInterval's epoch alignment for second-granularity
+        # intervals. The interval/min/max in the payload MUST come from the
+        # query result (any(...)), never be recomputed in Python: toUnixTimestamp
+        # truncates DateTime64(3) to whole seconds, so a Python float-duration
+        # recomputation could disagree with the interval the buckets used.
+        result = self.store.client.query(
             f"""
-            SELECT toStartOfInterval(timestamp, INTERVAL {interval} second) AS bucket,
-                   count() AS c
+            WITH (
+                SELECT (min(timestamp), max(timestamp))
+                FROM {database}.events
+                WHERE {where}
+            ) AS rng,
+            greatest(
+                1, intDiv(toUnixTimestamp(rng.2) - toUnixTimestamp(rng.1), {int(buckets)})
+            ) AS iv
+            SELECT toDateTime(intDiv(toUnixTimestamp(timestamp), iv) * iv) AS bucket,
+                   count() AS c,
+                   any(iv) AS interval_seconds,
+                   any(rng.1) AS min_ts,
+                   any(rng.2) AS max_ts
             FROM {database}.events
             WHERE {where} AND timestamp IS NOT NULL
             GROUP BY bucket
@@ -1212,15 +1256,17 @@ class EventQueryService:
             """,
             parameters=parameters,
         )
+        rows = result.result_rows
+        if not rows:
+            return {"interval_seconds": 0, "min": None, "max": None, "buckets": []}
 
-        bucket_list = [
-            {"start": ensure_utc_iso(row[0]), "count": row[1]} for row in bucket_result.result_rows
-        ]
+        min_ts = ensure_utc(rows[0][3])
+        max_ts = ensure_utc(rows[0][4])
         return {
-            "interval_seconds": interval,
+            "interval_seconds": int(rows[0][2]),
             "min": min_ts.isoformat(),
             "max": max_ts.isoformat(),
-            "buckets": bucket_list,
+            "buckets": [{"start": ensure_utc_iso(row[0]), "count": row[1]} for row in rows],
         }
 
     def field_terms(self, query: EventQuery, field_token: str, limit: int = 50) -> dict[str, Any]:
