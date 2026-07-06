@@ -50,6 +50,9 @@ describe("tour store", () => {
     tourEvent("upload-dialog-opened");
     useTourStore.getState().next(); // converter-hint (manual)
     tourEvent("source-uploaded");
+    expect(step().id).toBe("ingesting");
+    tourEvent("ingest-complete");
+    expect(step().id).toBe("all-sources");
     s.handleRouteChange("/cases/c1/timelines/t1");
     useTourStore.getState().next(); // columns (manual)
     tourEvent("event-expanded");
@@ -74,7 +77,11 @@ describe("tour store", () => {
 
   it("every step selector uses the data-tour convention", () => {
     for (const s of TOUR_STEPS) {
-      if (s.selector) expect(s.selector).toMatch(/^\[data-tour="[a-z-]+"\]$/);
+      if (!s.selector) continue;
+      const selectors = Array.isArray(s.selector) ? s.selector : [s.selector];
+      for (const sel of selectors) {
+        expect(sel).toMatch(/^\[data-tour="[a-z-]+"\]/);
+      }
     }
   });
 });

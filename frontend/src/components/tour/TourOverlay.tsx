@@ -62,8 +62,13 @@ export function TourOverlay() {
       return;
     }
     let raf = 0;
+    const selectors = Array.isArray(step.selector) ? step.selector : [step.selector];
     const update = () => {
-      const el = document.querySelector(step.selector!);
+      let el: Element | null = null;
+      for (const sel of selectors) {
+        el = document.querySelector(sel);
+        if (el) break;
+      }
       setTarget((prev) => (prev === el ? prev : el));
       setRect((prev) => {
         const r = el ? el.getBoundingClientRect() : null;

@@ -187,6 +187,7 @@ export function UploadDialog({ caseId }: Props) {
             <Button
               variant="accent"
               size="sm"
+              data-tour="upload-submit"
               disabled={!file || isPending}
               onClick={() => mutate()}
             >

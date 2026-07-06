@@ -3,6 +3,7 @@
  * Jobs are polled from /api/jobs/{id} until terminal.
  */
 import { create } from "zustand";
+import { tourEvent } from "@/stores/tour";
 import type { Job } from "@/api/types";
 
 export interface TrackedJob extends Job {
@@ -46,6 +47,12 @@ export const useJobsStore = create<JobsState>((set) => ({
     set((s) => {
       const existing = s.jobs[job.id];
       if (!existing) return s;
+      const wasTerminal = existing.status === "completed" || existing.status === "failed";
+      const isTerminal = job.status === "completed" || job.status === "failed";
+      // Notify the onboarding tour when a tracked job finishes (the
+      // "ingesting" step waits on this; no-op otherwise). Failed counts too —
+      // the tour must not deadlock on a broken file.
+      if (!wasTerminal && isTerminal) tourEvent("ingest-complete");
       return {
         jobs: {
           ...s.jobs,

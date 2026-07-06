@@ -13,6 +13,7 @@ export type TourEventName =
   | "case-created"
   | "upload-dialog-opened"
   | "source-uploaded"
+  | "ingest-complete"
   | "event-expanded"
   | "filter-added";
 
@@ -25,8 +26,11 @@ export interface TourStep {
   id: string;
   /** react-router pattern the step's page must match (via `matchPath`). */
   routePattern: string;
-  /** `[data-tour="..."]` selector; omit for a centered card with no spotlight. */
-  selector?: string;
+  /** `[data-tour="..."]` selector(s); omit for a centered card with no
+   * spotlight. An array is a priority list — the first selector with a match
+   * wins, so a step can retarget as the user progresses (e.g. dropzone →
+   * enabled Upload button once a file is picked). */
+  selector?: string | string[];
   side: "top" | "right" | "bottom" | "left";
   title: string;
   body: string;
@@ -90,7 +94,9 @@ export const TOUR_STEPS: TourStep[] = [
   {
     id: "do-upload",
     routePattern: CASE,
-    selector: '[data-tour="upload-dropzone"]',
+    // Once a file is picked the Upload button enables — move the spotlight
+    // onto it so the next action is unmistakable.
+    selector: ['[data-tour="upload-submit"]:not([disabled])', '[data-tour="upload-dropzone"]'],
     side: "right",
     title: "Upload the file",
     body: "Drop a normalized log file here (or click to browse), then hit Upload. Ingestion runs as a background job — you can keep working while it loads.",
@@ -98,12 +104,21 @@ export const TOUR_STEPS: TourStep[] = [
     aboveDialog: true,
   },
   {
+    id: "ingesting",
+    routePattern: CASE,
+    selector: '[data-tour="job-tray"]',
+    side: "top",
+    title: "Ingestion in progress",
+    body: "TraceSignal is parsing and storing your file in the background — this tray tracks progress. The tour continues automatically once ingestion finishes.",
+    advance: { type: "event", name: "ingest-complete" },
+  },
+  {
     id: "all-sources",
     routePattern: CASE,
     selector: '[data-tour="all-sources-timeline"]',
     side: "bottom",
     title: "Open the All sources timeline",
-    body: "Every case has a default timeline aggregating all its sources. Your file may still show an Ingesting badge — that's fine, events stream in as they're parsed. Click the timeline to explore.",
+    body: "Ingestion is done. Every case has a default timeline aggregating all its sources — click it to explore the events.",
     advance: { type: "route", pattern: EXPLORER },
   },
   {
