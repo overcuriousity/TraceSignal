@@ -129,10 +129,18 @@ For active frontend development, run `npm install && npm run dev` in `frontend/`
 
 ### Docker/Podman Compose (optional containerized app)
 
-By default `docker-compose.yml` brings up only the three backing services; the app runs
-natively via `uv run tsig-web`. Operators who prefer one command for the whole stack can
-uncomment the `app` service in `docker-compose.yml` — it builds the image from the local
-checkout and reaches the backing services over the compose-internal network.
+`docker-compose.yml` includes an `app` service that builds the image from the local checkout
+and reaches the backing services over the compose-internal network — `docker compose up -d`
+(or `podman compose up -d`) brings up the full stack in one command.
+
+**This compose file is a reference/evaluation deployment, not a production hardening guide.**
+It ships with fixed, well-known defaults so it works out of the box: `postgres`/`tracesignal`
+DB credentials, no ClickHouse/Qdrant auth, and a one-time `TS_ADMIN_PASSWORD` bootstrap secret
+(forced to rotate on first login). For any deployment reachable by more than you — and
+generally for real production use — prefer the native `uv run tsig-web` install against
+properly credentialed, network-restricted backing services, and set your own
+`TS_ADMIN_PASSWORD`/`TS_*_PASSWORD`/`TS_QDRANT_API_KEY` values rather than the compose
+defaults.
 
 ### Airgapped installation
 
