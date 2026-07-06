@@ -32,6 +32,18 @@ already-ingested data.
       beyond ``z_threshold`` standard deviations from the series mean.
     * *temporal-z-score* — baseline = buckets before ``baseline_end``; detect =
       buckets after.  Mean/std computed from the baseline window only.
+
+**timestamp_order** (``detector="timestamp_order"``)
+    Flag events whose parsed timestamp jumps *backwards* relative to the
+    previous record in the source file (record order = ``byte_offset``, then
+    ``line_number``).  Log-tampering / clock-manipulation indicator, adapted
+    from AMiner's ``TimestampsUnsortedDetector``.  Mode-less
+    (``method="sequential"``): there is no baseline/detect split — the
+    violation is purely positional.  Each event is compared to its immediate
+    predecessor (``lagInFrame``), not to a running maximum, so a single
+    future-dated outlier flags two boundaries instead of cascading over every
+    later event.  ``min_skew_seconds`` suppresses sub-second logger jitter.
+    Score = backwards jump in seconds.
 """
 
 from __future__ import annotations
@@ -131,14 +143,34 @@ class FreqFinding:
 
 
 @dataclass
+class OrderFinding:
+    """One out-of-order timestamp returned by the timestamp-order detector."""
+
+    source_id: str
+    event_id: str
+    # Violating event's timestamp (ISO, UTC).
+    timestamp: str
+    # Previous record's timestamp in file/record order (ISO, UTC).
+    prev_timestamp: str
+    # prev_timestamp - timestamp, in seconds (always > 0 for a violation).
+    skew_seconds: float
+    byte_offset: int
+    line_number: int
+    # = skew_seconds; used for ranking.
+    score: float
+    event: dict[str, Any] | None
+    details: dict[str, Any]
+
+
+@dataclass
 class StatAnomalyResult:
     """Return value of statistical anomaly detection."""
 
     status: str  # "ok" | "no_data" | "insufficient_data"
-    detector: str  # "value_novelty" | "frequency"
-    method: str  # "self-baseline" | "temporal" | "z-score" | "temporal-z-score"
+    detector: str  # "value_novelty" | "frequency" | "timestamp_order"
+    method: str  # "self-baseline" | "temporal" | "z-score" | "temporal-z-score" | "sequential"
     baseline_size: int  # total events (value_novelty) or event-count used for z-score
-    results: list[ValueFinding | FreqFinding] = field(default_factory=list)
+    results: list[ValueFinding | FreqFinding | OrderFinding] = field(default_factory=list)
     # Effective |z| cutoff used by the frequency detector; None for value_novelty.
     z_threshold: float | None = None
 
@@ -1083,3 +1115,179 @@ class StatisticalAnomalyService:
             else:
                 hydrated.append(f)
         return hydrated
+
+    # ------------------------------------------------------------------
+    # Timestamp-order violations
+    # ------------------------------------------------------------------
+
+    def find_order_violations(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        min_skew_seconds: float = 1.0,
+        limit: int = 50,
+        exclude_event_ids: set[str] | None = None,
+    ) -> StatAnomalyResult:
+        """Return events whose timestamp jumps backwards in record order.
+
+        Record order within a source is ``byte_offset`` (the byte position of
+        the raw record in the source file — monotonic per file), then
+        ``line_number`` and ``event_id`` as deterministic tie-breaks. Each
+        event's timestamp is compared to its immediate predecessor
+        (``lagInFrame`` over a per-``source_id`` window); a backwards jump of
+        at least *min_skew_seconds* is a violation.
+
+        This detector is mode-less (``method="sequential"``) — there is no
+        baseline/detect split. NULL timestamps are excluded (they carry no
+        order signal).
+        """
+        self.ch.init_schema()
+        db = self.ch.database
+        base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        method = "sequential"
+
+        total_events = self._count_events(case_id, source_ids)
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data",
+                detector="timestamp_order",
+                method=method,
+                baseline_size=0,
+            )
+
+        # Inner subquery: per source, lag the timestamp over record order and
+        # compute the backwards skew (0 when in order). `dateDiff('millisecond')`
+        # / 1000 keeps sub-second precision that dateDiff('second') would lose.
+        inner = f"""
+            SELECT
+                source_id,
+                toString(event_id) AS event_id,
+                timestamp,
+                lagInFrame(timestamp) OVER w AS prev_ts,
+                byte_offset,
+                line_number,
+                message,
+                if(prev_ts IS NOT NULL AND timestamp < prev_ts,
+                   dateDiff('millisecond', timestamp, prev_ts) / 1000.0, 0.) AS skew
+            FROM {db}.events
+            WHERE case_id = {{cid:String}}
+              AND has({{src:Array(String)}}, source_id)
+              AND timestamp IS NOT NULL
+            WINDOW w AS (
+                PARTITION BY source_id
+                ORDER BY byte_offset, line_number, event_id
+                ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING
+            )
+        """
+
+        # Per-source summary: violation count + worst skew, for the UI's
+        # per-source grouping header and the overall status.
+        summary_params = {**base_params, "skew": float(min_skew_seconds)}
+        summary_sql = f"""
+            SELECT
+                source_id,
+                countIf(skew >= {{skew:Float64}}) AS n_viol,
+                maxIf(skew, skew >= {{skew:Float64}}) AS max_skew
+            FROM ({inner})
+            GROUP BY source_id
+        """
+        summary_rows = self.ch.client.query(summary_sql, parameters=summary_params).result_rows
+        source_summary: dict[str, tuple[int, float]] = {
+            str(r[0]): (int(r[1]), float(r[2]) if r[2] is not None else 0.0)
+            for r in summary_rows
+        }
+        total_violations = sum(n for n, _ in source_summary.values())
+
+        if total_violations == 0:
+            return StatAnomalyResult(
+                status="ok",
+                detector="timestamp_order",
+                method=method,
+                baseline_size=total_events,
+                results=[],
+            )
+
+        # Detail: the worst violations across all sources.
+        detail_params = {**base_params, "skew": float(min_skew_seconds), "lim": limit}
+        detail_sql = f"""
+            SELECT source_id, event_id, timestamp, prev_ts, skew, byte_offset, line_number, message
+            FROM ({inner})
+            WHERE skew >= {{skew:Float64}}
+            ORDER BY skew DESC, source_id, byte_offset
+            LIMIT {{lim:UInt32}}
+        """
+        rows = self.ch.client.query(detail_sql, parameters=detail_params).result_rows
+
+        findings: list[OrderFinding] = []
+        for row in rows:
+            source_id, event_id, ts, prev_ts, skew, byte_offset, line_number, msg = row
+            if not event_id:
+                continue
+            ts_str = ensure_utc(ts).isoformat() if ts else None
+            prev_str = ensure_utc(prev_ts).isoformat() if prev_ts else None
+            n_viol, max_skew = source_summary.get(str(source_id), (0, 0.0))
+            mini_event: dict[str, Any] = {
+                "event_id": str(event_id),
+                "case_id": case_id,
+                "source_id": str(source_id),
+                "message": str(msg) if msg else "",
+                "timestamp": ts_str,
+                "timestamp_desc": None,
+                "artifact": None,
+                "artifact_long": None,
+                "display_name": None,
+                "tags": [],
+                "attributes": {},
+                "content_hash": "",
+                "file_hash": "",
+                "parser_name": "",
+                "parser_version": "",
+                "source_file": "",
+                "byte_offset": int(byte_offset),
+                "line_number": int(line_number),
+                "embedding_model": None,
+                "embedding_config_hash": None,
+                "ingest_time": None,
+            }
+            details: dict[str, Any] = {
+                "detector": "timestamp_order",
+                "method": method,
+                "source_id": str(source_id),
+                "prev_timestamp": prev_str,
+                "skew_seconds": round(float(skew), 3),
+                "byte_offset": int(byte_offset),
+                "line_number": int(line_number),
+                "min_skew_seconds": float(min_skew_seconds),
+                "source_total_violations": n_viol,
+                "source_max_skew": round(max_skew, 3),
+            }
+            findings.append(
+                OrderFinding(
+                    source_id=str(source_id),
+                    event_id=str(event_id),
+                    timestamp=ts_str or "",
+                    prev_timestamp=prev_str or "",
+                    skew_seconds=round(float(skew), 3),
+                    byte_offset=int(byte_offset),
+                    line_number=int(line_number),
+                    score=round(float(skew), 3),
+                    event=mini_event,
+                    details=details,
+                )
+            )
+
+        # Suppress findings whose representative event was marked normal
+        # (before the limit is applied — filtering after would shrink the page
+        # instead of backfilling from the next-worst violation).
+        if exclude_event_ids:
+            findings = [
+                f for f in findings if not f.event_id or f.event_id not in exclude_event_ids
+            ]
+
+        return StatAnomalyResult(
+            status="ok",
+            detector="timestamp_order",
+            method=method,
+            baseline_size=total_events,
+            results=findings[:limit],
+        )

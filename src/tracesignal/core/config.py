@@ -61,6 +61,9 @@ class Settings(BaseSettings):
     stat_frequency_buckets: int = 60
     # Default per-field limit when scanning for rare values.
     stat_per_field_limit: int = 25
+    # Minimum backwards jump (seconds) before the timestamp-order detector
+    # flags a record — suppresses sub-second logger jitter. 0 = AMiner-strict.
+    stat_order_min_skew: float = 1.0
 
     # Ingestion
     # Events per ClickHouse insert during ingestion. Each batch is one HTTP

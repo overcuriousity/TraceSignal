@@ -2,13 +2,15 @@ import { get, post } from "./client";
 import type { AnomaliesResponse, Annotation, NoveltyFieldsResponse, TagAnomaliesResponse } from "./types";
 
 export interface AnomalyParams {
-  detector?: "value_novelty" | "frequency";
+  detector?: "value_novelty" | "frequency" | "timestamp_order";
   /** Comma-separated field tokens for value_novelty, e.g. "artifact,display_name,attr:user_agent" */
   fields?: string;
   /** Field to group frequency series by */
   series_field?: string;
   /** |z| cutoff for the frequency detector. Omit to use the server default. */
   z_threshold?: number;
+  /** Minimum backwards jump (seconds) for the timestamp_order detector. */
+  min_skew_seconds?: number;
   /** Explicit temporal baseline end timestamp */
   baseline_end?: string;
   /** Enable temporal mode (backend uses timeline midpoint when baseline_end is absent) */
@@ -51,7 +53,11 @@ export const anomaliesApi = {
     caseId: string,
     sourceId: string,
     eventId: string,
-    body: { detector: "value_novelty" | "frequency"; content: string; details: Record<string, unknown> },
+    body: {
+      detector: "value_novelty" | "frequency" | "timestamp_order";
+      content: string;
+      details: Record<string, unknown>;
+    },
   ) =>
     post<{ annotation: Annotation }>(
       `/cases/${caseId}/sources/${sourceId}/events/${eventId}/anomalies/persist`,

@@ -9,18 +9,19 @@ file and the "Method" tab copy in the same commit — see
 [Reality check](#reality-check-2026-07) at the bottom for the audit that
 produced this file and what was fixed as part of it.
 
-There are three independent analysis tools in TraceSignal:
+There are four independent analysis tools in TraceSignal:
 
 1. [Value novelty](#1-value-novelty-rare--first-seen-values) — rare/new field values (ClickHouse, no ML)
 2. [Frequency anomalies](#2-frequency-anomalies-volume-spikes--silences) — volume spikes/silences (ClickHouse, no ML)
-3. [Semantic similarity search](#3-semantic-similarity-search) — "find events like this one" (embeddings + Qdrant)
+3. [Timestamp order](#3-timestamp-order-out-of-order-records) — timestamps running backwards in record order (ClickHouse, no ML)
+4. [Semantic similarity search](#4-semantic-similarity-search) — "find events like this one" (embeddings + Qdrant)
 
-The first two are **statistical detectors**: pure counting and arithmetic over
+The first three are **statistical detectors**: pure counting and arithmetic over
 already-ingested events, no machine learning, no network calls, work the
-instant ingestion finishes. The third needs an explicit embedding step first.
+instant ingestion finishes. The fourth needs an explicit embedding step first.
 
-Code: `src/tracesignal/db/anomaly_stats.py` (detectors 1–2),
-`src/tracesignal/db/similarity.py` (detector 3). UI: `frontend/src/components/analysis/`.
+Code: `src/tracesignal/db/anomaly_stats.py` (detectors 1–3),
+`src/tracesignal/db/similarity.py` (detector 4). UI: `frontend/src/components/analysis/`.
 
 ---
 
@@ -264,7 +265,79 @@ severity regardless of whether your threshold is 2 or 6.
 
 ---
 
-## 3. Semantic similarity search
+## 3. Timestamp order (out-of-order records)
+
+**What it answers:** "Within a source file, does any event's timestamp jump
+*backwards* compared to the record physically before it?" A log line whose
+timestamp is earlier than the line above it did not arrive in chronological
+order — a strong indicator of log tampering, a clock reset, or two writers
+appending to one file.
+
+Adapted from AMiner's `TimestampsUnsortedDetector`.
+
+**Why it's useful:** Most log formats are append-only and monotonic — each new
+record is stamped no earlier than the last. A backwards jump is therefore
+anomalous by construction, and unlike "rare value" it needs no baseline to be
+meaningful. Deleting or editing lines in the middle of a log, or resetting a
+system clock, leaves exactly this signature.
+
+### This detector has no baseline/detect modes
+
+Value novelty and frequency both split time into a "normal" baseline and a
+"suspect" detect window. Timestamp order does not: the violation is *positional*
+(a record is out of place relative to its neighbour), not *temporal* (something
+changed after a point in time). The Method line reports `sequential`, and the
+UI shows no mode toggle.
+
+### What "record order" means
+
+Record order is the position of the raw record **in the source file**, not its
+parsed timestamp — that would be circular. Concretely the detector orders by:
+
+1. **byte offset** — where the raw record starts in the file. Monotonic per
+   file, so it is the natural record sequence.
+2. **line number**, then **event id** — deterministic tie-breaks only.
+
+Each event's timestamp is compared to its *immediate predecessor* in that order
+(ClickHouse `lagInFrame`), not to a running maximum. The distinction matters:
+if one event is stamped far in the future, comparing against a running maximum
+would flag every later event until the clock "caught up" — a cascade. Comparing
+against the predecessor flags just the two boundaries (the jump up, and the jump
+back down), which is what an analyst wants to triage.
+
+### Plain-language rule, then the notation
+
+Flag a record when its timestamp is at least θ seconds earlier than the record
+immediately before it in file order:
+
+```
+flag event i  when  ts(i) < ts(i-1) − θ        (records ordered by byte offset)
+skew(i)       =     ts(i-1) − ts(i)  in seconds  (the backwards jump, > 0)
+```
+
+`θ` is `min_skew_seconds` (config `stat_order_min_skew`, default 1.0s). It
+suppresses sub-second logger jitter — two events in the same millisecond bucket
+written "out of order" by a fraction of a second are almost never interesting.
+Set it to 0 for AMiner-strict behaviour (any backwards step flags).
+
+The **score** is the skew in seconds — larger backwards jumps rank first.
+
+### Caveats
+
+- **NULL timestamps are excluded.** A record with no parsed timestamp carries no
+  order signal and is skipped, not treated as position zero.
+- **Interleaved multi-writer logs legitimately jump.** Two processes appending
+  to one file (or a merged/rotated log) can interleave timestamps without any
+  tampering. Read a cluster of small-skew violations in one source as "this is a
+  multi-writer log", not "this was edited" — the byte offsets and per-source
+  violation count in `details` help tell the two apart.
+- Findings are grouped by source in the UI, each with the source's total
+  violation count and worst skew, so a systematically-unsorted source reads
+  differently from a single sharp jump.
+
+---
+
+## 4. Semantic similarity search
 
 Not a statistical anomaly detector — no baseline, no score threshold, no
 z-score — but it lives in the same Analysis tab and Method panel, so it's

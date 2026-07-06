@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { X, AlertTriangle, Search, BookOpen, Hash, Activity } from "lucide-react";
+import { X, AlertTriangle, Search, BookOpen, Hash, Activity, Rewind } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/Button";
 import {
@@ -11,6 +11,7 @@ import {
 } from "@/components/ui/Select";
 import { ValueNoveltyView } from "./ValueNoveltyView";
 import { FrequencyView } from "./FrequencyView";
+import { OrderViolationsView } from "./OrderViolationsView";
 import { SimilarEvents } from "./SimilarEvents";
 import { SemanticSearch } from "./SemanticSearch";
 import { EmbeddingStatusBanner } from "./EmbeddingStatusBanner";
@@ -20,7 +21,7 @@ import { cn } from "@/lib/cn";
 import type { AnomalyMarker, Event } from "@/api/types";
 
 type Tab = "anomalies" | "similar" | "methodology";
-type AnomalySubTab = "novelty" | "frequency";
+type AnomalySubTab = "novelty" | "frequency" | "order";
 
 /**
  * Detector registry for the anomaly dropdown. Flat sub-tab buttons stopped
@@ -44,6 +45,12 @@ const DETECTORS: {
     icon: Activity,
     label: "Frequency",
     description: "Event-count spikes and silences per series",
+  },
+  {
+    id: "order",
+    icon: Rewind,
+    label: "Timestamp order",
+    description: "Timestamps running backwards in record order",
   },
 ];
 
@@ -197,6 +204,17 @@ export function AnalysisPanel({
             caseId={caseId}
             timelineId={timelineId}
             onDrillField={onFrequencyDrill}
+            onFindingsChange={onAnomalyMarkers}
+            onRunIdChange={onAnomalyRunId}
+            onJumpToTime={onJumpToTime}
+          />
+        )}
+
+        {tab === "anomalies" && anomalySubTab === "order" && (
+          <OrderViolationsView
+            caseId={caseId}
+            timelineId={timelineId}
+            onSelectEvent={onSelectEvent}
             onFindingsChange={onAnomalyMarkers}
             onRunIdChange={onAnomalyRunId}
             onJumpToTime={onJumpToTime}

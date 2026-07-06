@@ -14,6 +14,7 @@ import {
   Hash,
   Cpu,
   Activity,
+  Rewind,
   ShieldCheck,
   BarChart2,
 } from "lucide-react";
@@ -121,11 +122,45 @@ export function MethodologyPanel({
           </div>
         </div>
 
+        {/* Timestamp order */}
+        <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3 space-y-2">
+          <p className="flex items-center gap-1.5 font-medium text-[var(--color-fg-primary)]">
+            <Rewind size={11} /> Timestamp order (timestamp_order)
+          </p>
+          <div className="space-y-1.5 text-[var(--color-fg-muted)]">
+            <Row label="Method">
+              Mode-less (sequential) — no baseline/detect split. Each event's
+              timestamp is compared to its immediate predecessor in record
+              order via a ClickHouse window function (lagInFrame).
+            </Row>
+            <Row label="Signal">
+              Events whose parsed timestamp runs backwards relative to the
+              previous record, by at least the minimum-jump threshold. Indicates
+              log tampering, clock resets, or interleaved multi-writer logs.
+            </Row>
+            <Row label="Order">
+              Record position = byte offset in the source file (monotonic per
+              file), then line number and event id as tie-breaks — not the
+              parsed timestamp. Comparison uses the predecessor, not a running
+              maximum, so one future-dated outlier flags two boundaries instead
+              of cascading over every later event.
+            </Row>
+            <Row label="Score">
+              Backwards jump in seconds. Carried in{" "}
+              <code className="font-mono text-xs">details.skew_seconds</code>.
+            </Row>
+            <Row label="Backend">
+              ClickHouse window function over (source_id, byte_offset). NULL
+              timestamps are excluded.
+            </Row>
+          </div>
+        </div>
+
         <div className="flex items-start gap-1.5 text-xs text-[var(--color-fg-muted)]">
           <ShieldCheck size={10} className="mt-0.5 shrink-0 text-[var(--color-success)]" />
           <span>
-            Both detectors are forensically defensible: every finding carries
-            the exact field, value, count, and baseline in{" "}
+            All detectors are forensically defensible: every finding carries
+            the exact field/value/count/baseline (or timestamps and skew) in{" "}
             <code className="font-mono">details</code>. Rare ≠ malicious — use
             for triage. Confirmed findings can be tagged as{" "}
             <strong className="text-[var(--color-fg-secondary)]">anomaly</strong>{" "}

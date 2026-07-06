@@ -282,7 +282,29 @@ export interface FrequencyFinding {
   details: Record<string, unknown>;
 }
 
-export type AnomalyFinding = ValueNoveltyFinding | FrequencyFinding;
+/** One out-of-order timestamp finding from the timestamp_order detector. */
+export interface TimestampOrderFinding {
+  type: "timestamp_order";
+  source_id: string;
+  event_id: string;
+  /** Violating event's timestamp (ISO, UTC). */
+  timestamp: string;
+  /** Previous record's timestamp in file/record order (ISO, UTC). */
+  prev_timestamp: string;
+  /** prev_timestamp − timestamp, in seconds (always > 0). */
+  skew_seconds: number;
+  byte_offset: number;
+  line_number: number;
+  /** = skew_seconds — used for ranking. */
+  score: number;
+  event: Event | null;
+  details: Record<string, unknown>;
+}
+
+export type AnomalyFinding =
+  | ValueNoveltyFinding
+  | FrequencyFinding
+  | TimestampOrderFinding;
 
 export interface AnomaliesResponse {
   status: "ok" | "no_data" | "insufficient_data";
@@ -321,7 +343,7 @@ export interface AnomalyMarker {
   /** Source id of the representative event — required to persist this finding. */
   sourceId?: string | null;
   /** Which detector produced this finding — required to persist this finding. */
-  detector: "value_novelty" | "frequency";
+  detector: "value_novelty" | "frequency" | "timestamp_order";
   /** Raw structured finding data — stored verbatim on the persisted annotation. */
   rawDetails: Record<string, unknown>;
   /** End of the anomalous window, for frequency findings — enables a range highlight. */

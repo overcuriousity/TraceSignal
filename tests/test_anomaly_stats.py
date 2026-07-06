@@ -1152,3 +1152,173 @@ def test_get_timeline_midpoint_returns_none_when_no_events():
         ]
     )
     assert svc.get_timeline_midpoint("c1", ["s1"]) is None
+
+
+# ---------------------------------------------------------------------------
+# find_order_violations — timestamp-order detector (D2)
+# ---------------------------------------------------------------------------
+
+
+def test_order_no_data():
+    """Returns no_data when the source has no events."""
+    svc = _svc([FakeQueryResult(result_rows=[(0,)], column_names=["count()"])])
+    result = svc.find_order_violations("c1", ["s1"])
+    assert result.status == "no_data"
+    assert result.detector == "timestamp_order"
+    assert result.method == "sequential"
+    assert result.results == []
+
+
+def test_order_no_violations():
+    """Total events > 0 but zero backwards jumps → ok with empty results."""
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
+            # summary: one source, zero violations
+            FakeQueryResult(
+                result_rows=[("s1", 0, None)],
+                column_names=["source_id", "n_viol", "max_skew"],
+            ),
+        ]
+    )
+    result = svc.find_order_violations("c1", ["s1"])
+    assert result.status == "ok"
+    assert result.results == []
+    assert result.baseline_size == 100
+
+
+def test_order_flags_backwards_jump_ranked_by_skew():
+    """Violations returned worst-skew first, with prev/skew details."""
+    ts_a = datetime(2024, 1, 1, 12, 0, 5, tzinfo=UTC)
+    prev_a = datetime(2024, 1, 1, 12, 1, 5, tzinfo=UTC)  # 60s ahead
+    ts_b = datetime(2024, 1, 1, 12, 0, 30, tzinfo=UTC)
+    prev_b = datetime(2024, 1, 1, 12, 0, 35, tzinfo=UTC)  # 5s ahead
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[("s1", 2, 60.0)],
+                column_names=["source_id", "n_viol", "max_skew"],
+            ),
+            FakeQueryResult(
+                result_rows=[
+                    ("s1", "evt-a", ts_a, prev_a, 60.0, 100, 3, "record a"),
+                    ("s1", "evt-b", ts_b, prev_b, 5.0, 250, 8, "record b"),
+                ],
+                column_names=[
+                    "source_id",
+                    "event_id",
+                    "timestamp",
+                    "prev_ts",
+                    "skew",
+                    "byte_offset",
+                    "line_number",
+                    "message",
+                ],
+            ),
+        ]
+    )
+    result = svc.find_order_violations("c1", ["s1"], min_skew_seconds=1.0)
+    assert result.status == "ok"
+    assert [f.event_id for f in result.results] == ["evt-a", "evt-b"]
+    worst = result.results[0]
+    assert worst.skew_seconds == 60.0
+    assert worst.score == 60.0
+    assert worst.byte_offset == 100
+    assert worst.prev_timestamp == prev_a.isoformat()
+    assert worst.timestamp == ts_a.isoformat()
+    assert worst.details["source_total_violations"] == 2
+    assert worst.details["source_max_skew"] == 60.0
+    assert worst.details["min_skew_seconds"] == 1.0
+    assert worst.event["byte_offset"] == 100
+
+
+def test_order_min_skew_bound_as_param():
+    """min_skew_seconds is bound into both summary and detail queries."""
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(10,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[("s1", 1, 3.0)],
+                column_names=["source_id", "n_viol", "max_skew"],
+            ),
+            FakeQueryResult(
+                result_rows=[
+                    (
+                        "s1",
+                        "evt-a",
+                        datetime(2024, 1, 1, tzinfo=UTC),
+                        datetime(2024, 1, 1, 0, 0, 3, tzinfo=UTC),
+                        3.0,
+                        10,
+                        1,
+                        "m",
+                    )
+                ],
+                column_names=[
+                    "source_id",
+                    "event_id",
+                    "timestamp",
+                    "prev_ts",
+                    "skew",
+                    "byte_offset",
+                    "line_number",
+                    "message",
+                ],
+            ),
+        ]
+    )
+    svc.find_order_violations("c1", ["s1"], min_skew_seconds=2.5)
+    params = svc.ch.client._all_parameters
+    # params[0] = count(); [1] = summary; [2] = detail
+    assert params[1]["skew"] == 2.5
+    assert params[2]["skew"] == 2.5
+
+
+def test_order_excludes_normal_marked_events():
+    """Events marked normal are suppressed before the limit is applied."""
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[("s1", 2, 60.0)],
+                column_names=["source_id", "n_viol", "max_skew"],
+            ),
+            FakeQueryResult(
+                result_rows=[
+                    (
+                        "s1",
+                        "evt-a",
+                        datetime(2024, 1, 1, 12, 0, 5, tzinfo=UTC),
+                        datetime(2024, 1, 1, 12, 1, 5, tzinfo=UTC),
+                        60.0,
+                        100,
+                        3,
+                        "a",
+                    ),
+                    (
+                        "s1",
+                        "evt-b",
+                        datetime(2024, 1, 1, 12, 0, 30, tzinfo=UTC),
+                        datetime(2024, 1, 1, 12, 0, 35, tzinfo=UTC),
+                        5.0,
+                        250,
+                        8,
+                        "b",
+                    ),
+                ],
+                column_names=[
+                    "source_id",
+                    "event_id",
+                    "timestamp",
+                    "prev_ts",
+                    "skew",
+                    "byte_offset",
+                    "line_number",
+                    "message",
+                ],
+            ),
+        ]
+    )
+    result = svc.find_order_violations("c1", ["s1"], exclude_event_ids={"evt-a"})
+    assert [f.event_id for f in result.results] == ["evt-b"]

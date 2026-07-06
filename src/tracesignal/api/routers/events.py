@@ -29,6 +29,7 @@ from tracesignal.core.events_bus import publish_annotation_change
 from tracesignal.db.anomaly_stats import (
     FreqFinding,
     NoveltyFieldInfo,
+    OrderFinding,
     StatisticalAnomalyService,
     ValueFinding,
 )
@@ -1218,6 +1219,7 @@ async def _run_stat_detector(
     baseline_end: datetime | None,
     temporal: bool,
     limit: int,
+    min_skew_seconds: float | None = None,
     field_mappings: dict[str, list[str]] | None = None,
 ) -> Any:
     """Resolve the temporal split point and normal-annotation suppression
@@ -1234,6 +1236,8 @@ async def _run_stat_detector(
 
     # Timeline-midpoint lookup and the normal-annotation fetch are independent
     # of each other's result — run them concurrently instead of back-to-back.
+    # (timestamp_order is mode-less and sends temporal=False, so the midpoint
+    # branch never fires for it.)
     normal_ids_task = store.list_event_ids_by_annotation_type(case_id, source_ids, "normal")
     if temporal and baseline_end is None:
         midpoint_task = run_in_threadpool(svc.get_timeline_midpoint, case_id, source_ids)
@@ -1242,6 +1246,19 @@ async def _run_stat_detector(
         effective_baseline_end = baseline_end
         normal_ids = await normal_ids_task
     exclude_ids: set[str] | None = set(normal_ids) if normal_ids else None
+
+    if detector == "timestamp_order":
+        # Mode-less: no baseline/detect split, no temporal-midpoint resolution.
+        return await run_in_threadpool(
+            svc.find_order_violations,
+            case_id=case_id,
+            source_ids=source_ids,
+            min_skew_seconds=(
+                min_skew_seconds if min_skew_seconds is not None else cfg.stat_order_min_skew
+            ),
+            limit=limit,
+            exclude_event_ids=exclude_ids,
+        )
 
     if detector == "frequency":
         return await run_in_threadpool(
@@ -1363,8 +1380,8 @@ async def semantic_search_events(
     }
 
 
-def _serialize_finding(r: ValueFinding | FreqFinding) -> dict[str, Any]:
-    """Serialise a ValueFinding or FreqFinding to a JSON-safe dict."""
+def _serialize_finding(r: ValueFinding | FreqFinding | OrderFinding) -> dict[str, Any]:
+    """Serialise a ValueFinding / FreqFinding / OrderFinding to a JSON-safe dict."""
     if isinstance(r, ValueFinding):
         return {
             "type": "value_novelty",
@@ -1374,6 +1391,20 @@ def _serialize_finding(r: ValueFinding | FreqFinding) -> dict[str, Any]:
             "score": r.score,
             "first_seen": r.first_seen,
             "event_id": r.event_id,
+            "event": r.event,
+            "details": r.details,
+        }
+    if isinstance(r, OrderFinding):
+        return {
+            "type": "timestamp_order",
+            "source_id": r.source_id,
+            "event_id": r.event_id,
+            "timestamp": r.timestamp,
+            "prev_timestamp": r.prev_timestamp,
+            "skew_seconds": r.skew_seconds,
+            "byte_offset": r.byte_offset,
+            "line_number": r.line_number,
+            "score": r.score,
             "event": r.event,
             "details": r.details,
         }
@@ -1455,6 +1486,7 @@ async def _persist_detector_run(
     temporal: bool,
     limit: int,
     payload: dict[str, Any],
+    min_skew_seconds: float | None = None,
 ) -> str:
     """Persist a detector scan's request params + serialized result, return the run_id."""
     store = get_store()
@@ -1469,6 +1501,7 @@ async def _persist_detector_run(
             "baseline_end": baseline_end.isoformat() if baseline_end else None,
             "temporal": temporal,
             "limit": limit,
+            "min_skew_seconds": min_skew_seconds,
         },
         result=payload,
     )
@@ -1499,7 +1532,7 @@ async def list_anomalies(
     timeline_id: str,
     detector: str = Query(
         default="value_novelty",
-        description="Detector to run: 'value_novelty' or 'frequency'.",
+        description="Detector to run: 'value_novelty', 'frequency', or 'timestamp_order'.",
     ),
     fields: str | None = Query(
         default=None,
@@ -1517,6 +1550,14 @@ async def list_anomalies(
         default=None,
         gt=0,
         description="|z| cutoff for the frequency detector. Omit to use the server default.",
+    ),
+    min_skew_seconds: float | None = Query(
+        default=None,
+        ge=0,
+        description=(
+            "Minimum backwards jump (seconds) for the timestamp_order detector. "
+            "Omit to use the server default."
+        ),
     ),
     baseline_end: datetime | None = Query(  # noqa: B008
         default=None,
@@ -1549,6 +1590,9 @@ async def list_anomalies(
 
     **frequency**: flags time windows with anomalous event-count z-scores per
     field-value series.
+
+    **timestamp_order**: flags events whose timestamp runs backwards relative
+    to record order within a source (log-tampering / clock-manipulation).
     """
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
     result = await _run_stat_detector(
@@ -1561,6 +1605,7 @@ async def list_anomalies(
         baseline_end=baseline_end,
         temporal=temporal,
         limit=limit,
+        min_skew_seconds=min_skew_seconds,
         field_mappings=field_mappings,
     )
 
@@ -1577,6 +1622,7 @@ async def list_anomalies(
             baseline_end=baseline_end,
             temporal=temporal,
             limit=limit,
+            min_skew_seconds=min_skew_seconds,
             payload=payload,
         )
     payload["run_id"] = run_id
@@ -1588,7 +1634,7 @@ class TagAnomaliesRequest(BaseModel):
 
     detector: str = Field(
         default="value_novelty",
-        description="Detector to run: 'value_novelty' or 'frequency'.",
+        description="Detector to run: 'value_novelty', 'frequency', or 'timestamp_order'.",
     )
     fields: str | None = Field(
         default=None,
@@ -1602,6 +1648,11 @@ class TagAnomaliesRequest(BaseModel):
         default=None,
         gt=0,
         description="|z| cutoff for the frequency detector. Omit to use the server default.",
+    )
+    min_skew_seconds: float | None = Field(
+        default=None,
+        ge=0,
+        description="Minimum backwards jump (seconds) for the timestamp_order detector.",
     )
     baseline_end: datetime | None = Field(
         default=None,
@@ -1649,6 +1700,7 @@ async def tag_anomalies(
         baseline_end=body.baseline_end,
         temporal=body.temporal,
         limit=body.limit,
+        min_skew_seconds=body.min_skew_seconds,
         field_mappings=field_mappings,
     )
 
@@ -1699,6 +1751,15 @@ async def tag_anomalies(
                     f"time(s) of {result.baseline_size:,} events in the "
                     f"corpus (surprise {r.score:.2f})"
                 )
+        elif isinstance(r, OrderFinding):
+            event_id = r.event_id or ""
+            src_id = r.event.get("source_id", "") if r.event else ""
+            content = (
+                f"Out-of-order timestamp — {r.source_id}: event at "
+                f"{r.timestamp} occurs after a record dated {r.prev_timestamp} "
+                f"({r.skew_seconds:.1f}s backwards; record order = byte offset "
+                f"{r.byte_offset})"
+            )
         else:
             event_id = r.event_id or ""
             src_id = r.event.get("source_id", "") if r.event else ""
@@ -1753,6 +1814,7 @@ async def tag_anomalies(
         baseline_end=body.baseline_end,
         temporal=body.temporal,
         limit=body.limit,
+        min_skew_seconds=body.min_skew_seconds,
         payload=payload,
     )
 

@@ -1,6 +1,35 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-06 (session 25 — PR #72 review fixes, five items: (1) SSE
+Last updated: 2026-07-06 (session 26 — Milestone 4 kickoff: detector-expansion prep +
+D2 timestamp-order detector. Prep (no behavior change): extracted the shared
+analysis-view chrome into `frontend/src/components/analysis/detector-shared.tsx`
+(ModeToggle, RefreshButton, DetectorStatusLine, FindingShell, TagFindingsBar, and the
+useAnomalyMarkers/useDetectorRunId hooks), migrated ValueNoveltyView + FrequencyView onto
+it (markup-identical), replaced the two-button anomaly sub-tab strip with a Radix `Select`
+detector dropdown fed by a `DETECTORS` registry (flat buttons stopped fitting the 320px
+panel at 3+ detectors), and standardized every anomaly query key to
+`["anomalies", caseId, timelineId, "<detector>"|"fields", ...]`. Backend `_col_expr` gained
+a `prefix` param (default "fk", behavior unchanged) so a multi-field query can bind several
+field tokens into one params dict — groundwork for D1. (Note: the M19 `shouldInvalidate`
+predicate from session 25 is preserved in the migrated views.) D2 (`find_order_violations`,
+AMiner `TimestampsUnsortedDetector`): flags events whose parsed timestamp runs backwards
+relative to *record order* within a source. Record order = `byte_offset` (monotonic per source
+file), then line_number/event_id as tie-breaks — not the parsed timestamp, which would be
+circular. Uses a ClickHouse `lagInFrame` window comparing each event to its immediate
+predecessor (not a running maximum: a single future-dated outlier would otherwise cascade-flag
+every later event until the clock caught up). Mode-less — `method="sequential"`, no
+baseline/detect split, no mode toggle in the UI. `min_skew_seconds` (config
+`stat_order_min_skew`, default 1.0s) suppresses sub-second logger jitter; score = skew in
+seconds. Two queries: a per-source summary (violation count + worst skew, stashed in each
+finding's `details` for the UI's per-source group header) and a global worst-first detail query.
+New `OrderViolationsView.tsx` groups findings by source. Verified end-to-end against live
+ClickHouse: a synthetic 5-row source with one 300s backwards jump flagged exactly that event
+(the subsequent forward re-jump correctly *not* flagged, confirming lag-not-running-max),
+correct prev-timestamp/skew/source-total, then cleaned up. Docs: new ANOMALY_DETECTION.md §3
+(count 3→4 tools, semantic renumbered to §4), MethodologyPanel block. Tests: 5 detector-unit +
+1 router-dispatch, full suite green.)
+
+Previous (session 25 — PR #72 review fixes, five items: (1) SSE
 invalidation now covers VisualizePage's `viz-field-terms` query key (was silently missing
 from `INVALIDATE_PREFIXES`, so a teammate's tag edit never refreshed that chart);
 (2) `_run_stat_detector`'s timeline-midpoint lookup and normal-annotation fetch now run
