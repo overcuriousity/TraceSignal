@@ -983,12 +983,21 @@ class _HistogramFakeClient:
     ) -> FakeQueryResult:
         self.queries.append((query, parameters))
         stripped = query.strip()
+        if "intDiv(toUnixTimestamp(timestamp)" in stripped:
+            # Combined single-round-trip histogram: bucket rows carry the
+            # server-computed interval and range alongside each bucket.
+            iv = max(1, int((self._max - self._min).total_seconds() // 60))
+            rows = [[b, c, iv, self._min, self._max] for b, c in self._buckets]
+            return FakeQueryResult(
+                result_rows=rows,
+                column_names=["bucket", "c", "interval_seconds", "min_ts", "max_ts"],
+            )
+        if "toStartOfInterval" in stripped:
+            return FakeQueryResult(result_rows=self._buckets, column_names=["bucket", "c"])
         if "min(timestamp)" in stripped:
             return FakeQueryResult(
                 result_rows=[[self._min, self._max]], column_names=["min", "max"]
             )
-        if "toStartOfInterval" in stripped:
-            return FakeQueryResult(result_rows=self._buckets, column_names=["bucket", "c"])
         # count() fallback
         return FakeQueryResult(result_rows=[[len(self._buckets)]])
 
@@ -1015,6 +1024,11 @@ def test_histogram_returns_bucket_count() -> None:
     assert result["interval_seconds"] > 0
     assert len(result["buckets"]) == 3
     assert result["buckets"][1]["count"] == 20
+    assert result["min"] == min_ts.isoformat()
+    assert result["max"] == max_ts.isoformat()
+    # M22(c): derived-range histogram must be a single ClickHouse round trip —
+    # no separate min/max range query before the bucket scan.
+    assert len(svc.store.client.queries) == 1  # type: ignore[union-attr]
 
 
 def test_histogram_respects_explicit_time_range() -> None:
@@ -1039,6 +1053,9 @@ def test_histogram_empty_dataset_returns_empty_buckets() -> None:
 
         def query(self, query: str, parameters: Any = None, **_: Any) -> FakeQueryResult:
             self.queries.append(query)
+            if "intDiv(toUnixTimestamp(timestamp)" in query:
+                # Combined query: no matching rows → zero result rows.
+                return FakeQueryResult(result_rows=[], column_names=["bucket", "c"])
             if "min(timestamp)" in query:
                 return FakeQueryResult(result_rows=[[None, None]])
             return FakeQueryResult(result_rows=[], column_names=["bucket", "c"])
