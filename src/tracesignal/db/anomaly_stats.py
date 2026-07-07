@@ -32,6 +32,40 @@ already-ingested data.
       beyond ``z_threshold`` standard deviations from the series mean.
     * *temporal-z-score* — baseline = buckets before ``baseline_end``; detect =
       buckets after.  Mean/std computed from the baseline window only.
+
+**value_combo** (``detector="value_combo"``)
+    The multi-field extension of ``value_novelty`` (AMiner
+    ``NewMatchPathValueComboDetector``): instead of scoring a single field's
+    values, score *combinations* of two or more fields (``GROUP BY`` over the
+    field expressions). A combination rare or absent in the baseline is
+    flagged even when each field's individual values are common — an
+    ``(action, hour)`` pair like ``(login_ok, 03:00)`` can be novel while
+    ``login_ok`` and ``03:00`` are each unremarkable. Same two modes and same
+    surprise score as ``value_novelty``; auto mode picks a single tuple from
+    the two highest-coverage recommended fields (no pair enumeration).
+
+**numeric_range** (``detector="numeric_range"``)
+    For fields whose values parse as numbers (syntactic type detection via
+    ``toFloat64OrNull`` — never by field meaning), learn a baseline band and
+    flag detect-window values outside it. AMiner ``ValueRangeDetector``. Two
+    modes: *self-baseline* (``method="iqr"``) uses a Tukey fence
+    ``[q1 − 1.5·IQR, q3 + 1.5·IQR]`` over the whole corpus — an exact min/max
+    over the corpus flags nothing by construction; *temporal*
+    (``method="temporal-range"``) learns exact min/max from the baseline
+    window and flags detect-window values outside it. Findings group by
+    distinct violating value; score = distance outside the band ÷ band width.
+
+**timestamp_order** (``detector="timestamp_order"``)
+    Flag events whose parsed timestamp jumps *backwards* relative to the
+    previous record in the source file (record order = ``byte_offset``, then
+    ``line_number``).  Log-tampering / clock-manipulation indicator, adapted
+    from AMiner's ``TimestampsUnsortedDetector``.  Mode-less
+    (``method="sequential"``): there is no baseline/detect split — the
+    violation is purely positional.  Each event is compared to its immediate
+    predecessor (``lagInFrame``), not to a running maximum, so a single
+    future-dated outlier flags two boundaries instead of cascading over every
+    later event.  ``min_skew_seconds`` suppresses sub-second logger jitter.
+    Score = backwards jump in seconds.
 """
 
 from __future__ import annotations
@@ -45,8 +79,13 @@ from typing import Any
 import numpy as np
 
 from tracesignal.db._buckets import bucket_interval_seconds, query_timestamp_range
-from tracesignal.db._columns import EVENT_SELECT_COLUMNS, resolve_column_token
-from tracesignal.db._dt import ensure_utc, ensure_utc_iso, to_clickhouse_utc
+from tracesignal.db._columns import resolve_column_token
+from tracesignal.db._dt import (
+    TS_NOT_SENTINEL_SQL,
+    ensure_utc,
+    is_null_ts_sentinel,
+    to_clickhouse_utc,
+)
 from tracesignal.db.clickhouse import ClickHouseStore
 from tracesignal.db.field_mappings import mapping_coalesce_expr, resolve_mapping
 
@@ -55,7 +94,13 @@ from tracesignal.db.field_mappings import mapping_coalesce_expr, resolve_mapping
 # ---------------------------------------------------------------------------
 
 # Default fields scanned by value_novelty when no list is supplied (fallback only).
-_DEFAULT_NOVELTY_FIELDS = ["artifact", "timestamp_desc", "display_name"]
+_DEFAULT_NOVELTY_FIELDS = ["timestamp_desc"]
+
+# Pipeline-synthesized fields (added by normalization, not present in the raw
+# log data). Never auto-recommended for novelty scanning — rare values here
+# reflect ingestion metadata, not analyst-relevant log content. Still valid
+# tokens for explicit `fields=` selections and the viz field picker.
+_SYNTHETIC_FIELDS = {"artifact", "display_name", "parser_name", "parser_version", "source_file"}
 
 # Top-level columns considered by the field recommender (excludes free-text
 # and identifier-like columns that are not useful for novelty detection).
@@ -78,6 +123,14 @@ _RECOMMENDER_MAX_ATTR_KEYS = 50
 # sorts by (recommended, -coverage).
 _MAX_AUTO_SCAN_FIELDS = 15
 
+# Minimum baseline numeric samples before the range detector trusts a field's
+# learned band — below this, the min/max or quartiles are too noisy to score.
+_MIN_RANGE_BASELINE = 20
+
+# Fraction of a field's non-empty values that must parse as numbers for it to
+# be offered as a range-detector candidate (syntactic type detection only).
+_MIN_NUMERIC_RATIO = 0.9
+
 # Minimum buckets in a frequency series for z-scoring to be meaningful.
 _MIN_FREQUENCY_BUCKETS = 3
 
@@ -86,11 +139,6 @@ _MIN_FREQUENCY_BUCKETS = 3
 # excluded point (half an event-count unit — small enough to still flag any
 # real deviation, large enough to avoid blowing up the z-score to inf/NaN).
 _MIN_FREQUENCY_STD = 0.5
-
-# Columns selected when hydrating a representative event — shared with
-# queries.py's per-event projection, see _columns.EVENT_SELECT_COLUMNS.
-_EVENT_COLUMNS = EVENT_SELECT_COLUMNS
-
 
 # ---------------------------------------------------------------------------
 # Result types
@@ -131,14 +179,84 @@ class FreqFinding:
 
 
 @dataclass
+class RangeFinding:
+    """One out-of-range numeric value from the numeric-range detector."""
+
+    field: str
+    value: float
+    count: int
+    # excess distance beyond the band, normalized by band width.
+    score: float
+    direction: str  # "below" | "above"
+    lower: float
+    upper: float
+    first_seen: str | None
+    event_id: str | None
+    event: dict[str, Any] | None
+    details: dict[str, Any]
+
+
+@dataclass
+class NumericFieldInfo:
+    """A numeric-parseable field candidate for the range detector."""
+
+    token: str
+    distinct: int
+    coverage: float
+    # fraction of non-empty values that parse as a number (0–1).
+    numeric_ratio: float
+    recommended: bool
+
+
+@dataclass
+class ComboFinding:
+    """One rare/novel field *combination* from the value-combo detector."""
+
+    fields: list[str]
+    values: list[str]
+    count: int
+    # -log(count / total_events); higher = rarer.
+    score: float
+    first_seen: str | None
+    event_id: str | None
+    event: dict[str, Any] | None
+    details: dict[str, Any]
+
+
+@dataclass
+class OrderFinding:
+    """One out-of-order timestamp returned by the timestamp-order detector."""
+
+    source_id: str
+    event_id: str
+    # Violating event's timestamp (ISO, UTC).
+    timestamp: str
+    # Previous record's timestamp in file/record order (ISO, UTC).
+    prev_timestamp: str
+    # prev_timestamp - timestamp, in seconds (always > 0 for a violation).
+    skew_seconds: float
+    byte_offset: int
+    line_number: int
+    # = skew_seconds; used for ranking.
+    score: float
+    event: dict[str, Any] | None
+    details: dict[str, Any]
+
+
+@dataclass
 class StatAnomalyResult:
     """Return value of statistical anomaly detection."""
 
     status: str  # "ok" | "no_data" | "insufficient_data"
-    detector: str  # "value_novelty" | "frequency"
-    method: str  # "self-baseline" | "temporal" | "z-score" | "temporal-z-score"
+    # "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range"
+    detector: str
+    # "self-baseline" | "temporal" | "z-score" | "temporal-z-score" | "sequential"
+    #  | "iqr" | "temporal-range"
+    method: str
     baseline_size: int  # total events (value_novelty) or event-count used for z-score
-    results: list[ValueFinding | FreqFinding] = field(default_factory=list)
+    results: list[ValueFinding | FreqFinding | OrderFinding | ComboFinding | RangeFinding] = field(
+        default_factory=list
+    )
     # Effective |z| cutoff used by the frequency detector; None for value_novelty.
     z_threshold: float | None = None
 
@@ -167,6 +285,7 @@ def _col_expr(
     field_token: str,
     params: dict[str, Any],
     field_mappings: dict[str, list[str]] | None = None,
+    prefix: str = "fk",
 ) -> str:
     """Return a ClickHouse SQL expression for a field token.
 
@@ -177,22 +296,23 @@ def _col_expr(
     score against an always-empty attribute lookup instead of the values the
     events view shows for that field. Attribute keys prefixed with
     ``"attr:"`` (``"attr:user_agent"``) or any other non-top-level token are
-    returned as ``attributes[{fk:String}]`` with the key injected into
-    *params*. Every call site uses a fresh *params* dict for a single field
-    token, so a fixed parameter name is safe — no counter needed.
+    returned as ``attributes[{prefix:String}]`` with the key injected into
+    *params*. Single-field call sites use a fresh *params* dict per token, so
+    the default ``"fk"`` name is safe; multi-field queries (value_combo) pass
+    a distinct *prefix* per field (``fk0``, ``fk1``, …) to share one dict.
 
     ``field_mappings`` (issue #10): a token naming a canonical mapped field
     resolves to a coalesce over its raw attribute keys (parameter names
-    ``fk_m0..fk_mN`` — same single-field-per-params-dict assumption).
+    ``{prefix}_m0..{prefix}_mN`` — same params-dict-uniqueness assumption).
     """
     mapped_raws = resolve_mapping(field_token, field_mappings)
     if mapped_raws:
-        return mapping_coalesce_expr(mapped_raws, params, "fk")
+        return mapping_coalesce_expr(mapped_raws, params, prefix)
     column, attr_key = resolve_column_token(field_token)
     if column is not None:
         return column
-    params["fk"] = attr_key
-    return "attributes[{fk:String}]"
+    params[prefix] = attr_key
+    return f"attributes[{{{prefix}:String}}]"
 
 
 def _freq_finding(
@@ -233,37 +353,66 @@ def _freq_finding(
     )
 
 
-def _row_to_event(columns: tuple[str, ...], row: tuple) -> dict[str, Any]:
-    """Convert a ClickHouse result row into an Event-compatible dict.
+# Shared guardrails for every whole-corpus detector scan (GROUP BY over up to
+# hundreds of millions of rows): spill large aggregation states to disk
+# instead of ballooning RAM, cap the query's memory hard (fail one query, not
+# the server), and bound thread fan-out so several concurrent detector scans
+# don't oversubscribe the box. Values match the field-inventory scan that
+# first needed them.
+_HEAVY_SCAN_SETTINGS = (
+    "SETTINGS max_threads = 8, "
+    "max_bytes_before_external_group_by = 4000000000, "
+    "max_memory_usage = 12000000000"
+)
 
-    `timestamp`/`ingest_time` come back as naive `datetime` objects (the
-    columns have no explicit timezone component) — attach UTC before
-    serializing, otherwise the resulting "YYYY-MM-DDTHH:MM:SS" string (no
-    offset) is ambiguous to JS's `Date` parser, which treats it as local time
-    and silently shifts the displayed/compared timestamp by the browser's
-    UTC offset.
 
-    `content_hash`/`file_hash`/`embedding_config_hash` are `FixedString(64)`,
-    which clickhouse-connect returns as raw `bytes`, NUL-padded to the fixed
-    width. Left as-is they crash the router's JSON serialization ("Object of
-    type bytes is not JSON serializable") — a 500 that only the frequency
-    detector hits, because it's the one path that serializes a fully-hydrated
-    event dict (value_novelty builds its stub with string literals). Decode
-    and strip the NUL padding here, otherwise an empty `embedding_config_hash`
-    becomes a non-empty string of "\x00" chars — truthy and wrong.
+def _stub_event(evt_id: str | None, case_id: str, first_seen: str | None) -> dict[str, Any] | None:
+    """Minimal full-shape event stub for a finding's representative event.
+
+    The scan queries only aggregate ``argMin(event_id, ...)`` — fat columns
+    (message, attributes) are deliberately not read there. Findings that
+    survive ranking get their stub replaced by a fully hydrated event via
+    ``StatisticalAnomalyService._hydrate_finding_events``; this stub is the
+    fallback shape when hydration misses (e.g. a concurrent source delete).
     """
-    d: dict[str, Any] = dict(zip(columns, row, strict=False))
-    for key in ("timestamp", "ingest_time"):
-        v = d.get(key)
-        if v is not None and not isinstance(v, str):
-            d[key] = ensure_utc_iso(v)
-    for key in ("content_hash", "file_hash", "embedding_config_hash"):
-        v = d.get(key)
-        if isinstance(v, bytes):
-            d[key] = v.decode("utf-8", "replace").rstrip("\x00")
-    if "event_id" in d:
-        d["event_id"] = str(d["event_id"])
-    return d
+    if not evt_id:
+        return None
+    return {
+        "event_id": evt_id,
+        "case_id": case_id,
+        "source_id": "",
+        "message": "",
+        "timestamp": first_seen,
+        "timestamp_desc": None,
+        "artifact": None,
+        "artifact_long": None,
+        "display_name": None,
+        "tags": [],
+        "attributes": {},
+        "content_hash": "",
+        "file_hash": "",
+        "parser_name": "",
+        "parser_version": "",
+        "source_file": "",
+        "byte_offset": None,
+        "line_number": None,
+        "embedding_model": None,
+        "embedding_config_hash": None,
+        "ingest_time": None,
+    }
+
+
+def _present_ts(value: Any) -> str | None:
+    """Serialize a first-seen/anchor timestamp for API payloads.
+
+    Maps falsy values and the no-timestamp storage sentinel (see
+    `db/_dt.py`) to ``None`` so findings never surface the fake 2299 date —
+    a group whose representative rows are all undated has no meaningful
+    first-seen time.
+    """
+    if not value or is_null_ts_sentinel(value):
+        return None
+    return ensure_utc(value).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +480,28 @@ class StatisticalAnomalyService:
         )
         return int(total_res.result_rows[0][0]) if total_res.result_rows else 0
 
+    def _hydrate_finding_events(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        findings: list[Any],
+    ) -> None:
+        """Replace findings' stub events with fully hydrated rows, in one batch.
+
+        Called on the final (post-suppression, post-limit) finding slice, so
+        at most ``limit`` events are fetched — the detector scans themselves
+        only aggregate ``argMin(event_id, ...)`` and never read the fat
+        message/attributes columns. Findings whose id is missing from the
+        result keep their :func:`_stub_event` fallback.
+        """
+        ids = [f.event_id for f in findings if f.event_id]
+        if not ids:
+            return
+        by_id = self.ch.get_events_by_ids(case_id, source_ids, ids)
+        for f in findings:
+            if f.event_id and f.event_id in by_id:
+                f.event = by_id[f.event_id]
+
     def field_inventory(
         self,
         case_id: str,
@@ -372,6 +543,7 @@ class StatisticalAnomalyService:
             f" FROM {db}.events"
             f" WHERE case_id = {{cid:String}}"
             f" AND has({{src:Array(String)}}, source_id)"
+            f" {_HEAVY_SCAN_SETTINGS}"
         )
         top_res = self.ch.client.query(top_sql, parameters=params)
         if top_res.result_rows:
@@ -390,8 +562,9 @@ class StatisticalAnomalyService:
         # ``uniq`` (approximate, ~1% error) replaces ``uniqExact`` — the
         # cardinality classification thresholds don't need exactness, and
         # exact per-key hash sets over near-unique values are the other
-        # memory blowup. External GROUP BY spill + a query memory cap bound
-        # the worst case instead of trusting the server-wide limit.
+        # memory blowup. _HEAVY_SCAN_SETTINGS (external GROUP BY spill + a
+        # query memory cap) bounds the worst case instead of trusting the
+        # server-wide limit.
         attr_sql = f"""
             SELECT
                 key,
@@ -405,9 +578,7 @@ class StatisticalAnomalyService:
             GROUP BY key
             ORDER BY cov_count DESC
             LIMIT {{max_keys:UInt32}}
-            SETTINGS max_threads = 8,
-                     max_bytes_before_external_group_by = 4000000000,
-                     max_memory_usage = 12000000000
+            {_HEAVY_SCAN_SETTINGS}
         """
         attr_res = self.ch.client.query(
             attr_sql, parameters={**params, "max_keys": _RECOMMENDER_MAX_ATTR_KEYS}
@@ -451,6 +622,7 @@ class StatisticalAnomalyService:
             f" FROM {db}.events"
             f" WHERE case_id = {{cid:String}}"
             f" AND has({{src:Array(String)}}, source_id)"
+            f" {_HEAVY_SCAN_SETTINGS}"
         )
         m_res = self.ch.client.query(m_sql, parameters=m_params)
         out: list[tuple[str, int, int]] = []
@@ -501,6 +673,8 @@ class StatisticalAnomalyService:
         findings: list[NoveltyFieldInfo] = []
         for token, dist, cov_count in inventory:
             kind, recommended = _classify_field(dist, cov_count, total)
+            if token in _SYNTHETIC_FIELDS:
+                recommended = False
             findings.append(
                 NoveltyFieldInfo(
                     token=token,
@@ -531,8 +705,7 @@ class StatisticalAnomalyService:
         min_dt, max_dt = query_timestamp_range(
             self.ch.client,
             db,
-            "case_id = {cid:String} AND has({src:Array(String)}, source_id)"
-            " AND timestamp IS NOT NULL",
+            "case_id = {cid:String} AND has({src:Array(String)}, source_id)",
             params,
         )
         if min_dt is None or max_dt is None:
@@ -643,9 +816,7 @@ class StatisticalAnomalyService:
                         {col} AS val,
                         count() AS cnt,
                         min(timestamp) AS first_seen,
-                        toString(argMin(event_id, timestamp)) AS evt_id,
-                        argMin(source_id, timestamp) AS src_id,
-                        argMin(message, timestamp) AS msg
+                        toString(argMin(event_id, timestamp)) AS evt_id
                     FROM {db}.events
                     WHERE case_id = {{cid:String}}
                       AND has({{src:Array(String)}}, source_id)
@@ -654,6 +825,7 @@ class StatisticalAnomalyService:
                     HAVING cnt <= {{floor:UInt32}}
                     ORDER BY cnt ASC, first_seen ASC
                     LIMIT {{lim:UInt32}}
+                    {_HEAVY_SCAN_SETTINGS}
                 """
             else:
                 # Temporal: flag values seen in detect window but not in baseline.
@@ -665,28 +837,27 @@ class StatisticalAnomalyService:
                         countIf(timestamp >= {{bl:String}}) AS detect_cnt,
                         countIf(timestamp < {{bl:String}}) AS baseline_cnt,
                         minIf(timestamp, timestamp >= {{bl:String}}) AS first_seen,
-                        toString(argMinIf(event_id, timestamp, timestamp >= {{bl:String}})) AS evt_id,
-                        argMinIf(source_id, timestamp, timestamp >= {{bl:String}}) AS src_id,
-                        argMinIf(message, timestamp, timestamp >= {{bl:String}}) AS msg
+                        toString(argMinIf(event_id, timestamp, timestamp >= {{bl:String}})) AS evt_id
                     FROM {db}.events
                     WHERE case_id = {{cid:String}}
                       AND has({{src:Array(String)}}, source_id)
                       AND {col} != ''
-                      AND timestamp IS NOT NULL
+                      AND {TS_NOT_SENTINEL_SQL}
                     GROUP BY val
                     HAVING baseline_cnt = 0 AND detect_cnt > 0
                     ORDER BY detect_cnt ASC, first_seen ASC
                     LIMIT {{lim:UInt32}}
+                    {_HEAVY_SCAN_SETTINGS}
                 """
 
             rows = self.ch.client.query(sql, parameters=params).result_rows
 
             for row in rows:
                 if baseline_end is None:
-                    val, cnt, first_seen, evt_id, src_id, msg = row
+                    val, cnt, first_seen, evt_id = row
                     effective_cnt = int(cnt)
                 else:
-                    val, detect_cnt, _bl_cnt, first_seen, evt_id, src_id, msg = row
+                    val, detect_cnt, _bl_cnt, first_seen, evt_id = row
                     effective_cnt = int(detect_cnt)
 
                 if not val:
@@ -703,33 +874,9 @@ class StatisticalAnomalyService:
                 # string is ambiguous to JS's Date parser (browsers treat it as
                 # local time), which silently shifted the histogram markers and
                 # event-grid anomaly matching by the browser's UTC offset.
-                first_seen_str = ensure_utc(first_seen).isoformat() if first_seen else None
+                first_seen_str = _present_ts(first_seen)
                 evt_id_str = str(evt_id) if evt_id else None
-                mini_event: dict[str, Any] | None = None
-                if evt_id:
-                    mini_event = {
-                        "event_id": evt_id_str,
-                        "case_id": case_id,
-                        "source_id": str(src_id) if src_id else "",
-                        "message": str(msg) if msg else "",
-                        "timestamp": first_seen_str,
-                        "timestamp_desc": None,
-                        "artifact": None,
-                        "artifact_long": None,
-                        "display_name": None,
-                        "tags": [],
-                        "attributes": {},
-                        "content_hash": "",
-                        "file_hash": "",
-                        "parser_name": "",
-                        "parser_version": "",
-                        "source_file": "",
-                        "byte_offset": None,
-                        "line_number": None,
-                        "embedding_model": None,
-                        "embedding_config_hash": None,
-                        "ingest_time": None,
-                    }
+                mini_event = _stub_event(evt_id_str, case_id, first_seen_str)
 
                 details: dict[str, Any] = {
                     "detector": "value_novelty",
@@ -762,14 +909,486 @@ class StatisticalAnomalyService:
                 f for f in all_findings if not f.event_id or f.event_id not in exclude_event_ids
             ]
 
-        # Sort by surprise descending (rarest first), apply global limit.
+        # Sort by surprise descending (rarest first), apply global limit,
+        # then hydrate only the surviving findings' representative events.
         all_findings.sort(key=lambda f: f.score, reverse=True)
+        results = all_findings[:limit]
+        self._hydrate_finding_events(case_id, source_ids, results)
         return StatAnomalyResult(
             status="ok",
             detector="value_novelty",
             method=method,
             baseline_size=baseline_size,
-            results=all_findings[:limit],
+            results=results,
+        )
+
+    def find_value_combos(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        fields: list[str] | None = None,
+        limit: int = 50,
+        rarity_floor: int = 3,
+        baseline_end: datetime | None = None,
+        exclude_event_ids: set[str] | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
+    ) -> StatAnomalyResult:
+        """Return rare or first-seen *combinations* of field values.
+
+        The multi-field extension of :meth:`find_value_novelty`: instead of
+        grouping by a single field, group by two or more field expressions
+        together (``GROUP BY expr0, expr1, ...``) and score each surviving
+        combination by the same surprise formula.
+
+        *fields* must name at least two field tokens. When ``None``, the top
+        two highest-coverage recommended fields are used as a single tuple —
+        no pairwise enumeration (that would be one ClickHouse round-trip per
+        pair and a result set no analyst can triage).
+
+        Modes mirror :meth:`find_value_novelty`: *self-baseline* flags
+        combinations appearing ≤ *rarity_floor* times in the whole corpus;
+        *temporal* flags combinations absent from the baseline window but
+        present after ``baseline_end``.
+
+        Raises:
+            ValueError: if fewer than two fields are resolved.
+        """
+        self.ch.init_schema()
+        db = self.ch.database
+        base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        method = "self-baseline" if baseline_end is None else "temporal"
+
+        total_events = self._count_events(case_id, source_ids)
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data",
+                detector="value_combo",
+                method=method,
+                baseline_size=0,
+            )
+
+        # Field resolution (auto mode) issues live queries — only after the
+        # empty-corpus short-circuit above.
+        if fields is not None:
+            combo_fields = fields
+        else:
+            rec = self.recommend_novelty_fields(
+                case_id, source_ids, total=total_events, field_mappings=field_mappings
+            )
+            combo_fields = [f.token for f in rec if f.recommended][:2]
+
+        if len(combo_fields) < 2:
+            if fields is not None:
+                raise ValueError("value_combo requires at least two fields")
+            # Auto mode couldn't find two useful fields to combine.
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector="value_combo",
+                method=method,
+                baseline_size=total_events,
+            )
+
+        # Build one expression per field into a single shared params dict —
+        # distinct prefixes (fk0, fk1, …) keep the attribute-key bind params
+        # from colliding (see _col_expr's `prefix`).
+        params: dict[str, Any] = {**base_params}
+        exprs = [
+            _col_expr(tok, params, field_mappings, prefix=f"fk{i}")
+            for i, tok in enumerate(combo_fields)
+        ]
+        val_cols = ", ".join(f"{expr} AS v{i}" for i, expr in enumerate(exprs))
+        group_by = ", ".join(f"v{i}" for i in range(len(exprs)))
+        non_empty = " AND ".join(f"{expr} != ''" for expr in exprs)
+
+        # Baseline size (temporal only).
+        baseline_size = total_events
+        if baseline_end is not None:
+            bl_res = self.ch.client.query(
+                f"SELECT count() FROM {db}.events"
+                f" WHERE case_id = {{cid:String}}"
+                f" AND has({{src:Array(String)}}, source_id)"
+                f" AND timestamp < {{bl:String}}",
+                parameters={**base_params, "bl": to_clickhouse_utc(baseline_end)},
+            )
+            baseline_size = int(bl_res.result_rows[0][0]) if bl_res.result_rows else 0
+
+        if baseline_end is None:
+            params["floor"] = rarity_floor
+            params["lim"] = limit
+            sql = f"""
+                SELECT
+                    {val_cols},
+                    count() AS cnt,
+                    min(timestamp) AS first_seen,
+                    toString(argMin(event_id, timestamp)) AS evt_id
+                FROM {db}.events
+                WHERE case_id = {{cid:String}}
+                  AND has({{src:Array(String)}}, source_id)
+                  AND {non_empty}
+                GROUP BY {group_by}
+                HAVING cnt <= {{floor:UInt32}}
+                ORDER BY cnt ASC, first_seen ASC
+                LIMIT {{lim:UInt32}}
+                {_HEAVY_SCAN_SETTINGS}
+            """
+        else:
+            params["bl"] = to_clickhouse_utc(baseline_end)
+            params["lim"] = limit
+            sql = f"""
+                SELECT
+                    {val_cols},
+                    countIf(timestamp >= {{bl:String}}) AS detect_cnt,
+                    countIf(timestamp < {{bl:String}}) AS baseline_cnt,
+                    minIf(timestamp, timestamp >= {{bl:String}}) AS first_seen,
+                    toString(argMinIf(event_id, timestamp, timestamp >= {{bl:String}})) AS evt_id
+                FROM {db}.events
+                WHERE case_id = {{cid:String}}
+                  AND has({{src:Array(String)}}, source_id)
+                  AND {non_empty}
+                  AND {TS_NOT_SENTINEL_SQL}
+                GROUP BY {group_by}
+                HAVING baseline_cnt = 0 AND detect_cnt > 0
+                ORDER BY detect_cnt ASC, first_seen ASC
+                LIMIT {{lim:UInt32}}
+                {_HEAVY_SCAN_SETTINGS}
+            """
+
+        rows = self.ch.client.query(sql, parameters=params).result_rows
+        n_fields = len(exprs)
+
+        all_findings: list[ComboFinding] = []
+        for row in rows:
+            values = [str(v) for v in row[:n_fields]]
+            if baseline_end is None:
+                cnt = int(row[n_fields])
+                first_seen, evt_id = row[n_fields + 1 : n_fields + 3]
+            else:
+                cnt = int(row[n_fields])  # detect_cnt
+                first_seen, evt_id = row[n_fields + 2 : n_fields + 4]
+
+            if any(v == "" for v in values):
+                continue
+
+            score = -math.log(cnt / total_events) if cnt > 0 and total_events > 0 else 0.0
+            first_seen_str = _present_ts(first_seen)
+            evt_id_str = str(evt_id) if evt_id else None
+            mini_event = _stub_event(evt_id_str, case_id, first_seen_str)
+
+            details: dict[str, Any] = {
+                "detector": "value_combo",
+                "method": method,
+                "fields": combo_fields,
+                "values": values,
+                "count": cnt,
+                "total_events": total_events,
+                "surprise": round(score, 4),
+            }
+            if baseline_end is not None:
+                details["baseline_size"] = baseline_size
+
+            all_findings.append(
+                ComboFinding(
+                    fields=list(combo_fields),
+                    values=values,
+                    count=cnt,
+                    score=round(score, 4),
+                    first_seen=first_seen_str,
+                    event_id=evt_id_str,
+                    event=mini_event,
+                    details=details,
+                )
+            )
+
+        if exclude_event_ids:
+            all_findings = [
+                f for f in all_findings if not f.event_id or f.event_id not in exclude_event_ids
+            ]
+
+        all_findings.sort(key=lambda f: f.score, reverse=True)
+        results = all_findings[:limit]
+        self._hydrate_finding_events(case_id, source_ids, results)
+        return StatAnomalyResult(
+            status="ok",
+            detector="value_combo",
+            method=method,
+            baseline_size=baseline_size,
+            results=results,
+        )
+
+    # ------------------------------------------------------------------
+    # Numeric range violations
+    # ------------------------------------------------------------------
+
+    def recommend_numeric_fields(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        total: int | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
+        inventory: list[tuple[str, int, int]] | None = None,
+        min_ratio: float = _MIN_NUMERIC_RATIO,
+    ) -> list[NumericFieldInfo]:
+        """Return fields whose values parse as numbers, for the range detector.
+
+        Candidates come from the field inventory (top-level columns + attribute
+        keys, or a supplied *inventory* — the per-source stats cache); the ones
+        with non-trivial coverage and cardinality are probed with a single
+        batched query computing, per field, the fraction of non-empty values
+        that ``toFloat64OrNull`` parses. Fields at or above *min_ratio* are
+        marked recommended. Type detection is purely syntactic — a field of
+        HTTP status codes qualifies, but so would any numeric-looking id, which
+        is why the UI leans on temporal mode for those.
+        """
+        if inventory is None:
+            inventory, total = self.field_inventory(case_id, source_ids, total, field_mappings)
+        elif total is None:
+            raise ValueError("total is required when inventory is supplied")
+        if not total:
+            return []
+
+        # Keep fields with ≥5% coverage and more than one distinct value, cap 15.
+        candidates = [
+            (tok, dist, cov) for tok, dist, cov in inventory if cov / total >= 0.05 and dist > 1
+        ][:_MAX_AUTO_SCAN_FIELDS]
+        if not candidates:
+            return []
+
+        db = self.ch.database
+        params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        parts = []
+        exprs = []
+        for i, (tok, _, _) in enumerate(candidates):
+            expr = _col_expr(tok, params, field_mappings, prefix=f"nf{i}")
+            exprs.append(expr)
+            parts.append(
+                f"countIf(toFloat64OrNull({expr}) IS NOT NULL) AS num{i}, "
+                f"countIf({expr} != '') AS ne{i}"
+            )
+        probe_sql = (
+            f"SELECT {', '.join(parts)}"
+            f" FROM {db}.events"
+            f" WHERE case_id = {{cid:String}}"
+            f" AND has({{src:Array(String)}}, source_id)"
+            f" {_HEAVY_SCAN_SETTINGS}"
+        )
+        row = self.ch.client.query(probe_sql, parameters=params).result_rows
+        out: list[NumericFieldInfo] = []
+        if row:
+            r = row[0]
+            for i, (tok, dist, cov) in enumerate(candidates):
+                num = int(r[i * 2])
+                ne = int(r[i * 2 + 1])
+                ratio = num / ne if ne else 0.0
+                out.append(
+                    NumericFieldInfo(
+                        token=tok,
+                        distinct=dist,
+                        coverage=round(cov / total, 4),
+                        numeric_ratio=round(ratio, 4),
+                        recommended=ratio >= min_ratio,
+                    )
+                )
+        out.sort(key=lambda f: (not f.recommended, -f.numeric_ratio, -f.coverage))
+        return out
+
+    def find_range_violations(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        fields: list[str] | None = None,
+        limit: int = 50,
+        per_field_limit: int = 25,
+        baseline_end: datetime | None = None,
+        exclude_event_ids: set[str] | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
+    ) -> StatAnomalyResult:
+        """Return numeric values falling outside a field's learned range.
+
+        For each numeric field, learn a baseline band and flag values outside
+        it. *self-baseline* (``method="iqr"``) uses the Tukey fence
+        ``[q1 − 1.5·IQR, q3 + 1.5·IQR]`` over the whole corpus; *temporal*
+        (``method="temporal-range"``) learns exact min/max from the baseline
+        window (``timestamp < baseline_end``) and flags detect-window values
+        outside it.
+
+        When *fields* is ``None`` the numeric-field recommender selects
+        candidates automatically. A field with fewer than ``_MIN_RANGE_BASELINE``
+        numeric baseline samples is skipped; when every scanned field is skipped
+        the status is ``insufficient_data``.
+        """
+        self.ch.init_schema()
+        db = self.ch.database
+        base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        method = "iqr" if baseline_end is None else "temporal-range"
+
+        total_events = self._count_events(case_id, source_ids)
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data",
+                detector="numeric_range",
+                method=method,
+                baseline_size=0,
+            )
+
+        if fields is not None:
+            scan_fields = fields
+        else:
+            rec = self.recommend_numeric_fields(
+                case_id, source_ids, total=total_events, field_mappings=field_mappings
+            )
+            scan_fields = [f.token for f in rec if f.recommended][:_MAX_AUTO_SCAN_FIELDS]
+
+        bl_str = to_clickhouse_utc(baseline_end) if baseline_end is not None else None
+        all_findings: list[RangeFinding] = []
+        evaluated_fields = 0
+
+        for field_token in scan_fields:
+            # --- Learn the band from the baseline. ---
+            stat_params: dict[str, Any] = {**base_params}
+            col = _col_expr(field_token, stat_params, field_mappings)
+            num_src = (
+                f"SELECT toFloat64OrNull({col}) AS num, timestamp"
+                f" FROM {db}.events"
+                f" WHERE case_id = {{cid:String}}"
+                f" AND has({{src:Array(String)}}, source_id)"
+                f" AND {col} != ''"
+            )
+            if baseline_end is None:
+                stat_sql = (
+                    f"SELECT quantile(0.25)(num) AS q1, quantile(0.75)(num) AS q3, count() AS n"
+                    f" FROM ({num_src}) WHERE num IS NOT NULL {_HEAVY_SCAN_SETTINGS}"
+                )
+            else:
+                stat_params["bl"] = bl_str
+                stat_sql = (
+                    f"SELECT min(num) AS lo, max(num) AS hi, count() AS n"
+                    f" FROM ({num_src}) WHERE num IS NOT NULL AND timestamp < {{bl:String}}"
+                    f" {_HEAVY_SCAN_SETTINGS}"
+                )
+            srows = self.ch.client.query(stat_sql, parameters=stat_params).result_rows
+            if not srows or srows[0][2] is None:
+                continue
+            a, b, n = srows[0]
+            if int(n) < _MIN_RANGE_BASELINE or a is None or b is None:
+                continue
+
+            if baseline_end is None:
+                q1, q3 = float(a), float(b)
+                iqr = q3 - q1
+                lower = q1 - 1.5 * iqr
+                upper = q3 + 1.5 * iqr
+                band_extra: dict[str, Any] = {
+                    "q1": round(q1, 4),
+                    "q3": round(q3, 4),
+                    "iqr": round(iqr, 4),
+                }
+            else:
+                lower, upper = float(a), float(b)
+                band_extra = {"baseline_min": round(lower, 4), "baseline_max": round(upper, 4)}
+
+            # A degenerate (zero-width) band would divide the score by zero and
+            # flag every off-band value with infinite severity — floor the width.
+            width = max(upper - lower, 1e-9)
+            evaluated_fields += 1
+
+            # --- Flag values outside the band. ---
+            viol_params: dict[str, Any] = {**base_params}
+            vcol = _col_expr(field_token, viol_params, field_mappings)
+            viol_params["lo"] = lower
+            viol_params["hi"] = upper
+            viol_params["plim"] = per_field_limit
+            detect_clause = ""
+            if baseline_end is not None:
+                viol_params["bl"] = bl_str
+                # Exclude sentinel/undated rows: they satisfy `>= bl` (year-2299
+                # sentinel) and would otherwise attribute an undated event's
+                # numeric value to the detect window. Matches the sentinel guard
+                # value_combo/frequency apply.
+                detect_clause = f" AND timestamp >= {{bl:String}} AND {TS_NOT_SENTINEL_SQL}"
+            viol_sql = f"""
+                SELECT
+                    num AS val,
+                    count() AS cnt,
+                    min(timestamp) AS first_seen,
+                    toString(argMin(event_id, timestamp)) AS evt_id
+                FROM (
+                    SELECT toFloat64OrNull({vcol}) AS num, timestamp, event_id
+                    FROM {db}.events
+                    WHERE case_id = {{cid:String}}
+                      AND has({{src:Array(String)}}, source_id)
+                      AND {vcol} != ''
+                )
+                WHERE num IS NOT NULL AND (num < {{lo:Float64}} OR num > {{hi:Float64}}){detect_clause}
+                GROUP BY val
+                ORDER BY greatest({{lo:Float64}} - val, val - {{hi:Float64}}) DESC, first_seen ASC
+                LIMIT {{plim:UInt32}}
+                {_HEAVY_SCAN_SETTINGS}
+            """
+            vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
+
+            for vrow in vrows:
+                val, cnt, first_seen, evt_id = vrow
+                if val is None:
+                    continue
+                val_f = float(val)
+                direction = "below" if val_f < lower else "above"
+                excess = (lower - val_f) if val_f < lower else (val_f - upper)
+                score = round(excess / width, 4)
+                first_seen_str = _present_ts(first_seen)
+                evt_id_str = str(evt_id) if evt_id else None
+                mini_event = _stub_event(evt_id_str, case_id, first_seen_str)
+
+                details: dict[str, Any] = {
+                    "detector": "numeric_range",
+                    "method": method,
+                    "field": field_token,
+                    "value": val_f,
+                    "count": int(cnt),
+                    "lower": round(lower, 4),
+                    "upper": round(upper, 4),
+                    "direction": direction,
+                    "excess": round(excess, 4),
+                    "baseline_n": int(n),
+                    **band_extra,
+                }
+                all_findings.append(
+                    RangeFinding(
+                        field=field_token,
+                        value=val_f,
+                        count=int(cnt),
+                        score=score,
+                        direction=direction,
+                        lower=round(lower, 4),
+                        upper=round(upper, 4),
+                        first_seen=first_seen_str,
+                        event_id=evt_id_str,
+                        event=mini_event,
+                        details=details,
+                    )
+                )
+
+        if evaluated_fields == 0:
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector="numeric_range",
+                method=method,
+                baseline_size=total_events,
+            )
+
+        if exclude_event_ids:
+            all_findings = [
+                f for f in all_findings if not f.event_id or f.event_id not in exclude_event_ids
+            ]
+
+        all_findings.sort(key=lambda f: f.score, reverse=True)
+        results = all_findings[:limit]
+        self._hydrate_finding_events(case_id, source_ids, results)
+        return StatAnomalyResult(
+            status="ok",
+            detector="numeric_range",
+            method=method,
+            baseline_size=total_events,
+            results=results,
         )
 
     # ------------------------------------------------------------------
@@ -812,8 +1431,7 @@ class StatisticalAnomalyService:
         min_ts, max_ts = query_timestamp_range(
             self.ch.client,
             db,
-            "case_id = {cid:String} AND has({src:Array(String)}, source_id)"
-            " AND timestamp IS NOT NULL",
+            "case_id = {cid:String} AND has({src:Array(String)}, source_id)",
             src_params,
         )
         if min_ts is None or max_ts is None:
@@ -837,10 +1455,11 @@ class StatisticalAnomalyService:
             FROM {db}.events
             WHERE case_id = {{cid:String}}
               AND has({{src:Array(String)}}, source_id)
-              AND timestamp IS NOT NULL
+              AND {TS_NOT_SENTINEL_SQL}
               AND {col} != ''
             GROUP BY bucket, series_val
             ORDER BY bucket
+            {_HEAVY_SCAN_SETTINGS}
         """
         brows = self.ch.client.query(bucket_sql, parameters=params).result_rows
 
@@ -1036,14 +1655,11 @@ class StatisticalAnomalyService:
             "buckets": buckets,
             "iv": interval,
         }
-        # Aliased distinctly from the raw column names (agg_<col>) — reusing
-        # a WHERE-filtered column name (e.g. "case_id", "source_id") as an
-        # argMin(...) alias makes ClickHouse resolve that WHERE reference to
-        # the aggregate expression itself, raising "Aggregate function ...
-        # is found in WHERE" (ILLEGAL_AGGREGATION). Downstream parsing is
-        # positional (_row_to_event), so the alias names themselves are
-        # otherwise unused.
-        agg_cols_sql = ", ".join(f"argMin({c}, timestamp) AS agg_{c}" for c in _EVENT_COLUMNS)
+        # Phase 1 aggregates only argMin(event_id, ...) per (bucket, series)
+        # pair — the former all-column argMin dragged message/attributes for
+        # every matching row through the aggregation. The winners' full rows
+        # are then fetched in one bounded get_events_by_ids batch.
+        #
         # `timestamp` is DateTime64(3), and toStartOfInterval over a DateTime64
         # returns DateTime64 on ClickHouse builds that preserve the argument's
         # precision — comparing that against an Array(DateTime) literal then
@@ -1057,27 +1673,217 @@ class StatisticalAnomalyService:
             SELECT
                 {bucket_expr} AS bucket,
                 {col} AS series_val,
-                {agg_cols_sql}
+                toString(argMin(event_id, timestamp)) AS evt_id
             FROM {db}.events
             WHERE case_id = {{cid:String}}
               AND has({{src:Array(String)}}, source_id)
               AND {col} IN {{vals:Array(String)}}
               AND {bucket_expr} IN {{buckets:Array(DateTime)}}
             GROUP BY bucket, series_val
+            {_HEAVY_SCAN_SETTINGS}
         """
         rows = self.ch.client.query(sql, parameters=params).result_rows
 
-        by_key: dict[tuple[str, str], dict[str, Any]] = {}
-        for row in rows:
-            bucket, series_val = row[0], row[1]
-            evt = _row_to_event(_EVENT_COLUMNS, row[2:])
-            by_key[(str(series_val), ensure_utc(bucket).isoformat())] = evt
+        id_by_key: dict[tuple[str, str], str] = {
+            (str(series_val), ensure_utc(bucket).isoformat()): str(evt_id)
+            for bucket, series_val, evt_id in rows
+            if evt_id
+        }
+        events_by_id = self.ch.get_events_by_ids(
+            case_id, source_ids, sorted(set(id_by_key.values()))
+        )
 
         hydrated: list[FreqFinding] = []
         for f in findings:
-            evt = by_key.get((f.series_value, f.window_start))
+            evt_id = id_by_key.get((f.series_value, f.window_start))
+            evt = events_by_id.get(evt_id) if evt_id else None
             if evt is not None:
                 hydrated.append(replace(f, event_id=str(evt.get("event_id", "")), event=evt))
+            elif evt_id:
+                hydrated.append(
+                    replace(f, event_id=evt_id, event=_stub_event(evt_id, case_id, None))
+                )
             else:
                 hydrated.append(f)
         return hydrated
+
+    # ------------------------------------------------------------------
+    # Timestamp-order violations
+    # ------------------------------------------------------------------
+
+    def find_order_violations(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        min_skew_seconds: float = 1.0,
+        limit: int = 50,
+        exclude_event_ids: set[str] | None = None,
+    ) -> StatAnomalyResult:
+        """Return events whose timestamp jumps backwards in record order.
+
+        Record order within a source is ``byte_offset`` (the byte position of
+        the raw record in the source file — monotonic per file), then
+        ``line_number`` and ``event_id`` as deterministic tie-breaks. Each
+        event's timestamp is compared to its immediate predecessor
+        (``lagInFrame`` over a per-``source_id`` window); a backwards jump of
+        at least *min_skew_seconds* is a violation.
+
+        This detector is mode-less (``method="sequential"``) — there is no
+        baseline/detect split. NULL timestamps are excluded (they carry no
+        order signal).
+        """
+        self.ch.init_schema()
+        db = self.ch.database
+        base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        method = "sequential"
+
+        total_events = self._count_events(case_id, source_ids)
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data",
+                detector="timestamp_order",
+                method=method,
+                baseline_size=0,
+            )
+
+        # Inner subquery: per source, lag the timestamp over record order and
+        # compute the backwards skew (0 when in order). `dateDiff('millisecond')`
+        # / 1000 keeps sub-second precision that dateDiff('second') would lose.
+        inner = f"""
+            SELECT
+                source_id,
+                toString(event_id) AS event_id,
+                timestamp,
+                -- toNullable: on the non-Nullable timestamp column lagInFrame
+                -- returns the type default (1970-01-01), not NULL, for each
+                -- source's first row — which would make the IS NOT NULL
+                -- first-row guard below always-true.
+                lagInFrame(toNullable(timestamp)) OVER w AS prev_ts,
+                byte_offset,
+                line_number,
+                message,
+                if(prev_ts IS NOT NULL AND timestamp < prev_ts,
+                   dateDiff('millisecond', timestamp, prev_ts) / 1000.0, 0.) AS skew
+            FROM {db}.events
+            WHERE case_id = {{cid:String}}
+              AND has({{src:Array(String)}}, source_id)
+              AND {TS_NOT_SENTINEL_SQL}
+            WINDOW w AS (
+                PARTITION BY source_id
+                ORDER BY byte_offset, line_number, event_id
+                ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING
+            )
+        """
+
+        # Per-source summary: violation count + worst skew, for the UI's
+        # per-source grouping header and the overall status.
+        summary_params = {**base_params, "skew": float(min_skew_seconds)}
+        summary_sql = f"""
+            SELECT
+                source_id,
+                countIf(skew >= {{skew:Float64}}) AS n_viol,
+                maxIf(skew, skew >= {{skew:Float64}}) AS max_skew
+            FROM ({inner})
+            GROUP BY source_id
+            {_HEAVY_SCAN_SETTINGS}
+        """
+        summary_rows = self.ch.client.query(summary_sql, parameters=summary_params).result_rows
+        source_summary: dict[str, tuple[int, float]] = {
+            str(r[0]): (int(r[1]), float(r[2]) if r[2] is not None else 0.0) for r in summary_rows
+        }
+        total_violations = sum(n for n, _ in source_summary.values())
+
+        if total_violations == 0:
+            return StatAnomalyResult(
+                status="ok",
+                detector="timestamp_order",
+                method=method,
+                baseline_size=total_events,
+                results=[],
+            )
+
+        # Detail: the worst violations across all sources.
+        detail_params = {**base_params, "skew": float(min_skew_seconds), "lim": limit}
+        detail_sql = f"""
+            SELECT source_id, event_id, timestamp, prev_ts, skew, byte_offset, line_number, message
+            FROM ({inner})
+            WHERE skew >= {{skew:Float64}}
+            ORDER BY skew DESC, source_id, byte_offset
+            LIMIT {{lim:UInt32}}
+            {_HEAVY_SCAN_SETTINGS}
+        """
+        rows = self.ch.client.query(detail_sql, parameters=detail_params).result_rows
+
+        findings: list[OrderFinding] = []
+        for row in rows:
+            source_id, event_id, ts, prev_ts, skew, byte_offset, line_number, msg = row
+            if not event_id:
+                continue
+            ts_str = _present_ts(ts)
+            prev_str = ensure_utc(prev_ts).isoformat() if prev_ts else None
+            n_viol, max_skew = source_summary.get(str(source_id), (0, 0.0))
+            mini_event: dict[str, Any] = {
+                "event_id": str(event_id),
+                "case_id": case_id,
+                "source_id": str(source_id),
+                "message": str(msg) if msg else "",
+                "timestamp": ts_str,
+                "timestamp_desc": None,
+                "artifact": None,
+                "artifact_long": None,
+                "display_name": None,
+                "tags": [],
+                "attributes": {},
+                "content_hash": "",
+                "file_hash": "",
+                "parser_name": "",
+                "parser_version": "",
+                "source_file": "",
+                "byte_offset": int(byte_offset),
+                "line_number": int(line_number),
+                "embedding_model": None,
+                "embedding_config_hash": None,
+                "ingest_time": None,
+            }
+            details: dict[str, Any] = {
+                "detector": "timestamp_order",
+                "method": method,
+                "source_id": str(source_id),
+                "prev_timestamp": prev_str,
+                "skew_seconds": round(float(skew), 3),
+                "byte_offset": int(byte_offset),
+                "line_number": int(line_number),
+                "min_skew_seconds": float(min_skew_seconds),
+                "source_total_violations": n_viol,
+                "source_max_skew": round(max_skew, 3),
+            }
+            findings.append(
+                OrderFinding(
+                    source_id=str(source_id),
+                    event_id=str(event_id),
+                    timestamp=ts_str or "",
+                    prev_timestamp=prev_str or "",
+                    skew_seconds=round(float(skew), 3),
+                    byte_offset=int(byte_offset),
+                    line_number=int(line_number),
+                    score=round(float(skew), 3),
+                    event=mini_event,
+                    details=details,
+                )
+            )
+
+        # Suppress findings whose representative event was marked normal
+        # (before the limit is applied — filtering after would shrink the page
+        # instead of backfilling from the next-worst violation).
+        if exclude_event_ids:
+            findings = [
+                f for f in findings if not f.event_id or f.event_id not in exclude_event_ids
+            ]
+
+        return StatAnomalyResult(
+            status="ok",
+            detector="timestamp_order",
+            method=method,
+            baseline_size=total_events,
+            results=findings[:limit],
+        )

@@ -5,7 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from tracesignal.ingestion.parser import JsonlParser, TimesketchCsvParser, detect_format, get_parser
+from tracesignal.db._dt import NULL_TS_SENTINEL
+from tracesignal.ingestion.parser import (
+    JsonlParser,
+    TimesketchCsvParser,
+    _normalise_tag_field,
+    detect_format,
+    get_parser,
+)
 from tracesignal.models.event import Event, ParserConfig, content_hash
 
 
@@ -30,6 +37,25 @@ def jsonl_file(tmp_path: Path) -> Path:
         '{"timestamp":"2024-01-01T00:01:00+00:00","timestamp_desc":"created","message":"User logout","source":"auth","tags":"logout","extra_field":"value2"}\n'
     )
     return path
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("", []),
+        ("login", ["login"]),
+        ("login|success", ["login", "success"]),
+        ("login,success", ["login", "success"]),
+        ('["API Error", "Sensitive File"]', ["API Error", "Sensitive File"]),
+        ("['API Error', 'Sensitive File']", ["API Error", "Sensitive File"]),
+        ("[]", []),
+        ('["single"]', ["single"]),
+        # Malformed list literal falls back to comma splitting.
+        ('["broken", "list"', ['["broken"', '"list"']),
+    ],
+)
+def test_normalise_tag_field(value: str, expected: list[str]) -> None:
+    assert _normalise_tag_field(value) == expected
 
 
 def test_detect_format(tmp_path: Path) -> None:
@@ -241,7 +267,9 @@ def test_event_to_clickhouse_row_parses_timestamp() -> None:
     assert row["timestamp"] == datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
 
 
-def test_event_to_clickhouse_row_null_for_bad_timestamp() -> None:
+def test_event_to_clickhouse_row_sentinel_for_bad_timestamp() -> None:
+    # Unparsable timestamps store the year-2299 sentinel (the column is a
+    # non-Nullable MergeTree sort key); serialization presents it as null.
     event = Event(
         case_id="c",
         source_id="s",
@@ -255,4 +283,4 @@ def test_event_to_clickhouse_row_null_for_bad_timestamp() -> None:
         timestamp="not-a-date",
     )
     row = event.to_clickhouse_row()
-    assert row["timestamp"] is None
+    assert row["timestamp"] == NULL_TS_SENTINEL

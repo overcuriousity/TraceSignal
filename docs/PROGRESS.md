@@ -1,6 +1,106 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-06 (session 25 — PR #72 review fixes, five items: (1) SSE
+Last updated: 2026-07-07 (session 27 — ClickHouse query-cost overhaul after 300M-row incident).
+
+## Session 27 — 2026-07-07: 300M-row perf overhaul (timestamp sentinel, two-phase queries)
+
+A production 80 GiB / 300M-row nginx ingest exposed that every Explorer "load more" click read
+**187 GiB** (~80 s) and every anomaly-panel open ~1 TiB, taking the server down (swap
+exhaustion, load 126). Root causes, measured live via `system.query_log` + `EXPLAIN`:
+
+1. `timestamp Nullable(DateTime64(3))` in the MergeTree sort key (`allow_nullable_key`)
+   disables ClickHouse's read-in-order optimization → every `ORDER BY timestamp LIMIT 100`
+   became a full-partition top-N sort;
+2. the keyset cursor's `coalesce(timestamp, sentinel)` wrapper was unsargable (no granule
+   pruning);
+3. the page query selected all 21 columns (incl. `message`/`attributes`) for the sort
+   (no lazy materialization in CH 24.10);
+4. `find_value_novelty`/`find_value_combos` aggregated `argMin(message, timestamp)` per group
+   → 136 GiB decompressed per scanned field, ~7 fields per panel view.
+
+Fixes (this session, PR #73): non-Nullable `timestamp` storing the year-2299 sentinel for
+undated events (presented as `null` everywhere; `db/_dt.py` is the single home for the
+sentinel + `TS_NOT_SENTINEL_SQL` guard); sargable plain-tuple cursor + redundant scalar
+`timestamp <= :ts` bound; two-phase grid fetch (thin `(event_id, timestamp)` top-N, then
+timestamp-bounded hydration by id — 187 GiB → ~4.5 MiB per page measured); single-element
+list filters emit `=` instead of `IN` (fixed sort-key prefix requirement); detectors
+aggregate only `argMin(event_id, …)` and batch-hydrate the post-limit findings via
+`get_events_by_ids`; every whole-corpus detector scan carries `_HEAVY_SCAN_SETTINGS`
+(external GROUP BY spill, 12 GB per-query cap, 8 threads).
+
+**One-time migration (existing deployments)** — new code refuses to start against the legacy
+Nullable schema (`init_schema` guard). With the app stopped: create `events_migration_new`
+with the new DDL, `INSERT … SELECT` with `coalesce(timestamp, toDateTime64('2299-12-31
+23:59:59.999', 3, 'UTC'))`, verify (row count, `countIf(IS NULL)` old == `countIf(= sentinel)`
+new, `sum(cityHash64(event_id, content_hash))` checksum, min/max), then `EXCHANGE TABLES` and
+keep the old table as `events_legacy_pre_migration` until burn-in. Preflight aborts if any
+real event already carries the exact sentinel timestamp. Ran on dev (6.2M rows) and prod
+(300M rows). Behavioral note: undated events now sort at the *top* of the default
+newest-first grid (sentinel = max datetime; deliberate, keeps broken timestamps visible).
+
+D4 (`find_range_violations`, AMiner `ValueRangeDetector`): for fields whose values parse as
+numbers (syntactic `toFloat64OrNull`, never by meaning), learn a baseline band and flag values
+outside it. Self-baseline (`method="iqr"`) uses the Tukey fence `[q1−1.5·IQR, q3+1.5·IQR]` over
+the corpus — exact corpus min/max flags nothing by construction; temporal (`method=
+"temporal-range"`) learns exact baseline-window min/max (AMiner-faithful). Findings group by
+distinct violating value; score = distance outside band ÷ band width (normalizes severity
+across fields of different scales); degenerate zero-width band floored to 1e-9. Fields with <20
+numeric baseline samples skipped; all-skipped → insufficient_data. New `recommend_numeric_fields`
+probes candidate coverage/cardinality then one batched `countIf(toFloat64OrNull(...) IS NOT NULL)`
+query for the ≥90% numeric-ratio filter, exposed via new `GET /anomalies/numeric-fields`
+(cache inventory + live probe, mirroring /anomalies/fields). Verified live: 100 events with
+`resp_bytes` in [100,300] plus outliers 50000/60000 flagged both above the IQR band [-1.5,426.5]
+ranked by excess, recommender detected resp_bytes as 100% numeric. New `NumericRangeView.tsx`
+(band rendered inline as the explainability shot; AnomalyFieldPicker gained a `numeric` mode
+fetching numeric-fields and showing parse ratios). Docs: ANOMALY_DETECTION.md §4 (5 tools now,
+semantic → §5); MethodologyPanel block. Tests: 6 detector-unit + 1 router-dispatch.
+
+D1 (`find_value_combos`, AMiner `NewMatchPathValueComboDetector`): the multi-field extension
+of value_novelty. Groups by two or more field expressions together (`GROUP BY v0, v1, …`) and
+scores each surviving combination by the same surprise `−log(count/total)`. Catches
+combinations rare even when each field's values are common — verified live: a source of 50
+`(login_ok, day)` events + 1 `(login_ok, night)` flagged only the night combo (surprise 3.93),
+though `login_ok` alone is common. Both modes carry over (self-baseline rarity floor / temporal
+baseline_cnt=0). Requires ≥2 fields; router returns 422 on a single explicit field, service
+raises ValueError. Auto mode combines exactly the top-2 highest-coverage recommended fields —
+no pair enumeration (105 pairs from 15 fields would be untriageable). Field expressions share
+one params dict via the new `_col_expr(prefix=fk0/fk1/…)`. New `ComboNoveltyView.tsx` (2–4
+field picker via `AnomalyFieldPicker`'s new min/max-selected props; query gated below 2 fields);
+combo drill applies every (field,value) pair as a conjunction in one `setFilters` fold
+(ExplorerPage `handleComboDrill`) rather than looping `handleDrillField`, which would clobber
+against the same stale `filters` closure. Docs: ANOMALY_DETECTION.md §1 "Value combinations"
+subsection (kept under value novelty rather than renumbering); MethodologyPanel block. Tests: 7
+detector-unit + 2 router (dispatch + 422).
+
+D2 timestamp-order detector. Prep (no behavior change): extracted the shared
+analysis-view chrome into `frontend/src/components/analysis/detector-shared.tsx`
+(ModeToggle, RefreshButton, DetectorStatusLine, FindingShell, TagFindingsBar, and the
+useAnomalyMarkers/useDetectorRunId hooks), migrated ValueNoveltyView + FrequencyView onto
+it (markup-identical), replaced the two-button anomaly sub-tab strip with a Radix `Select`
+detector dropdown fed by a `DETECTORS` registry (flat buttons stopped fitting the 320px
+panel at 3+ detectors), and standardized every anomaly query key to
+`["anomalies", caseId, timelineId, "<detector>"|"fields", ...]`. Backend `_col_expr` gained
+a `prefix` param (default "fk", behavior unchanged) so a multi-field query can bind several
+field tokens into one params dict — groundwork for D1. (Note: the M19 `shouldInvalidate`
+predicate from session 25 is preserved in the migrated views.) D2 (`find_order_violations`,
+AMiner `TimestampsUnsortedDetector`): flags events whose parsed timestamp runs backwards
+relative to *record order* within a source. Record order = `byte_offset` (monotonic per source
+file), then line_number/event_id as tie-breaks — not the parsed timestamp, which would be
+circular. Uses a ClickHouse `lagInFrame` window comparing each event to its immediate
+predecessor (not a running maximum: a single future-dated outlier would otherwise cascade-flag
+every later event until the clock caught up). Mode-less — `method="sequential"`, no
+baseline/detect split, no mode toggle in the UI. `min_skew_seconds` (config
+`stat_order_min_skew`, default 1.0s) suppresses sub-second logger jitter; score = skew in
+seconds. Two queries: a per-source summary (violation count + worst skew, stashed in each
+finding's `details` for the UI's per-source group header) and a global worst-first detail query.
+New `OrderViolationsView.tsx` groups findings by source. Verified end-to-end against live
+ClickHouse: a synthetic 5-row source with one 300s backwards jump flagged exactly that event
+(the subsequent forward re-jump correctly *not* flagged, confirming lag-not-running-max),
+correct prev-timestamp/skew/source-total, then cleaned up. Docs: new ANOMALY_DETECTION.md §3
+(count 3→4 tools, semantic renumbered to §4), MethodologyPanel block. Tests: 5 detector-unit +
+1 router-dispatch, full suite green.)
+
+Previous (session 25 — PR #72 review fixes, five items: (1) SSE
 invalidation now covers VisualizePage's `viz-field-terms` query key (was silently missing
 from `INVALIDATE_PREFIXES`, so a teammate's tag edit never refreshed that chart);
 (2) `_run_stat_detector`'s timeline-midpoint lookup and normal-annotation fetch now run

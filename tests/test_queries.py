@@ -8,7 +8,13 @@ from typing import Any
 
 import pytest
 
-from tracesignal.db.queries import EventQuery, EventQueryService, TagFilter
+from tracesignal.db._dt import NULL_TS_SENTINEL, TS_NOT_SENTINEL_SQL
+from tracesignal.db.queries import (
+    EventQuery,
+    EventQueryService,
+    TagFilter,
+    _normalize_event_row,
+)
 
 
 @dataclass
@@ -56,8 +62,17 @@ class FakeClickHouseClient:
         **_kwargs: Any,
     ) -> FakeQueryResult:
         self.queries.append((query, parameters))
-        if query.strip().startswith("SELECT count()"):
+        stripped = query.strip()
+        if stripped.startswith("SELECT count()"):
             return FakeQueryResult(result_rows=[[0]])
+        if stripped.startswith("SELECT event_id, timestamp"):
+            # Phase 1 of the two-phase page fetch: thin sort-key rows.
+            id_idx = self.event_columns.index("event_id")
+            ts_idx = self.event_columns.index("timestamp")
+            return FakeQueryResult(
+                result_rows=[(row[id_idx], row[ts_idx]) for row in self.event_rows],
+                column_names=["event_id", "timestamp"],
+            )
         return FakeQueryResult(
             result_rows=self.event_rows,
             column_names=self.event_columns,
@@ -216,6 +231,35 @@ def test_time_range_filter_formats_datetime(service: EventQueryService) -> None:
     assert "timestamp <= {p2:String}" in query
     assert params.get("p1") == "2024-01-01 12:00:00"
     assert params.get("p2") == "2024-01-02 12:00:00"
+
+
+def test_time_range_filter_excludes_sentinel_rows(service: EventQueryService) -> None:
+    # A time-range filter must never match sentinel (no-timestamp) rows —
+    # mirrors how NULL rows failed any >=/<= comparison on the old Nullable
+    # column.
+    service.query(EventQuery(case_id="case-1", start=datetime(2024, 1, 1, tzinfo=UTC)))
+    query, _ = _last_query(service)
+    assert TS_NOT_SENTINEL_SQL in query
+
+
+def test_no_time_range_no_sentinel_guard(service: EventQueryService) -> None:
+    # Without a time filter, sentinel rows are regular grid citizens.
+    service.query(EventQuery(case_id="case-1"))
+    query, _ = _last_query(service)
+    assert TS_NOT_SENTINEL_SQL not in query
+
+
+def test_normalize_event_row_presents_sentinel_timestamp_as_null() -> None:
+    sentinel_naive = NULL_TS_SENTINEL.replace(tzinfo=None)
+    row = {
+        "event_id": "e1",
+        "timestamp": sentinel_naive,
+        "ingest_time": datetime(2024, 1, 1, 12, 0, 0),
+    }
+    normalized = _normalize_event_row(row)
+    assert normalized["timestamp"] is None
+    # ingest_time is always real — never nulled, just UTC-ISO'd.
+    assert normalized["ingest_time"] == "2024-01-01T12:00:00+00:00"
 
 
 def test_top_level_field_filter_uses_column(service: EventQueryService) -> None:
@@ -399,7 +443,9 @@ def test_combined_query_builds_single_where_clause(
     )
     count_query, count_params = _find_query(service, "SELECT count()")
     assert "case_id = {p0:String}" in count_query
-    assert "source_id IN {p1:Array(String)}" in count_query
+    # Single-element source list becomes equality — a fixed sort-key prefix
+    # is what lets ClickHouse read in order for ORDER BY ... LIMIT pages.
+    assert "source_id = {p1:String}" in count_query
     assert "message ILIKE {p2:String}" in count_query
     assert "artifact = {p3:String}" in count_query
     assert "attributes[{p4:String}] = {p5:String}" in count_query
@@ -606,13 +652,12 @@ def test_after_cursor_uses_lt_predicate_for_default_desc_order(
     ts = datetime(2026, 6, 25, 7, 30, 1)
     service.query(EventQuery(case_id="case-1", after=(ts, "evt-1")))
     query, params = _last_query(service)
-    assert (
-        "(coalesce(timestamp, {p3:DateTime64(3)}), event_id) < "
-        "({p1:DateTime64(3)}, {p2:UUID})" in query
-    )
+    assert "(timestamp, event_id) < ({p1:DateTime64(3)}, {p2:UUID})" in query
+    # Redundant scalar bound: only a scalar sort-key comparison prunes
+    # primary-index granules; the tuple form alone re-reads the partition.
+    assert "AND timestamp <= {p1:DateTime64(3)}" in query
     assert params["p1"] == "2026-06-25 07:30:01.000"
     assert params["p2"] == "evt-1"
-    assert params["p3"] == "2299-12-31 23:59:59.999"
     assert "OFFSET" not in query
 
 
@@ -622,10 +667,8 @@ def test_before_cursor_uses_gt_predicate_and_reversed_fetch_direction(
     ts = datetime(2026, 6, 25, 7, 30, 1)
     service.query(EventQuery(case_id="case-1", before=(ts, "evt-1")))
     query, _ = _last_query(service)
-    assert (
-        "(coalesce(timestamp, {p3:DateTime64(3)}), event_id) > "
-        "({p1:DateTime64(3)}, {p2:UUID})" in query
-    )
+    assert "(timestamp, event_id) > ({p1:DateTime64(3)}, {p2:UUID})" in query
+    assert "AND timestamp >= {p1:DateTime64(3)}" in query
     assert "ORDER BY timestamp ASC, event_id ASC" in query
 
 
@@ -686,11 +729,12 @@ def test_cursor_page_echoes_next_and_prev_cursor() -> None:
 # ── NULL-timestamp cursor tests (F3) ───────────────────────────────────────────
 
 
-def test_cursor_substitutes_sentinel_for_null_timestamp() -> None:
-    """A NULL-timestamp row at a page boundary must never produce a `None`
-    cursor component — `[null, id]` serializes to JSON and is not a
-    parseable "<iso-ts>,<event_id>" string on the way back in (400)."""
-    row = _cursor_row("evt-null", None)
+def test_cursor_substitutes_sentinel_for_undated_row() -> None:
+    """An undated row (stored as the year-2299 sentinel, presented as null)
+    at a page boundary must never produce a `None` cursor component —
+    `[null, id]` serializes to JSON and is not a parseable
+    "<iso-ts>,<event_id>" string on the way back in (400)."""
+    row = _cursor_row("evt-null", NULL_TS_SENTINEL.replace(tzinfo=None))
     svc = EventQueryService(store=FakeClickHouseStore(event_rows=[row]))
     page = svc.query(EventQuery(case_id="case-1"))
     assert page.events[0]["timestamp"] is None
@@ -698,18 +742,72 @@ def test_cursor_substitutes_sentinel_for_null_timestamp() -> None:
     assert page.next_cursor == ("2299-12-31T23:59:59.999000+00:00", "evt-null")
 
 
-def test_cursor_predicate_coalesces_null_timestamp_to_sentinel(
+def test_cursor_predicate_is_sargable_plain_tuple(
     service: EventQueryService,
 ) -> None:
-    """The keyset predicate must coalesce the `timestamp` column to the same
-    sentinel used in cursor construction, or a NULL-timestamp row's tuple
-    comparison evaluates to NULL (not true/false) and the row is silently
-    unreachable via pagination regardless of direction."""
+    """No `coalesce()` wrapper on the cursor predicate: the column stores the
+    year-2299 sentinel instead of NULL, so the plain tuple comparison is both
+    correct for undated rows and usable by the primary index — the coalesce
+    form defeated granule pruning entirely."""
     ts = datetime(2026, 6, 25, 7, 30, 1)
     service.query(EventQuery(case_id="case-1", after=(ts, "evt-1")))
     query, params = _last_query(service)
-    assert "coalesce(timestamp, {p3:DateTime64(3)})" in query
-    assert params["p3"] == "2299-12-31 23:59:59.999"
+    assert "coalesce(" not in query
+    assert "(timestamp, event_id) < ({p1:DateTime64(3)}, {p2:UUID})" in query
+    assert "p3" not in (params or {})
+
+
+def test_two_phase_page_fetch_shapes() -> None:
+    """Phase 1 must select only (event_id, timestamp); phase 2 must re-filter
+    by the page's timestamp bounds plus an explicit event_id set, and return
+    rows in phase-1 order."""
+    rows = [
+        _cursor_row("evt-1", datetime(2026, 6, 25, 7, 30, 1)),
+        _cursor_row("evt-2", datetime(2026, 6, 25, 7, 30, 2)),
+    ]
+    svc = EventQueryService(store=FakeClickHouseStore(event_rows=rows))
+    page = svc.query(
+        EventQuery(case_id="case-1", limit=2, after=(datetime(2026, 6, 25, 7, 29, 0), "evt-0"))
+    )
+    queries = [q for q, _ in svc.store.client.queries]
+    phase1 = [q for q in queries if q.strip().startswith("SELECT event_id, timestamp")]
+    assert len(phase1) == 1
+    assert "ORDER BY timestamp" in phase1[0]
+    hydrate = [q for q in queries if "event_id IN (" in q]
+    assert len(hydrate) == 1
+    assert "timestamp >= {hts_min:DateTime64(3)}" in hydrate[0]
+    assert "timestamp <= {hts_max:DateTime64(3)}" in hydrate[0]
+    # The fat columns are only ever selected in the bounded hydration query.
+    assert "message" not in phase1[0]
+    assert "message" in hydrate[0]
+    _, hydrate_params = next((q, p) for q, p in svc.store.client.queries if "event_id IN (" in q)
+    assert hydrate_params["hid0"] == "evt-1"
+    assert hydrate_params["hid1"] == "evt-2"
+    assert [e["event_id"] for e in page.events] == ["evt-1", "evt-2"]
+
+
+def test_hydration_reorders_rows_to_phase1_order() -> None:
+    """The hydration SELECT has no ORDER BY — row order must be restored from
+    the phase-1 key order."""
+
+    class _ShuffledClient(FakeClickHouseClient):
+        def query(self, query: str, parameters=None, **kwargs: Any) -> FakeQueryResult:
+            result = super().query(query, parameters, **kwargs)
+            if "event_id IN (" in query:
+                result.result_rows = list(reversed(result.result_rows))
+            return result
+
+    rows = [
+        _cursor_row("evt-1", datetime(2026, 6, 25, 7, 30, 2)),
+        _cursor_row("evt-2", datetime(2026, 6, 25, 7, 30, 1)),
+    ]
+    store = FakeClickHouseStore()
+    store.client = _ShuffledClient(rows)
+    svc = EventQueryService(store=store)
+    page = svc.query(
+        EventQuery(case_id="case-1", limit=2, after=(datetime(2026, 6, 25, 7, 31, 0), "evt-0"))
+    )
+    assert [e["event_id"] for e in page.events] == ["evt-1", "evt-2"]
 
 
 def test_cursor_predicate_maps_empty_event_id_to_min_uuid(
@@ -1042,6 +1140,25 @@ def test_histogram_respects_explicit_time_range() -> None:
     range_queries = [q for q, _ in svc.store.client.queries if "min(timestamp)" in q]  # type: ignore[union-attr]
     assert range_queries == []
     assert result["buckets"][0]["count"] == 7
+
+
+def test_histogram_queries_exclude_sentinel_rows() -> None:
+    # Both histogram branches must exclude no-timestamp sentinel rows — the
+    # derived-range CTE especially, where a sentinel would blow up
+    # max(timestamp) and stretch every bucket interval to ~275 years.
+    min_ts = datetime(2024, 1, 1, tzinfo=UTC)
+    max_ts = datetime(2024, 1, 2, tzinfo=UTC)
+    svc = _histogram_service(min_ts, max_ts, [[min_ts, 1]])
+    svc.histogram(EventQuery(case_id="c1", source_ids=["s1"]), buckets=60)
+    derived_sql = svc.store.client.queries[-1][0]  # type: ignore[union-attr]
+    assert derived_sql.count(TS_NOT_SENTINEL_SQL) == 2  # CTE range + bucket scan
+
+    svc2 = _histogram_service(min_ts, max_ts, [[min_ts, 1]])
+    svc2.histogram(
+        EventQuery(case_id="c1", source_ids=["s1"], start=min_ts, end=max_ts), buckets=60
+    )
+    explicit_sql = svc2.store.client.queries[-1][0]  # type: ignore[union-attr]
+    assert TS_NOT_SENTINEL_SQL in explicit_sql
 
 
 def test_histogram_empty_dataset_returns_empty_buckets() -> None:

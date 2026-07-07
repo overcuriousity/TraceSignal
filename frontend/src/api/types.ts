@@ -282,7 +282,64 @@ export interface FrequencyFinding {
   details: Record<string, unknown>;
 }
 
-export type AnomalyFinding = ValueNoveltyFinding | FrequencyFinding;
+/** One rare / first-seen field *combination* from the value_combo detector. */
+export interface ValueComboFinding {
+  type: "value_combo";
+  /** The combined field tokens, in order. */
+  fields: string[];
+  /** The combination's values, aligned with `fields`. */
+  values: string[];
+  count: number;
+  /** -log(count/total) — higher is rarer. */
+  score: number;
+  first_seen: string | null;
+  event_id: string | null;
+  event: Event | null;
+  details: Record<string, unknown>;
+}
+
+/** One out-of-range numeric value from the numeric_range detector. */
+export interface NumericRangeFinding {
+  type: "numeric_range";
+  field: string;
+  value: number;
+  count: number;
+  /** excess distance beyond the band ÷ band width. */
+  score: number;
+  direction: "below" | "above";
+  lower: number;
+  upper: number;
+  first_seen: string | null;
+  event_id: string | null;
+  event: Event | null;
+  details: Record<string, unknown>;
+}
+
+/** One out-of-order timestamp finding from the timestamp_order detector. */
+export interface TimestampOrderFinding {
+  type: "timestamp_order";
+  source_id: string;
+  event_id: string;
+  /** Violating event's timestamp (ISO, UTC). */
+  timestamp: string;
+  /** Previous record's timestamp in file/record order (ISO, UTC). */
+  prev_timestamp: string;
+  /** prev_timestamp − timestamp, in seconds (always > 0). */
+  skew_seconds: number;
+  byte_offset: number;
+  line_number: number;
+  /** = skew_seconds — used for ranking. */
+  score: number;
+  event: Event | null;
+  details: Record<string, unknown>;
+}
+
+export type AnomalyFinding =
+  | ValueNoveltyFinding
+  | ValueComboFinding
+  | FrequencyFinding
+  | TimestampOrderFinding
+  | NumericRangeFinding;
 
 export interface AnomaliesResponse {
   status: "ok" | "no_data" | "insufficient_data";
@@ -321,7 +378,12 @@ export interface AnomalyMarker {
   /** Source id of the representative event — required to persist this finding. */
   sourceId?: string | null;
   /** Which detector produced this finding — required to persist this finding. */
-  detector: "value_novelty" | "frequency";
+  detector:
+    | "value_novelty"
+    | "value_combo"
+    | "frequency"
+    | "timestamp_order"
+    | "numeric_range";
   /** Raw structured finding data — stored verbatim on the persisted annotation. */
   rawDetails: Record<string, unknown>;
   /** End of the anomalous window, for frequency findings — enables a range highlight. */
@@ -350,6 +412,20 @@ export interface NoveltyFieldInfo {
 
 export interface NoveltyFieldsResponse {
   fields: NoveltyFieldInfo[];
+}
+
+/** One numeric-parseable field candidate from GET /anomalies/numeric-fields. */
+export interface NumericFieldInfo {
+  token: string;
+  distinct: number;
+  coverage: number;
+  /** Fraction of non-empty values that parse as a number (0–1). */
+  numeric_ratio: number;
+  recommended: boolean;
+}
+
+export interface NumericFieldsResponse {
+  fields: NumericFieldInfo[];
 }
 
 /** Per-field heuristic verdict from the wizard recommender. */

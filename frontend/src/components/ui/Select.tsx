@@ -38,7 +38,7 @@ export function SelectContent({ className, children, ...props }: RadixSelect.Sel
         sideOffset={4}
         {...props}
       >
-        <RadixSelect.Viewport className="max-h-72 overflow-y-auto p-1">{children}</RadixSelect.Viewport>
+        <RadixSelect.Viewport className="max-h-[var(--radix-select-content-available-height)] overflow-y-auto p-1">{children}</RadixSelect.Viewport>
       </RadixSelect.Content>
     </RadixSelect.Portal>
   );

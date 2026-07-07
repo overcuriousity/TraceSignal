@@ -9,6 +9,7 @@ and hash of the immutable source file.
 
 from __future__ import annotations
 
+import ast
 import csv
 import json
 from abc import ABC, abstractmethod
@@ -68,10 +69,25 @@ class _RecordTrackingIterator:
 def _normalise_tag_field(value: str) -> list[str]:
     """Split a Timesketch tag field into individual tags.
 
-    Timesketch stores multiple tags separated by commas or pipes.
+    Timesketch stores multiple tags separated by commas or pipes. Some
+    exporters instead serialise the tag list as a JSON or Python literal
+    (``["a", "b"]`` / ``['a', 'b']``), so list-shaped values are decoded
+    before falling back to delimiter splitting.
     """
     if not value:
         return []
+    stripped = value.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        parsed = None
+        try:
+            parsed = json.loads(stripped)
+        except ValueError:
+            try:
+                parsed = ast.literal_eval(stripped)
+            except (ValueError, SyntaxError):
+                parsed = None
+        if isinstance(parsed, list):
+            return [str(t).strip() for t in parsed if str(t).strip()]
     tags: list[str] = []
     for delimiter in (",", "|"):
         if delimiter in value:

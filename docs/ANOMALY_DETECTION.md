@@ -9,18 +9,44 @@ file and the "Method" tab copy in the same commit — see
 [Reality check](#reality-check-2026-07) at the bottom for the audit that
 produced this file and what was fixed as part of it.
 
-There are three independent analysis tools in TraceSignal:
+There are five independent analysis tools in TraceSignal:
 
-1. [Value novelty](#1-value-novelty-rare--first-seen-values) — rare/new field values (ClickHouse, no ML)
+1. [Value novelty](#1-value-novelty-rare--first-seen-values) — rare/new field values, single field or [combinations](#value-combinations-the-value_combo-variant) (ClickHouse, no ML)
 2. [Frequency anomalies](#2-frequency-anomalies-volume-spikes--silences) — volume spikes/silences (ClickHouse, no ML)
-3. [Semantic similarity search](#3-semantic-similarity-search) — "find events like this one" (embeddings + Qdrant)
+3. [Timestamp order](#3-timestamp-order-out-of-order-records) — timestamps running backwards in record order (ClickHouse, no ML)
+4. [Numeric range](#4-numeric-range-out-of-band-values) — numeric values outside a learned band (ClickHouse, no ML)
+5. [Semantic similarity search](#5-semantic-similarity-search) — "find events like this one" (embeddings + Qdrant)
 
-The first two are **statistical detectors**: pure counting and arithmetic over
+The first four are **statistical detectors**: pure counting and arithmetic over
 already-ingested events, no machine learning, no network calls, work the
-instant ingestion finishes. The third needs an explicit embedding step first.
+instant ingestion finishes. The fifth needs an explicit embedding step first.
 
-Code: `src/tracesignal/db/anomaly_stats.py` (detectors 1–2),
-`src/tracesignal/db/similarity.py` (detector 3). UI: `frontend/src/components/analysis/`.
+Code: `src/tracesignal/db/anomaly_stats.py` (detectors 1–4),
+`src/tracesignal/db/similarity.py` (detector 5). UI: `frontend/src/components/analysis/`.
+
+### Query-cost discipline (all statistical detectors)
+
+Three cross-cutting rules keep detector scans survivable on 100M+-row cases
+(added 2026-07 after a 300M-row nginx case took a production box down):
+
+- **Two-phase representative events.** Detector scans aggregate only
+  `argMin(event_id, timestamp)` per group — never `argMin(message, …)`, which
+  forces decompressing the fat `message` column for *every scanned row*
+  (~136 GiB per field on the 300M case). The ≤`limit` findings that survive
+  ranking are hydrated afterwards in one batched `get_events_by_ids` call
+  (`_hydrate_finding_events` / `_hydrate_freq_findings`); a finding whose
+  event vanished mid-flight keeps a minimal `_stub_event` shape.
+- **`_HEAVY_SCAN_SETTINGS` on every whole-corpus scan** (`max_threads = 8`,
+  `max_bytes_before_external_group_by = 4 GB`, `max_memory_usage = 12 GB`):
+  large GROUP BY states spill to disk, a runaway query fails alone instead of
+  taking the server with it, and concurrent panel scans can't oversubscribe
+  the box. Any new detector query that touches the whole corpus must carry it.
+- **No-timestamp events are stored as a sentinel, not NULL.** `timestamp` is
+  a non-Nullable sort-key column; events without a parseable timestamp carry
+  `2299-12-31 23:59:59.999 UTC` (`db/_dt.py NULL_TS_SENTINEL`) and are
+  presented as `null` by the API. Every aggregate/bucket over `timestamp`
+  must exclude them via `TS_NOT_SENTINEL_SQL` — exactly where the old
+  Nullable schema used `timestamp IS NOT NULL`.
 
 ---
 
@@ -111,6 +137,14 @@ type:
 | `identifier` | distinct values ÷ non-empty events ≥ 0.9 (hashes, UUIDs, free-text messages — nearly every value is unique) | No — nothing repeats, so nothing can be "rare" relative to a peer group |
 | `categorical` | everything else — moderate cardinality, decent coverage | Yes |
 
+One exception overrides the cardinality rule: pipeline-synthesized fields
+(`artifact`, `display_name`, `parser_name`, `parser_version`, `source_file` —
+`_SYNTHETIC_FIELDS` in `db/anomaly_stats.py`) are never auto-recommended and
+are hidden from the Fields picker. These values are stamped on by
+normalization, not present in the raw log data, so "rare" values there
+reflect ingestion metadata rather than analyst-relevant behavior. They remain
+valid tokens for explicit `fields=` API selections.
+
 The attribute-key inventory behind this classification counts distinct values
 with ClickHouse's approximate `uniq()` (~1% error), not `uniqExact` — the
 thresholds above are coarse ratios, and exact per-key hash sets over
@@ -141,6 +175,32 @@ recommendation set (up to ~54 candidate fields) could turn one panel-open
 into dozens of round-trips. The highest-coverage recommended fields win the
 cap; you can always override with an explicit field list via the Fields
 picker to scan something the auto-selector skipped.
+
+### Value combinations (the `value_combo` variant)
+
+The **Value combos** detector (AMiner `NewMatchPathValueComboDetector`) is the
+multi-field extension of rare values: instead of scoring one field's values, it
+scores *combinations* of two or more fields together.
+
+**Why a separate detector:** a combination can be rare even when each field's
+individual values are common. `login_ok` is a common action; `03:00` is a common
+hour; but `(login_ok, 03:00)` — a successful login at 3am — may be a combination
+that has never occurred before. Single-field novelty can't see this; it only
+knows each value in isolation.
+
+**How it works:** exactly like rare values, but the ClickHouse `GROUP BY` spans
+every selected field expression instead of one, and the count/first-seen and
+surprise score are computed per *combination*. Both modes carry over unchanged —
+self-baseline flags combinations appearing ≤ the rarity floor; temporal flags
+combinations absent from the baseline window but present after the split. The
+score is the same `−log(count / total events)`.
+
+**Field selection differs in one way:** you must give it at least two fields (the
+picker enforces 2–4). Auto mode does **not** enumerate every pair — with 15
+candidate fields that would be 105 combinations, 105 queries, and a result set no
+analyst can triage. Instead auto mode combines exactly the two highest-coverage
+recommended fields into a single tuple. Pick fields explicitly for any other
+combination.
 
 ---
 
@@ -264,7 +324,149 @@ severity regardless of whether your threshold is 2 or 6.
 
 ---
 
-## 3. Semantic similarity search
+## 3. Timestamp order (out-of-order records)
+
+**What it answers:** "Within a source file, does any event's timestamp jump
+*backwards* compared to the record physically before it?" A log line whose
+timestamp is earlier than the line above it did not arrive in chronological
+order — a strong indicator of log tampering, a clock reset, or two writers
+appending to one file.
+
+Adapted from AMiner's `TimestampsUnsortedDetector`.
+
+**Why it's useful:** Most log formats are append-only and monotonic — each new
+record is stamped no earlier than the last. A backwards jump is therefore
+anomalous by construction, and unlike "rare value" it needs no baseline to be
+meaningful. Deleting or editing lines in the middle of a log, or resetting a
+system clock, leaves exactly this signature.
+
+### This detector has no baseline/detect modes
+
+Value novelty and frequency both split time into a "normal" baseline and a
+"suspect" detect window. Timestamp order does not: the violation is *positional*
+(a record is out of place relative to its neighbour), not *temporal* (something
+changed after a point in time). The Method line reports `sequential`, and the
+UI shows no mode toggle.
+
+### What "record order" means
+
+Record order is the position of the raw record **in the source file**, not its
+parsed timestamp — that would be circular. Concretely the detector orders by:
+
+1. **byte offset** — where the raw record starts in the file. Monotonic per
+   file, so it is the natural record sequence.
+2. **line number**, then **event id** — deterministic tie-breaks only.
+
+Each event's timestamp is compared to its *immediate predecessor* in that order
+(ClickHouse `lagInFrame`), not to a running maximum. The distinction matters:
+if one event is stamped far in the future, comparing against a running maximum
+would flag every later event until the clock "caught up" — a cascade. Comparing
+against the predecessor flags just the two boundaries (the jump up, and the jump
+back down), which is what an analyst wants to triage.
+
+### Plain-language rule, then the notation
+
+Flag a record when its timestamp is at least θ seconds earlier than the record
+immediately before it in file order:
+
+```
+flag event i  when  ts(i) < ts(i-1) − θ        (records ordered by byte offset)
+skew(i)       =     ts(i-1) − ts(i)  in seconds  (the backwards jump, > 0)
+```
+
+`θ` is `min_skew_seconds` (config `stat_order_min_skew`, default 1.0s). It
+suppresses sub-second logger jitter — two events in the same millisecond bucket
+written "out of order" by a fraction of a second are almost never interesting.
+Set it to 0 for AMiner-strict behaviour (any backwards step flags).
+
+The **score** is the skew in seconds — larger backwards jumps rank first.
+
+### Caveats
+
+- **NULL timestamps are excluded.** A record with no parsed timestamp carries no
+  order signal and is skipped, not treated as position zero.
+- **Interleaved multi-writer logs legitimately jump.** Two processes appending
+  to one file (or a merged/rotated log) can interleave timestamps without any
+  tampering. Read a cluster of small-skew violations in one source as "this is a
+  multi-writer log", not "this was edited" — the byte offsets and per-source
+  violation count in `details` help tell the two apart.
+- Findings are grouped by source in the UI, each with the source's total
+  violation count and worst skew, so a systematically-unsorted source reads
+  differently from a single sharp jump.
+
+---
+
+## 4. Numeric range (out-of-band values)
+
+**What it answers:** "For fields that hold numbers, is any value far outside the
+range the field normally takes?" A `response_bytes` of 5 GB when the field
+normally sits in the kilobytes, a negative `duration`, a port number where one
+never appeared before.
+
+Adapted from AMiner's `ValueRangeDetector`.
+
+**Why it's useful:** Numeric fields have a natural notion of "too big" / "too
+small" that categorical novelty can't express — 9,999 is not "a rare value" the
+way a new username is, it's *out of range*. Data exfiltration (huge byte
+counts), malformed records (negative or absurd values), and scanning (ports
+outside the usual set) all show up here.
+
+**Field selection is syntactic, never semantic.** A field qualifies if at least
+90% of its non-empty values parse as numbers (`toFloat64OrNull`). The detector
+never interprets what the number *means* — a field of HTTP status codes
+qualifies exactly like a field of byte counts. That's a strength (works on any
+log) and a caveat (see below).
+
+### Two modes
+
+| | Self-baseline (`iqr`) | Temporal (`temporal-range`) |
+|---|---|---|
+| Baseline | the whole corpus | values before `baseline_end` |
+| Band | Tukey fence `[q1 − 1.5·IQR, q3 + 1.5·IQR]` | exact `[min, max]` of the baseline |
+| Flags | statistical outliers | anything outside the historical range |
+
+**Why self-baseline needs the IQR fence.** An exact min/max over the whole
+corpus flags nothing by construction — every value is within [min, max] because
+min and max *are* corpus values. So self-baseline mode instead uses the Tukey
+fence: the interquartile range (IQR = q3 − q1, the spread of the middle 50% of
+values) extended 1.5× past each quartile. This is the standard boxplot-outlier
+rule, and it's fully explainable ("the middle 50% of `bytes` sat between 100 and
+300; this value of 9,000 is far past the q3 + 1.5·IQR fence of 426").
+
+**Why temporal uses exact min/max.** With a real baseline/detect split, the
+AMiner-faithful behaviour is exactly right: learn the range the field took
+*before* the incident window, flag anything outside it *after*. "The largest
+`bytes` value in the 300-event baseline was 500; this detect-window value is
+9,999."
+
+### The score
+
+```
+score = distance outside the band ÷ band width
+```
+
+A value one band-width past the edge scores 1.0; ten band-widths past scores
+10.0. It normalises severity across fields with very different scales, so a
+`bytes` outlier and a `duration` outlier rank comparably. Findings group by
+distinct violating value.
+
+### Caveats
+
+- **Numeric-looking identifiers.** Ports, status codes, PIDs, and error codes
+  all parse as numbers but have no meaningful "range" — an IQR fence over status
+  codes is nonsense (404 is not an outlier of 200). For these, prefer **temporal
+  mode** (did a code appear that was never seen in the baseline?) or just don't
+  select them. The picker shows each field's numeric parse ratio to help you
+  judge.
+- **Baseline size floor.** A field with fewer than 20 numeric baseline samples
+  is skipped — quartiles and min/max over a handful of points are too noisy to
+  trust. If every scanned field is skipped, the status is `insufficient_data`.
+- Rare ≠ malicious, as everywhere: a legitimate large file transfer and an
+  exfiltration both produce a large `bytes` value.
+
+---
+
+## 5. Semantic similarity search
 
 Not a statistical anomaly detector — no baseline, no score threshold, no
 z-score — but it lives in the same Analysis tab and Method panel, so it's

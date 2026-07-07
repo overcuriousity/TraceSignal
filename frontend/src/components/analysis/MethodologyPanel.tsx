@@ -12,8 +12,11 @@
 import {
   Info,
   Hash,
+  Layers,
   Cpu,
   Activity,
+  Rewind,
+  Ruler,
   ShieldCheck,
   BarChart2,
 } from "lucide-react";
@@ -89,6 +92,38 @@ export function MethodologyPanel({
           </div>
         </div>
 
+        {/* Value combo */}
+        <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3 space-y-2">
+          <p className="flex items-center gap-1.5 font-medium text-[var(--color-fg-primary)]">
+            <Layers size={11} /> Value combos (value_combo)
+          </p>
+          <div className="space-y-1.5 text-[var(--color-fg-muted)]">
+            <Row label="Method">
+              The multi-field extension of rare values — group by two or more
+              fields together and score each surviving combination by the same
+              surprise formula. Self-baseline or temporal, same as rare values.
+            </Row>
+            <Row label="Signal">
+              Combinations that are rare (self-baseline) or first-seen in the
+              detect window (temporal) — even when each field's individual
+              values are common. E.g. (action, hour) = (login_ok, 03:00).
+            </Row>
+            <Row label="Score">
+              −log(count / total events), over the combination's count. Carried
+              in <code className="font-mono text-xs">details.surprise</code>.
+            </Row>
+            <Row label="Fields">
+              Auto mode combines the two highest-coverage recommended fields
+              (no pairwise enumeration — that would be one query per pair).
+              Analyst can pick 2–4 explicit fields.
+            </Row>
+            <Row label="Backend">
+              ClickHouse GROUP BY over the field expressions — exact match, no
+              ML.
+            </Row>
+          </div>
+        </div>
+
         {/* Frequency */}
         <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3 space-y-2">
           <p className="flex items-center gap-1.5 font-medium text-[var(--color-fg-primary)]">
@@ -121,11 +156,72 @@ export function MethodologyPanel({
           </div>
         </div>
 
+        {/* Timestamp order */}
+        <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3 space-y-2">
+          <p className="flex items-center gap-1.5 font-medium text-[var(--color-fg-primary)]">
+            <Rewind size={11} /> Timestamp order (timestamp_order)
+          </p>
+          <div className="space-y-1.5 text-[var(--color-fg-muted)]">
+            <Row label="Method">
+              Mode-less (sequential) — no baseline/detect split. Each event's
+              timestamp is compared to its immediate predecessor in record
+              order via a ClickHouse window function (lagInFrame).
+            </Row>
+            <Row label="Signal">
+              Events whose parsed timestamp runs backwards relative to the
+              previous record, by at least the minimum-jump threshold. Indicates
+              log tampering, clock resets, or interleaved multi-writer logs.
+            </Row>
+            <Row label="Order">
+              Record position = byte offset in the source file (monotonic per
+              file), then line number and event id as tie-breaks — not the
+              parsed timestamp. Comparison uses the predecessor, not a running
+              maximum, so one future-dated outlier flags two boundaries instead
+              of cascading over every later event.
+            </Row>
+            <Row label="Score">
+              Backwards jump in seconds. Carried in{" "}
+              <code className="font-mono text-xs">details.skew_seconds</code>.
+            </Row>
+            <Row label="Backend">
+              ClickHouse window function over (source_id, byte_offset). NULL
+              timestamps are excluded.
+            </Row>
+          </div>
+        </div>
+
+        {/* Numeric range */}
+        <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3 space-y-2">
+          <p className="flex items-center gap-1.5 font-medium text-[var(--color-fg-primary)]">
+            <Ruler size={11} /> Numeric range (numeric_range)
+          </p>
+          <div className="space-y-1.5 text-[var(--color-fg-muted)]">
+            <Row label="Method">
+              Self-baseline uses a Tukey IQR fence [q1−1.5·IQR, q3+1.5·IQR] over
+              the whole corpus; temporal learns the exact min/max of the
+              baseline window. Fields are selected by parsing values as numbers
+              (toFloat64OrNull ≥ 90% parse rate) — never by field meaning.
+            </Row>
+            <Row label="Signal">
+              Numeric values falling outside the learned band. Findings group by
+              distinct value, ranked by how far outside they fall.
+            </Row>
+            <Row label="Score">
+              Distance outside the band ÷ band width. Carried with the band
+              bounds in <code className="font-mono text-xs">details</code>.
+            </Row>
+            <Row label="Backend">
+              ClickHouse quantile()/min()/max() over toFloat64OrNull — no ML.
+              Fields with fewer than 20 numeric baseline samples are skipped.
+            </Row>
+          </div>
+        </div>
+
         <div className="flex items-start gap-1.5 text-xs text-[var(--color-fg-muted)]">
           <ShieldCheck size={10} className="mt-0.5 shrink-0 text-[var(--color-success)]" />
           <span>
-            Both detectors are forensically defensible: every finding carries
-            the exact field, value, count, and baseline in{" "}
+            All detectors are forensically defensible: every finding carries
+            the exact field/value/count/baseline (or timestamps and skew) in{" "}
             <code className="font-mono">details</code>. Rare ≠ malicious — use
             for triage. Confirmed findings can be tagged as{" "}
             <strong className="text-[var(--color-fg-secondary)]">anomaly</strong>{" "}

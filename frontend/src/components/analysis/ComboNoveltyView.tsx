@@ -1,16 +1,16 @@
 /**
- * ValueNoveltyView — ranked list of rare / first-seen field values.
+ * ComboNoveltyView — rare / first-seen *combinations* of two or more fields.
  *
- * Calls the value_novelty detector endpoint and shows each finding as an
- * interactive row: field badge + value + surprise score + first-seen timestamp
- * + click-to-drill.  "First-seen in detect window" findings are highlighted.
+ * The multi-field sibling of ValueNoveltyView: calls the value_combo detector
+ * and shows each finding as the field=value pairs of a rare tuple, plus its
+ * surprise score. Auto mode combines the two highest-coverage recommended
+ * fields; the analyst can pick 2–4 explicit fields instead.
  */
 import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, ChevronsRight, Clock, Info } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
 import { eventsApi } from "@/api/events";
-import { shouldInvalidate } from "@/hooks/useCaseStream";
 import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
 import {
   DetectorStatusLine,
@@ -23,47 +23,46 @@ import {
   type DetectorMode,
 } from "./detector-shared";
 import { Spinner } from "@/components/ui/Spinner";
-import type { Event, ValueNoveltyFinding } from "@/api/types";
+import type { AnomalyMarker, Event, ValueComboFinding } from "@/api/types";
 import { cn } from "@/lib/cn";
 import { anomalyFieldLabel as fieldLabel } from "@/lib/format";
 import { fmtTimestampCompactUtc as fmtTs } from "@/lib/time";
+
+const MIN_FIELDS = 2;
+const MAX_FIELDS = 4;
 
 interface Props {
   caseId: string;
   timelineId: string;
   onSelectEvent: (event: Event) => void;
-  /** Called when analyst drills into findings — passes a field filter. */
-  onDrillField?: (field: string, value: string) => void;
-  /** Called whenever the finding set changes — feeds the histogram overlay and event grid. */
-  onFindingsChange?: (markers: import("@/api/types").AnomalyMarker[]) => void;
-  /** Called with the latest scan's persisted run_id, so the grid can filter to it. */
+  /** Applies every (field, value) pair of a combination as a conjunctive filter. */
+  onComboDrill?: (pairs: [string, string][]) => void;
+  onFindingsChange?: (markers: AnomalyMarker[]) => void;
   onRunIdChange?: (runId: string | undefined) => void;
-  /** Scrolls the main grid to this finding's timestamp, clearing filters first. */
   onJumpToTime?: (ts: string, eventId?: string) => void;
 }
 
-interface FindingRowProps {
-  caseId: string;
-  timelineId: string;
-  finding: ValueNoveltyFinding;
-  onSelectEvent: (event: Event) => void;
-  onDrillField?: (field: string, value: string) => void;
-  onJumpToTime?: (ts: string, eventId?: string) => void;
-  isFirstSeen: boolean;
+function comboLabel(f: ValueComboFinding): string {
+  return f.fields.map((fld, i) => `${fieldLabel(fld)}=${f.values[i]}`).join(" · ");
 }
 
-function FindingRow({
+function ComboRow({
   caseId,
   timelineId,
   finding,
   onSelectEvent,
-  onDrillField,
+  onComboDrill,
   onJumpToTime,
   isFirstSeen,
-}: FindingRowProps) {
-  // The detector's finding only carries a lightweight, partial "event" stub
-  // (missing artifact/tags/attributes/etc.) for bookkeeping — fetch the full
-  // event record before handing it to the Event Detail panel.
+}: {
+  caseId: string;
+  timelineId: string;
+  finding: ValueComboFinding;
+  onSelectEvent: (event: Event) => void;
+  onComboDrill?: (pairs: [string, string][]) => void;
+  onJumpToTime?: (ts: string, eventId?: string) => void;
+  isFirstSeen: boolean;
+}) {
   const openEvent = useMutation({
     mutationFn: () => eventsApi.getById(caseId, timelineId, finding.event_id!),
     onSuccess: (event) => {
@@ -71,24 +70,24 @@ function FindingRow({
     },
   });
 
+  const pairs = finding.fields.map((fld, i) => [fld, finding.values[i]] as [string, string]);
+
   return (
     <FindingShell
       highlight={isFirstSeen}
       details={finding.details}
       onClick={() => {
-        if (finding.event_id) {
-          openEvent.mutate();
-        }
+        if (finding.event_id) openEvent.mutate();
       }}
       actions={
         <>
-          {onDrillField && (
+          {onComboDrill && (
             <button
-              title={`Filter to ${finding.field}=${finding.value}`}
+              title="Filter to this combination"
               className="rounded p-0.5 hover:bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)] hover:text-[var(--color-accent)]"
               onClick={(e) => {
                 e.stopPropagation();
-                onDrillField(finding.field, finding.value);
+                onComboDrill(pairs);
               }}
             >
               <ChevronsRight size={12} />
@@ -110,35 +109,40 @@ function FindingRow({
         </>
       }
     >
-      {/* Field badge + value */}
-      <div className="flex flex-wrap items-center gap-1">
-        <span className="inline-block rounded bg-[var(--color-bg-elevated)] px-1.5 py-0.5 font-mono text-xs text-[var(--color-fg-muted)]">
-          {fieldLabel(finding.field)}
-        </span>
-        <span
-          className={cn(
-            "font-mono text-xs break-all leading-tight",
-            isFirstSeen
-              ? "text-[var(--color-accent)] font-medium"
-              : "text-[var(--color-fg-primary)]",
-          )}
-        >
-          {finding.value}
-        </span>
+      {/* Stacked field=value pairs */}
+      <div className="space-y-0.5">
+        {finding.fields.map((fld, i) => (
+          <div key={fld} className="flex flex-wrap items-center gap-1">
+            <span className="inline-block rounded bg-[var(--color-bg-elevated)] px-1.5 py-0.5 font-mono text-xs text-[var(--color-fg-muted)]">
+              {fieldLabel(fld)}
+            </span>
+            <span
+              className={cn(
+                "font-mono text-xs break-all leading-tight",
+                isFirstSeen
+                  ? "text-[var(--color-accent)] font-medium"
+                  : "text-[var(--color-fg-primary)]",
+              )}
+            >
+              {finding.values[i]}
+            </span>
+          </div>
+        ))}
+      </div>
+
+      {/* Meta line */}
+      <div className="flex flex-wrap items-center gap-2 pt-0.5 text-xs text-[var(--color-fg-muted)]">
         {isFirstSeen && (
           <span className="rounded bg-[var(--color-accent)] px-1 py-0.5 text-[9px] font-semibold text-white/90 uppercase tracking-wide">
             first seen
           </span>
         )}
-      </div>
-
-      {/* Meta line */}
-      <div className="flex flex-wrap items-center gap-2 text-xs text-[var(--color-fg-muted)]">
         <span>
           count <strong className="text-[var(--color-fg-secondary)]">{finding.count}</strong>
         </span>
         <span>
-          surprise <strong className="text-[var(--color-fg-secondary)]">{finding.score.toFixed(2)}</strong>
+          surprise{" "}
+          <strong className="text-[var(--color-fg-secondary)]">{finding.score.toFixed(2)}</strong>
         </span>
         {finding.first_seen && <span>first {fmtTs(finding.first_seen)}</span>}
       </div>
@@ -146,63 +150,53 @@ function FindingRow({
   );
 }
 
-export function ValueNoveltyView({
+export function ComboNoveltyView({
   caseId,
   timelineId,
   onSelectEvent,
-  onDrillField,
+  onComboDrill,
   onFindingsChange,
   onRunIdChange,
   onJumpToTime,
 }: Props) {
   const [mode, setMode] = useState<DetectorMode>("self");
-  // null = use backend smart default; string[] = explicit analyst selection.
+  // null = auto (top-2 recommended); string[] = explicit selection (≥ 2 to run).
   const [selectedFields, setSelectedFields] = useState<string[] | null>(null);
   const qc = useQueryClient();
 
-  // Compute the fields param for the API. null → omit param → backend
-  // auto-selects. [] (explicitly deselected every field) can't be sent as an
-  // empty string — the API client drops empty-string params — so it's sent as
-  // the reserved "__none__" token, which the backend maps to "scan nothing".
-  const fieldsParam =
-    selectedFields === null
-      ? undefined
-      : selectedFields.length > 0
-        ? selectedFields.join(",")
-        : "__none__";
+  const explicitTooFew = selectedFields !== null && selectedFields.length < MIN_FIELDS;
+  const fieldsParam = selectedFields !== null ? selectedFields.join(",") : undefined;
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "novelty", mode, fieldsParam ?? "__auto__"],
+    queryKey: ["anomalies", caseId, timelineId, "combo", mode, fieldsParam ?? "__auto__"],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
-        detector: "value_novelty",
+        detector: "value_combo",
         limit: 50,
         temporal: mode === "temporal",
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
+    // Don't fire while the explicit selection is below the two-field minimum.
+    enabled: !explicitTooFew,
     staleTime: 60_000,
   });
 
   const tagMutation = useMutation({
     mutationFn: () =>
       anomaliesApi.tag(caseId, timelineId, {
-        detector: "value_novelty",
+        detector: "value_combo",
         limit: 50,
         temporal: mode === "temporal",
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     onSuccess: () => {
-      qc.invalidateQueries({ predicate: (query) => shouldInvalidate(query.queryKey, caseId) });
+      qc.invalidateQueries({ queryKey: ["annotations"] });
     },
   });
 
-  // Memoized against `data` (stable react-query reference) so the marker
-  // hook below doesn't re-fire — and loop — on every render.
   const findings = useMemo(
     () =>
-      (data?.results ?? []).filter(
-        (r): r is ValueNoveltyFinding => r.type === "value_novelty",
-      ),
+      (data?.results ?? []).filter((r): r is ValueComboFinding => r.type === "value_combo"),
     [data],
   );
 
@@ -211,18 +205,14 @@ export function ValueNoveltyView({
     (f) => {
       const ts = f.event?.timestamp ?? f.first_seen;
       if (!ts) return null;
-      const label = `${fieldLabel(f.field)}=${f.value}`;
-      // Temporal-mode findings are, by construction, absent from the
-      // baseline window (the backend only returns baseline_cnt = 0 rows) —
-      // a materially stronger, more specific claim than "rare", so say
-      // exactly that rather than reusing the self-baseline phrasing.
+      const label = comboLabel(f);
       const detail =
         data?.method === "temporal"
-          ? `New value: ${label} — absent from the ${(data.baseline_size ?? 0).toLocaleString()}-event ` +
+          ? `New combination: ${label} — absent from the ${(data.baseline_size ?? 0).toLocaleString()}-event ` +
             `baseline window; first appears in the detect window` +
             `${f.first_seen ? ` at ${fmtTs(f.first_seen)}` : ""} ` +
             `(${f.count} occurrence${f.count === 1 ? "" : "s"} here; surprise ${f.score.toFixed(2)})`
-          : `Rare value: ${label} — appears ${f.count} time${f.count === 1 ? "" : "s"}` +
+          : `Rare combination: ${label} — appears ${f.count} time${f.count === 1 ? "" : "s"}` +
             `${data?.baseline_size ? ` of ${data.baseline_size.toLocaleString()} events in the corpus` : ""} ` +
             `(surprise ${f.score.toFixed(2)})`;
       return {
@@ -231,7 +221,7 @@ export function ValueNoveltyView({
         detail,
         eventId: f.event_id,
         sourceId: f.event?.source_id,
-        detector: "value_novelty" as const,
+        detector: "value_combo" as const,
         rawDetails: f.details,
       };
     },
@@ -251,28 +241,38 @@ export function ValueNoveltyView({
           timelineId={timelineId}
           selected={selectedFields}
           onChange={setSelectedFields}
-          autoCount={15}
+          minSelected={MIN_FIELDS}
+          maxSelected={MAX_FIELDS}
+          autoCount={2}
+          autoLabel="top 2"
         />
         <RefreshButton isFetching={isFetching} onClick={() => refetch()} />
       </div>
 
-      <DetectorStatusLine data={data} />
+      {!explicitTooFew && <DetectorStatusLine data={data} />}
 
-      {isLoading && (
+      {explicitTooFew && (
+        <div className="flex items-center gap-2 py-4 text-xs text-[var(--color-warning)]">
+          <Info size={13} />
+          <span>Pick at least two fields to combine, or reset to auto (top 2).</span>
+        </div>
+      )}
+
+      {!explicitTooFew && isLoading && (
         <div className="flex justify-center py-6">
           <Spinner size={18} />
         </div>
       )}
 
-      {!isLoading && findings.length === 0 && (
+      {!explicitTooFew && !isLoading && findings.length === 0 && (
         <div className="flex items-center gap-2 py-4 text-xs text-[var(--color-fg-muted)]">
           <Info size={13} />
           <span>
-            {selectedFields !== null && selectedFields.length === 0
-              ? "No fields selected to scan. Pick fields above, or reset to auto."
-              : data?.status === "no_data"
-                ? "No rare values detected. No events ingested yet."
-                : "No rare values detected. All field values appear frequently."}
+            {data?.status === "no_data"
+              ? "No combinations detected. No events ingested yet."
+              : data?.status === "insufficient_data"
+                ? "Not enough distinct fields to combine. Pick fields explicitly above."
+                : "No rare combinations detected. All field pairings appear frequently."}
           </span>
         </div>
       )}
@@ -281,13 +281,13 @@ export function ValueNoveltyView({
       {findings.length > 0 && (
         <div className="space-y-1.5">
           {findings.map((f, i) => (
-            <FindingRow
-              key={`${f.field}:${f.value}:${i}`}
+            <ComboRow
+              key={`${f.values.join("|")}:${i}`}
               caseId={caseId}
               timelineId={timelineId}
               finding={f}
               onSelectEvent={onSelectEvent}
-              onDrillField={onDrillField}
+              onComboDrill={onComboDrill}
               onJumpToTime={onJumpToTime}
               isFirstSeen={data?.method === "temporal"}
             />
@@ -304,11 +304,10 @@ export function ValueNoveltyView({
       <div className="flex items-start gap-1.5 text-xs text-[var(--color-fg-muted)] pt-1">
         <AlertTriangle size={10} className="mt-0.5 shrink-0" />
         <span>
-          Rare ≠ malicious.{" "}
-          {mode === "temporal"
-            ? "Temporal mode ignores the rarity floor — it flags any value absent from the baseline window but present in the detect window."
-            : "Self-baseline mode flags values that appear ≤ rarity floor times in the whole corpus."}{" "}
-          Score = −log(count/total); higher is rarer.
+          A combination can be rare even when each field's values are common —
+          e.g. an <span className="font-mono">(action, hour)</span> pair like{" "}
+          <span className="font-mono">(login_ok, 03:00)</span>. Auto mode combines the two
+          highest-coverage recommended fields. Score = −log(count/total); higher is rarer.
         </span>
       </div>
     </div>

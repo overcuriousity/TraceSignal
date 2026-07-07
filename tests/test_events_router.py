@@ -547,6 +547,9 @@ class _FakeStatAnomalyService:
         self._midpoint = midpoint
         self.frequency_calls: list[dict] = []
         self.value_novelty_calls: list[dict] = []
+        self.combo_calls: list[dict] = []
+        self.order_calls: list[dict] = []
+        self.range_calls: list[dict] = []
 
     def get_timeline_midpoint(self, case_id, source_ids):
         return self._midpoint
@@ -558,6 +561,18 @@ class _FakeStatAnomalyService:
     def find_value_novelty(self, **kwargs):
         self.value_novelty_calls.append(kwargs)
         return "value-novelty-result"
+
+    def find_value_combos(self, **kwargs):
+        self.combo_calls.append(kwargs)
+        return "value-combo-result"
+
+    def find_order_violations(self, **kwargs):
+        self.order_calls.append(kwargs)
+        return "order-result"
+
+    def find_range_violations(self, **kwargs):
+        self.range_calls.append(kwargs)
+        return "range-result"
 
 
 @pytest.fixture()
@@ -648,6 +663,95 @@ async def test_run_stat_detector_auto_fields_resolves_cache_inventory(
     assert call["fields"] is None
     assert call["inventory"] == [("artifact", 2, 10)]
     assert call["inventory_total"] == 10
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_dispatches_to_value_combo(patched_store, monkeypatch):
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    result = await events._run_stat_detector(
+        "c1",
+        ["s1"],
+        detector="value_combo",
+        fields="attr:action,attr:hour",
+        series_field="artifact",
+        z_threshold=None,
+        baseline_end=None,
+        temporal=False,
+        limit=50,
+    )
+    assert result == "value-combo-result"
+    assert fake_svc.combo_calls[0]["fields"] == ["attr:action", "attr:hour"]
+    assert not fake_svc.value_novelty_calls
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_value_combo_rejects_single_field(patched_store, monkeypatch):
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    with pytest.raises(HTTPException) as exc:
+        await events._run_stat_detector(
+            "c1",
+            ["s1"],
+            detector="value_combo",
+            fields="artifact",
+            series_field="artifact",
+            z_threshold=None,
+            baseline_end=None,
+            temporal=False,
+            limit=50,
+        )
+    assert exc.value.status_code == 422
+    assert not fake_svc.combo_calls
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_dispatches_to_numeric_range(patched_store, monkeypatch):
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    result = await events._run_stat_detector(
+        "c1",
+        ["s1"],
+        detector="numeric_range",
+        fields="attr:bytes",
+        series_field="artifact",
+        z_threshold=None,
+        baseline_end=None,
+        temporal=False,
+        limit=50,
+    )
+    assert result == "range-result"
+    assert fake_svc.range_calls[0]["fields"] == ["attr:bytes"]
+    assert not fake_svc.value_novelty_calls
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_dispatches_to_timestamp_order(patched_store, monkeypatch):
+    """timestamp_order dispatches without resolving a temporal midpoint (mode-less)."""
+    fake_svc = _FakeStatAnomalyService(midpoint=datetime(2024, 6, 15, 12, 0, 0))
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    result = await events._run_stat_detector(
+        "c1",
+        ["s1"],
+        detector="timestamp_order",
+        fields=None,
+        series_field="artifact",
+        z_threshold=None,
+        baseline_end=None,
+        temporal=True,  # ignored by this detector
+        limit=50,
+        min_skew_seconds=5.0,
+    )
+    assert result == "order-result"
+    assert len(fake_svc.order_calls) == 1
+    assert fake_svc.order_calls[0]["min_skew_seconds"] == 5.0
+    # Mode-less: never touches the value/frequency paths.
+    assert not fake_svc.frequency_calls
+    assert not fake_svc.value_novelty_calls
 
 
 @pytest.mark.asyncio
@@ -789,6 +893,7 @@ def _call_list_anomalies(persist: bool = True):
         fields=None,
         series_field="artifact",
         z_threshold=None,
+        min_skew_seconds=None,
         baseline_end=None,
         temporal=False,
         limit=50,

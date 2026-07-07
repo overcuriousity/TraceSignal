@@ -17,6 +17,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from tracesignal.db._dt import NULL_TS_SENTINEL
+
 
 @dataclass(frozen=True, slots=True)
 class ParserConfig:
@@ -218,7 +220,11 @@ class Event:
             "parser_version": self.parser_version,
             "ingest_time": self.ingest_time,
             "message": self.message,
-            "timestamp": parsed_ts if parsed_ts is not None else None,
+            # Storage sentinel, not NULL: `timestamp` is a (non-Nullable)
+            # MergeTree sort-key column. Presented as null on the way out —
+            # see db/_dt.py. The raw line and content_hash are untouched, so
+            # forensic provenance is unaffected by this encoding.
+            "timestamp": parsed_ts if parsed_ts is not None else NULL_TS_SENTINEL,
             "timestamp_desc": self.timestamp_desc or "",
             "artifact": self.artifact or "",
             "artifact_long": self.artifact_long or "",

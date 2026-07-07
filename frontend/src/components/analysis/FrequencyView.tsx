@@ -7,12 +7,10 @@
  * time range. Clicking a row (onDrillField/onJumpToTime) narrows the event
  * explorer to that series value and scrolls/highlights the anomalous window.
  */
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
-  RefreshCw,
-  Tag,
   Info,
   TrendingUp,
   TrendingDown,
@@ -21,11 +19,16 @@ import {
 import { anomaliesApi } from "@/api/anomalies";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { shouldInvalidate } from "@/hooks/useCaseStream";
-import { Button } from "@/components/ui/Button";
+import {
+  DetectorStatusLine,
+  RefreshButton,
+  TagFindingsBar,
+  useAnomalyMarkers,
+  useDetectorRunId,
+} from "./detector-shared";
 import { Spinner } from "@/components/ui/Spinner";
 import type { AnomalyMarker, FrequencyFinding } from "@/api/types";
 import { cn } from "@/lib/cn";
-import { tagResultLabel } from "@/lib/format";
 import { fmtTimestampCompactUtc as fmtTs } from "@/lib/time";
 
 interface Props {
@@ -190,7 +193,7 @@ export function FrequencyView({
 
   // Fetch dynamic attribute fields to extend the GROUP BY dropdown.
   const { data: fieldsData } = useQuery({
-    queryKey: ["anomaly-fields", caseId, timelineId],
+    queryKey: ["anomalies", caseId, timelineId, "fields"],
     queryFn: () => anomaliesApi.fields(caseId, timelineId),
     staleTime: 5 * 60 * 1000,
   });
@@ -207,7 +210,7 @@ export function FrequencyView({
   }, [fieldsData]);
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies-frequency", caseId, timelineId, seriesField, zThresholdParam],
+    queryKey: ["anomalies", caseId, timelineId, "frequency", seriesField, zThresholdParam],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "frequency",
@@ -241,9 +244,9 @@ export function FrequencyView({
     [data],
   );
 
-  useEffect(() => {
-    if (!onFindingsChange) return;
-    const markers: AnomalyMarker[] = findings.map((f) => {
+  useAnomalyMarkers(
+    findings,
+    (f): AnomalyMarker => {
       const label = `${f.series_field}=${f.series_value} spike`;
       const direction = f.z_score > 0 ? "spike" : "drop";
       // In self-baseline (non-temporal) z-score mode, "expected" comes from a
@@ -270,17 +273,11 @@ export function FrequencyView({
         rawDetails: f.details,
         windowEnd: f.window_end,
       };
-    });
-    onFindingsChange(markers);
-    return () => onFindingsChange([]);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [findings]);
+    },
+    onFindingsChange,
+  );
 
-  useEffect(() => {
-    if (!onRunIdChange) return;
-    onRunIdChange(data?.run_id ?? undefined);
-    return () => onRunIdChange(undefined);
-  }, [data?.run_id, onRunIdChange]);
+  useDetectorRunId(data?.run_id, onRunIdChange);
 
   return (
     <div className="space-y-3">
@@ -327,30 +324,13 @@ export function FrequencyView({
             className="w-12 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-1 py-0.5 text-xs text-[var(--color-fg-primary)] focus:outline-none focus:border-[var(--color-accent)]"
           />
         </span>
-        <button
-          title="Refresh"
-          className="rounded p-0.5 hover:bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)]"
-          onClick={() => refetch()}
-        >
-          <RefreshCw size={12} className={isFetching ? "animate-spin" : ""} />
-        </button>
+        <RefreshButton isFetching={isFetching} onClick={() => refetch()} />
       </div>
 
-      {/* Status line */}
-      {data && (
-        <div className="flex items-center gap-2 text-xs text-[var(--color-fg-muted)]">
-          <span className="capitalize">{data.method}</span>
-          <span>·</span>
-          <span>z ≥ {data.z_threshold ?? zThresholdParam ?? "?"}</span>
-          <span>·</span>
-          <span>{data.baseline_size.toLocaleString()} events in baseline</span>
-          {data.status !== "ok" && (
-            <span className="text-[var(--color-warning)]">
-              · {data.status.replace(/_/g, " ")}
-            </span>
-          )}
-        </div>
-      )}
+      <DetectorStatusLine
+        data={data}
+        extra={<span>z ≥ {data?.z_threshold ?? zThresholdParam ?? "?"}</span>}
+      />
 
       {isLoading && (
         <div className="flex justify-center py-6">
@@ -387,26 +367,7 @@ export function FrequencyView({
 
       {/* Tag action */}
       {findings.length > 0 && (
-        <div className="flex items-center gap-2 pt-1 border-t border-[var(--color-border)]">
-          <Button
-            size="sm"
-            variant="ghost"
-            disabled={tagMutation.isPending}
-            onClick={() => tagMutation.mutate()}
-            className="gap-1.5 text-xs"
-          >
-            {tagMutation.isPending ? <Spinner size={11} /> : <Tag size={11} />}
-            Tag {findings.length} windows
-          </Button>
-          {tagMutation.isSuccess && (
-            <span className="text-xs text-[var(--color-success)]">
-              {tagResultLabel(tagMutation.data)}
-            </span>
-          )}
-          {tagMutation.isError && (
-            <span className="text-xs text-[var(--color-error)]">Failed</span>
-          )}
-        </div>
+        <TagFindingsBar mutation={tagMutation} label={`Tag ${findings.length} windows`} />
       )}
 
       {/* Hint */}

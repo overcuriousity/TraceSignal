@@ -323,6 +323,23 @@ export function ExplorerPage() {
   );
 
   /**
+   * Wired to ComboNoveltyView — applies every (field, value) pair of a
+   * combination as a conjunction in a single update. Folding one applyFieldFilter
+   * call per pair (rather than calling handleDrillField in a loop) avoids each
+   * call clobbering the previous against the same stale `filters` closure.
+   */
+  const handleComboDrill = useCallback(
+    (pairs: [string, string][]) => {
+      let next = filters;
+      for (const [field, value] of pairs) {
+        next = applyFieldFilter(next, mapAnomalyField(field), value, true);
+      }
+      setFilters(next);
+    },
+    [filters, setFilters, applyFieldFilter, mapAnomalyField],
+  );
+
+  /**
    * Wired to FrequencyView — narrows the time range to the anomalous window
    * AND filters to the series field=value that spiked, in a single update.
    */
@@ -1099,6 +1116,7 @@ export function ExplorerPage() {
                     onSelectEvent={(ev) => handleExpandEvent(ev)}
                     onSimilarClose={() => setSimilarAnchor(null)}
                     onDrillField={handleDrillField}
+                    onComboDrill={handleComboDrill}
                     onFrequencyDrill={handleFrequencyDrill}
                     onAnomalyMarkers={setAnomalyMarkers}
                     onAnomalyRunId={setAnomalyRunId}

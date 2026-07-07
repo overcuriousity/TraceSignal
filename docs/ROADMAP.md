@@ -28,6 +28,13 @@ resolved — this file holds only the condensed, still-open action items.
 
 ## Milestone 1 — correctness & forensic integrity (Medium severity)
 
+- [ ] **Enricher eligibility shares one ClickHouse client across threads.** The timeline
+  enrichers endpoint (`api/routers/cases.py`, `list_timeline_enrichers` handler) builds a
+  single `ClickHouseStore()` then fans out `check_eligibility` over
+  `asyncio.gather(run_in_threadpool(...))`. `clickhouse_connect` clients are not thread-safe,
+  so concurrent queries on one client can interleave on the shared connection and block or
+  corrupt responses. Harmless today (only GeoIP is registered → gather of one), but a second
+  enricher makes it live. Fix: one `ClickHouseStore` per eligibility check, or serialize them.
 
 ## Milestone 2 — high-leverage improvements
 
@@ -45,6 +52,14 @@ resolved — this file holds only the condensed, still-open action items.
   for ~100M rows). Revisit only if measured insufficient: ClickHouse native protocol
   (clickhouse-driver, port 9000), `async_insert`, parse/insert pipelining (parser thread
   feeding an insert thread).
+
+- [ ] **M23 — detector-scan residue (post 300M-row overhaul, session 27).** Two follow-ups
+  deliberately deferred: (a) `canonical_inventory` stays a live query — it only runs when a
+  timeline has field mappings, which the 300M reference case doesn't; add the planned
+  Postgres cache (key = case + sorted sources + mappings + per-source `computed_at`) only if
+  a mapped timeline at that scale measures slow. (b) Per-field novelty scans each re-read the
+  whole `attributes` map column (~12 GiB / ~23 s per field at 300M rows); batching all
+  scanned fields into one pass over `attributes` would amortize that ~7× for a panel open.
 
 - [ ] **M22 residue — tokenbf text-search fast path.** Items (a) typed `IN` for String
   columns, (c) single-round-trip histogram, and (d) novelty auto-field selection via the
@@ -73,27 +88,24 @@ resolved — this file holds only the condensed, still-open action items.
 
 Detectors adapted from [ait-aecid/logdata-anomaly-miner](https://github.com/ait-aecid/logdata-anomaly-miner),
 constrained to be **field-agnostic**: they operate on value identity, syntax, and statistics —
-never on what a field value *means*. All follow the existing baseline/detect-window pattern in
-`db/anomaly_stats.py` (self-baseline + temporal `baseline_end` modes) and must stay
-SQL-explainable per the forensic-reproducibility requirement. Update `docs/ANOMALY_DETECTION.md`
-in the same commit as each detector.
+never on what a field value *means*. Most follow the existing baseline/detect-window pattern in
+`db/anomaly_stats.py` (self-baseline + temporal `baseline_end` modes); a few are mode-less
+(e.g. shipped D2 is positional, `method="sequential"`). All must stay SQL-explainable per the
+forensic-reproducibility requirement. Update `docs/ANOMALY_DETECTION.md` in the same commit as
+each detector.
+
+Prep landed: shared frontend detector scaffolding (`components/analysis/detector-shared.tsx`),
+a Radix `Select` detector switcher replacing the flat sub-tab strip, standardized
+`["anomalies", caseId, timelineId, ...]` query keys, and an `_col_expr(prefix=...)` param for
+multi-field queries. **D1 (value-combo), D2 (timestamp-order), and D4 (numeric-range)
+shipped.**
 
 High value first:
 
-- [ ] **D1 — Value-combo novelty** (AMiner `NewMatchPathValueComboDetector`): extend
-  `value_novelty` from single fields to field *tuples* (e.g. any two selected fields) — flag
-  combinations first seen in the detect window. ClickHouse `GROUP BY tuple(...)`; exact-match,
-  fully explainable.
-- [ ] **D2 — Timestamp-order violations** (AMiner `TimestampsUnsortedDetector`): flag
-  out-of-order timestamps within a source relative to ingest/record order. Log-tampering and
-  clock-manipulation indicator; near-free via window functions over `(source_id, record order)`.
 - [ ] **D3 — Charset novelty** (AMiner `CharsetDetector`): per field, learn the baseline
   character set of values; flag values in the detect window containing never-seen characters
   (null bytes, unicode homoglyphs, injection metacharacters — detected syntactically, not by
   meaning).
-- [ ] **D4 — Numeric range violations** (AMiner `ValueRangeDetector`): for fields whose values
-  parse as numeric (syntactic type detection only), learn baseline min/max or quantile band;
-  flag detect-window values outside it. Trivial SQL, trivially explainable.
 - [ ] **D5 — Value entropy outliers** (AMiner `EntropyDetector`): per field, Shannon
   character-entropy of each value vs. the field's baseline entropy distribution; flags
   random-looking strings (DGA domains, encoded payloads) without interpreting them.
