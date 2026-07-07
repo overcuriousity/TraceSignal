@@ -537,6 +537,8 @@ export interface HealthResponse {
   status: "ok";
   version: string;
   oidc_enabled: boolean;
+  /** False when neither local embedding deps nor a remote endpoint are configured. */
+  embeddings_available: boolean;
 }
 
 /** Non-default field-filter match modes; "exact" is implied by absence. */
