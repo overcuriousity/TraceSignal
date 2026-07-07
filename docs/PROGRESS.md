@@ -1,6 +1,37 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-07 (session 27 — ClickHouse query-cost overhaul after 300M-row incident).
+Last updated: 2026-07-07 (session 28 — D3 charset + D5 entropy detectors, M1 enricher fix).
+
+## Session 28 — 2026-07-07: charset + entropy detectors (D3/D5), enricher client fix (M1)
+
+Milestone-4 detector expansion continued with the next two AMiner-inspired, field-agnostic
+detectors, plus the Milestone-1 thread-safety fix:
+
+- **M1**: the timeline-enrichers endpoint shared one `ClickHouseStore` across its
+  `asyncio.gather(run_in_threadpool(...))` eligibility fan-out; `clickhouse_connect` clients
+  are not thread-safe. Each check now builds its own store inside the worker thread.
+- **D3 `charset`** (`find_charset_novelty`): per field, learn a reference character set over
+  *distinct values* and flag values containing characters outside it (NUL bytes, homoglyphs,
+  injection metacharacters — purely syntactic). Self-baseline inverts the degenerate
+  whole-corpus charset into a rare-character rule (chars in ≤ rarity_floor distinct values);
+  temporal learns the baseline window's alphabet. Score = value_novelty's surprise family
+  summed per novel char; findings carry the chars + U+XXXX codepoints. Skips fields with
+  < 20 distinct baseline values or alphabets > 5000 chars.
+- **D5 `entropy`** (`find_entropy_outliers`): Shannon character entropy per distinct value vs.
+  a Tukey fence over the field's baseline entropy distribution — above-band ≈ random-looking
+  (DGA/encoded), below-band ≈ degenerate (padding). Both modes use the IQR fence (quantiles,
+  unlike min/max, aren't degenerate over their own population). Values < 6 codepoints excluded
+  throughout; score = excess ÷ band width like numeric_range.
+- Shared `_auto_string_fields` helper: auto-selection for D3/D5 keeps identifier-kind fields
+  (URLs, UAs, filenames) — exactly where injected metacharacters and random strings live —
+  unlike value_novelty's categorical-only default.
+- Frontend: `CharsetNoveltyView` + `EntropyView` on the shared detector scaffolding, registry
+  entries, Method-tab sections; `docs/ANOMALY_DETECTION.md` §5/§6 (similarity renumbered §7).
+- Validated live against ClickHouse 26.6: `extractAll(val, '(?s).')` round-trips NUL and
+  unicode (incl. via `Array(String)` params); invalid UTF-8 bytes are *dropped* by re2 —
+  documented as a caveat with a byte-level fallback option. End-to-end synthetic run flagged
+  a DGA hostname (charset novel-chars + entropy above-band) and an `aaaa…` host (below-band)
+  in both modes.
 
 ## Session 27 — 2026-07-07: 300M-row perf overhaul (timestamp sentinel, two-phase queries)
 
