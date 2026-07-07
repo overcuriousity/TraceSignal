@@ -28,6 +28,13 @@ resolved — this file holds only the condensed, still-open action items.
 
 ## Milestone 1 — correctness & forensic integrity (Medium severity)
 
+- [ ] **Enricher eligibility shares one ClickHouse client across threads.** The timeline
+  enrichers endpoint (`api/routers/cases.py`, `list_timeline_enrichers` handler) builds a
+  single `ClickHouseStore()` then fans out `check_eligibility` over
+  `asyncio.gather(run_in_threadpool(...))`. `clickhouse_connect` clients are not thread-safe,
+  so concurrent queries on one client can interleave on the shared connection and block or
+  corrupt responses. Harmless today (only GeoIP is registered → gather of one), but a second
+  enricher makes it live. Fix: one `ClickHouseStore` per eligibility check, or serialize them.
 
 ## Milestone 2 — high-leverage improvements
 
