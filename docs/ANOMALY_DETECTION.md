@@ -9,20 +9,22 @@ file and the "Method" tab copy in the same commit — see
 [Reality check](#reality-check-2026-07) at the bottom for the audit that
 produced this file and what was fixed as part of it.
 
-There are five independent analysis tools in TraceSignal:
+There are seven independent analysis tools in TraceSignal:
 
 1. [Value novelty](#1-value-novelty-rare--first-seen-values) — rare/new field values, single field or [combinations](#value-combinations-the-value_combo-variant) (ClickHouse, no ML)
 2. [Frequency anomalies](#2-frequency-anomalies-volume-spikes--silences) — volume spikes/silences (ClickHouse, no ML)
 3. [Timestamp order](#3-timestamp-order-out-of-order-records) — timestamps running backwards in record order (ClickHouse, no ML)
 4. [Numeric range](#4-numeric-range-out-of-band-values) — numeric values outside a learned band (ClickHouse, no ML)
-5. [Semantic similarity search](#5-semantic-similarity-search) — "find events like this one" (embeddings + Qdrant)
+5. [Charset novelty](#5-charset-novelty-never-seen-characters) — values containing characters outside a field's learned character set (ClickHouse, no ML)
+6. [Entropy outliers](#6-entropy-outliers-random-looking-values) — values whose character entropy falls outside the field's learned band (ClickHouse, no ML)
+7. [Semantic similarity search](#7-semantic-similarity-search) — "find events like this one" (embeddings + Qdrant)
 
-The first four are **statistical detectors**: pure counting and arithmetic over
+The first six are **statistical detectors**: pure counting and arithmetic over
 already-ingested events, no machine learning, no network calls, work the
-instant ingestion finishes. The fifth needs an explicit embedding step first.
+instant ingestion finishes. The seventh needs an explicit embedding step first.
 
-Code: `src/tracesignal/db/anomaly_stats.py` (detectors 1–4),
-`src/tracesignal/db/similarity.py` (detector 5). UI: `frontend/src/components/analysis/`.
+Code: `src/tracesignal/db/anomaly_stats.py` (detectors 1–6),
+`src/tracesignal/db/similarity.py` (detector 7). UI: `frontend/src/components/analysis/`.
 
 ### Query-cost discipline (all statistical detectors)
 
@@ -466,7 +468,162 @@ distinct violating value.
 
 ---
 
-## 5. Semantic similarity search
+## 5. Charset novelty (never-seen characters)
+
+**What it answers:** "Does any value of this field contain a *character* that
+this field's values never otherwise contain?" A null byte inside a username, a
+Cyrillic homoglyph in a hostname, a `'` or `;` in a field that is otherwise
+plain alphanumerics.
+
+Adapted from AMiner's `CharsetDetector`.
+
+**Why it's useful:** Injection payloads, encoding-smuggling, and homoglyph
+spoofing change a value's *alphabet* before they change anything a value- or
+frequency-level detector can see. `admin` and `аdmin` (Cyrillic а) are two
+different rare values to the novelty detector — but only the charset detector
+says *why* the second one is suspicious. Detection is purely syntactic: the
+detector compares character identities, never what a value means.
+
+**Character sets are learned over distinct values, not rows.** A character
+carried by one hot value that repeats a million times counts once. This keeps
+a field's reference alphabet a property of its vocabulary, not of its traffic
+volume.
+
+### Two modes
+
+| | Self-baseline (`rare-chars`) | Temporal (`temporal-charset`) |
+|---|---|---|
+| Reference set | characters appearing in **more than** `rarity_floor` (3) distinct values | every character seen in baseline-window values |
+| Flags | values containing a character almost no other value has | detect-window values containing a character the baseline never had |
+
+**Why self-baseline can't use the plain charset.** The whole corpus's
+character set trivially contains every character in the corpus — nothing could
+ever be novel (the same degeneracy as an exact min/max band in the numeric
+range detector). So self-baseline mode inverts it: a character is *rare* when
+it appears in at most `rarity_floor` distinct values, and any value containing
+a rare character is flagged. "Of 5,000 distinct usernames, exactly one
+contains a NUL byte" is precisely the finding this mode exists for.
+
+**Temporal mode is the AMiner-faithful one:** learn the baseline window's
+alphabet, flag detect-window values whose characters step outside it.
+
+### The score
+
+```
+score = Σ over the value's novel characters of −log(values_with_char / distinct_values)
+```
+
+The same "surprise" family as value novelty, summed per novel character — a
+value containing two rare characters outranks a value containing one, and a
+character shared by 3 values scores lower than a character in exactly 1. In
+temporal mode a novel character was never seen at all, so each contributes the
++1-smoothed maximum `log(distinct_values + 1)`. Findings carry the novel
+characters *and their unicode codepoints* (`U+0000`, …) in `details`, so
+invisible characters are visible in the report.
+
+### Caveats
+
+- **Free-text fields in large scripts.** A field whose reference alphabet
+  exceeds 5,000 characters (CJK prose, base64 blobs mixing full alphabets) is
+  skipped — "novel character" is meaningless there. Fields with fewer than 20
+  distinct baseline values are skipped too (an alphabet learned from a handful
+  of values flags everything). If every scanned field skips, the status is
+  `insufficient_data`.
+- **Characters are extracted with re2 (`extractAll(val, '(?s).')`) in UTF-8
+  mode.** Codepoints — including NUL — are handled; byte sequences that are not
+  valid UTF-8 may be skipped by the regex engine rather than surfaced as
+  findings. (A byte-level fallback exists as a documented option if this bites
+  in practice.)
+- **Auto field selection differs from value novelty:** identifier-kind fields
+  (URLs, filenames, user agents — near-unique values) are *included*, since
+  that's exactly where injected metacharacters live. Constant and sparse
+  fields stay excluded. Within the 15-field auto cap, up to 5 slots are
+  reserved for identifier fields so a source with many categorical columns
+  can't crowd them out (categoricals otherwise sort first); the Fields picker's
+  "auto" preview mirrors this selection.
+- **Tuning:** the rare-character floor is its own setting,
+  `stat_charset_rarity_floor` (`TS_STAT_CHARSET_RARITY_FLOOR`, default 3),
+  separate from value novelty's `stat_rarity_floor` so the two detectors can be
+  tuned independently — they count different things (distinct-values-per-char
+  vs. value occurrences).
+- Rare ≠ malicious, as everywhere: a legitimately imported UTF-8 name and a
+  homoglyph attack look identical to this detector. It ranks for triage.
+
+---
+
+## 6. Entropy outliers (random-looking values)
+
+**What it answers:** "Does any value of this field look *statistically unlike*
+the field's normal values — too random, or too repetitive?" A DGA domain
+(`kq3v9xz2m8w1.com`) among human-named hosts, a base64 payload in a field of
+plain words, a padding string of one repeated character.
+
+Adapted from AMiner's `EntropyDetector`.
+
+**Why it's useful:** Randomness is a fingerprint of machine-generated content
+— DGA domains, encoded/encrypted payloads, session keys dropped into the wrong
+field. None of these are "rare values" in a useful sense (every DGA domain is
+unique, so all of them are maximally rare) — what distinguishes them is
+*character-level* statistics. The inverse signal matters too: near-zero
+entropy means degenerate stuffing (`AAAA…`, `xxxxxxxx`) that often marks
+overflow padding or sanitizer artifacts.
+
+**The measurement: Shannon character entropy.** For one value, count how often
+each character occurs, turn the counts into frequencies, and sum
+`−f·log₂(f)` over the characters. The result is bits per character: English
+words sit around 2.5–4 bits, uniformly random alphanumerics near 5–6, a single
+repeated character at exactly 0. The detector never interprets the value —
+only its character histogram.
+
+**Entropies are per distinct value, not per row.** A hot value repeated a
+million times contributes one point to the field's entropy distribution, so
+traffic volume can't drag the band. Values shorter than 6 characters are
+excluded outright (baseline and detect): a 3-character string's entropy is
+degenerate and would flood the band with false lows.
+
+### Two modes
+
+| | Self-baseline (`iqr`) | Temporal (`temporal-iqr`) |
+|---|---|---|
+| Baseline population | entropies of every distinct value in the corpus | entropies of distinct values before `baseline_end` |
+| Band | Tukey fence `[q1 − 1.5·IQR, q3 + 1.5·IQR]` | same fence, learned from the baseline window |
+| Flags | statistical entropy outliers anywhere | detect-window values outside the baseline's band |
+
+Unlike the numeric-range detector, *both* modes can use the fence directly:
+quartiles are not degenerate over their own population the way an exact
+min/max is, so self-baseline mode needs no special construction.
+
+### The score
+
+```
+score = distance outside the band ÷ band width
+```
+
+Identical to the numeric-range score — a value one band-width past the fence
+scores 1.0. `direction` says which side: **above** = random-looking, **below**
+= degenerate/repetitive. Findings carry the entropy, band, quartiles, and
+baseline size in `details`.
+
+### Caveats
+
+- **Legitimate high-entropy fields.** Hashes, UUIDs, and tokens are *supposed*
+  to be random — a field of session IDs will produce a high, tight band and
+  flag nothing (good), but a mixed field (URLs that sometimes embed tokens)
+  will flag the tokens. That's usually the interesting case anyway; deselect
+  the field if not.
+- **Entropy is length-insensitive beyond the minimum.** A short random string
+  and a long random string score similarly; this detector finds *character
+  randomness*, not payload size — pair with numeric range over a length field
+  if size matters.
+- **Baseline size floor.** Fields with fewer than 20 qualifying distinct
+  baseline values are skipped; if every scanned field skips, the status is
+  `insufficient_data`.
+- Rare ≠ malicious, as everywhere: a CDN hostname and a DGA domain can score
+  identically. It ranks for triage.
+
+---
+
+## 7. Semantic similarity search
 
 Not a statistical anomaly detector — no baseline, no score threshold, no
 z-score — but it lives in the same Analysis tab and Method panel, so it's

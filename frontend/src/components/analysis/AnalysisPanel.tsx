@@ -9,6 +9,8 @@ import {
   Rewind,
   Layers,
   Ruler,
+  Shuffle,
+  Type,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/Button";
@@ -24,6 +26,8 @@ import { ComboNoveltyView } from "./ComboNoveltyView";
 import { FrequencyView } from "./FrequencyView";
 import { OrderViolationsView } from "./OrderViolationsView";
 import { NumericRangeView } from "./NumericRangeView";
+import { CharsetNoveltyView } from "./CharsetNoveltyView";
+import { EntropyView } from "./EntropyView";
 import { SimilarEvents } from "./SimilarEvents";
 import { SemanticSearch } from "./SemanticSearch";
 import { EmbeddingStatusBanner } from "./EmbeddingStatusBanner";
@@ -34,7 +38,7 @@ import { cn } from "@/lib/cn";
 import type { AnomalyMarker, Event } from "@/api/types";
 
 type Tab = "anomalies" | "similar" | "methodology";
-type AnomalySubTab = "novelty" | "combo" | "frequency" | "order" | "range";
+type AnomalySubTab = "novelty" | "combo" | "frequency" | "order" | "range" | "charset" | "entropy";
 
 /**
  * Detector registry for the anomaly dropdown. Flat sub-tab buttons stopped
@@ -76,6 +80,18 @@ const DETECTORS: {
     icon: Ruler,
     label: "Numeric range",
     description: "Numeric values outside a learned band",
+  },
+  {
+    id: "charset",
+    icon: Type,
+    label: "Charset novelty",
+    description: "Values containing never-seen characters",
+  },
+  {
+    id: "entropy",
+    icon: Shuffle,
+    label: "Entropy outliers",
+    description: "Random-looking or degenerate strings",
   },
 ];
 
@@ -299,6 +315,30 @@ export function AnalysisPanel({
 
         {tab === "anomalies" && anomalySubTab === "range" && (
           <NumericRangeView
+            caseId={caseId}
+            timelineId={timelineId}
+            onSelectEvent={onSelectEvent}
+            onDrillField={onDrillField}
+            onFindingsChange={onAnomalyMarkers}
+            onRunIdChange={onAnomalyRunId}
+            onJumpToTime={onJumpToTime}
+          />
+        )}
+
+        {tab === "anomalies" && anomalySubTab === "charset" && (
+          <CharsetNoveltyView
+            caseId={caseId}
+            timelineId={timelineId}
+            onSelectEvent={onSelectEvent}
+            onDrillField={onDrillField}
+            onFindingsChange={onAnomalyMarkers}
+            onRunIdChange={onAnomalyRunId}
+            onJumpToTime={onJumpToTime}
+          />
+        )}
+
+        {tab === "anomalies" && anomalySubTab === "entropy" && (
+          <EntropyView
             caseId={caseId}
             timelineId={timelineId}
             onSelectEvent={onSelectEvent}

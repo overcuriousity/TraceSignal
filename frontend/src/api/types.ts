@@ -315,6 +315,41 @@ export interface NumericRangeFinding {
   details: Record<string, unknown>;
 }
 
+/** One value containing never-seen characters from the charset detector. */
+export interface CharsetFinding {
+  type: "charset";
+  field: string;
+  value: string;
+  /** Characters in the value outside the field's reference character set. */
+  novel_chars: string[];
+  count: number;
+  /** Sum of per-novel-char surprise — higher = more/rarer novel characters. */
+  score: number;
+  first_seen: string | null;
+  event_id: string | null;
+  event: Event | null;
+  details: Record<string, unknown>;
+}
+
+/** One entropy-outlier value from the entropy detector. */
+export interface EntropyFinding {
+  type: "entropy";
+  field: string;
+  value: string;
+  /** Shannon character entropy of the value, in bits. */
+  entropy: number;
+  count: number;
+  /** excess distance beyond the entropy band ÷ band width. */
+  score: number;
+  direction: "below" | "above";
+  lower: number;
+  upper: number;
+  first_seen: string | null;
+  event_id: string | null;
+  event: Event | null;
+  details: Record<string, unknown>;
+}
+
 /** One out-of-order timestamp finding from the timestamp_order detector. */
 export interface TimestampOrderFinding {
   type: "timestamp_order";
@@ -339,7 +374,9 @@ export type AnomalyFinding =
   | ValueComboFinding
   | FrequencyFinding
   | TimestampOrderFinding
-  | NumericRangeFinding;
+  | NumericRangeFinding
+  | CharsetFinding
+  | EntropyFinding;
 
 export interface AnomaliesResponse {
   status: "ok" | "no_data" | "insufficient_data";
@@ -383,7 +420,9 @@ export interface AnomalyMarker {
     | "value_combo"
     | "frequency"
     | "timestamp_order"
-    | "numeric_range";
+    | "numeric_range"
+    | "charset"
+    | "entropy";
   /** Raw structured finding data — stored verbatim on the persisted annotation. */
   rawDetails: Record<string, unknown>;
   /** End of the anomalous window, for frequency findings — enables a range highlight. */
@@ -498,6 +537,8 @@ export interface HealthResponse {
   status: "ok";
   version: string;
   oidc_enabled: boolean;
+  /** False when neither local embedding deps nor a remote endpoint are configured. */
+  embeddings_available: boolean;
 }
 
 /** Non-default field-filter match modes; "exact" is implied by absence. */

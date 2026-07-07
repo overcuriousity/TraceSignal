@@ -1,15 +1,17 @@
 /**
- * ValueNoveltyView — ranked list of rare / first-seen field values.
+ * EntropyView — values whose Shannon character entropy falls outside the
+ * field's learned band.
  *
- * Calls the value_novelty detector endpoint and shows each finding as an
- * interactive row: field badge + value + surprise score + first-seen timestamp
- * + click-to-drill.  "First-seen in detect window" findings are highlighted.
+ * Calls the entropy detector. Both modes use a Tukey IQR fence over
+ * per-distinct-value entropies (whole corpus, or the baseline window in
+ * temporal mode). Above-band values look random (DGA domains, encoded
+ * payloads); below-band values look degenerate (padding, character stuffing).
+ * The entropy + band are the explainability money-shot, rendered inline.
  */
 import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Info } from "lucide-react";
+import { AlertTriangle, Info, MoveUp, MoveDown } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
-import { shouldInvalidate } from "@/hooks/useCaseStream";
 import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
 import {
   DetectorStatusLine,
@@ -25,57 +27,44 @@ import {
   type DetectorMode,
 } from "./detector-shared";
 import { Spinner } from "@/components/ui/Spinner";
-import type { Event, ValueNoveltyFinding } from "@/api/types";
-import { cn } from "@/lib/cn";
-import { anomalyFieldLabel as fieldLabel } from "@/lib/format";
+import type { AnomalyMarker, EntropyFinding, Event } from "@/api/types";
+import { anomalyFieldLabel as fieldLabel, truncate } from "@/lib/format";
 import { fmtTimestampCompactUtc as fmtTs } from "@/lib/time";
 
 interface Props {
   caseId: string;
   timelineId: string;
   onSelectEvent: (event: Event) => void;
-  /** Called when analyst drills into findings — passes a field filter. */
   onDrillField?: (field: string, value: string) => void;
-  /** Called whenever the finding set changes — feeds the histogram overlay and event grid. */
-  onFindingsChange?: (markers: import("@/api/types").AnomalyMarker[]) => void;
-  /** Called with the latest scan's persisted run_id, so the grid can filter to it. */
+  onFindingsChange?: (markers: AnomalyMarker[]) => void;
   onRunIdChange?: (runId: string | undefined) => void;
-  /** Scrolls the main grid to this finding's timestamp, clearing filters first. */
   onJumpToTime?: (ts: string, eventId?: string) => void;
 }
 
-interface FindingRowProps {
-  caseId: string;
-  timelineId: string;
-  finding: ValueNoveltyFinding;
-  onSelectEvent: (event: Event) => void;
-  onDrillField?: (field: string, value: string) => void;
-  onJumpToTime?: (ts: string, eventId?: string) => void;
-  isFirstSeen: boolean;
-}
-
-function FindingRow({
+function EntropyRow({
   caseId,
   timelineId,
   finding,
   onSelectEvent,
   onDrillField,
   onJumpToTime,
-  isFirstSeen,
-}: FindingRowProps) {
-  // The detector's finding only carries a lightweight, partial "event" stub
-  // (missing artifact/tags/attributes/etc.) for bookkeeping — fetch the full
-  // event record before handing it to the Event Detail panel.
+}: {
+  caseId: string;
+  timelineId: string;
+  finding: EntropyFinding;
+  onSelectEvent: (event: Event) => void;
+  onDrillField?: (field: string, value: string) => void;
+  onJumpToTime?: (ts: string, eventId?: string) => void;
+}) {
   const openEvent = useOpenEvent(caseId, timelineId, finding.event_id, onSelectEvent);
+
+  const above = finding.direction === "above";
 
   return (
     <FindingShell
-      highlight={isFirstSeen}
       details={finding.details}
       onClick={() => {
-        if (finding.event_id) {
-          openEvent.mutate();
-        }
+        if (finding.event_id) openEvent.mutate();
       }}
       actions={
         <FindingRowActions
@@ -88,26 +77,28 @@ function FindingRow({
         />
       }
     >
-      {/* Field badge + value */}
+      {/* Field + value */}
       <div className="flex flex-wrap items-center gap-1">
         <span className="inline-block rounded bg-[var(--color-bg-elevated)] px-1.5 py-0.5 font-mono text-xs text-[var(--color-fg-muted)]">
           {fieldLabel(finding.field)}
         </span>
-        <span
-          className={cn(
-            "font-mono text-xs break-all leading-tight",
-            isFirstSeen
-              ? "text-[var(--color-accent)] font-medium"
-              : "text-[var(--color-fg-primary)]",
-          )}
-        >
-          {finding.value}
-        </span>
-        {isFirstSeen && (
-          <span className="rounded bg-[var(--color-accent)] px-1 py-0.5 text-[9px] font-semibold text-white/90 uppercase tracking-wide">
-            first seen
-          </span>
+        {above ? (
+          <MoveUp size={12} className="shrink-0 text-[var(--color-error)]" />
+        ) : (
+          <MoveDown size={12} className="shrink-0 text-[var(--color-warning)]" />
         )}
+        <span className="min-w-0 break-all font-mono text-xs font-medium text-[var(--color-fg-primary)]">
+          {truncate(finding.value)}
+        </span>
+      </div>
+
+      {/* Entropy + band (the explainability shot) */}
+      <div className="text-xs text-[var(--color-fg-muted)]">
+        {finding.entropy.toFixed(2)} bits — {above ? "above" : "below"} band{" "}
+        <span className="font-mono text-[var(--color-fg-secondary)]">
+          [{finding.lower.toFixed(2)}, {finding.upper.toFixed(2)}]
+        </span>{" "}
+        ({above ? "random-looking" : "degenerate/repetitive"})
       </div>
 
       {/* Meta line */}
@@ -116,7 +107,8 @@ function FindingRow({
           count <strong className="text-[var(--color-fg-secondary)]">{finding.count}</strong>
         </span>
         <span>
-          surprise <strong className="text-[var(--color-fg-secondary)]">{finding.score.toFixed(2)}</strong>
+          severity{" "}
+          <strong className="text-[var(--color-fg-secondary)]">{finding.score.toFixed(1)}×</strong>
         </span>
         {finding.first_seen && <span>first {fmtTs(finding.first_seen)}</span>}
       </div>
@@ -124,7 +116,7 @@ function FindingRow({
   );
 }
 
-export function ValueNoveltyView({
+export function EntropyView({
   caseId,
   timelineId,
   onSelectEvent,
@@ -134,21 +126,16 @@ export function ValueNoveltyView({
   onJumpToTime,
 }: Props) {
   const [mode, setMode] = useState<DetectorMode>("self");
-  // null = use backend smart default; string[] = explicit analyst selection.
   const [selectedFields, setSelectedFields] = useState<string[] | null>(null);
   const qc = useQueryClient();
 
-  // Compute the fields param for the API. null → omit param → backend
-  // auto-selects. [] (explicitly deselected every field) can't be sent as an
-  // empty string — the API client drops empty-string params — so it's sent as
-  // the reserved "__none__" token, which the backend maps to "scan nothing".
   const fieldsParam = fieldsParamOf(selectedFields);
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "novelty", mode, fieldsParam ?? "__auto__"],
+    queryKey: ["anomalies", caseId, timelineId, "entropy", mode, fieldsParam ?? "__auto__"],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
-        detector: "value_novelty",
+        detector: "entropy",
         limit: 50,
         temporal: mode === "temporal",
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
@@ -159,23 +146,18 @@ export function ValueNoveltyView({
   const tagMutation = useMutation({
     mutationFn: () =>
       anomaliesApi.tag(caseId, timelineId, {
-        detector: "value_novelty",
+        detector: "entropy",
         limit: 50,
         temporal: mode === "temporal",
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     onSuccess: () => {
-      qc.invalidateQueries({ predicate: (query) => shouldInvalidate(query.queryKey, caseId) });
+      qc.invalidateQueries({ queryKey: ["annotations"] });
     },
   });
 
-  // Memoized against `data` (stable react-query reference) so the marker
-  // hook below doesn't re-fire — and loop — on every render.
   const findings = useMemo(
-    () =>
-      (data?.results ?? []).filter(
-        (r): r is ValueNoveltyFinding => r.type === "value_novelty",
-      ),
+    () => (data?.results ?? []).filter((r): r is EntropyFinding => r.type === "entropy"),
     [data],
   );
 
@@ -184,27 +166,23 @@ export function ValueNoveltyView({
     (f) => {
       const ts = f.event?.timestamp ?? f.first_seen;
       if (!ts) return null;
-      const label = `${fieldLabel(f.field)}=${f.value}`;
-      // Temporal-mode findings are, by construction, absent from the
-      // baseline window (the backend only returns baseline_cnt = 0 rows) —
-      // a materially stronger, more specific claim than "rare", so say
-      // exactly that rather than reusing the self-baseline phrasing.
+      const label = `${fieldLabel(f.field)}=${truncate(f.value)}`;
+      const bandDesc =
+        data?.method === "temporal-iqr"
+          ? "baseline-window entropy IQR fence"
+          : "corpus entropy IQR fence";
+      const look = f.direction === "above" ? "random-looking" : "degenerate/repetitive";
       const detail =
-        data?.method === "temporal"
-          ? `New value: ${label} — absent from the ${(data.baseline_size ?? 0).toLocaleString()}-event ` +
-            `baseline window; first appears in the detect window` +
-            `${f.first_seen ? ` at ${fmtTs(f.first_seen)}` : ""} ` +
-            `(${f.count} occurrence${f.count === 1 ? "" : "s"} here; surprise ${f.score.toFixed(2)})`
-          : `Rare value: ${label} — appears ${f.count} time${f.count === 1 ? "" : "s"}` +
-            `${data?.baseline_size ? ` of ${data.baseline_size.toLocaleString()} events in the corpus` : ""} ` +
-            `(surprise ${f.score.toFixed(2)})`;
+        `Entropy outlier: ${label} — ${f.entropy.toFixed(2)} bits, ${f.direction} the ` +
+        `learned band [${f.lower.toFixed(2)}, ${f.upper.toFixed(2)}] (${bandDesc}; ${look}; ` +
+        `${f.count} occurrence${f.count === 1 ? "" : "s"})`;
       return {
         ts,
         label,
         detail,
         eventId: f.event_id,
         sourceId: f.event?.source_id,
-        detector: "value_novelty" as const,
+        detector: "entropy" as const,
         rawDetails: f.details,
       };
     },
@@ -224,7 +202,7 @@ export function ValueNoveltyView({
           timelineId={timelineId}
           selected={selectedFields}
           onChange={setSelectedFields}
-          autoCount={15}
+          autoIncludesIdentifiers
         />
         <RefreshButton isFetching={isFetching} onClick={() => refetch()} />
       </div>
@@ -241,11 +219,13 @@ export function ValueNoveltyView({
         <div className="flex items-center gap-2 py-4 text-xs text-[var(--color-fg-muted)]">
           <Info size={13} />
           <span>
-            {selectedFields !== null && selectedFields.length === 0
-              ? "No fields selected to scan. Pick fields above, or reset to auto."
-              : data?.status === "no_data"
-                ? "No rare values detected. No events ingested yet."
-                : "No rare values detected. All field values appear frequently."}
+            {data?.status === "no_data"
+              ? "No entropy outliers. No events ingested yet."
+              : data?.status === "insufficient_data"
+                ? "No fields with enough distinct baseline values (min length 6 chars). Pick fields explicitly above."
+                : mode === "temporal"
+                  ? "No detect-window values outside the baseline entropy band."
+                  : "No values outside the corpus entropy band."}
           </span>
         </div>
       )}
@@ -254,7 +234,7 @@ export function ValueNoveltyView({
       {findings.length > 0 && (
         <div className="space-y-1.5">
           {findings.map((f, i) => (
-            <FindingRow
+            <EntropyRow
               key={`${f.field}:${f.value}:${i}`}
               caseId={caseId}
               timelineId={timelineId}
@@ -262,7 +242,6 @@ export function ValueNoveltyView({
               onSelectEvent={onSelectEvent}
               onDrillField={onDrillField}
               onJumpToTime={onJumpToTime}
-              isFirstSeen={data?.method === "temporal"}
             />
           ))}
         </div>
@@ -277,11 +256,10 @@ export function ValueNoveltyView({
       <div className="flex items-start gap-1.5 text-xs text-[var(--color-fg-muted)] pt-1">
         <AlertTriangle size={10} className="mt-0.5 shrink-0" />
         <span>
-          Rare ≠ malicious.{" "}
           {mode === "temporal"
-            ? "Temporal mode ignores the rarity floor — it flags any value absent from the baseline window but present in the detect window."
-            : "Self-baseline mode flags values that appear ≤ rarity floor times in the whole corpus."}{" "}
-          Score = −log(count/total); higher is rarer.
+            ? "Temporal mode learns the entropy band [q1−1.5·IQR, q3+1.5·IQR] from the baseline window's distinct values and flags detect-window values outside it."
+            : "Self-baseline mode flags values outside the Tukey fence [q1−1.5·IQR, q3+1.5·IQR] over the entropy of every distinct value."}{" "}
+          Entropy is computed per distinct value from character frequencies alone — high ≈ random-looking (DGA, encoded payloads), low ≈ repetitive — never from what a value means.
         </span>
       </div>
     </div>

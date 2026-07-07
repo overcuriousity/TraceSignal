@@ -26,16 +26,6 @@ Point-in-time PR review findings are archived under `docs/archive/PR{N}_REVIEW_F
 (full unrestricted finding set, one file per reviewed PR) once triaged into this backlog or
 resolved — this file holds only the condensed, still-open action items.
 
-## Milestone 1 — correctness & forensic integrity (Medium severity)
-
-- [ ] **Enricher eligibility shares one ClickHouse client across threads.** The timeline
-  enrichers endpoint (`api/routers/cases.py`, `list_timeline_enrichers` handler) builds a
-  single `ClickHouseStore()` then fans out `check_eligibility` over
-  `asyncio.gather(run_in_threadpool(...))`. `clickhouse_connect` clients are not thread-safe,
-  so concurrent queries on one client can interleave on the shared connection and block or
-  corrupt responses. Harmless today (only GeoIP is registered → gather of one), but a second
-  enricher makes it live. Fix: one `ClickHouseStore` per eligibility check, or serialize them.
-
 ## Milestone 2 — high-leverage improvements
 
 - [ ] **M15 residue — `list_fields_by_artifact` stays live (deliberate).** The per-source
@@ -97,18 +87,11 @@ each detector.
 Prep landed: shared frontend detector scaffolding (`components/analysis/detector-shared.tsx`),
 a Radix `Select` detector switcher replacing the flat sub-tab strip, standardized
 `["anomalies", caseId, timelineId, ...]` query keys, and an `_col_expr(prefix=...)` param for
-multi-field queries. **D1 (value-combo), D2 (timestamp-order), and D4 (numeric-range)
-shipped.**
+multi-field queries. **D1 (value-combo), D2 (timestamp-order), D3 (charset), D4
+(numeric-range), and D5 (entropy) shipped.**
 
 High value first:
 
-- [ ] **D3 — Charset novelty** (AMiner `CharsetDetector`): per field, learn the baseline
-  character set of values; flag values in the detect window containing never-seen characters
-  (null bytes, unicode homoglyphs, injection metacharacters — detected syntactically, not by
-  meaning).
-- [ ] **D5 — Value entropy outliers** (AMiner `EntropyDetector`): per field, Shannon
-  character-entropy of each value vs. the field's baseline entropy distribution; flags
-  random-looking strings (DGA domains, encoded payloads) without interpreting them.
 - [ ] **D6 — Per-value silence** (AMiner `MissingMatchPathValueDetector`): a value that
   appeared regularly in the baseline stops appearing in the detect window (agent killed,
   log source suppressed). Complements the existing `frequency` detector's global silences.

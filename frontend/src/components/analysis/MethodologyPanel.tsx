@@ -17,6 +17,8 @@ import {
   Activity,
   Rewind,
   Ruler,
+  Shuffle,
+  Type,
   ShieldCheck,
   BarChart2,
 } from "lucide-react";
@@ -213,6 +215,70 @@ export function MethodologyPanel({
             <Row label="Backend">
               ClickHouse quantile()/min()/max() over toFloat64OrNull — no ML.
               Fields with fewer than 20 numeric baseline samples are skipped.
+            </Row>
+          </div>
+        </div>
+
+        {/* Charset novelty */}
+        <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3 space-y-2">
+          <p className="flex items-center gap-1.5 font-medium text-[var(--color-fg-primary)]">
+            <Type size={11} /> Charset novelty (charset)
+          </p>
+          <div className="space-y-1.5 text-[var(--color-fg-muted)]">
+            <Row label="Method">
+              Per field, learns a reference character set over distinct values.
+              Self-baseline ("rare-chars") treats characters appearing in ≤ 3
+              distinct values as rare and flags values containing them;
+              temporal learns the baseline window's character set and flags
+              detect-window values with never-seen characters.
+            </Row>
+            <Row label="Signal">
+              Null bytes, unicode homoglyphs, injection metacharacters —
+              detected purely by character identity, never by what a value
+              means. Fields with fewer than 20 distinct baseline values or an
+              alphabet over 5000 characters (free text in large scripts) are
+              skipped.
+            </Row>
+            <Row label="Score">
+              Sum over the value's novel characters of −log(values-with-char /
+              distinct-values) — value_novelty's surprise family. Novel
+              characters and their codepoints are carried in{" "}
+              <code className="font-mono text-xs">details</code>.
+            </Row>
+            <Row label="Backend">
+              ClickHouse extractAll + array functions over distinct values — no
+              ML.
+            </Row>
+          </div>
+        </div>
+
+        {/* Entropy outliers */}
+        <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3 space-y-2">
+          <p className="flex items-center gap-1.5 font-medium text-[var(--color-fg-primary)]">
+            <Shuffle size={11} /> Entropy outliers (entropy)
+          </p>
+          <div className="space-y-1.5 text-[var(--color-fg-muted)]">
+            <Row label="Method">
+              Shannon character entropy of each distinct value, compared to a
+              Tukey fence [q1−1.5·IQR, q3+1.5·IQR] over the field's entropy
+              distribution — the whole corpus in self-baseline mode, the
+              baseline window in temporal mode.
+            </Row>
+            <Row label="Signal">
+              Above-band values look random (DGA domains, encoded payloads,
+              keys); below-band values look degenerate (padding, repeated
+              characters). Purely syntactic — computed from character
+              frequencies, never from what a value means.
+            </Row>
+            <Row label="Score">
+              Distance outside the band ÷ band width, like numeric range.
+              Entropy, band, and quartiles are carried in{" "}
+              <code className="font-mono text-xs">details</code>.
+            </Row>
+            <Row label="Backend">
+              ClickHouse array functions over distinct values — no ML. Values
+              shorter than 6 characters are excluded; fields with fewer than
+              20 qualifying baseline values are skipped.
             </Row>
           </div>
         </div>

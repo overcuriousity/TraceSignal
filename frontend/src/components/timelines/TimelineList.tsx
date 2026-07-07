@@ -107,7 +107,7 @@ function TimelineRow({
           <EditFieldMappingsDialog caseId={caseId} timeline={tl} />
         )}
         {tl.source_ids.length > 0 && (
-          <EmbedWizard caseId={caseId} timeline={tl} />
+          <EmbedWizard caseId={caseId} timeline={tl} iconTrigger />
         )}
         {tl.source_ids.length > 0 && (
           <EnrichersDialog caseId={caseId} timeline={tl} />
