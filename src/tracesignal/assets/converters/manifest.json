@@ -1,6 +1,6 @@
 {
   "upstream": "https://github.com/overcuriousity/2timesketch",
-  "commit": "cb5ce0e435494ea8be4765473ded7a01360d3b88",
+  "commit": "c1c0f5ae33253e1ee0406ba8fe3bc86dface111a",
   "version": "1.0.0",
   "license": "MIT License",
   "converters": [
@@ -12,8 +12,8 @@
         "places.sqlite",
         "History (Chromium SQLite)"
       ],
-      "size_bytes": 98831,
-      "sha256": "e768429f30f485a10a341999e817e464bdd5ef7bc19d2d2f3bb497abf014c237"
+      "size_bytes": 101161,
+      "sha256": "01bc24830aac86e407d555aa27d6921ed967b1575e358268a84d1831bb32416c"
     },
     {
       "name": "cloudtrail2timesketch",
@@ -22,8 +22,8 @@
       "inputs": [
         "CloudTrail .json / .json.gz"
       ],
-      "size_bytes": 40280,
-      "sha256": "276242e4f192fd03bfbc11f86e72de2def492056252aac2f7ccbd6217dbe1db0"
+      "size_bytes": 42610,
+      "sha256": "9bd4cb01e14c5eb4db19e3a88e25d375679140a7a77af36f8ba8bbb0f5a4cfcf"
     },
     {
       "name": "filterlog2timesketch",
@@ -32,8 +32,8 @@
       "inputs": [
         "filter.log (syslog filterlog lines)"
       ],
-      "size_bytes": 48783,
-      "sha256": "6cee8f89c0e32e3572d47d84efeab721d8c043398149af27df019b3d273e4167"
+      "size_bytes": 51113,
+      "sha256": "1c62ad11252149d2f4a7825f36deebd2926f32c8ef0accfc01f871946aa2d372"
     },
     {
       "name": "journal2timesketch",
@@ -42,8 +42,8 @@
       "inputs": [
         "journal directory / journalctl -o json"
       ],
-      "size_bytes": 36572,
-      "sha256": "3868d829cb92e06cd51830a257d62f7ed3cb8919932be82f97d9fa3b9c237949"
+      "size_bytes": 38902,
+      "sha256": "7a9167f1c72c0cda63158dc29e3393ccf1ac9652b4658cac3779c1c2eca969b8"
     },
     {
       "name": "nginx2timesketch",
@@ -53,8 +53,8 @@
         "access.log*",
         "error.log*"
       ],
-      "size_bytes": 41334,
-      "sha256": "da8cc90c0c334b51e4716932b942ff4b8ef9bc05834b255d0f314492071603bb"
+      "size_bytes": 46588,
+      "sha256": "7a9e20856a97884766861953a3662f9326ab6d6508cbdd4eb904b3bff7bab1bb"
     },
     {
       "name": "suricata2timesketch",
@@ -65,8 +65,8 @@
         "fast.log",
         "OPNsense suricata syslog export"
       ],
-      "size_bytes": 51186,
-      "sha256": "d1bb31830a31be6a2b4702e74bc483f196901f53c93c16285ebfd03ebd2f2260"
+      "size_bytes": 53516,
+      "sha256": "859bc01697715d3f1355b45426d604d703030f749f4f74ac2a926dca3a7bd526"
     }
   ]
 }
