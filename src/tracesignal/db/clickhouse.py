@@ -585,7 +585,17 @@ class ClickHouseStore:
             _normalize_event_datetimes(dict(zip(columns, row, strict=False)))
             for row in result.result_rows
         ]
-        return {str(row["event_id"]): row for row in rows}
+        for row in rows:
+            # FixedString(64) columns come back as NUL-padded raw bytes —
+            # not JSON-serializable, and an "empty" value would otherwise be
+            # a truthy string of 64 NULs. Same treatment as
+            # anomaly_stats._row_to_event.
+            for key in ("content_hash", "file_hash", "embedding_config_hash"):
+                value = row.get(key)
+                if isinstance(value, bytes):
+                    row[key] = value.decode("utf-8", "replace").rstrip("\x00")
+            row["event_id"] = str(row["event_id"])
+        return {row["event_id"]: row for row in rows}
 
     def delete_source_events(self, case_id: str, source_id: str) -> None:
         """Remove all events for a source by dropping its ClickHouse partition.

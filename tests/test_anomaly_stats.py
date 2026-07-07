@@ -52,9 +52,19 @@ class FakeClickHouseStore:
     def __init__(self, client: FakeClient) -> None:
         self.client = client
         self.database = "tracesignal"
+        # Seedable hydration source for get_events_by_ids; calls are recorded
+        # so tests can assert hydration is one batched fetch.
+        self.events_by_id: dict[str, dict] = {}
+        self.hydration_calls: list[list[str]] = []
 
     def init_schema(self) -> None:
         pass
+
+    def get_events_by_ids(
+        self, case_id: str, source_ids: list[str], event_ids: list[str]
+    ) -> dict[str, dict]:
+        self.hydration_calls.append(list(event_ids))
+        return {i: self.events_by_id[i] for i in event_ids if i in self.events_by_id}
 
 
 # ---------------------------------------------------------------------------
@@ -164,17 +174,17 @@ def test_value_novelty_self_baseline_returns_rare_values():
             result_rows=[
                 # Naive datetimes — matches clickhouse-connect's real return type
                 # for a DateTime column with no explicit timezone.
-                ("suspicious.exe", 1, datetime(2024, 1, 2), "evt-1", "s1", "msg1"),
-                ("unusual_tool", 2, datetime(2024, 1, 1), "evt-2", "s1", "msg2"),
+                ("suspicious.exe", 1, datetime(2024, 1, 2), "evt-1"),
+                ("unusual_tool", 2, datetime(2024, 1, 1), "evt-2"),
             ],
-            column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
+            column_names=["val", "cnt", "first_seen", "evt_id"],
         ),
         # timestamp_desc field: one rare value
         FakeQueryResult(
             result_rows=[
-                ("Malware execution", 1, datetime(2024, 1, 2, 1), "evt-3", "s1", "msg3"),
+                ("Malware execution", 1, datetime(2024, 1, 2, 1), "evt-3"),
             ],
-            column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
+            column_names=["val", "cnt", "first_seen", "evt_id"],
         ),
         # display_name field: no rare values
         FakeQueryResult(result_rows=[], column_names=[]),
@@ -223,10 +233,9 @@ def test_value_novelty_self_baseline_limit_applied():
     per_field = [
         FakeQueryResult(
             result_rows=[
-                (f"val_{i}", 1, datetime(2024, 1, 1), f"evt-{j * 3 + i}", "s1", "m")
-                for i in range(3)
+                (f"val_{i}", 1, datetime(2024, 1, 1), f"evt-{j * 3 + i}") for i in range(3)
             ],
-            column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
+            column_names=["val", "cnt", "first_seen", "evt_id"],
         )
         for j in range(3)
     ]
@@ -252,11 +261,18 @@ def test_value_novelty_event_id_populated():
         [
             FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
             FakeQueryResult(
-                result_rows=[("backdoor.exe", 1, datetime(2024, 1, 1), "evt-abc", "s1", "bad msg")],
-                column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
+                result_rows=[("backdoor.exe", 1, datetime(2024, 1, 1), "evt-abc")],
+                column_names=["val", "cnt", "first_seen", "evt_id"],
             ),
         ]
     )
+    # Seed the hydration source: the scan only aggregates event_id, the full
+    # event is fetched in one get_events_by_ids batch on the final slice.
+    svc.ch.events_by_id["evt-abc"] = {
+        "event_id": "evt-abc",
+        "message": "bad msg",
+        "timestamp": "2024-01-01T00:00:00+00:00",
+    }
     result = svc.find_value_novelty("c1", ["s1"], fields=["artifact"])
     assert result.status == "ok"
     assert len(result.results) == 1
@@ -265,6 +281,8 @@ def test_value_novelty_event_id_populated():
     assert r.event is not None
     assert r.event["message"] == "bad msg"
     assert r.value == "backdoor.exe"
+    # Hydration ran as exactly one batched fetch.
+    assert svc.ch.hydration_calls == [["evt-abc"]]
     # first_seen must carry an explicit UTC offset — a bare "YYYY-MM-DD
     # HH:MM:SS" string is ambiguous to JS's Date parser (browsers treat it as
     # local time), which silently shifted histogram markers and event-grid
@@ -281,10 +299,10 @@ def test_value_novelty_skips_empty_values():
             FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
             FakeQueryResult(
                 result_rows=[
-                    ("", 1, datetime(2024, 1, 1), "evt-1", "s1", "msg"),
-                    ("real_value", 2, datetime(2024, 1, 1), "evt-2", "s1", "msg2"),
+                    ("", 1, datetime(2024, 1, 1), "evt-1"),
+                    ("real_value", 2, datetime(2024, 1, 1), "evt-2"),
                 ],
-                column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
+                column_names=["val", "cnt", "first_seen", "evt_id"],
             ),
         ]
     )
@@ -318,8 +336,6 @@ def test_value_novelty_temporal_baseline_first_seen():
                         0,
                         datetime(2024, 1, 16),
                         "evt-9",
-                        "s1",
-                        "new exe",
                     ),
                 ],
                 column_names=[
@@ -328,8 +344,6 @@ def test_value_novelty_temporal_baseline_first_seen():
                     "baseline_cnt",
                     "first_seen",
                     "evt_id",
-                    "src_id",
-                    "msg",
                 ],
             ),
         ]
@@ -372,8 +386,6 @@ def test_value_novelty_temporal_baseline_converts_non_utc_offset_for_sql():
                     "baseline_cnt",
                     "first_seen",
                     "evt_id",
-                    "src_id",
-                    "msg",
                 ],
             ),
         ]
@@ -950,8 +962,8 @@ def test_value_novelty_smart_default_calls_recommender():
         ),  # attribute keys
         # find_value_novelty field scans (recommended fields = artifact + attr:status_code):
         FakeQueryResult(
-            result_rows=[("404", 2, datetime(2024, 1, 1), "evt-1", "s1", "404 not found")],
-            column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
+            result_rows=[("404", 2, datetime(2024, 1, 1), "evt-1")],
+            column_names=["val", "cnt", "first_seen", "evt_id"],
         ),  # artifact field scan
         FakeQueryResult(
             result_rows=[],
@@ -1007,10 +1019,10 @@ def test_value_novelty_exclude_event_ids():
         FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
         FakeQueryResult(
             result_rows=[
-                ("malware.exe", 1, datetime(2024, 1, 1), "evt-bad", "s1", "msg"),
-                ("tool.exe", 2, datetime(2024, 1, 1), "evt-ok", "s1", "msg2"),
+                ("malware.exe", 1, datetime(2024, 1, 1), "evt-bad"),
+                ("tool.exe", 2, datetime(2024, 1, 1), "evt-ok"),
             ],
-            column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
+            column_names=["val", "cnt", "first_seen", "evt_id"],
         ),
     ]
     svc = _svc(responses)
@@ -1060,7 +1072,7 @@ def test_hydrate_freq_findings_batches_into_a_single_query():
     """
     from datetime import timedelta
 
-    from tracesignal.db.anomaly_stats import _EVENT_COLUMNS, FreqFinding
+    from tracesignal.db.anomaly_stats import FreqFinding
 
     bucket_a = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
     bucket_b = datetime(2024, 1, 1, 4, 0, 0, tzinfo=UTC)
@@ -1093,23 +1105,21 @@ def test_hydrate_freq_findings_batches_into_a_single_query():
         ),
     ]
 
-    def _build_row(event_id: str, message: str) -> tuple:
-        values = {"event_id": event_id, "case_id": "c1", "source_id": "s1", "message": message}
-        return tuple(values.get(col) for col in _EVENT_COLUMNS)
-
-    row_a = _build_row("evt-a", "spike A")
-    row_b = _build_row("evt-b", "spike B")
     svc = _svc(
         [
             FakeQueryResult(
                 result_rows=[
-                    (bucket_a.replace(tzinfo=None), "A", *row_a),
-                    (bucket_b.replace(tzinfo=None), "B", *row_b),
+                    (bucket_a.replace(tzinfo=None), "A", "evt-a"),
+                    (bucket_b.replace(tzinfo=None), "B", "evt-b"),
                 ],
-                column_names=["bucket", "series_val", *_EVENT_COLUMNS],
+                column_names=["bucket", "series_val", "evt_id"],
             ),
         ]
     )
+    svc.ch.events_by_id = {
+        "evt-a": {"event_id": "evt-a", "message": "spike A"},
+        "evt-b": {"event_id": "evt-b", "message": "spike B"},
+    }
 
     hydrated = svc._hydrate_freq_findings(
         findings,
@@ -1121,7 +1131,9 @@ def test_hydrate_freq_findings_batches_into_a_single_query():
         3600,
     )
 
+    # One grouped argMin(event_id) scan + one batched get_events_by_ids.
     assert len(svc.ch.client._calls) == 1
+    assert svc.ch.hydration_calls == [["evt-a", "evt-b"]]
     assert {f.event_id for f in hydrated} == {"evt-a", "evt-b"}
     by_value = {f.series_value: f for f in hydrated}
     assert by_value["A"].event["message"] == "spike A"
@@ -1355,10 +1367,10 @@ def test_value_combo_self_baseline_returns_rare_combos():
         FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
         FakeQueryResult(
             result_rows=[
-                ("login_ok", "03:00", 1, fs, "evt-a", "s1", "rare combo"),
-                ("login_ok", "09:00", 3, fs, "evt-b", "s1", "common-ish"),
+                ("login_ok", "03:00", 1, fs, "evt-a"),
+                ("login_ok", "09:00", 3, fs, "evt-b"),
             ],
-            column_names=["v0", "v1", "cnt", "first_seen", "evt_id", "src_id", "msg"],
+            column_names=["v0", "v1", "cnt", "first_seen", "evt_id"],
         ),
     ]
     svc = _svc(responses)
@@ -1382,8 +1394,8 @@ def test_value_combo_binds_distinct_prefixes_for_attr_fields():
         [
             FakeQueryResult(result_rows=[(10,)], column_names=["count()"]),
             FakeQueryResult(
-                result_rows=[("a", "b", 1, datetime(2024, 1, 1, tzinfo=UTC), "e", "s1", "m")],
-                column_names=["v0", "v1", "cnt", "first_seen", "evt_id", "src_id", "msg"],
+                result_rows=[("a", "b", 1, datetime(2024, 1, 1, tzinfo=UTC), "e")],
+                column_names=["v0", "v1", "cnt", "first_seen", "evt_id"],
             ),
         ]
     )
@@ -1403,8 +1415,8 @@ def test_value_combo_temporal_flags_new_combos():
         FakeQueryResult(result_rows=[(300,)], column_names=["count()"]),  # baseline size
         FakeQueryResult(
             result_rows=[
-                # v0, v1, detect_cnt, baseline_cnt, first_seen, evt_id, src_id, msg
-                ("admin", "10.0.0.9", 2, 0, fs, "evt-x", "s1", "new combo"),
+                # v0, v1, detect_cnt, baseline_cnt, first_seen, evt_id
+                ("admin", "10.0.0.9", 2, 0, fs, "evt-x"),
             ],
             column_names=[
                 "v0",
@@ -1413,8 +1425,6 @@ def test_value_combo_temporal_flags_new_combos():
                 "baseline_cnt",
                 "first_seen",
                 "evt_id",
-                "src_id",
-                "msg",
             ],
         ),
     ]
@@ -1460,10 +1470,10 @@ def test_value_combo_excludes_normal_marked_events():
         FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
         FakeQueryResult(
             result_rows=[
-                ("a", "1", 1, fs, "evt-keep", "s1", "m"),
-                ("b", "2", 1, fs, "evt-drop", "s1", "m"),
+                ("a", "1", 1, fs, "evt-keep"),
+                ("b", "2", 1, fs, "evt-drop"),
             ],
-            column_names=["v0", "v1", "cnt", "first_seen", "evt_id", "src_id", "msg"],
+            column_names=["v0", "v1", "cnt", "first_seen", "evt_id"],
         ),
     ]
     svc = _svc(responses)
@@ -1505,8 +1515,8 @@ def test_range_self_baseline_iqr_flags_outliers():
         FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
         FakeQueryResult(result_rows=[(100.0, 200.0, 500)], column_names=["q1", "q3", "n"]),
         FakeQueryResult(
-            result_rows=[(9000.0, 2, fs, "evt-hi", "s1", "huge")],
-            column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
+            result_rows=[(9000.0, 2, fs, "evt-hi")],
+            column_names=["val", "cnt", "first_seen", "evt_id"],
         ),
     ]
     svc = _svc(responses)
@@ -1533,8 +1543,8 @@ def test_range_temporal_uses_baseline_minmax():
         # baseline min=10, max=500, n=300
         FakeQueryResult(result_rows=[(10.0, 500.0, 300)], column_names=["lo", "hi", "n"]),
         FakeQueryResult(
-            result_rows=[(9999.0, 1, fs, "evt-x", "s1", "spike")],
-            column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
+            result_rows=[(9999.0, 1, fs, "evt-x")],
+            column_names=["val", "cnt", "first_seen", "evt_id"],
         ),
     ]
     svc = _svc(responses)
@@ -1555,10 +1565,10 @@ def test_range_excludes_normal_marked_events():
         FakeQueryResult(result_rows=[(100.0, 200.0, 500)], column_names=["q1", "q3", "n"]),
         FakeQueryResult(
             result_rows=[
-                (9000.0, 1, fs, "evt-drop", "s1", "m"),
-                (8000.0, 1, fs, "evt-keep", "s1", "m"),
+                (9000.0, 1, fs, "evt-drop"),
+                (8000.0, 1, fs, "evt-keep"),
             ],
-            column_names=["val", "cnt", "first_seen", "evt_id", "src_id", "msg"],
+            column_names=["val", "cnt", "first_seen", "evt_id"],
         ),
     ]
     svc = _svc(responses)
@@ -1585,3 +1595,41 @@ def test_recommend_numeric_fields_filters_by_ratio():
     assert by_token["attr:bytes"].recommended is True
     assert by_token["attr:bytes"].numeric_ratio == 0.98
     assert by_token["attr:user"].recommended is False
+
+
+def test_heavy_detector_scans_carry_memory_settings():
+    """Every whole-corpus detector scan must carry the shared SETTINGS clause
+    (external GROUP BY spill + per-query memory cap + thread cap) — a scan
+    without it trusts the server-wide limit and can take the box down on a
+    300M-row case."""
+    from tracesignal.db.anomaly_stats import _HEAVY_SCAN_SETTINGS
+
+    class _RecordingClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.full_queries: list[str] = []
+
+        def query(self, sql: str, parameters: dict | None = None) -> FakeQueryResult:
+            self.full_queries.append(sql)
+            if sql.strip().startswith("SELECT count()"):
+                return FakeQueryResult(result_rows=[(100,)], column_names=["count()"])
+            return FakeQueryResult(result_rows=[], column_names=[])
+
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    store = FakeClickHouseStore(FakeClient([]))
+    client = _RecordingClient()
+    store.client = client
+    svc.ch = store
+
+    svc.find_value_novelty("c1", ["s1"], fields=["artifact"])
+    svc.find_value_combos("c1", ["s1"], fields=["artifact", "timestamp_desc"])
+    svc.field_inventory("c1", ["s1"], total=100)
+
+    scans = [
+        q
+        for q in client.full_queries
+        if not q.strip().startswith("SELECT count()") and "min(timestamp), max(timestamp)" not in q
+    ]
+    assert scans
+    for sql in scans:
+        assert _HEAVY_SCAN_SETTINGS in sql, sql[:120]

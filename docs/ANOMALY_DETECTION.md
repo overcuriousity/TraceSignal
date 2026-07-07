@@ -24,6 +24,30 @@ instant ingestion finishes. The fifth needs an explicit embedding step first.
 Code: `src/tracesignal/db/anomaly_stats.py` (detectors 1–4),
 `src/tracesignal/db/similarity.py` (detector 5). UI: `frontend/src/components/analysis/`.
 
+### Query-cost discipline (all statistical detectors)
+
+Three cross-cutting rules keep detector scans survivable on 100M+-row cases
+(added 2026-07 after a 300M-row nginx case took a production box down):
+
+- **Two-phase representative events.** Detector scans aggregate only
+  `argMin(event_id, timestamp)` per group — never `argMin(message, …)`, which
+  forces decompressing the fat `message` column for *every scanned row*
+  (~136 GiB per field on the 300M case). The ≤`limit` findings that survive
+  ranking are hydrated afterwards in one batched `get_events_by_ids` call
+  (`_hydrate_finding_events` / `_hydrate_freq_findings`); a finding whose
+  event vanished mid-flight keeps a minimal `_stub_event` shape.
+- **`_HEAVY_SCAN_SETTINGS` on every whole-corpus scan** (`max_threads = 8`,
+  `max_bytes_before_external_group_by = 4 GB`, `max_memory_usage = 12 GB`):
+  large GROUP BY states spill to disk, a runaway query fails alone instead of
+  taking the server with it, and concurrent panel scans can't oversubscribe
+  the box. Any new detector query that touches the whole corpus must carry it.
+- **No-timestamp events are stored as a sentinel, not NULL.** `timestamp` is
+  a non-Nullable sort-key column; events without a parseable timestamp carry
+  `2299-12-31 23:59:59.999 UTC` (`db/_dt.py NULL_TS_SENTINEL`) and are
+  presented as `null` by the API. Every aggregate/bucket over `timestamp`
+  must exclude them via `TS_NOT_SENTINEL_SQL` — exactly where the old
+  Nullable schema used `timestamp IS NOT NULL`.
+
 ---
 
 ## 1. Value novelty (rare / first-seen values)

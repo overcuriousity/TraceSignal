@@ -1,7 +1,42 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-06 (session 26 — Milestone 4: detector-expansion prep + D1 value-combo +
-D2 timestamp-order + D4 numeric-range detectors.
+Last updated: 2026-07-07 (session 27 — ClickHouse query-cost overhaul after 300M-row incident).
+
+## Session 27 — 2026-07-07: 300M-row perf overhaul (timestamp sentinel, two-phase queries)
+
+A production 80 GiB / 300M-row nginx ingest exposed that every Explorer "load more" click read
+**187 GiB** (~80 s) and every anomaly-panel open ~1 TiB, taking the server down (swap
+exhaustion, load 126). Root causes, measured live via `system.query_log` + `EXPLAIN`:
+
+1. `timestamp Nullable(DateTime64(3))` in the MergeTree sort key (`allow_nullable_key`)
+   disables ClickHouse's read-in-order optimization → every `ORDER BY timestamp LIMIT 100`
+   became a full-partition top-N sort;
+2. the keyset cursor's `coalesce(timestamp, sentinel)` wrapper was unsargable (no granule
+   pruning);
+3. the page query selected all 21 columns (incl. `message`/`attributes`) for the sort
+   (no lazy materialization in CH 24.10);
+4. `find_value_novelty`/`find_value_combos` aggregated `argMin(message, timestamp)` per group
+   → 136 GiB decompressed per scanned field, ~7 fields per panel view.
+
+Fixes (this session, PR #73): non-Nullable `timestamp` storing the year-2299 sentinel for
+undated events (presented as `null` everywhere; `db/_dt.py` is the single home for the
+sentinel + `TS_NOT_SENTINEL_SQL` guard); sargable plain-tuple cursor + redundant scalar
+`timestamp <= :ts` bound; two-phase grid fetch (thin `(event_id, timestamp)` top-N, then
+timestamp-bounded hydration by id — 187 GiB → ~4.5 MiB per page measured); single-element
+list filters emit `=` instead of `IN` (fixed sort-key prefix requirement); detectors
+aggregate only `argMin(event_id, …)` and batch-hydrate the post-limit findings via
+`get_events_by_ids`; every whole-corpus detector scan carries `_HEAVY_SCAN_SETTINGS`
+(external GROUP BY spill, 12 GB per-query cap, 8 threads).
+
+**One-time migration (existing deployments)** — new code refuses to start against the legacy
+Nullable schema (`init_schema` guard). With the app stopped: create `events_migration_new`
+with the new DDL, `INSERT … SELECT` with `coalesce(timestamp, toDateTime64('2299-12-31
+23:59:59.999', 3, 'UTC'))`, verify (row count, `countIf(IS NULL)` old == `countIf(= sentinel)`
+new, `sum(cityHash64(event_id, content_hash))` checksum, min/max), then `EXCHANGE TABLES` and
+keep the old table as `events_legacy_pre_migration` until burn-in. Preflight aborts if any
+real event already carries the exact sentinel timestamp. Ran on dev (6.2M rows) and prod
+(300M rows). Behavioral note: undated events now sort at the *top* of the default
+newest-first grid (sentinel = max datetime; deliberate, keeps broken timestamps visible).
 
 D4 (`find_range_violations`, AMiner `ValueRangeDetector`): for fields whose values parse as
 numbers (syntactic `toFloat64OrNull`, never by meaning), learn a baseline band and flag values

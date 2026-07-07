@@ -79,11 +79,10 @@ from typing import Any
 import numpy as np
 
 from tracesignal.db._buckets import bucket_interval_seconds, query_timestamp_range
-from tracesignal.db._columns import EVENT_SELECT_COLUMNS, resolve_column_token
+from tracesignal.db._columns import resolve_column_token
 from tracesignal.db._dt import (
     TS_NOT_SENTINEL_SQL,
     ensure_utc,
-    ensure_utc_iso,
     is_null_ts_sentinel,
     to_clickhouse_utc,
 )
@@ -134,11 +133,6 @@ _MIN_FREQUENCY_BUCKETS = 3
 # excluded point (half an event-count unit — small enough to still flag any
 # real deviation, large enough to avoid blowing up the z-score to inf/NaN).
 _MIN_FREQUENCY_STD = 0.5
-
-# Columns selected when hydrating a representative event — shared with
-# queries.py's per-event projection, see _columns.EVENT_SELECT_COLUMNS.
-_EVENT_COLUMNS = EVENT_SELECT_COLUMNS
-
 
 # ---------------------------------------------------------------------------
 # Result types
@@ -353,37 +347,53 @@ def _freq_finding(
     )
 
 
-def _row_to_event(columns: tuple[str, ...], row: tuple) -> dict[str, Any]:
-    """Convert a ClickHouse result row into an Event-compatible dict.
+# Shared guardrails for every whole-corpus detector scan (GROUP BY over up to
+# hundreds of millions of rows): spill large aggregation states to disk
+# instead of ballooning RAM, cap the query's memory hard (fail one query, not
+# the server), and bound thread fan-out so several concurrent detector scans
+# don't oversubscribe the box. Values match the field-inventory scan that
+# first needed them.
+_HEAVY_SCAN_SETTINGS = (
+    "SETTINGS max_threads = 8, "
+    "max_bytes_before_external_group_by = 4000000000, "
+    "max_memory_usage = 12000000000"
+)
 
-    `timestamp`/`ingest_time` come back as naive `datetime` objects (the
-    columns have no explicit timezone component) — attach UTC before
-    serializing, otherwise the resulting "YYYY-MM-DDTHH:MM:SS" string (no
-    offset) is ambiguous to JS's `Date` parser, which treats it as local time
-    and silently shifts the displayed/compared timestamp by the browser's
-    UTC offset.
 
-    `content_hash`/`file_hash`/`embedding_config_hash` are `FixedString(64)`,
-    which clickhouse-connect returns as raw `bytes`, NUL-padded to the fixed
-    width. Left as-is they crash the router's JSON serialization ("Object of
-    type bytes is not JSON serializable") — a 500 that only the frequency
-    detector hits, because it's the one path that serializes a fully-hydrated
-    event dict (value_novelty builds its stub with string literals). Decode
-    and strip the NUL padding here, otherwise an empty `embedding_config_hash`
-    becomes a non-empty string of "\x00" chars — truthy and wrong.
+def _stub_event(evt_id: str | None, case_id: str, first_seen: str | None) -> dict[str, Any] | None:
+    """Minimal full-shape event stub for a finding's representative event.
+
+    The scan queries only aggregate ``argMin(event_id, ...)`` — fat columns
+    (message, attributes) are deliberately not read there. Findings that
+    survive ranking get their stub replaced by a fully hydrated event via
+    ``StatisticalAnomalyService._hydrate_finding_events``; this stub is the
+    fallback shape when hydration misses (e.g. a concurrent source delete).
     """
-    d: dict[str, Any] = dict(zip(columns, row, strict=False))
-    for key in ("timestamp", "ingest_time"):
-        v = d.get(key)
-        if v is not None and not isinstance(v, str):
-            d[key] = None if key == "timestamp" and is_null_ts_sentinel(v) else ensure_utc_iso(v)
-    for key in ("content_hash", "file_hash", "embedding_config_hash"):
-        v = d.get(key)
-        if isinstance(v, bytes):
-            d[key] = v.decode("utf-8", "replace").rstrip("\x00")
-    if "event_id" in d:
-        d["event_id"] = str(d["event_id"])
-    return d
+    if not evt_id:
+        return None
+    return {
+        "event_id": evt_id,
+        "case_id": case_id,
+        "source_id": "",
+        "message": "",
+        "timestamp": first_seen,
+        "timestamp_desc": None,
+        "artifact": None,
+        "artifact_long": None,
+        "display_name": None,
+        "tags": [],
+        "attributes": {},
+        "content_hash": "",
+        "file_hash": "",
+        "parser_name": "",
+        "parser_version": "",
+        "source_file": "",
+        "byte_offset": None,
+        "line_number": None,
+        "embedding_model": None,
+        "embedding_config_hash": None,
+        "ingest_time": None,
+    }
 
 
 def _present_ts(value: Any) -> str | None:
@@ -464,6 +474,28 @@ class StatisticalAnomalyService:
         )
         return int(total_res.result_rows[0][0]) if total_res.result_rows else 0
 
+    def _hydrate_finding_events(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        findings: list[Any],
+    ) -> None:
+        """Replace findings' stub events with fully hydrated rows, in one batch.
+
+        Called on the final (post-suppression, post-limit) finding slice, so
+        at most ``limit`` events are fetched — the detector scans themselves
+        only aggregate ``argMin(event_id, ...)`` and never read the fat
+        message/attributes columns. Findings whose id is missing from the
+        result keep their :func:`_stub_event` fallback.
+        """
+        ids = [f.event_id for f in findings if f.event_id]
+        if not ids:
+            return
+        by_id = self.ch.get_events_by_ids(case_id, source_ids, ids)
+        for f in findings:
+            if f.event_id and f.event_id in by_id:
+                f.event = by_id[f.event_id]
+
     def field_inventory(
         self,
         case_id: str,
@@ -505,6 +537,7 @@ class StatisticalAnomalyService:
             f" FROM {db}.events"
             f" WHERE case_id = {{cid:String}}"
             f" AND has({{src:Array(String)}}, source_id)"
+            f" {_HEAVY_SCAN_SETTINGS}"
         )
         top_res = self.ch.client.query(top_sql, parameters=params)
         if top_res.result_rows:
@@ -523,8 +556,9 @@ class StatisticalAnomalyService:
         # ``uniq`` (approximate, ~1% error) replaces ``uniqExact`` — the
         # cardinality classification thresholds don't need exactness, and
         # exact per-key hash sets over near-unique values are the other
-        # memory blowup. External GROUP BY spill + a query memory cap bound
-        # the worst case instead of trusting the server-wide limit.
+        # memory blowup. _HEAVY_SCAN_SETTINGS (external GROUP BY spill + a
+        # query memory cap) bounds the worst case instead of trusting the
+        # server-wide limit.
         attr_sql = f"""
             SELECT
                 key,
@@ -538,9 +572,7 @@ class StatisticalAnomalyService:
             GROUP BY key
             ORDER BY cov_count DESC
             LIMIT {{max_keys:UInt32}}
-            SETTINGS max_threads = 8,
-                     max_bytes_before_external_group_by = 4000000000,
-                     max_memory_usage = 12000000000
+            {_HEAVY_SCAN_SETTINGS}
         """
         attr_res = self.ch.client.query(
             attr_sql, parameters={**params, "max_keys": _RECOMMENDER_MAX_ATTR_KEYS}
@@ -584,6 +616,7 @@ class StatisticalAnomalyService:
             f" FROM {db}.events"
             f" WHERE case_id = {{cid:String}}"
             f" AND has({{src:Array(String)}}, source_id)"
+            f" {_HEAVY_SCAN_SETTINGS}"
         )
         m_res = self.ch.client.query(m_sql, parameters=m_params)
         out: list[tuple[str, int, int]] = []
@@ -775,9 +808,7 @@ class StatisticalAnomalyService:
                         {col} AS val,
                         count() AS cnt,
                         min(timestamp) AS first_seen,
-                        toString(argMin(event_id, timestamp)) AS evt_id,
-                        argMin(source_id, timestamp) AS src_id,
-                        argMin(message, timestamp) AS msg
+                        toString(argMin(event_id, timestamp)) AS evt_id
                     FROM {db}.events
                     WHERE case_id = {{cid:String}}
                       AND has({{src:Array(String)}}, source_id)
@@ -786,6 +817,7 @@ class StatisticalAnomalyService:
                     HAVING cnt <= {{floor:UInt32}}
                     ORDER BY cnt ASC, first_seen ASC
                     LIMIT {{lim:UInt32}}
+                    {_HEAVY_SCAN_SETTINGS}
                 """
             else:
                 # Temporal: flag values seen in detect window but not in baseline.
@@ -797,9 +829,7 @@ class StatisticalAnomalyService:
                         countIf(timestamp >= {{bl:String}}) AS detect_cnt,
                         countIf(timestamp < {{bl:String}}) AS baseline_cnt,
                         minIf(timestamp, timestamp >= {{bl:String}}) AS first_seen,
-                        toString(argMinIf(event_id, timestamp, timestamp >= {{bl:String}})) AS evt_id,
-                        argMinIf(source_id, timestamp, timestamp >= {{bl:String}}) AS src_id,
-                        argMinIf(message, timestamp, timestamp >= {{bl:String}}) AS msg
+                        toString(argMinIf(event_id, timestamp, timestamp >= {{bl:String}})) AS evt_id
                     FROM {db}.events
                     WHERE case_id = {{cid:String}}
                       AND has({{src:Array(String)}}, source_id)
@@ -809,16 +839,17 @@ class StatisticalAnomalyService:
                     HAVING baseline_cnt = 0 AND detect_cnt > 0
                     ORDER BY detect_cnt ASC, first_seen ASC
                     LIMIT {{lim:UInt32}}
+                    {_HEAVY_SCAN_SETTINGS}
                 """
 
             rows = self.ch.client.query(sql, parameters=params).result_rows
 
             for row in rows:
                 if baseline_end is None:
-                    val, cnt, first_seen, evt_id, src_id, msg = row
+                    val, cnt, first_seen, evt_id = row
                     effective_cnt = int(cnt)
                 else:
-                    val, detect_cnt, _bl_cnt, first_seen, evt_id, src_id, msg = row
+                    val, detect_cnt, _bl_cnt, first_seen, evt_id = row
                     effective_cnt = int(detect_cnt)
 
                 if not val:
@@ -837,31 +868,7 @@ class StatisticalAnomalyService:
                 # event-grid anomaly matching by the browser's UTC offset.
                 first_seen_str = _present_ts(first_seen)
                 evt_id_str = str(evt_id) if evt_id else None
-                mini_event: dict[str, Any] | None = None
-                if evt_id:
-                    mini_event = {
-                        "event_id": evt_id_str,
-                        "case_id": case_id,
-                        "source_id": str(src_id) if src_id else "",
-                        "message": str(msg) if msg else "",
-                        "timestamp": first_seen_str,
-                        "timestamp_desc": None,
-                        "artifact": None,
-                        "artifact_long": None,
-                        "display_name": None,
-                        "tags": [],
-                        "attributes": {},
-                        "content_hash": "",
-                        "file_hash": "",
-                        "parser_name": "",
-                        "parser_version": "",
-                        "source_file": "",
-                        "byte_offset": None,
-                        "line_number": None,
-                        "embedding_model": None,
-                        "embedding_config_hash": None,
-                        "ingest_time": None,
-                    }
+                mini_event = _stub_event(evt_id_str, case_id, first_seen_str)
 
                 details: dict[str, Any] = {
                     "detector": "value_novelty",
@@ -894,14 +901,17 @@ class StatisticalAnomalyService:
                 f for f in all_findings if not f.event_id or f.event_id not in exclude_event_ids
             ]
 
-        # Sort by surprise descending (rarest first), apply global limit.
+        # Sort by surprise descending (rarest first), apply global limit,
+        # then hydrate only the surviving findings' representative events.
         all_findings.sort(key=lambda f: f.score, reverse=True)
+        results = all_findings[:limit]
+        self._hydrate_finding_events(case_id, source_ids, results)
         return StatAnomalyResult(
             status="ok",
             detector="value_novelty",
             method=method,
             baseline_size=baseline_size,
-            results=all_findings[:limit],
+            results=results,
         )
 
     def find_value_combos(
@@ -1001,9 +1011,7 @@ class StatisticalAnomalyService:
                     {val_cols},
                     count() AS cnt,
                     min(timestamp) AS first_seen,
-                    toString(argMin(event_id, timestamp)) AS evt_id,
-                    argMin(source_id, timestamp) AS src_id,
-                    argMin(message, timestamp) AS msg
+                    toString(argMin(event_id, timestamp)) AS evt_id
                 FROM {db}.events
                 WHERE case_id = {{cid:String}}
                   AND has({{src:Array(String)}}, source_id)
@@ -1012,6 +1020,7 @@ class StatisticalAnomalyService:
                 HAVING cnt <= {{floor:UInt32}}
                 ORDER BY cnt ASC, first_seen ASC
                 LIMIT {{lim:UInt32}}
+                {_HEAVY_SCAN_SETTINGS}
             """
         else:
             params["bl"] = to_clickhouse_utc(baseline_end)
@@ -1022,9 +1031,7 @@ class StatisticalAnomalyService:
                     countIf(timestamp >= {{bl:String}}) AS detect_cnt,
                     countIf(timestamp < {{bl:String}}) AS baseline_cnt,
                     minIf(timestamp, timestamp >= {{bl:String}}) AS first_seen,
-                    toString(argMinIf(event_id, timestamp, timestamp >= {{bl:String}})) AS evt_id,
-                    argMinIf(source_id, timestamp, timestamp >= {{bl:String}}) AS src_id,
-                    argMinIf(message, timestamp, timestamp >= {{bl:String}}) AS msg
+                    toString(argMinIf(event_id, timestamp, timestamp >= {{bl:String}})) AS evt_id
                 FROM {db}.events
                 WHERE case_id = {{cid:String}}
                   AND has({{src:Array(String)}}, source_id)
@@ -1034,6 +1041,7 @@ class StatisticalAnomalyService:
                 HAVING baseline_cnt = 0 AND detect_cnt > 0
                 ORDER BY detect_cnt ASC, first_seen ASC
                 LIMIT {{lim:UInt32}}
+                {_HEAVY_SCAN_SETTINGS}
             """
 
         rows = self.ch.client.query(sql, parameters=params).result_rows
@@ -1044,10 +1052,10 @@ class StatisticalAnomalyService:
             values = [str(v) for v in row[:n_fields]]
             if baseline_end is None:
                 cnt = int(row[n_fields])
-                first_seen, evt_id, src_id, msg = row[n_fields + 1 : n_fields + 5]
+                first_seen, evt_id = row[n_fields + 1 : n_fields + 3]
             else:
                 cnt = int(row[n_fields])  # detect_cnt
-                first_seen, evt_id, src_id, msg = row[n_fields + 2 : n_fields + 6]
+                first_seen, evt_id = row[n_fields + 2 : n_fields + 4]
 
             if any(v == "" for v in values):
                 continue
@@ -1055,31 +1063,7 @@ class StatisticalAnomalyService:
             score = -math.log(cnt / total_events) if cnt > 0 and total_events > 0 else 0.0
             first_seen_str = _present_ts(first_seen)
             evt_id_str = str(evt_id) if evt_id else None
-            mini_event: dict[str, Any] | None = None
-            if evt_id:
-                mini_event = {
-                    "event_id": evt_id_str,
-                    "case_id": case_id,
-                    "source_id": str(src_id) if src_id else "",
-                    "message": str(msg) if msg else "",
-                    "timestamp": first_seen_str,
-                    "timestamp_desc": None,
-                    "artifact": None,
-                    "artifact_long": None,
-                    "display_name": None,
-                    "tags": [],
-                    "attributes": {},
-                    "content_hash": "",
-                    "file_hash": "",
-                    "parser_name": "",
-                    "parser_version": "",
-                    "source_file": "",
-                    "byte_offset": None,
-                    "line_number": None,
-                    "embedding_model": None,
-                    "embedding_config_hash": None,
-                    "ingest_time": None,
-                }
+            mini_event = _stub_event(evt_id_str, case_id, first_seen_str)
 
             details: dict[str, Any] = {
                 "detector": "value_combo",
@@ -1112,12 +1096,14 @@ class StatisticalAnomalyService:
             ]
 
         all_findings.sort(key=lambda f: f.score, reverse=True)
+        results = all_findings[:limit]
+        self._hydrate_finding_events(case_id, source_ids, results)
         return StatAnomalyResult(
             status="ok",
             detector="value_combo",
             method=method,
             baseline_size=baseline_size,
-            results=all_findings[:limit],
+            results=results,
         )
 
     # ------------------------------------------------------------------
@@ -1174,6 +1160,7 @@ class StatisticalAnomalyService:
             f" FROM {db}.events"
             f" WHERE case_id = {{cid:String}}"
             f" AND has({{src:Array(String)}}, source_id)"
+            f" {_HEAVY_SCAN_SETTINGS}"
         )
         row = self.ch.client.query(probe_sql, parameters=params).result_rows
         out: list[NumericFieldInfo] = []
@@ -1260,13 +1247,14 @@ class StatisticalAnomalyService:
             if baseline_end is None:
                 stat_sql = (
                     f"SELECT quantile(0.25)(num) AS q1, quantile(0.75)(num) AS q3, count() AS n"
-                    f" FROM ({num_src}) WHERE num IS NOT NULL"
+                    f" FROM ({num_src}) WHERE num IS NOT NULL {_HEAVY_SCAN_SETTINGS}"
                 )
             else:
                 stat_params["bl"] = bl_str
                 stat_sql = (
                     f"SELECT min(num) AS lo, max(num) AS hi, count() AS n"
                     f" FROM ({num_src}) WHERE num IS NOT NULL AND timestamp < {{bl:String}}"
+                    f" {_HEAVY_SCAN_SETTINGS}"
                 )
             srows = self.ch.client.query(stat_sql, parameters=stat_params).result_rows
             if not srows or srows[0][2] is None:
@@ -1309,11 +1297,9 @@ class StatisticalAnomalyService:
                     num AS val,
                     count() AS cnt,
                     min(timestamp) AS first_seen,
-                    toString(argMin(event_id, timestamp)) AS evt_id,
-                    argMin(source_id, timestamp) AS src_id,
-                    argMin(message, timestamp) AS msg
+                    toString(argMin(event_id, timestamp)) AS evt_id
                 FROM (
-                    SELECT toFloat64OrNull({vcol}) AS num, timestamp, event_id, source_id, message
+                    SELECT toFloat64OrNull({vcol}) AS num, timestamp, event_id
                     FROM {db}.events
                     WHERE case_id = {{cid:String}}
                       AND has({{src:Array(String)}}, source_id)
@@ -1323,11 +1309,12 @@ class StatisticalAnomalyService:
                 GROUP BY val
                 ORDER BY greatest({{lo:Float64}} - val, val - {{hi:Float64}}) DESC, first_seen ASC
                 LIMIT {{plim:UInt32}}
+                {_HEAVY_SCAN_SETTINGS}
             """
             vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
 
             for vrow in vrows:
-                val, cnt, first_seen, evt_id, src_id, msg = vrow
+                val, cnt, first_seen, evt_id = vrow
                 if val is None:
                     continue
                 val_f = float(val)
@@ -1336,31 +1323,7 @@ class StatisticalAnomalyService:
                 score = round(excess / width, 4)
                 first_seen_str = _present_ts(first_seen)
                 evt_id_str = str(evt_id) if evt_id else None
-                mini_event: dict[str, Any] | None = None
-                if evt_id:
-                    mini_event = {
-                        "event_id": evt_id_str,
-                        "case_id": case_id,
-                        "source_id": str(src_id) if src_id else "",
-                        "message": str(msg) if msg else "",
-                        "timestamp": first_seen_str,
-                        "timestamp_desc": None,
-                        "artifact": None,
-                        "artifact_long": None,
-                        "display_name": None,
-                        "tags": [],
-                        "attributes": {},
-                        "content_hash": "",
-                        "file_hash": "",
-                        "parser_name": "",
-                        "parser_version": "",
-                        "source_file": "",
-                        "byte_offset": None,
-                        "line_number": None,
-                        "embedding_model": None,
-                        "embedding_config_hash": None,
-                        "ingest_time": None,
-                    }
+                mini_event = _stub_event(evt_id_str, case_id, first_seen_str)
 
                 details: dict[str, Any] = {
                     "detector": "numeric_range",
@@ -1405,12 +1368,14 @@ class StatisticalAnomalyService:
             ]
 
         all_findings.sort(key=lambda f: f.score, reverse=True)
+        results = all_findings[:limit]
+        self._hydrate_finding_events(case_id, source_ids, results)
         return StatAnomalyResult(
             status="ok",
             detector="numeric_range",
             method=method,
             baseline_size=total_events,
-            results=all_findings[:limit],
+            results=results,
         )
 
     # ------------------------------------------------------------------
@@ -1481,6 +1446,7 @@ class StatisticalAnomalyService:
               AND {col} != ''
             GROUP BY bucket, series_val
             ORDER BY bucket
+            {_HEAVY_SCAN_SETTINGS}
         """
         brows = self.ch.client.query(bucket_sql, parameters=params).result_rows
 
@@ -1676,14 +1642,11 @@ class StatisticalAnomalyService:
             "buckets": buckets,
             "iv": interval,
         }
-        # Aliased distinctly from the raw column names (agg_<col>) — reusing
-        # a WHERE-filtered column name (e.g. "case_id", "source_id") as an
-        # argMin(...) alias makes ClickHouse resolve that WHERE reference to
-        # the aggregate expression itself, raising "Aggregate function ...
-        # is found in WHERE" (ILLEGAL_AGGREGATION). Downstream parsing is
-        # positional (_row_to_event), so the alias names themselves are
-        # otherwise unused.
-        agg_cols_sql = ", ".join(f"argMin({c}, timestamp) AS agg_{c}" for c in _EVENT_COLUMNS)
+        # Phase 1 aggregates only argMin(event_id, ...) per (bucket, series)
+        # pair — the former all-column argMin dragged message/attributes for
+        # every matching row through the aggregation. The winners' full rows
+        # are then fetched in one bounded get_events_by_ids batch.
+        #
         # `timestamp` is DateTime64(3), and toStartOfInterval over a DateTime64
         # returns DateTime64 on ClickHouse builds that preserve the argument's
         # precision — comparing that against an Array(DateTime) literal then
@@ -1697,27 +1660,36 @@ class StatisticalAnomalyService:
             SELECT
                 {bucket_expr} AS bucket,
                 {col} AS series_val,
-                {agg_cols_sql}
+                toString(argMin(event_id, timestamp)) AS evt_id
             FROM {db}.events
             WHERE case_id = {{cid:String}}
               AND has({{src:Array(String)}}, source_id)
               AND {col} IN {{vals:Array(String)}}
               AND {bucket_expr} IN {{buckets:Array(DateTime)}}
             GROUP BY bucket, series_val
+            {_HEAVY_SCAN_SETTINGS}
         """
         rows = self.ch.client.query(sql, parameters=params).result_rows
 
-        by_key: dict[tuple[str, str], dict[str, Any]] = {}
-        for row in rows:
-            bucket, series_val = row[0], row[1]
-            evt = _row_to_event(_EVENT_COLUMNS, row[2:])
-            by_key[(str(series_val), ensure_utc(bucket).isoformat())] = evt
+        id_by_key: dict[tuple[str, str], str] = {
+            (str(series_val), ensure_utc(bucket).isoformat()): str(evt_id)
+            for bucket, series_val, evt_id in rows
+            if evt_id
+        }
+        events_by_id = self.ch.get_events_by_ids(
+            case_id, source_ids, sorted(set(id_by_key.values()))
+        )
 
         hydrated: list[FreqFinding] = []
         for f in findings:
-            evt = by_key.get((f.series_value, f.window_start))
+            evt_id = id_by_key.get((f.series_value, f.window_start))
+            evt = events_by_id.get(evt_id) if evt_id else None
             if evt is not None:
                 hydrated.append(replace(f, event_id=str(evt.get("event_id", "")), event=evt))
+            elif evt_id:
+                hydrated.append(
+                    replace(f, event_id=evt_id, event=_stub_event(evt_id, case_id, None))
+                )
             else:
                 hydrated.append(f)
         return hydrated
