@@ -46,6 +46,14 @@ resolved — this file holds only the condensed, still-open action items.
   (clickhouse-driver, port 9000), `async_insert`, parse/insert pipelining (parser thread
   feeding an insert thread).
 
+- [ ] **M23 — detector-scan residue (post 300M-row overhaul, session 27).** Two follow-ups
+  deliberately deferred: (a) `canonical_inventory` stays a live query — it only runs when a
+  timeline has field mappings, which the 300M reference case doesn't; add the planned
+  Postgres cache (key = case + sorted sources + mappings + per-source `computed_at`) only if
+  a mapped timeline at that scale measures slow. (b) Per-field novelty scans each re-read the
+  whole `attributes` map column (~12 GiB / ~23 s per field at 300M rows); batching all
+  scanned fields into one pass over `attributes` would amortize that ~7× for a panel open.
+
 - [ ] **M22 residue — tokenbf text-search fast path.** Items (a) typed `IN` for String
   columns, (c) single-round-trip histogram, and (d) novelty auto-field selection via the
   field-stats cache landed 2026-07-06 (session 24). Remaining: broad text search is still
