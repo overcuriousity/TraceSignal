@@ -60,7 +60,13 @@ export function ChangeCaseScopeDialog({ case_ }: Props) {
           variant="ghost"
           size="icon"
           className="opacity-0 group-hover:opacity-100 transition-base text-[var(--color-fg-muted)] hover:text-[var(--color-fg-primary)]"
-          onClick={(e) => e.preventDefault()}
+          onClick={(e) => {
+            // preventDefault() alone cancels Radix's composed open-handler
+            // (checkForDefaultPrevented), leaving the button dead — open
+            // explicitly, matching DeleteCaseDialog.
+            e.preventDefault();
+            setOpen(true);
+          }}
           title="Change case scope"
         >
           <Users size={14} />
