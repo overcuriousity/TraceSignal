@@ -62,8 +62,17 @@ class FakeClickHouseClient:
         **_kwargs: Any,
     ) -> FakeQueryResult:
         self.queries.append((query, parameters))
-        if query.strip().startswith("SELECT count()"):
+        stripped = query.strip()
+        if stripped.startswith("SELECT count()"):
             return FakeQueryResult(result_rows=[[0]])
+        if stripped.startswith("SELECT event_id, timestamp"):
+            # Phase 1 of the two-phase page fetch: thin sort-key rows.
+            id_idx = self.event_columns.index("event_id")
+            ts_idx = self.event_columns.index("timestamp")
+            return FakeQueryResult(
+                result_rows=[(row[id_idx], row[ts_idx]) for row in self.event_rows],
+                column_names=["event_id", "timestamp"],
+            )
         return FakeQueryResult(
             result_rows=self.event_rows,
             column_names=self.event_columns,
@@ -434,7 +443,9 @@ def test_combined_query_builds_single_where_clause(
     )
     count_query, count_params = _find_query(service, "SELECT count()")
     assert "case_id = {p0:String}" in count_query
-    assert "source_id IN {p1:Array(String)}" in count_query
+    # Single-element source list becomes equality — a fixed sort-key prefix
+    # is what lets ClickHouse read in order for ORDER BY ... LIMIT pages.
+    assert "source_id = {p1:String}" in count_query
     assert "message ILIKE {p2:String}" in count_query
     assert "artifact = {p3:String}" in count_query
     assert "attributes[{p4:String}] = {p5:String}" in count_query
@@ -718,11 +729,12 @@ def test_cursor_page_echoes_next_and_prev_cursor() -> None:
 # ── NULL-timestamp cursor tests (F3) ───────────────────────────────────────────
 
 
-def test_cursor_substitutes_sentinel_for_null_timestamp() -> None:
-    """A NULL-timestamp row at a page boundary must never produce a `None`
-    cursor component — `[null, id]` serializes to JSON and is not a
-    parseable "<iso-ts>,<event_id>" string on the way back in (400)."""
-    row = _cursor_row("evt-null", None)
+def test_cursor_substitutes_sentinel_for_undated_row() -> None:
+    """An undated row (stored as the year-2299 sentinel, presented as null)
+    at a page boundary must never produce a `None` cursor component —
+    `[null, id]` serializes to JSON and is not a parseable
+    "<iso-ts>,<event_id>" string on the way back in (400)."""
+    row = _cursor_row("evt-null", NULL_TS_SENTINEL.replace(tzinfo=None))
     svc = EventQueryService(store=FakeClickHouseStore(event_rows=[row]))
     page = svc.query(EventQuery(case_id="case-1"))
     assert page.events[0]["timestamp"] is None
@@ -743,6 +755,59 @@ def test_cursor_predicate_is_sargable_plain_tuple(
     assert "coalesce(" not in query
     assert "(timestamp, event_id) < ({p1:DateTime64(3)}, {p2:UUID})" in query
     assert "p3" not in (params or {})
+
+
+def test_two_phase_page_fetch_shapes() -> None:
+    """Phase 1 must select only (event_id, timestamp); phase 2 must re-filter
+    by the page's timestamp bounds plus an explicit event_id set, and return
+    rows in phase-1 order."""
+    rows = [
+        _cursor_row("evt-1", datetime(2026, 6, 25, 7, 30, 1)),
+        _cursor_row("evt-2", datetime(2026, 6, 25, 7, 30, 2)),
+    ]
+    svc = EventQueryService(store=FakeClickHouseStore(event_rows=rows))
+    page = svc.query(
+        EventQuery(case_id="case-1", limit=2, after=(datetime(2026, 6, 25, 7, 29, 0), "evt-0"))
+    )
+    queries = [q for q, _ in svc.store.client.queries]
+    phase1 = [q for q in queries if q.strip().startswith("SELECT event_id, timestamp")]
+    assert len(phase1) == 1
+    assert "ORDER BY timestamp" in phase1[0]
+    hydrate = [q for q in queries if "event_id IN (" in q]
+    assert len(hydrate) == 1
+    assert "timestamp >= {hts_min:DateTime64(3)}" in hydrate[0]
+    assert "timestamp <= {hts_max:DateTime64(3)}" in hydrate[0]
+    # The fat columns are only ever selected in the bounded hydration query.
+    assert "message" not in phase1[0]
+    assert "message" in hydrate[0]
+    _, hydrate_params = next((q, p) for q, p in svc.store.client.queries if "event_id IN (" in q)
+    assert hydrate_params["hid0"] == "evt-1"
+    assert hydrate_params["hid1"] == "evt-2"
+    assert [e["event_id"] for e in page.events] == ["evt-1", "evt-2"]
+
+
+def test_hydration_reorders_rows_to_phase1_order() -> None:
+    """The hydration SELECT has no ORDER BY — row order must be restored from
+    the phase-1 key order."""
+
+    class _ShuffledClient(FakeClickHouseClient):
+        def query(self, query: str, parameters=None, **kwargs: Any) -> FakeQueryResult:
+            result = super().query(query, parameters, **kwargs)
+            if "event_id IN (" in query:
+                result.result_rows = list(reversed(result.result_rows))
+            return result
+
+    rows = [
+        _cursor_row("evt-1", datetime(2026, 6, 25, 7, 30, 2)),
+        _cursor_row("evt-2", datetime(2026, 6, 25, 7, 30, 1)),
+    ]
+    store = FakeClickHouseStore()
+    store.client = _ShuffledClient(rows)
+    svc = EventQueryService(store=store)
+    page = svc.query(
+        EventQuery(case_id="case-1", limit=2, after=(datetime(2026, 6, 25, 7, 31, 0), "evt-0"))
+    )
+    assert [e["event_id"] for e in page.events] == ["evt-1", "evt-2"]
 
 
 def test_cursor_predicate_maps_empty_event_id_to_min_uuid(

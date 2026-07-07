@@ -357,10 +357,19 @@ class _ParameterizedQueryBuilder:
         implicit common type (ClickHouse error 386 NO_COMMON_TYPE), even
         when the array is empty. Neither form prunes on ``event_id`` anyway
         (not in the primary key), so nothing is lost there.
+
+        A single-element list emits plain equality instead of ``IN``: only a
+        fixed (equality-constrained) sort-key prefix lets ClickHouse read in
+        order for ``ORDER BY timestamp LIMIT n`` — the common single-source
+        timeline otherwise falls back to scanning every row's sort keys.
         """
         name = self._param_name()
         if cast_to_string:
             self.conditions.append(f"has({{{name}:Array(String)}}, toString({column}))")
+        elif len(values) == 1:
+            self.conditions.append(f"{column} = {{{name}:String}}")
+            self.parameters[name] = values[0]
+            return
         else:
             self.conditions.append(f"{column} IN {{{name}:Array(String)}}")
         self.parameters[name] = values
@@ -706,9 +715,17 @@ class EventQueryService:
         else:
             fetch_dir = display_dir
 
+        # Two-phase fetch. Phase 1 selects only the sort-key tail
+        # (event_id, timestamp) — thin columns, so the ORDER BY ... LIMIT
+        # top-N never touches the fat message/attributes columns; with the
+        # sort-key-aligned ORDER BY it terminates after ~LIMIT granules via
+        # read-in-order. Phase 2 hydrates just the page's rows by id,
+        # bounded by the page's timestamp range so the primary index prunes
+        # the hydration scan too. One-phase SELECT * was measured at
+        # 187 GiB read per page on a 300M-row case.
         fetch_limit = query.limit + 1 if cursor_mode else query.limit
         sql = f"""
-            SELECT {_EVENT_SELECT_COLUMNS}
+            SELECT event_id, timestamp
             FROM {database}.events
             WHERE {where}
             ORDER BY timestamp {fetch_dir}, event_id {fetch_dir}
@@ -730,25 +747,27 @@ class EventQueryService:
                 )
                 return count_result.result_rows[0][0] if count_result.result_rows else 0
 
-            total, event_result = self._run_parallel(
+            total, key_result = self._run_parallel(
                 _count,
                 lambda: self.store.client.query(sql, parameters=parameters),
             )
         else:
-            event_result = self.store.client.query(sql, parameters=parameters)
-        columns = event_result.column_names
-        rows = event_result.result_rows
+            key_result = self.store.client.query(sql, parameters=parameters)
+        key_rows = key_result.result_rows
 
         has_more_after = False
         has_more_before = False
         if cursor_mode:
-            has_extra = len(rows) > query.limit
-            rows = rows[: query.limit]
+            has_extra = len(key_rows) > query.limit
+            key_rows = key_rows[: query.limit]
             if query.before is not None:
                 has_more_before = has_extra
             else:
                 has_more_after = has_extra
-        elif total is not None:
+
+        columns, rows = self._hydrate_page(where, parameters, key_rows)
+
+        if not cursor_mode and total is not None:
             # Offset mode (only used for the very first page): derive
             # has_more_after from the COUNT already computed above, since
             # there's no cursor-side limit+1 trick to lean on here.
@@ -761,11 +780,11 @@ class EventQueryService:
         next_cursor = None
         prev_cursor = None
         if events:
-            # A NULL timestamp must never reach the cursor as `None` — it
-            # would serialize to JSON `null`, and `[null, id]` is not a
-            # parseable "<iso-ts>,<event_id>" cursor string on the way back
-            # in. Use the same sentinel the keyset predicate coalesces NULLs
-            # to, so round-tripping this cursor lands back on the NULL rows.
+            # Undated rows are *presented* as null but *stored* as the
+            # sentinel — a `None` here would serialize to JSON `null`, and
+            # `[null, id]` is not a parseable "<iso-ts>,<event_id>" cursor
+            # string on the way back in. Substitute the sentinel ISO so the
+            # round-tripped cursor seeks back to the same stored value.
             prev_ts = events[0]["timestamp"] or _NULL_TIMESTAMP_SENTINEL_ISO
             next_ts = events[-1]["timestamp"] or _NULL_TIMESTAMP_SENTINEL_ISO
             prev_cursor = (prev_ts, events[0]["event_id"])
@@ -781,6 +800,54 @@ class EventQueryService:
             next_cursor=next_cursor,
             prev_cursor=prev_cursor,
         )
+
+    def _hydrate_page(
+        self,
+        where: str,
+        parameters: dict[str, Any],
+        key_rows: list[tuple[Any, Any]],
+    ) -> tuple[tuple[str, ...], list[tuple]]:
+        """Fetch full rows for phase-1 ``(event_id, timestamp)`` keys, in key order.
+
+        Reuses the page query's WHERE (the keys were selected by it, so it
+        can only be a no-op re-filter) and adds two pruning predicates: the
+        page's [min, max] timestamp bounds — which the primary index turns
+        into a handful of granules — and the explicit event_id set. Rows
+        missing from the result (a concurrent partition swap could do this)
+        are dropped with a warning rather than served as empty stubs.
+        """
+        if not key_rows:
+            return (), []
+        params = dict(parameters)
+        timestamps = [ts for _, ts in key_rows]
+        params["hts_min"] = to_clickhouse_utc(ensure_utc(min(timestamps)), precise=True)
+        params["hts_max"] = to_clickhouse_utc(ensure_utc(max(timestamps)), precise=True)
+        id_names = [f"hid{i}" for i in range(len(key_rows))]
+        for name, (event_id, _) in zip(id_names, key_rows, strict=True):
+            params[name] = str(event_id)
+        id_list = ", ".join(f"{{{name}:UUID}}" for name in id_names)
+        result = self.store.client.query(
+            f"""
+            SELECT {_EVENT_SELECT_COLUMNS}
+            FROM {self.store.database}.events
+            WHERE {where}
+              AND timestamp >= {{hts_min:DateTime64(3)}}
+              AND timestamp <= {{hts_max:DateTime64(3)}}
+              AND event_id IN ({id_list})
+            """,
+            parameters=params,
+        )
+        columns = tuple(result.column_names)
+        id_idx = columns.index("event_id")
+        by_id = {str(row[id_idx]): row for row in result.result_rows}
+        rows: list[tuple] = []
+        for event_id, _ in key_rows:
+            row = by_id.get(str(event_id))
+            if row is None:
+                _logger.warning("hydration missed event_id=%s — dropping from page", event_id)
+                continue
+            rows.append(row)
+        return columns, rows
 
     def iter_events(self, query: EventQuery, batch_size: int = 1000) -> Iterator[dict[str, Any]]:
         """Yield every event matching *query*, paging through ClickHouse in batches.
