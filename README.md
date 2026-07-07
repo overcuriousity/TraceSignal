@@ -1,11 +1,10 @@
 # TraceSignal
 
-A local-first, forensic-grade log investigation platform for small security teams.
+A forensic-grade post-mortem log investigation platform.
 
 TraceSignal ingests Timesketch-compatible timelines at scale, lets analysts explore events
 through an ELK-like web interface, and surfaces anomalies both statistically and by embedding
-every log line into a vector database. It's built to run entirely on a team's own hardware —
-airgapped if needed — with reproducible, auditable processing at every step.
+every log line into a vector database. It's built to run airgapped if needed — with reproducible, auditable processing at every step.
 
 ## Why
 
@@ -24,10 +23,10 @@ embeddings surface the needles in the haystack, without needing a cluster to run
   loading everything into memory.
 - Every ingested file (**Source**) is SHA-256 hashed and retained content-addressed for
   re-download — forensic provenance and immutability by construction.
-- CLI-first (`tsig ingest`), so ingestion is scriptable and reproducible outside the web UI.
+- CLI-available (`tsig ingest`), so ingestion is scriptable and reproducible outside the web UI.
   For very large files (tens of GiB and up), prefer `tsig ingest` over the web upload: it
   streams straight from disk with no HTTP upload, no temp copy, and no `TS_MAX_UPLOAD_BYTES`
-  cap (web uploads default to 10 GiB). Insert batching is tuned via `TS_INGEST_BATCH_SIZE`
+  cap. Insert batching is tuned via `TS_INGEST_BATCH_SIZE`
   (default 20 000 events per ClickHouse round-trip). Run `tsig cases list` first to find the
   target case's ID (with its owner and team) — `tsig ingest` requires a real case ID, not a
   name, and validates it before touching the file. Ingestion shows a live progress box
@@ -40,6 +39,7 @@ embeddings surface the needles in the haystack, without needing a cluster to run
 ### Explorer
 - A virtualized, ELK-like event grid: resizable/pickable columns, comfortable/compact density,
   light/dark theme.
+- Color Scheme and Fonts optimized for best-in-class eye-friendly working envoronment.
 - Full-text and structured filtering (artifact type, source, tags, arbitrary field
   equality/exclusion), pushed down into ClickHouse rather than resolved client-side.
 - Time histogram with anomaly overlay markers, bidirectional keyset pagination with jump-to-time.
@@ -52,18 +52,7 @@ embeddings surface the needles in the haystack, without needing a cluster to run
   [`ait-aecid/logdata-anomaly-miner`](https://github.com/ait-aecid/logdata-anomaly-miner)'s
   value/frequency detector approach, run directly against ClickHouse — no embeddings required.
   See [Anomaly Detection](docs/ANOMALY_DETECTION.md) for a plain-language explanation of every
-  detector, its formula, and its default values:
-  - `value_novelty` — rare or first-seen field values.
-  - `frequency` — z-score spikes and silences over time buckets.
-  - Both support a self-baseline mode and a temporal mode (split a case into a baseline window
-    and a detection window).
-  - Detector runs persist to Postgres, so results survive rather than being re-derived from a
-    URL-encoded event-ID list.
-- **Vector-backed similarity and semantic search**, via a local sentence-transformer or an
-  OpenAI-compatible remote embedding endpoint, backed by Qdrant. Nearest-neighbor search,
-  distance-to-centroid outlier scoring, and free-text semantic search across a case.
-- Cross-detector suppression and pinned, forensic-grade annotations of confirmed findings —
-  framed throughout the UI as *triage*, not automated threat detection.
+  detector.
 
 ### Authentication, access control, and audit
 - Session-cookie authentication for local accounts, with a seeded one-time bootstrap admin and
