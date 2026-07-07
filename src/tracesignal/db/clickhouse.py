@@ -111,8 +111,16 @@ _EVENT_COLUMNS = [
     "embedding_config_hash",
 ]
 
+# `timestamp` is deliberately non-Nullable: it sits in the MergeTree sort key,
+# and a Nullable sort-key column (via allow_nullable_key) disables ClickHouse's
+# read-in-order optimization — turning every ORDER BY timestamp LIMIT N grid
+# page into a full-partition top-N sort. Events without a parseable timestamp
+# store the year-2299 sentinel (db/_dt.py NULL_TS_SENTINEL) and are presented
+# as null by the serialization helpers. The `{table}` slot exists so the
+# one-time legacy migration can create the new-shape table under a scratch
+# name before swapping it in.
 _EVENTS_TABLE_DDL = """
-CREATE TABLE IF NOT EXISTS {database}.events (
+CREATE TABLE IF NOT EXISTS {database}.{table} (
     event_id UUID,
     case_id LowCardinality(String),
     source_id LowCardinality(String),
@@ -125,7 +133,7 @@ CREATE TABLE IF NOT EXISTS {database}.events (
     parser_version LowCardinality(String),
     ingest_time DateTime64(3),
     message String,
-    timestamp Nullable(DateTime64(3)),
+    timestamp DateTime64(3),
     timestamp_desc LowCardinality(String),
     artifact LowCardinality(String),
     artifact_long LowCardinality(String),
@@ -140,7 +148,7 @@ CREATE TABLE IF NOT EXISTS {database}.events (
 ENGINE = MergeTree()
 ORDER BY (case_id, source_id, timestamp, event_id)
 PARTITION BY (case_id, source_id)
-SETTINGS index_granularity = 8192, allow_nullable_key = 1
+SETTINGS index_granularity = 8192
 """.strip()
 
 # Prefix for the transient tables the enrichment-apply stage/finalize step
@@ -205,13 +213,38 @@ class ClickHouseStore:
         if getattr(self, "_schema_ready", False):
             return
         self.client.command(f"CREATE DATABASE IF NOT EXISTS {self.database}")
-        self.client.command(_EVENTS_TABLE_DDL.format(database=self.database))
+        self.client.command(_EVENTS_TABLE_DDL.format(database=self.database, table="events"))
+        self._assert_not_legacy_schema()
         self._schema_ready = True
         # Enrichment output moved into events.attributes (stage_enrichment_rows / finalize_enrichment_apply);
         # the former side table is dead. Destructive, but pre-release
         # databases are documented as deprecated and the data is derived —
         # re-running the enricher regenerates it.
         self.client.command(f"DROP TABLE IF EXISTS {self.database}.event_enrichments")
+
+    def _assert_not_legacy_schema(self) -> None:
+        """Fail loudly when the events table still has the legacy Nullable timestamp.
+
+        The current query layer assumes the non-Nullable sentinel schema: its
+        plain tuple cursor predicate evaluates to NULL for NULL-timestamp rows
+        (silently unreachable by pagination) and its sentinel guards don't
+        exclude genuine NULLs from aggregates. Refusing to run beats silently
+        wrong forensic results. Fresh installs create the new shape directly
+        and never trip this; existing deployments run the one-time migration
+        documented in docs/PROGRESS.md (rebuild + EXCHANGE TABLES).
+        """
+        result = self.client.query(
+            "SELECT type FROM system.columns "
+            "WHERE database = {db:String} AND table = 'events' AND name = 'timestamp'",
+            parameters={"db": self.database},
+        )
+        rows = result.result_rows
+        if rows and str(rows[0][0]).startswith("Nullable("):
+            raise RuntimeError(
+                "events table has the legacy Nullable(DateTime64(3)) timestamp schema; "
+                "run the one-time timestamp-sentinel migration (docs/PROGRESS.md) "
+                "with the app stopped before starting this version."
+            )
 
     def insert_events(self, events: list[Event]) -> int:
         """Insert a batch of events into ClickHouse.

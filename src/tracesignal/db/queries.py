@@ -522,24 +522,29 @@ class _ParameterizedQueryBuilder:
         ``(case_id, source_id, timestamp, event_id)`` primary index, which
         ``toString()`` would defeat.
 
-        ``timestamp`` is coalesced to :data:`_NULL_TIMESTAMP_SENTINEL` because
-        a NULL component makes the whole tuple comparison evaluate to NULL
-        (not true/false), which would silently drop every NULL-timestamp row
-        from keyset-paginated results. An empty ``event_id`` is the
-        jump-to-time synthetic bound (a target time with no anchor event) and
-        is mapped to :data:`_MIN_EVENT_ID`, the lowest possible UUID, so it
-        keeps sorting before every real event at that timestamp.
+        The redundant scalar bound (``timestamp <= :ts`` for ``<``, ``>=``
+        for ``>``) is deliberate: ClickHouse's primary-index granule pruning
+        works on scalar sort-key comparisons but not on the tuple form, so
+        without it a deep page seek re-reads the whole partition. It never
+        changes the result set — every row matching the tuple predicate also
+        satisfies the scalar bound on its first component. No-timestamp rows
+        carry the year-2299 storage sentinel (a real column value, not NULL),
+        so they participate in both predicates like any other row.
+
+        An empty ``event_id`` is the jump-to-time synthetic bound (a target
+        time with no anchor event) and is mapped to :data:`_MIN_EVENT_ID`,
+        the lowest possible UUID, so it keeps sorting before every real
+        event at that timestamp.
         """
         ts_name = self._param_name()
         id_name = self._param_name()
-        sentinel_name = self._param_name()
+        scalar_op = "<=" if op == "<" else ">="
         self.conditions.append(
-            f"(coalesce(timestamp, {{{sentinel_name}:DateTime64(3)}}), event_id) {op} "
-            f"({{{ts_name}:DateTime64(3)}}, {{{id_name}:UUID}})"
+            f"(timestamp, event_id) {op} ({{{ts_name}:DateTime64(3)}}, {{{id_name}:UUID}})"
+            f" AND timestamp {scalar_op} {{{ts_name}:DateTime64(3)}}"
         )
         self.parameters[ts_name] = to_clickhouse_utc(ts, precise=True)
         self.parameters[id_name] = event_id or _MIN_EVENT_ID
-        self.parameters[sentinel_name] = to_clickhouse_utc(_NULL_TIMESTAMP_SENTINEL, precise=True)
 
     def _column_expr(self, key: str) -> str:
         return _field_column_expr(

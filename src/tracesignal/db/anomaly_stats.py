@@ -1769,7 +1769,11 @@ class StatisticalAnomalyService:
                 source_id,
                 toString(event_id) AS event_id,
                 timestamp,
-                lagInFrame(timestamp) OVER w AS prev_ts,
+                -- toNullable: on the non-Nullable timestamp column lagInFrame
+                -- returns the type default (1970-01-01), not NULL, for each
+                -- source's first row — which would make the IS NOT NULL
+                -- first-row guard below always-true.
+                lagInFrame(toNullable(timestamp)) OVER w AS prev_ts,
                 byte_offset,
                 line_number,
                 message,

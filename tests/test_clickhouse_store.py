@@ -3,6 +3,7 @@
 import pytest
 
 from tracesignal.db.clickhouse import (
+    _EVENTS_TABLE_DDL,
     ClickHouseStore,
     _partition_expr,
     _validate_partition_id,
@@ -104,6 +105,55 @@ class _FailingClient(_RecordingClient):
     def command(self, cmd):
         super().command(cmd)
         raise RuntimeError(self.message)
+
+
+class TestEventsSchema:
+    def test_timestamp_is_non_nullable_sort_key(self):
+        # A Nullable sort-key column (allow_nullable_key) disables
+        # ClickHouse's read-in-order optimization — every grid page would
+        # full-sort the partition. Undated events use the storage sentinel.
+        assert "timestamp DateTime64(3)" in _EVENTS_TABLE_DDL
+        assert "Nullable" not in _EVENTS_TABLE_DDL
+        assert "allow_nullable_key" not in _EVENTS_TABLE_DDL
+        assert "ORDER BY (case_id, source_id, timestamp, event_id)" in _EVENTS_TABLE_DDL
+
+    def test_init_schema_rejects_legacy_nullable_table(self, store):
+        class _LegacyClient(_RecordingClient):
+            def query(self, query, parameters=None):
+                super().query(query, parameters)
+                if "system.columns" in query:
+                    return _FakeResult([("Nullable(DateTime64(3))",)])
+                return _FakeResult([(42,)])
+
+        store.client = _LegacyClient()
+        with pytest.raises(RuntimeError, match="one-time timestamp-sentinel migration"):
+            store.init_schema()
+        # The guard must fire before the ready-flag caches success.
+        assert not getattr(store, "_schema_ready", False)
+
+    def test_init_schema_accepts_migrated_table(self, store):
+        class _MigratedClient(_RecordingClient):
+            def query(self, query, parameters=None):
+                super().query(query, parameters)
+                if "system.columns" in query:
+                    return _FakeResult([("DateTime64(3)",)])
+                return _FakeResult([(42,)])
+
+        store.client = _MigratedClient()
+        store.init_schema()
+        assert store._schema_ready is True
+
+    def test_init_schema_accepts_fresh_install(self, store):
+        class _EmptyClient(_RecordingClient):
+            def query(self, query, parameters=None):
+                super().query(query, parameters)
+                if "system.columns" in query:
+                    return _FakeResult([])
+                return _FakeResult([(42,)])
+
+        store.client = _EmptyClient()
+        store.init_schema()
+        assert store._schema_ready is True
 
 
 class TestDeleteSourceEventsErrors:

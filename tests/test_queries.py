@@ -641,13 +641,12 @@ def test_after_cursor_uses_lt_predicate_for_default_desc_order(
     ts = datetime(2026, 6, 25, 7, 30, 1)
     service.query(EventQuery(case_id="case-1", after=(ts, "evt-1")))
     query, params = _last_query(service)
-    assert (
-        "(coalesce(timestamp, {p3:DateTime64(3)}), event_id) < "
-        "({p1:DateTime64(3)}, {p2:UUID})" in query
-    )
+    assert "(timestamp, event_id) < ({p1:DateTime64(3)}, {p2:UUID})" in query
+    # Redundant scalar bound: only a scalar sort-key comparison prunes
+    # primary-index granules; the tuple form alone re-reads the partition.
+    assert "AND timestamp <= {p1:DateTime64(3)}" in query
     assert params["p1"] == "2026-06-25 07:30:01.000"
     assert params["p2"] == "evt-1"
-    assert params["p3"] == "2299-12-31 23:59:59.999"
     assert "OFFSET" not in query
 
 
@@ -657,10 +656,8 @@ def test_before_cursor_uses_gt_predicate_and_reversed_fetch_direction(
     ts = datetime(2026, 6, 25, 7, 30, 1)
     service.query(EventQuery(case_id="case-1", before=(ts, "evt-1")))
     query, _ = _last_query(service)
-    assert (
-        "(coalesce(timestamp, {p3:DateTime64(3)}), event_id) > "
-        "({p1:DateTime64(3)}, {p2:UUID})" in query
-    )
+    assert "(timestamp, event_id) > ({p1:DateTime64(3)}, {p2:UUID})" in query
+    assert "AND timestamp >= {p1:DateTime64(3)}" in query
     assert "ORDER BY timestamp ASC, event_id ASC" in query
 
 
@@ -733,18 +730,19 @@ def test_cursor_substitutes_sentinel_for_null_timestamp() -> None:
     assert page.next_cursor == ("2299-12-31T23:59:59.999000+00:00", "evt-null")
 
 
-def test_cursor_predicate_coalesces_null_timestamp_to_sentinel(
+def test_cursor_predicate_is_sargable_plain_tuple(
     service: EventQueryService,
 ) -> None:
-    """The keyset predicate must coalesce the `timestamp` column to the same
-    sentinel used in cursor construction, or a NULL-timestamp row's tuple
-    comparison evaluates to NULL (not true/false) and the row is silently
-    unreachable via pagination regardless of direction."""
+    """No `coalesce()` wrapper on the cursor predicate: the column stores the
+    year-2299 sentinel instead of NULL, so the plain tuple comparison is both
+    correct for undated rows and usable by the primary index — the coalesce
+    form defeated granule pruning entirely."""
     ts = datetime(2026, 6, 25, 7, 30, 1)
     service.query(EventQuery(case_id="case-1", after=(ts, "evt-1")))
     query, params = _last_query(service)
-    assert "coalesce(timestamp, {p3:DateTime64(3)})" in query
-    assert params["p3"] == "2299-12-31 23:59:59.999"
+    assert "coalesce(" not in query
+    assert "(timestamp, event_id) < ({p1:DateTime64(3)}, {p2:UUID})" in query
+    assert "p3" not in (params or {})
 
 
 def test_cursor_predicate_maps_empty_event_id_to_min_uuid(

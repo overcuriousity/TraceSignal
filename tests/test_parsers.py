@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from tracesignal.db._dt import NULL_TS_SENTINEL
 from tracesignal.ingestion.parser import (
     JsonlParser,
     TimesketchCsvParser,
@@ -266,7 +267,9 @@ def test_event_to_clickhouse_row_parses_timestamp() -> None:
     assert row["timestamp"] == datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
 
 
-def test_event_to_clickhouse_row_null_for_bad_timestamp() -> None:
+def test_event_to_clickhouse_row_sentinel_for_bad_timestamp() -> None:
+    # Unparsable timestamps store the year-2299 sentinel (the column is a
+    # non-Nullable MergeTree sort key); serialization presents it as null.
     event = Event(
         case_id="c",
         source_id="s",
@@ -280,4 +283,4 @@ def test_event_to_clickhouse_row_null_for_bad_timestamp() -> None:
         timestamp="not-a-date",
     )
     row = event.to_clickhouse_row()
-    assert row["timestamp"] is None
+    assert row["timestamp"] == NULL_TS_SENTINEL
