@@ -1296,6 +1296,11 @@ async def _run_stat_detector(
                 status_code=422,
                 detail="value_combo requires at least two fields.",
             )
+        if parsed_fields is not None and len(parsed_fields) > 4:
+            raise HTTPException(
+                status_code=422,
+                detail="value_combo supports at most four fields.",
+            )
         try:
             return await run_in_threadpool(
                 svc.find_value_combos,

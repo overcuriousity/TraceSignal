@@ -137,6 +137,14 @@ type:
 | `identifier` | distinct values ÷ non-empty events ≥ 0.9 (hashes, UUIDs, free-text messages — nearly every value is unique) | No — nothing repeats, so nothing can be "rare" relative to a peer group |
 | `categorical` | everything else — moderate cardinality, decent coverage | Yes |
 
+One exception overrides the cardinality rule: pipeline-synthesized fields
+(`artifact`, `display_name`, `parser_name`, `parser_version`, `source_file` —
+`_SYNTHETIC_FIELDS` in `db/anomaly_stats.py`) are never auto-recommended and
+are hidden from the Fields picker. These values are stamped on by
+normalization, not present in the raw log data, so "rare" values there
+reflect ingestion metadata rather than analyst-relevant behavior. They remain
+valid tokens for explicit `fields=` API selections.
+
 The attribute-key inventory behind this classification counts distinct values
 with ClickHouse's approximate `uniq()` (~1% error), not `uniqExact` — the
 thresholds above are coarse ratios, and exact per-key hash sets over

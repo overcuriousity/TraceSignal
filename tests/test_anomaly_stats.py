@@ -833,9 +833,10 @@ def test_recommend_novelty_fields_categorical_recommended():
 
     by_token = {f.token: f for f in result}
 
-    # artifact: categorical
+    # artifact: categorical cardinality, but synthetic (pipeline-added) →
+    # never auto-recommended
     assert by_token["artifact"].kind == "categorical"
-    assert by_token["artifact"].recommended is True
+    assert by_token["artifact"].recommended is False
 
     # timestamp_desc: categorical
     assert by_token["timestamp_desc"].kind == "categorical"

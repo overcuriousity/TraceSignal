@@ -230,6 +230,7 @@ export function NumericRangeView({
           timelineId={timelineId}
           selected={selectedFields}
           onChange={setSelectedFields}
+          autoCount={15}
           numeric
         />
         <RefreshButton isFetching={isFetching} onClick={() => refetch()} />

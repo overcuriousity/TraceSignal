@@ -94,7 +94,13 @@ from tracesignal.db.field_mappings import mapping_coalesce_expr, resolve_mapping
 # ---------------------------------------------------------------------------
 
 # Default fields scanned by value_novelty when no list is supplied (fallback only).
-_DEFAULT_NOVELTY_FIELDS = ["artifact", "timestamp_desc", "display_name"]
+_DEFAULT_NOVELTY_FIELDS = ["timestamp_desc"]
+
+# Pipeline-synthesized fields (added by normalization, not present in the raw
+# log data). Never auto-recommended for novelty scanning — rare values here
+# reflect ingestion metadata, not analyst-relevant log content. Still valid
+# tokens for explicit `fields=` selections and the viz field picker.
+_SYNTHETIC_FIELDS = {"artifact", "display_name", "parser_name", "parser_version", "source_file"}
 
 # Top-level columns considered by the field recommender (excludes free-text
 # and identifier-like columns that are not useful for novelty detection).
@@ -667,6 +673,8 @@ class StatisticalAnomalyService:
         findings: list[NoveltyFieldInfo] = []
         for token, dist, cov_count in inventory:
             kind, recommended = _classify_field(dist, cov_count, total)
+            if token in _SYNTHETIC_FIELDS:
+                recommended = False
             findings.append(
                 NoveltyFieldInfo(
                     token=token,

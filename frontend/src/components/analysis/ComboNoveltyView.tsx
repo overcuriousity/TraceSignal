@@ -243,6 +243,7 @@ export function ComboNoveltyView({
           onChange={setSelectedFields}
           minSelected={MIN_FIELDS}
           maxSelected={MAX_FIELDS}
+          autoCount={2}
           autoLabel="top 2"
         />
         <RefreshButton isFetching={isFetching} onClick={() => refetch()} />

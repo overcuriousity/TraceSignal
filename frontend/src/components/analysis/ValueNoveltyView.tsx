@@ -251,6 +251,7 @@ export function ValueNoveltyView({
           timelineId={timelineId}
           selected={selectedFields}
           onChange={setSelectedFields}
+          autoCount={15}
         />
         <RefreshButton isFetching={isFetching} onClick={() => refetch()} />
       </div>

@@ -10,11 +10,12 @@
  * The chip design mirrors the EmbedWizard field selector so the UX is
  * consistent across the anomaly and embedding workflows.
  */
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Hash, Check, Settings2 } from "lucide-react";
+import { Hash, Check, Search, Settings2 } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
 import { Button } from "@/components/ui/Button";
+import { Input } from "@/components/ui/Input";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
 import {
@@ -43,6 +44,12 @@ interface Props {
   minSelected?: number;
   /** Maximum number of fields an explicit selection may hold (value_combo caps at 4). */
   maxSelected?: number;
+  /**
+   * How many recommended fields the backend's auto mode actually scans
+   * (value_combo uses the top 2). When set, the auto default shows only that
+   * many fields as checked so the picker mirrors what really runs.
+   */
+  autoCount?: number;
   /** Label for the "reset to backend default" action ("auto" by default). */
   autoLabel?: string;
   /**
@@ -52,6 +59,17 @@ interface Props {
    */
   numeric?: boolean;
 }
+
+// Pipeline-synthesized fields (normalization metadata, not raw log content) —
+// hidden from the picker entirely; mirrors _SYNTHETIC_FIELDS in
+// db/anomaly_stats.py, which stops the backend from auto-recommending them.
+const SYNTHETIC_TOKENS = new Set([
+  "artifact",
+  "display_name",
+  "parser_name",
+  "parser_version",
+  "source_file",
+]);
 
 const KIND_HINT: Record<string, string> = {
   constant: "constant",
@@ -120,9 +138,11 @@ export function AnomalyFieldPicker({
   onChange,
   minSelected,
   maxSelected,
+  autoCount,
   autoLabel = "auto",
   numeric = false,
 }: Props) {
+  const [query, setQuery] = useState("");
   const { data, isLoading } = useQuery({
     queryKey: ["anomalies", caseId, timelineId, numeric ? "numeric-fields" : "fields"],
     queryFn: (): Promise<NoveltyFieldsResponse | NumericFieldsResponse> =>
@@ -146,44 +166,80 @@ export function AnomalyFieldPicker({
   }, [numeric, data]);
 
   const allFields: NoveltyFieldInfo[] = useMemo(() => {
+    let fields: NoveltyFieldInfo[];
     if (!data) return [];
-    if (!numeric) return data.fields as NoveltyFieldInfo[];
-    return (data.fields as { token: string; distinct: number; coverage: number; recommended: boolean }[]).map(
-      (f) => ({
-        token: f.token,
-        distinct: f.distinct,
-        coverage: f.coverage,
-        kind: f.recommended ? "categorical" : "identifier",
-        recommended: f.recommended,
-      }),
-    );
+    if (!numeric) {
+      fields = data.fields as NoveltyFieldInfo[];
+    } else {
+      fields = (data.fields as { token: string; distinct: number; coverage: number; recommended: boolean }[]).map(
+        (f) => ({
+          token: f.token,
+          distinct: f.distinct,
+          coverage: f.coverage,
+          kind: f.recommended ? "categorical" : "identifier",
+          recommended: f.recommended,
+        }),
+      );
+    }
+    return fields.filter((f) => !SYNTHETIC_TOKENS.has(f.token));
   }, [data, numeric]);
+
+  // Substring search across the display label and the raw token.
+  const visibleFields = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return allFields;
+    return allFields.filter(
+      (f) =>
+        f.token.toLowerCase().includes(q) || tokenLabel(f.token).toLowerCase().includes(q),
+    );
+  }, [allFields, query]);
 
   // Standard fields = top-level columns (no "attr:" prefix).
   // Dynamic fields = attribute keys.
   const { standard, dynamic } = useMemo(() => {
     return {
-      standard: allFields.filter((f) => !f.token.startsWith("attr:")),
-      dynamic: allFields.filter((f) => f.token.startsWith("attr:")),
+      standard: visibleFields.filter((f) => !f.token.startsWith("attr:")),
+      dynamic: visibleFields.filter((f) => f.token.startsWith("attr:")),
     };
-  }, [allFields]);
+  }, [visibleFields]);
 
-  // Effective selection: when null, use recommended defaults (shown as checked).
+  // Effective selection: when null, use recommended defaults (shown as
+  // checked). autoCount mirrors backends that only scan the top N of the
+  // recommended set (value_combo scans the top 2) — the list is already
+  // sorted recommended-first / coverage-descending by the backend.
   const effectiveSelected = useMemo(() => {
     if (selected !== null) return new Set(selected);
-    return new Set(allFields.filter((f) => f.recommended).map((f) => f.token));
-  }, [selected, allFields]);
+    const rec = allFields.filter((f) => f.recommended).map((f) => f.token);
+    return new Set(autoCount !== undefined ? rec.slice(0, autoCount) : rec);
+  }, [selected, allFields, autoCount]);
 
   const toggle = (token: string) => {
-    // Materialise the current effective set and toggle one token.
+    // Materialise the current effective set and toggle one token. Dropping
+    // below minSelected is allowed (the caller disables the query and warns)
+    // so a selection can be rebuilt from scratch.
     const next = new Set(effectiveSelected);
     if (next.has(token)) {
-      if (minSelected !== undefined && next.size <= minSelected) return; // floor
       next.delete(token);
     } else {
       if (maxSelected !== undefined && next.size >= maxSelected) return; // ceiling
       next.add(token);
     }
+    onChange(Array.from(next));
+  };
+
+  // All/none act on the currently visible (search-filtered) fields.
+  const selectAllVisible = () => {
+    const next = new Set(effectiveSelected);
+    for (const f of visibleFields) {
+      if (maxSelected !== undefined && next.size >= maxSelected) break;
+      next.add(f.token);
+    }
+    onChange(Array.from(next));
+  };
+
+  const selectNoneVisible = () => {
+    const next = new Set(effectiveSelected);
+    for (const f of visibleFields) next.delete(f.token);
     onChange(Array.from(next));
   };
 
@@ -208,25 +264,61 @@ export function AnomalyFieldPicker({
         </Button>
       </PopoverTrigger>
 
-      <PopoverContent className="w-72 p-0" align="end">
-        <div className="border-b border-[var(--color-border)] px-3 py-2">
-          <p className="text-xs font-semibold text-[var(--color-fg-primary)]">
-            Fields to scan
-          </p>
-          <p className="text-xs text-[var(--color-fg-muted)] mt-0.5">
-            {minSelected !== undefined
-              ? `Pick ${minSelected}${maxSelected ? `–${maxSelected}` : "+"} fields to combine.`
-              : "Recommended fields are pre-selected based on cardinality."}
-          </p>
+      <PopoverContent className="w-96 p-0" align="end">
+        <div className="border-b border-[var(--color-border)] px-3 py-2 space-y-2">
+          <div>
+            <p className="text-xs font-semibold text-[var(--color-fg-primary)]">
+              Fields to scan
+            </p>
+            <p className="text-xs text-[var(--color-fg-muted)] mt-0.5">
+              {minSelected !== undefined
+                ? `Pick ${minSelected}${maxSelected ? `–${maxSelected}` : "+"} fields to combine.`
+                : "Recommended fields are pre-selected based on cardinality."}
+            </p>
+          </div>
+          <div className="relative">
+            <Search
+              size={12}
+              className="absolute left-2 top-1/2 -translate-y-1/2 text-[var(--color-fg-muted)]"
+            />
+            <Input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search fields…"
+              className="h-7 pl-7 text-xs"
+            />
+          </div>
+          <div className="flex items-center gap-3 text-xs">
+            {maxSelected === undefined && (
+              <button
+                type="button"
+                onClick={selectAllVisible}
+                className="text-[var(--color-fg-muted)] hover:text-[var(--color-fg-primary)] transition-colors"
+              >
+                Select all{query.trim() ? " matching" : ""}
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={selectNoneVisible}
+              className="text-[var(--color-fg-muted)] hover:text-[var(--color-fg-primary)] transition-colors"
+            >
+              Clear{query.trim() ? " matching" : " all"}
+            </button>
+          </div>
         </div>
 
-        <div className="max-h-72 overflow-y-auto px-3 py-2 space-y-3">
+        <div className="max-h-[26rem] overflow-y-auto px-3 py-2 space-y-3">
           {isLoading ? (
             <div className="flex justify-center py-4">
               <Spinner size={16} />
             </div>
           ) : allFields.length === 0 ? (
             <p className="py-3 text-xs text-[var(--color-fg-muted)]">No fields found.</p>
+          ) : visibleFields.length === 0 ? (
+            <p className="py-3 text-xs text-[var(--color-fg-muted)]">
+              No fields match “{query.trim()}”.
+            </p>
           ) : (
             <>
               {standard.length > 0 && (
