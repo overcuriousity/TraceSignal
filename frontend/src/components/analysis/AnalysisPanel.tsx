@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   X,
   AlertTriangle,
@@ -29,6 +29,7 @@ import { SemanticSearch } from "./SemanticSearch";
 import { EmbeddingStatusBanner } from "./EmbeddingStatusBanner";
 import { MethodologyPanel } from "./MethodologyPanel";
 import { timelinesApi } from "@/api/timelines";
+import { useUiStore } from "@/stores/ui";
 import { cn } from "@/lib/cn";
 import type { AnomalyMarker, Event } from "@/api/types";
 
@@ -138,8 +139,44 @@ export function AnalysisPanel({
   // Show the similarity banner when: not embedded at all, OR embedded-but-stale.
   const showBanner = !hasVectors || (timeline?.is_stale ?? false);
 
+  // ── Resize drag (mirrors EventDetailPanel) ─────────────────────────────
+  const { analysisPanelWidth, setAnalysisPanelWidth } = useUiStore();
+  const dragState = useRef<{ startX: number; startWidth: number } | null>(null);
+
+  const onDragStart = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    dragState.current = { startX: e.clientX, startWidth: analysisPanelWidth };
+  }, [analysisPanelWidth]);
+
+  useEffect(() => {
+    function onMouseMove(e: MouseEvent) {
+      if (!dragState.current) return;
+      const delta = dragState.current.startX - e.clientX;
+      const newWidth = Math.max(320, Math.min(720, dragState.current.startWidth + delta));
+      setAnalysisPanelWidth(newWidth);
+    }
+    function onMouseUp() {
+      dragState.current = null;
+    }
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+    };
+  }, [setAnalysisPanelWidth]);
+
   return (
-    <div className="flex h-full w-80 shrink-0 flex-col border-l border-[var(--color-border)] bg-[var(--color-bg-surface)]">
+    <div
+      className="relative flex h-full shrink-0 flex-col border-l border-[var(--color-border)] bg-[var(--color-bg-surface)]"
+      style={{ width: analysisPanelWidth }}
+    >
+      {/* Drag handle — left edge */}
+      <div
+        onMouseDown={onDragStart}
+        className="absolute left-0 top-0 h-full w-1 cursor-col-resize opacity-0 hover:opacity-100 hover:bg-[var(--color-accent)] transition-opacity z-10"
+        style={{ marginLeft: -2 }}
+      />
       {/* Header */}
       <div className="flex items-center gap-2 border-b border-[var(--color-border)] px-4 py-3">
         <h3 className="flex-1 text-sm font-semibold text-[var(--color-fg-primary)]">

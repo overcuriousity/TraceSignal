@@ -36,6 +36,10 @@ interface UiState {
   detailPanelWidth: number;
   setDetailPanelWidth: (w: number) => void;
 
+  /** Width of the analysis panel in pixels. */
+  analysisPanelWidth: number;
+  setAnalysisPanelWidth: (w: number) => void;
+
   /** Persisted event grid column widths (px), keyed by column id. */
   columnWidths: Record<string, number>;
   setColumnWidth: (id: string, width: number) => void;
@@ -97,6 +101,9 @@ export const useUiStore = create<UiState>()(
 
       detailPanelWidth: 420,
       setDetailPanelWidth: (w) => set({ detailPanelWidth: w }),
+
+      analysisPanelWidth: 400,
+      setAnalysisPanelWidth: (w) => set({ analysisPanelWidth: w }),
 
       columnWidths: {},
       setColumnWidth: (id, width) =>
