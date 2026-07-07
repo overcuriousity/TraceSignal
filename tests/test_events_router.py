@@ -550,6 +550,7 @@ class _FakeStatAnomalyService:
         self.combo_calls: list[dict] = []
         self.order_calls: list[dict] = []
         self.range_calls: list[dict] = []
+        self.charset_calls: list[dict] = []
 
     def get_timeline_midpoint(self, case_id, source_ids):
         return self._midpoint
@@ -573,6 +574,10 @@ class _FakeStatAnomalyService:
     def find_range_violations(self, **kwargs):
         self.range_calls.append(kwargs)
         return "range-result"
+
+    def find_charset_novelty(self, **kwargs):
+        self.charset_calls.append(kwargs)
+        return "charset-result"
 
 
 @pytest.fixture()
@@ -726,6 +731,49 @@ async def test_run_stat_detector_dispatches_to_numeric_range(patched_store, monk
     assert result == "range-result"
     assert fake_svc.range_calls[0]["fields"] == ["attr:bytes"]
     assert not fake_svc.value_novelty_calls
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_dispatches_to_charset(patched_store, monkeypatch):
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    result = await events._run_stat_detector(
+        "c1",
+        ["s1"],
+        detector="charset",
+        fields="attr:user",
+        series_field="artifact",
+        z_threshold=None,
+        baseline_end=None,
+        temporal=False,
+        limit=50,
+    )
+    assert result == "charset-result"
+    assert fake_svc.charset_calls[0]["fields"] == ["attr:user"]
+    # Explicit fields → the field-stats cache inventory is not resolved.
+    assert fake_svc.charset_calls[0]["inventory"] is None
+    assert not fake_svc.value_novelty_calls
+
+
+def test_serialize_finding_charset_shape():
+    from tracesignal.db.anomaly_stats import CharsetFinding
+
+    f = CharsetFinding(
+        field="attr:user",
+        value="ab\x00",
+        novel_chars=["\x00"],
+        count=2,
+        score=4.6052,
+        first_seen="2024-01-01T00:00:00+00:00",
+        event_id="evt-1",
+        event=None,
+        details={"detector": "charset"},
+    )
+    out = events._serialize_finding(f)
+    assert out["type"] == "charset"
+    assert out["novel_chars"] == ["\x00"]
+    assert out["score"] == 4.6052
 
 
 @pytest.mark.asyncio

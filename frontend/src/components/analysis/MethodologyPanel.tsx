@@ -17,6 +17,7 @@ import {
   Activity,
   Rewind,
   Ruler,
+  Type,
   ShieldCheck,
   BarChart2,
 } from "lucide-react";
@@ -213,6 +214,39 @@ export function MethodologyPanel({
             <Row label="Backend">
               ClickHouse quantile()/min()/max() over toFloat64OrNull — no ML.
               Fields with fewer than 20 numeric baseline samples are skipped.
+            </Row>
+          </div>
+        </div>
+
+        {/* Charset novelty */}
+        <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3 space-y-2">
+          <p className="flex items-center gap-1.5 font-medium text-[var(--color-fg-primary)]">
+            <Type size={11} /> Charset novelty (charset)
+          </p>
+          <div className="space-y-1.5 text-[var(--color-fg-muted)]">
+            <Row label="Method">
+              Per field, learns a reference character set over distinct values.
+              Self-baseline ("rare-chars") treats characters appearing in ≤ 3
+              distinct values as rare and flags values containing them;
+              temporal learns the baseline window's character set and flags
+              detect-window values with never-seen characters.
+            </Row>
+            <Row label="Signal">
+              Null bytes, unicode homoglyphs, injection metacharacters —
+              detected purely by character identity, never by what a value
+              means. Fields with fewer than 20 distinct baseline values or an
+              alphabet over 5000 characters (free text in large scripts) are
+              skipped.
+            </Row>
+            <Row label="Score">
+              Sum over the value's novel characters of −log(values-with-char /
+              distinct-values) — value_novelty's surprise family. Novel
+              characters and their codepoints are carried in{" "}
+              <code className="font-mono text-xs">details</code>.
+            </Row>
+            <Row label="Backend">
+              ClickHouse extractAll + array functions over distinct values — no
+              ML.
             </Row>
           </div>
         </div>

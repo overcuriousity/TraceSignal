@@ -55,6 +55,19 @@ already-ingested data.
     window and flags detect-window values outside it. Findings group by
     distinct violating value; score = distance outside the band ÷ band width.
 
+**charset** (``detector="charset"``)
+    Per field, learn a reference character set over *distinct values* and flag
+    values containing characters outside it (null bytes, unicode homoglyphs,
+    injection metacharacters — purely syntactic, never by meaning). AMiner
+    ``CharsetDetector``. Two modes: *self-baseline* (``method="rare-chars"``)
+    treats characters appearing in ≤ ``rarity_floor`` distinct values as rare
+    and flags values containing them (the whole-corpus charset trivially
+    contains everything — same degeneracy the numeric_range detector's IQR
+    fence works around); *temporal* (``method="temporal-charset"``) learns the
+    baseline-window charset and flags detect-window values with never-seen
+    characters. Score = Σ per novel char ``-log(n_vals_with_char / n_vals)``
+    (temporal: ``log(n_vals + 1)`` per char) — value_novelty's surprise family.
+
 **timestamp_order** (``detector="timestamp_order"``)
     Flag events whose parsed timestamp jumps *backwards* relative to the
     previous record in the source file (record order = ``byte_offset``, then
@@ -131,6 +144,15 @@ _MIN_RANGE_BASELINE = 20
 # be offered as a range-detector candidate (syntactic type detection only).
 _MIN_NUMERIC_RATIO = 0.9
 
+# Minimum distinct baseline values before the charset detector trusts a
+# field's learned character set — below this, "never seen" is noise.
+_MIN_CHARSET_BASELINE = 20
+
+# Skip fields whose reference character set exceeds this (free text in large
+# scripts, e.g. CJK) — a huge alphabet makes "novel character" meaningless and
+# the reference-set query parameter unreasonably large.
+_MAX_CHARSET_SIZE = 5000
+
 # Minimum buckets in a frequency series for z-scoring to be meaningful.
 _MIN_FREQUENCY_BUCKETS = 3
 
@@ -197,6 +219,23 @@ class RangeFinding:
 
 
 @dataclass
+class CharsetFinding:
+    """One value containing never-seen characters from the charset detector."""
+
+    field: str
+    value: str
+    # Characters in the value that are outside the field's reference charset.
+    novel_chars: list[str]
+    count: int
+    # Sum of per-novel-char surprise; higher = more/rarer novel characters.
+    score: float
+    first_seen: str | None
+    event_id: str | None
+    event: dict[str, Any] | None
+    details: dict[str, Any]
+
+
+@dataclass
 class NumericFieldInfo:
     """A numeric-parseable field candidate for the range detector."""
 
@@ -249,14 +288,15 @@ class StatAnomalyResult:
 
     status: str  # "ok" | "no_data" | "insufficient_data"
     # "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range"
+    #  | "charset"
     detector: str
     # "self-baseline" | "temporal" | "z-score" | "temporal-z-score" | "sequential"
-    #  | "iqr" | "temporal-range"
+    #  | "iqr" | "temporal-range" | "rare-chars" | "temporal-charset"
     method: str
     baseline_size: int  # total events (value_novelty) or event-count used for z-score
-    results: list[ValueFinding | FreqFinding | OrderFinding | ComboFinding | RangeFinding] = field(
-        default_factory=list
-    )
+    results: list[
+        ValueFinding | FreqFinding | OrderFinding | ComboFinding | RangeFinding | CharsetFinding
+    ] = field(default_factory=list)
     # Effective |z| cutoff used by the frequency detector; None for value_novelty.
     z_threshold: float | None = None
 
@@ -1386,6 +1426,287 @@ class StatisticalAnomalyService:
         return StatAnomalyResult(
             status="ok",
             detector="numeric_range",
+            method=method,
+            baseline_size=total_events,
+            results=results,
+        )
+
+    # ------------------------------------------------------------------
+    # Charset novelty
+    # ------------------------------------------------------------------
+
+    def _auto_string_fields(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        total_events: int,
+        field_mappings: dict[str, list[str]] | None,
+        inventory: list[tuple[str, int, int]] | None,
+        inventory_total: int | None,
+    ) -> list[str]:
+        """Auto-select string fields for the charset/entropy detectors.
+
+        Unlike value_novelty's default (categorical only), identifier-kind
+        fields are kept: near-unique values (URLs, filenames, user agents,
+        hashes) are exactly where injected metacharacters and random-looking
+        strings appear. Constant and sparse fields stay excluded, as do
+        pipeline-synthesized fields.
+        """
+        rec = self.recommend_novelty_fields(
+            case_id,
+            source_ids,
+            total=inventory_total if inventory is not None else total_events,
+            field_mappings=field_mappings,
+            inventory=inventory,
+        )
+        tokens = [
+            f.token
+            for f in rec
+            if f.kind in ("categorical", "identifier") and f.token not in _SYNTHETIC_FIELDS
+        ]
+        return tokens[:_MAX_AUTO_SCAN_FIELDS]
+
+    def find_charset_novelty(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        fields: list[str] | None = None,
+        limit: int = 50,
+        per_field_limit: int = 25,
+        rarity_floor: int = 3,
+        baseline_end: datetime | None = None,
+        exclude_event_ids: set[str] | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
+        inventory: list[tuple[str, int, int]] | None = None,
+        inventory_total: int | None = None,
+    ) -> StatAnomalyResult:
+        """Return values containing characters outside a field's reference charset.
+
+        Per field, learn a reference character set and flag values in the
+        detect scope containing characters outside it (null bytes, unicode
+        homoglyphs, injection metacharacters — detected purely syntactically).
+        AMiner ``CharsetDetector``. Character sets are computed over *distinct
+        values* (not rows), so a character carried by one hot value counts
+        once.
+
+        Two modes:
+
+        * *self-baseline* (``method="rare-chars"``) — the whole-corpus charset
+          trivially contains every character, so instead a character appearing
+          in ≤ ``rarity_floor`` distinct values is *rare*; the reference set is
+          all non-rare characters and any value containing a rare character is
+          flagged (mirrors the IQR fallback the numeric_range detector uses
+          for the same degeneracy).
+        * *temporal* (``method="temporal-charset"``) — reference set = every
+          character seen in baseline-window values (``timestamp <
+          baseline_end``); detect-window values containing characters absent
+          from it are flagged.
+
+        Score = Σ over the value's novel characters of ``-log(n_vals_with_char
+        / n_distinct_values)`` (self mode; temporal uses ``log(n_distinct + 1)``
+        per never-seen character) — same surprise family as value_novelty.
+
+        Fields with fewer than ``_MIN_CHARSET_BASELINE`` distinct baseline
+        values or a reference charset larger than ``_MAX_CHARSET_SIZE`` are
+        skipped; when every scanned field skips the status is
+        ``insufficient_data``.
+        """
+        self.ch.init_schema()
+        db = self.ch.database
+        base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        method = "rare-chars" if baseline_end is None else "temporal-charset"
+
+        total_events = self._count_events(case_id, source_ids)
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data",
+                detector="charset",
+                method=method,
+                baseline_size=0,
+            )
+
+        if fields is not None:
+            scan_fields = fields
+        else:
+            scan_fields = self._auto_string_fields(
+                case_id, source_ids, total_events, field_mappings, inventory, inventory_total
+            )
+
+        bl_str = to_clickhouse_utc(baseline_end) if baseline_end is not None else None
+        all_findings: list[CharsetFinding] = []
+        evaluated_fields = 0
+
+        for field_token in scan_fields:
+            # --- Learn the reference charset. ---
+            char_counts: dict[str, int] = {}
+            if baseline_end is None:
+                # Per-character distinct-value counts over the whole corpus.
+                cc_params: dict[str, Any] = {**base_params}
+                col = _col_expr(field_token, cc_params, field_mappings)
+                cc_sql = f"""
+                    SELECT c, count() AS n_vals_with_c
+                    FROM (
+                        SELECT DISTINCT {col} AS val
+                        FROM {db}.events
+                        WHERE case_id = {{cid:String}}
+                          AND has({{src:Array(String)}}, source_id)
+                          AND {col} != ''
+                    )
+                    ARRAY JOIN arrayDistinct(extractAll(val, '(?s).')) AS c
+                    GROUP BY c
+                    {_HEAVY_SCAN_SETTINGS}
+                """
+                cc_rows = self.ch.client.query(cc_sql, parameters=cc_params).result_rows
+                char_counts = {str(c): int(nv) for c, nv in cc_rows}
+
+                nv_params: dict[str, Any] = {**base_params}
+                nv_col = _col_expr(field_token, nv_params, field_mappings)
+                nv_rows = self.ch.client.query(
+                    f"SELECT uniqExact({nv_col}) FROM {db}.events"
+                    f" WHERE case_id = {{cid:String}}"
+                    f" AND has({{src:Array(String)}}, source_id)"
+                    f" AND {nv_col} != ''"
+                    f" {_HEAVY_SCAN_SETTINGS}",
+                    parameters=nv_params,
+                ).result_rows
+                n_vals = int(nv_rows[0][0]) if nv_rows else 0
+                reference = [c for c, nv in char_counts.items() if nv > rarity_floor]
+            else:
+                # Charset of the baseline window (sentinel rows sort after
+                # baseline_end, so `timestamp <` already excludes them).
+                bs_params: dict[str, Any] = {**base_params, "bl": bl_str}
+                col = _col_expr(field_token, bs_params, field_mappings)
+                bs_sql = f"""
+                    SELECT
+                        groupUniqArrayArray(arrayDistinct(extractAll(val, '(?s).'))) AS charset,
+                        count() AS n_vals
+                    FROM (
+                        SELECT DISTINCT {col} AS val
+                        FROM {db}.events
+                        WHERE case_id = {{cid:String}}
+                          AND has({{src:Array(String)}}, source_id)
+                          AND {col} != ''
+                          AND timestamp < {{bl:String}}
+                    )
+                    {_HEAVY_SCAN_SETTINGS}
+                """
+                bs_rows = self.ch.client.query(bs_sql, parameters=bs_params).result_rows
+                if not bs_rows:
+                    continue
+                charset_arr, n_vals = bs_rows[0]
+                n_vals = int(n_vals)
+                reference = [str(c) for c in (charset_arr or [])]
+
+            if n_vals < _MIN_CHARSET_BASELINE or len(reference) > _MAX_CHARSET_SIZE:
+                continue
+            evaluated_fields += 1
+
+            # --- Flag values containing characters outside the reference set. ---
+            viol_params: dict[str, Any] = {**base_params}
+            vcol = _col_expr(field_token, viol_params, field_mappings)
+            viol_params["base"] = reference
+            viol_params["plim"] = per_field_limit
+            detect_clause = ""
+            if baseline_end is not None:
+                viol_params["bl"] = bl_str
+                # Exclude sentinel/undated rows: they satisfy `>= bl` (year-2299
+                # sentinel) and would otherwise land in the detect window.
+                detect_clause = f" AND timestamp >= {{bl:String}} AND {TS_NOT_SENTINEL_SQL}"
+            viol_sql = f"""
+                SELECT val, novel, cnt, first_seen, evt_id
+                FROM (
+                    SELECT
+                        val,
+                        arrayFilter(
+                            c -> NOT has({{base:Array(String)}}, c),
+                            arrayDistinct(extractAll(val, '(?s).'))
+                        ) AS novel,
+                        cnt, first_seen, evt_id
+                    FROM (
+                        SELECT
+                            {vcol} AS val,
+                            count() AS cnt,
+                            min(timestamp) AS first_seen,
+                            toString(argMin(event_id, timestamp)) AS evt_id
+                        FROM {db}.events
+                        WHERE case_id = {{cid:String}}
+                          AND has({{src:Array(String)}}, source_id)
+                          AND {vcol} != ''{detect_clause}
+                        GROUP BY val
+                    )
+                )
+                WHERE length(novel) > 0
+                ORDER BY length(novel) DESC, cnt ASC
+                LIMIT {{plim:UInt32}}
+                {_HEAVY_SCAN_SETTINGS}
+            """
+            vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
+
+            for vrow in vrows:
+                val, novel, cnt, first_seen, evt_id = vrow
+                novel_chars = [str(c) for c in (novel or [])]
+                if not val or not novel_chars:
+                    continue
+                score = 0.0
+                for c in novel_chars:
+                    nv_c = char_counts.get(c, 0)
+                    if nv_c > 0 and n_vals > 0:
+                        score += -math.log(nv_c / n_vals)
+                    else:
+                        # Never seen in the baseline: +1-smoothed surprise.
+                        score += math.log(n_vals + 1)
+                first_seen_str = _present_ts(first_seen)
+                evt_id_str = str(evt_id) if evt_id else None
+                mini_event = _stub_event(evt_id_str, case_id, first_seen_str)
+
+                details: dict[str, Any] = {
+                    "detector": "charset",
+                    "method": method,
+                    "field": field_token,
+                    "value": str(val),
+                    "novel_chars": novel_chars,
+                    "codepoints": [f"U+{ord(c):04X}" for c in novel_chars if len(c) == 1],
+                    "count": int(cnt),
+                    "baseline_distinct_values": n_vals,
+                }
+                if baseline_end is None:
+                    details["rarity_floor"] = rarity_floor
+                    details["char_value_counts"] = {
+                        c: char_counts.get(c, 0) for c in novel_chars
+                    }
+                all_findings.append(
+                    CharsetFinding(
+                        field=field_token,
+                        value=str(val),
+                        novel_chars=novel_chars,
+                        count=int(cnt),
+                        score=round(score, 4),
+                        first_seen=first_seen_str,
+                        event_id=evt_id_str,
+                        event=mini_event,
+                        details=details,
+                    )
+                )
+
+        if evaluated_fields == 0:
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector="charset",
+                method=method,
+                baseline_size=total_events,
+            )
+
+        if exclude_event_ids:
+            all_findings = [
+                f for f in all_findings if not f.event_id or f.event_id not in exclude_event_ids
+            ]
+
+        all_findings.sort(key=lambda f: f.score, reverse=True)
+        results = all_findings[:limit]
+        self._hydrate_finding_events(case_id, source_ids, results)
+        return StatAnomalyResult(
+            status="ok",
+            detector="charset",
             method=method,
             baseline_size=total_events,
             results=results,

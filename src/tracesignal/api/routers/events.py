@@ -27,6 +27,7 @@ from tracesignal.api.deps import (
 from tracesignal.core.config import get_settings
 from tracesignal.core.events_bus import publish_annotation_change
 from tracesignal.db.anomaly_stats import (
+    CharsetFinding,
     ComboFinding,
     FreqFinding,
     NoveltyFieldInfo,
@@ -1317,15 +1318,31 @@ async def _run_stat_detector(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     # Auto-field selection (no explicit fields): resolve the candidate
-    # inventory from the per-source field-stats cache here — the detector
-    # runs sync in a worker thread and can't await the cache itself. This
-    # keeps find_value_novelty off the live map-scanning field_inventory
-    # query, which is expensive on wide sources.
+    # inventory from the per-source field-stats cache here — the detectors
+    # run sync in a worker thread and can't await the cache themselves. This
+    # keeps find_value_novelty/find_charset_novelty off the live map-scanning
+    # field_inventory query, which is expensive on wide sources.
     inventory: list[tuple[str, int, int]] | None = None
     inventory_total: int | None = None
     if parsed_fields is None:
         inventory, inventory_total = await _resolve_field_inventory(
             svc, store, case_id, source_ids, field_mappings
+        )
+
+    if detector == "charset":
+        return await run_in_threadpool(
+            svc.find_charset_novelty,
+            case_id=case_id,
+            source_ids=source_ids,
+            fields=parsed_fields,
+            limit=limit,
+            per_field_limit=cfg.stat_per_field_limit,
+            rarity_floor=cfg.stat_rarity_floor,
+            baseline_end=effective_baseline_end,
+            exclude_event_ids=exclude_ids,
+            field_mappings=field_mappings,
+            inventory=inventory,
+            inventory_total=inventory_total,
         )
 
     return await run_in_threadpool(
@@ -1422,9 +1439,22 @@ async def semantic_search_events(
 
 
 def _serialize_finding(
-    r: ValueFinding | FreqFinding | OrderFinding | ComboFinding | RangeFinding,
+    r: ValueFinding | FreqFinding | OrderFinding | ComboFinding | RangeFinding | CharsetFinding,
 ) -> dict[str, Any]:
-    """Serialise a Value/Freq/Order/Combo/Range finding to a JSON-safe dict."""
+    """Serialise a Value/Freq/Order/Combo/Range/Charset finding to a JSON-safe dict."""
+    if isinstance(r, CharsetFinding):
+        return {
+            "type": "charset",
+            "field": r.field,
+            "value": r.value,
+            "novel_chars": r.novel_chars,
+            "count": r.count,
+            "score": r.score,
+            "first_seen": r.first_seen,
+            "event_id": r.event_id,
+            "event": r.event,
+            "details": r.details,
+        }
     if isinstance(r, ValueFinding):
         return {
             "type": "value_novelty",
@@ -1639,7 +1669,7 @@ async def list_anomalies(
     timeline_id: str,
     detector: str = Query(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', or 'numeric_range'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', or 'charset'.",
     ),
     fields: str | None = Query(
         default=None,
@@ -1707,6 +1737,10 @@ async def list_anomalies(
 
     **numeric_range**: for numeric-parseable fields, learns a baseline band
     (IQR fence self-baseline, or min/max temporal) and flags values outside it.
+
+    **charset**: per field, learns a reference character set and flags values
+    containing characters outside it (rare-character self-baseline, or
+    never-seen-in-baseline temporal).
     """
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
     result = await _run_stat_detector(
@@ -1748,7 +1782,7 @@ class TagAnomaliesRequest(BaseModel):
 
     detector: str = Field(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', or 'numeric_range'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', or 'charset'.",
     )
     fields: str | None = Field(
         default=None,
@@ -1873,6 +1907,24 @@ async def tag_anomalies(
                 f"Out-of-range value — {r.field}={r.value:g}: {r.direction} the "
                 f"learned band [{r.lower:g}, {r.upper:g}] ({band_desc})"
             )
+        elif isinstance(r, CharsetFinding):
+            event_id = r.event_id or ""
+            src_id = r.event.get("source_id", "") if r.event else ""
+            chars_desc = ", ".join(
+                f"{c!r} (U+{ord(c):04X})" if len(c) == 1 else repr(c) for c in r.novel_chars
+            )
+            if result.method == "temporal-charset":
+                content = (
+                    f"Charset novelty — {r.field}={r.value!r}: contains "
+                    f"character(s) {chars_desc} never seen in this field's "
+                    f"baseline-window values (surprise {r.score:.2f})"
+                )
+            else:
+                content = (
+                    f"Charset novelty — {r.field}={r.value!r}: contains rare "
+                    f"character(s) {chars_desc} appearing in almost no other "
+                    f"value of this field (surprise {r.score:.2f})"
+                )
         elif isinstance(r, ComboFinding):
             event_id = r.event_id or ""
             src_id = r.event.get("source_id", "") if r.event else ""
@@ -1974,7 +2026,7 @@ class PersistAnomalyFindingRequest(BaseModel):
     """Body for persisting one live (not-yet-tagged) anomaly finding."""
 
     detector: str = Field(
-        ..., description="'value_novelty' or 'frequency' — which detector produced this finding."
+        ..., description="Detector id ('value_novelty', 'charset', …) that produced this finding."
     )
     content: str = Field(
         ...,

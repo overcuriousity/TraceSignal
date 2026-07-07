@@ -315,6 +315,22 @@ export interface NumericRangeFinding {
   details: Record<string, unknown>;
 }
 
+/** One value containing never-seen characters from the charset detector. */
+export interface CharsetFinding {
+  type: "charset";
+  field: string;
+  value: string;
+  /** Characters in the value outside the field's reference character set. */
+  novel_chars: string[];
+  count: number;
+  /** Sum of per-novel-char surprise — higher = more/rarer novel characters. */
+  score: number;
+  first_seen: string | null;
+  event_id: string | null;
+  event: Event | null;
+  details: Record<string, unknown>;
+}
+
 /** One out-of-order timestamp finding from the timestamp_order detector. */
 export interface TimestampOrderFinding {
   type: "timestamp_order";
@@ -339,7 +355,8 @@ export type AnomalyFinding =
   | ValueComboFinding
   | FrequencyFinding
   | TimestampOrderFinding
-  | NumericRangeFinding;
+  | NumericRangeFinding
+  | CharsetFinding;
 
 export interface AnomaliesResponse {
   status: "ok" | "no_data" | "insufficient_data";
@@ -383,7 +400,8 @@ export interface AnomalyMarker {
     | "value_combo"
     | "frequency"
     | "timestamp_order"
-    | "numeric_range";
+    | "numeric_range"
+    | "charset";
   /** Raw structured finding data — stored verbatim on the persisted annotation. */
   rawDetails: Record<string, unknown>;
   /** End of the anomalous window, for frequency findings — enables a range highlight. */

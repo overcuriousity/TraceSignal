@@ -92,10 +92,6 @@ shipped.**
 
 High value first:
 
-- [ ] **D3 — Charset novelty** (AMiner `CharsetDetector`): per field, learn the baseline
-  character set of values; flag values in the detect window containing never-seen characters
-  (null bytes, unicode homoglyphs, injection metacharacters — detected syntactically, not by
-  meaning).
 - [ ] **D5 — Value entropy outliers** (AMiner `EntropyDetector`): per field, Shannon
   character-entropy of each value vs. the field's baseline entropy distribution; flags
   random-looking strings (DGA domains, encoded payloads) without interpreting them.

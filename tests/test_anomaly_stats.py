@@ -1624,6 +1624,7 @@ def test_heavy_detector_scans_carry_memory_settings():
 
     svc.find_value_novelty("c1", ["s1"], fields=["artifact"])
     svc.find_value_combos("c1", ["s1"], fields=["artifact", "timestamp_desc"])
+    svc.find_charset_novelty("c1", ["s1"], fields=["artifact"])
     svc.field_inventory("c1", ["s1"], total=100)
 
     scans = [
@@ -1634,3 +1635,148 @@ def test_heavy_detector_scans_carry_memory_settings():
     assert scans
     for sql in scans:
         assert _HEAVY_SCAN_SETTINGS in sql, sql[:120]
+
+
+# ---------------------------------------------------------------------------
+# find_charset_novelty — charset detector (D3)
+# ---------------------------------------------------------------------------
+
+
+def test_charset_no_data():
+    svc = _svc([FakeQueryResult(result_rows=[(0,)], column_names=["count()"])])
+    result = svc.find_charset_novelty("c1", ["s1"], fields=["attr:user"])
+    assert result.status == "no_data"
+    assert result.detector == "charset"
+
+
+def test_charset_insufficient_when_baseline_too_small():
+    """A field with < _MIN_CHARSET_BASELINE distinct values is skipped."""
+    responses = [
+        FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
+        # per-char distinct-value counts
+        FakeQueryResult(result_rows=[("a", 5), ("b", 5)], column_names=["c", "n"]),
+        # uniqExact: only 5 distinct values → below the floor of 20
+        FakeQueryResult(result_rows=[(5,)], column_names=["u"]),
+    ]
+    svc = _svc(responses)
+    result = svc.find_charset_novelty("c1", ["s1"], fields=["attr:user"])
+    assert result.status == "insufficient_data"
+
+
+def test_charset_skips_huge_alphabet():
+    """A reference charset larger than _MAX_CHARSET_SIZE (free text in large
+    scripts) is skipped — "novel character" is meaningless there."""
+    big = [(chr(0x4E00 + i), 50) for i in range(5001)]
+    responses = [
+        FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=big, column_names=["c", "n"]),
+        FakeQueryResult(result_rows=[(80,)], column_names=["u"]),
+    ]
+    svc = _svc(responses)
+    result = svc.find_charset_novelty("c1", ["s1"], fields=["attr:msg"])
+    assert result.status == "insufficient_data"
+
+
+def test_charset_self_baseline_flags_rare_char():
+    """Self mode: chars in ≤ rarity_floor distinct values are rare; values
+    containing them flag with -log(n_vals_with_char / n_vals) surprise."""
+    import math
+
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    responses = [
+        FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+        # 'a'/'b' common (90 distinct values each), NUL byte rare (1 value)
+        FakeQueryResult(
+            result_rows=[("a", 90), ("b", 85), ("\x00", 1)], column_names=["c", "n"]
+        ),
+        FakeQueryResult(result_rows=[(100,)], column_names=["u"]),
+        FakeQueryResult(
+            result_rows=[("ab\x00ab", ["\x00"], 2, fs, "evt-nul")],
+            column_names=["val", "novel", "cnt", "first_seen", "evt_id"],
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_charset_novelty("c1", ["s1"], fields=["attr:user"])
+    assert result.status == "ok"
+    assert result.method == "rare-chars"
+    f = result.results[0]
+    assert f.field == "attr:user"
+    assert f.novel_chars == ["\x00"]
+    assert f.count == 2
+    assert f.score == round(-math.log(1 / 100), 4)
+    assert f.details["codepoints"] == ["U+0000"]
+    assert f.details["rarity_floor"] == 3
+    assert f.details["char_value_counts"] == {"\x00": 1}
+    # The reference-set parameter must exclude the rare char.
+    base_params = [p["base"] for p in svc.ch.client._all_parameters if "base" in p]
+    assert base_params == [["a", "b"]]
+
+
+def test_charset_temporal_flags_never_seen_chars_and_guards_sentinel():
+    """Temporal mode: reference set = baseline-window charset; detect window
+    is timestamp >= baseline_end with the year-2299 sentinel excluded."""
+    import math
+
+    from tracesignal.db._dt import TS_NOT_SENTINEL_SQL
+
+    class _RecordingClient(FakeClient):
+        def __init__(self, responses):
+            super().__init__(responses)
+            self.full_queries: list[str] = []
+
+        def query(self, sql, parameters=None):
+            self.full_queries.append(sql)
+            return super().query(sql, parameters)
+
+    bl = datetime(2024, 1, 2, tzinfo=UTC)
+    fs = datetime(2024, 1, 3, tzinfo=UTC)
+    responses = [
+        FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+        # baseline charset over 50 distinct baseline values
+        FakeQueryResult(
+            result_rows=[(list("abcdefghij"), 50)], column_names=["charset", "n"]
+        ),
+        FakeQueryResult(
+            result_rows=[("ab☃cd", ["☃"], 1, fs, "evt-snow")],
+            column_names=["val", "novel", "cnt", "first_seen", "evt_id"],
+        ),
+    ]
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    client = _RecordingClient(responses)
+    svc.ch = FakeClickHouseStore(FakeClient([]))
+    svc.ch.client = client
+    result = svc.find_charset_novelty("c1", ["s1"], fields=["attr:user"], baseline_end=bl)
+    assert result.status == "ok"
+    assert result.method == "temporal-charset"
+    f = result.results[0]
+    assert f.novel_chars == ["☃"]
+    # Never seen in baseline → +1-smoothed surprise over 50 distinct values.
+    assert f.score == round(math.log(51), 4)
+    baseline_sql = client.full_queries[1]
+    detect_sql = client.full_queries[2]
+    assert "timestamp < {bl:String}" in baseline_sql
+    assert "timestamp >= {bl:String}" in detect_sql
+    assert TS_NOT_SENTINEL_SQL in detect_sql
+
+
+def test_charset_excludes_normal_marked_events_and_limits():
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    responses = [
+        FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[("a", 90), ("$", 1), ("%", 1)], column_names=["c", "n"]),
+        FakeQueryResult(result_rows=[(100,)], column_names=["u"]),
+        FakeQueryResult(
+            result_rows=[
+                ("x$", ["$"], 1, fs, "evt-drop"),
+                ("y%", ["%"], 1, fs, "evt-keep"),
+            ],
+            column_names=["val", "novel", "cnt", "first_seen", "evt_id"],
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_charset_novelty(
+        "c1", ["s1"], fields=["attr:user"], exclude_event_ids={"evt-drop"}, limit=1
+    )
+    assert [f.event_id for f in result.results] == ["evt-keep"]
+    # Hydration happens once, on the surviving slice only.
+    assert svc.ch.hydration_calls == [["evt-keep"]]
