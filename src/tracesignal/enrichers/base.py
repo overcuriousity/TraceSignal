@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -22,10 +23,14 @@ from typing import Any
 
 from tracesignal.db.clickhouse import ClickHouseStore
 
-# Cap on how many attribute values (post ARRAY JOIN, so possibly several per
-# event) are sampled when checking eligibility, to keep the check a bounded
-# query rather than a full scan.
-_ELIGIBILITY_SAMPLE_LIMIT = 5000
+logger = logging.getLogger(__name__)
+
+# Wall-clock cap (seconds) on the eligibility existence scan. When IP-shaped
+# values exist the scan early-exits at the first match (near-instant); this cap
+# only bites when NO value matches and the scan would otherwise read the whole
+# timeline. On hitting the cap we fail OPEN (see check_eligibility) so a large
+# timeline is never wrongly declared ineligible.
+_ELIGIBILITY_MAX_SECONDS = 3
 
 # Derived-attribute naming contract: "<attr_key>:<output_field>" (e.g.
 # "src_ip:geo_country"), so derived columns sort beside their source
@@ -179,37 +184,60 @@ class Enricher(ABC):
     def check_eligibility(
         self, ch_store: ClickHouseStore, case_id: str, source_ids: list[str]
     ) -> EligibilityResult:
-        """Sample attribute values across the given sources and check for regex matches.
+        """Does any attribute value in these sources match the eligibility regex?
 
-        Pushes the sampling and regex match into ClickHouse (``match()``) so
-        no rows are paged into Python for this check, mirroring the
-        aggregation-in-SQL approach used by ``db/anomaly_stats.py``.
+        Pushes the regex ``match()`` into ClickHouse and early-exits at the
+        first hit (``LIMIT 1``), so when eligible values exist the scan is
+        near-instant regardless of table size.
+
+        Deliberately NOT a bounded head-sample (``... LIMIT 5000`` in
+        primary-key order): events cluster by ``(case_id, source_id,
+        timestamp)``, so a timeline's head can be thousands of IP-free rows —
+        e.g. CloudTrail service-principal events whose ``sourceIPAddress`` is
+        ``cloudtrail.amazonaws.com`` — while millions of real IPs sit deeper.
+        A head-sample declared such timelines ineligible and greyed out
+        "Run now". An existence scan can't be fooled by ordering.
+
+        The only expensive case is a genuinely ineligible timeline, where the
+        scan must read everything to prove absence; ``_ELIGIBILITY_MAX_SECONDS``
+        caps that, and on the cap we fail OPEN — better to offer an enricher
+        that finds nothing than to hide one that would have matched.
         """
         if not source_ids:
             return EligibilityResult(eligible=False, sample_checked=0, sample_matched=0)
-        result = ch_store.client.query(
-            f"""
-            SELECT
-                count() AS checked,
-                countIf(match(v, {{pattern:String}})) AS matched
-            FROM (
-                SELECT k, v
-                FROM {ch_store.database}.events
-                ARRAY JOIN mapKeys(attributes) AS k, mapValues(attributes) AS v
-                WHERE case_id = {{case_id:String}} AND source_id IN {{source_ids:Array(String)}}
-                    AND position(k, '{FIELD_KEY_SEPARATOR}') = 0
-                LIMIT {_ELIGIBILITY_SAMPLE_LIMIT}
+        try:
+            result = ch_store.client.query(
+                f"""
+                SELECT count() AS matched
+                FROM (
+                    SELECT 1
+                    FROM {ch_store.database}.events
+                    ARRAY JOIN mapValues(attributes) AS v
+                    WHERE case_id = {{case_id:String}}
+                        AND source_id IN {{source_ids:Array(String)}}
+                        AND match(v, {{pattern:String}})
+                    LIMIT 1
+                )
+                """,
+                parameters={
+                    "pattern": self.eligibility_regex,
+                    "case_id": case_id,
+                    "source_ids": source_ids,
+                },
+                settings={"max_execution_time": _ELIGIBILITY_MAX_SECONDS},
             )
-            """,
-            parameters={
-                "pattern": self.eligibility_regex,
-                "case_id": case_id,
-                "source_ids": source_ids,
-            },
-        )
-        checked, matched = result.result_rows[0] if result.result_rows else (0, 0)
+        except Exception:
+            # Timeout (TIMEOUT_EXCEEDED) or any query error: fail open so a
+            # slow/large timeline is never silently hidden.
+            logger.warning(
+                "Eligibility scan for enricher %r timed out or failed; failing open",
+                self.key,
+                exc_info=True,
+            )
+            return EligibilityResult(eligible=True, sample_checked=0, sample_matched=0)
+        matched = int(result.result_rows[0][0]) if result.result_rows else 0
         return EligibilityResult(
-            eligible=matched > 0, sample_checked=int(checked), sample_matched=int(matched)
+            eligible=matched > 0, sample_checked=matched, sample_matched=matched
         )
 
     def is_field_eligible(self, value: str) -> bool:

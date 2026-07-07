@@ -151,7 +151,7 @@ function EnricherRow({
       <div className="flex items-center justify-between gap-3 text-xs text-[var(--color-fg-muted)]">
         <span>
           {enricher.eligible
-            ? `Matches ${enricher.sample_matched} of ${enricher.sample_checked} sampled values`
+            ? "Matching field values found in this timeline's sources"
             : "No matching field values found in this timeline's sources"}
         </span>
         <div className="flex items-center gap-2 shrink-0">
