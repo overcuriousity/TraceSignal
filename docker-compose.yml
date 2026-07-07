@@ -26,7 +26,11 @@ services:
       retries: 5
 
   clickhouse:
-    image: docker.io/clickhouse/clickhouse-server:24-alpine
+    # Pinned to an exact build for forensic reproducibility. >= 25.4 brings
+    # lazy materialization (query_plan_optimize_lazy_materialization, default
+    # on since 25.5), which keeps any remaining full-row ORDER BY ... LIMIT
+    # query cheap server-side.
+    image: docker.io/clickhouse/clickhouse-server:26.6.1.1193-alpine
     ports:
       - "127.0.0.1:8123:8123"
       - "127.0.0.1:9000:9000"
