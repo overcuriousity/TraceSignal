@@ -15,12 +15,14 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 
 from tracesignal.api.deps import (
+    AccessLevel,
     get_current_user,
     get_store,
     require_case_contribute,
     require_case_manage,
     require_case_read,
     require_password_current,
+    resolve_case_access,
 )
 from tracesignal.api.uploads import receive_upload_to_tmp
 from tracesignal.core.config import get_settings
@@ -134,18 +136,45 @@ def _retention_path(file_hash: str) -> Path:
 # ═════════════════════════════════════════════════════════════════════════════
 
 
+def _bulk_access_level(case: Case, user: User, role_by_team: dict[str, str]) -> AccessLevel:
+    """`resolve_case_access` without the per-case membership query.
+
+    The caller supplies the user's team→role map once, so listing N cases
+    stays at one membership query total instead of N.
+    """
+    if user.is_admin:
+        return AccessLevel.MANAGE
+    if case.team_id:
+        role = role_by_team.get(case.team_id)
+        if role is None:
+            return AccessLevel.NONE
+        return AccessLevel.MANAGE if role == "manager" else AccessLevel.CONTRIBUTE
+    return AccessLevel.MANAGE if case.owner_id == user.id else AccessLevel.NONE
+
+
 @router.get("/")
 async def list_cases(user: User = Depends(get_current_user)) -> dict[str, Any]:
-    """List cases visible to the current user: their own, plus their teams' (all, if admin)."""
+    """List cases visible to the current user: their own, plus their teams' (all, if admin).
+
+    Each case carries the caller's resolved ``access_level``
+    (``none|read|contribute|manage``) so clients don't have to re-implement
+    the access rules.
+    """
     store = get_store()
     await store.init_schema()
     if user.is_admin:
         cases = await store.list_cases()
+        role_by_team: dict[str, str] = {}
     else:
         memberships = await store.list_user_memberships(user.id)
-        team_ids = [m.team_id for m in memberships]
-        cases = await store.list_cases_for_user(user.id, team_ids)
-    return {"cases": [c.to_dict() for c in cases]}
+        role_by_team = {m.team_id: m.role for m in memberships}
+        cases = await store.list_cases_for_user(user.id, list(role_by_team))
+    return {
+        "cases": [
+            {**c.to_dict(), "access_level": _bulk_access_level(c, user, role_by_team).name.lower()}
+            for c in cases
+        ]
+    }
 
 
 @router.post("/")
@@ -186,13 +215,18 @@ async def create_case(
         target_type="case",
         target_id=case_id,
     )
-    return {"case": case.to_dict()}
+    access = await resolve_case_access(user, case)
+    return {"case": {**case.to_dict(), "access_level": access.name.lower()}}
 
 
 @router.get("/{case_id}")
-async def get_case(case: Case = Depends(require_case_read)) -> dict[str, Any]:
-    """Get a case by ID."""
-    return {"case": case.to_dict()}
+async def get_case(
+    case: Case = Depends(require_case_read),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Get a case by ID, with the caller's resolved ``access_level``."""
+    access = await resolve_case_access(user, case)
+    return {"case": {**case.to_dict(), "access_level": access.name.lower()}}
 
 
 @router.patch("/{case_id}/scope")
@@ -234,7 +268,8 @@ async def update_case_scope(
         target_id=case.id,
         detail={"old_team_id": case.team_id, "new_team_id": new_team_id},
     )
-    return {"case": updated.to_dict()}
+    access = await resolve_case_access(user, updated)
+    return {"case": {**updated.to_dict(), "access_level": access.name.lower()}}
 
 
 @router.delete("/{case_id}")

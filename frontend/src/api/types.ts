@@ -8,6 +8,8 @@ export interface Case {
   owner_id: string | null;
   /** Investigation team this case belongs to, or null for a personal case. */
   team_id: string | null;
+  /** Caller's resolved access level, computed by the backend (api/deps.py). */
+  access_level: "none" | "read" | "contribute" | "manage";
   created_at: string;
   updated_at: string;
 }

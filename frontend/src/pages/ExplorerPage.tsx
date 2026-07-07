@@ -767,6 +767,32 @@ export function ExplorerPage() {
     [caseId, timelineId, filters, setFilters, sortDir, queryClient],
   );
 
+  /**
+   * Context query: pivot the whole explorer to a ±minutes window around an
+   * event's timestamp, across all sources. Unlike `handleJumpToTime` (which
+   * scrolls to the event, keeping the full timeline reachable) this *filters*
+   * to the window — grid, histogram, facets, and bulk actions all operate on
+   * exactly the neighborhood. All other filters are cleared deliberately:
+   * context means "everything that happened around this moment", not
+   * "matching events around this moment". The pre-context filter set lands in
+   * the same breadcrumb `handleJumpToTime` uses; nested context queries keep
+   * the original breadcrumb so "back" always restores the analyst's real view.
+   */
+  const handleContextQuery = useCallback(
+    (ts: string, minutes: number) => {
+      const anchor = new Date(ts).getTime();
+      if (Number.isNaN(anchor)) return;
+      setPreJumpFilters((prev) => prev ?? filters);
+      setRangeHighlight(null);
+      pendingJumpRef.current = null;
+      setFilters({
+        start: new Date(anchor - minutes * 60_000).toISOString(),
+        end: new Date(anchor + minutes * 60_000).toISOString(),
+      });
+    },
+    [filters, setFilters],
+  );
+
   const handleBackToFiltered = useCallback(() => {
     if (preJumpFilters) setFilters(preJumpFilters);
     setPreJumpFilters(null);
@@ -1085,6 +1111,7 @@ export function ExplorerPage() {
                     onAddFilter={handleAddFilter}
                     onShowFieldHistogram={handleShowFieldHistogram}
                     onJumpToTime={handleJumpToTime}
+                    onContextQuery={handleContextQuery}
                     tagSuggestions={tagSuggestions}
                   />
                 )}

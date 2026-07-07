@@ -19,6 +19,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from tracesignal.api.deps import (
+    get_current_user,
     get_store,
     require_case_contribute,
     require_case_read,
@@ -781,6 +782,20 @@ async def bulk_annotate_by_filter(
     tagged = await store.bulk_create_annotations(rows)
     if tagged:
         publish_annotation_change(case_id, timeline_id, None, user)
+    await store.record_audit(
+        action="events.bulk_annotate",
+        actor=user,
+        case_id=case_id,
+        target_type="timeline",
+        target_id=timeline_id,
+        detail={
+            "annotation_type": body.annotation_type,
+            "content": body.content.strip(),
+            "matched": len(refs),
+            "tagged": tagged,
+            "filter": body.model_dump(exclude_none=True, exclude_defaults=True),
+        },
+    )
     return {"tagged": tagged}
 
 
@@ -1103,6 +1118,7 @@ async def export_events(
     timeline_id: str,
     body: ExportRequest,
     case: Case = Depends(require_case_read),
+    user: User = Depends(get_current_user),
 ) -> StreamingResponse:
     """Stream all events matching the given filters as CSV or JSONL.
 
@@ -1173,6 +1189,21 @@ async def export_events(
         media_type = "text/csv"
         ext = "csv"
         content = _stream_csv(eq, annotations_by_event)
+
+    # Audited before streaming starts: an export that fails mid-stream still
+    # extracted data up to the failure point, so the attempt itself is the
+    # custody-relevant fact.
+    await store.record_audit(
+        action="events.export",
+        actor=user,
+        case_id=case_id,
+        target_type="timeline",
+        target_id=timeline_id,
+        detail={
+            "format": body.format,
+            "filter": body.filter.model_dump(exclude_none=True, exclude_defaults=True),
+        },
+    )
 
     filename = f"{case_id}-{timeline_id}-events.{ext}"
     return StreamingResponse(
@@ -1748,6 +1779,7 @@ async def list_anomalies(
         ),
     ),
     case: Case = Depends(require_case_read),
+    user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Run a statistical anomaly detector on the timeline and return findings.
 
@@ -1807,6 +1839,23 @@ async def list_anomalies(
             limit=limit,
             min_skew_seconds=min_skew_seconds,
             payload=payload,
+        )
+        # GETs are skipped by the generic audit middleware, so detector-run
+        # launches would otherwise leave no trace at all.
+        await get_store().record_audit(
+            action="anomaly.run",
+            actor=user,
+            case_id=case_id,
+            target_type="detector_run",
+            target_id=run_id,
+            detail={
+                "detector": detector,
+                "timeline_id": timeline_id,
+                "fields": fields,
+                "series_field": series_field,
+                "temporal": temporal,
+                "baseline_end": baseline_end.isoformat() if baseline_end else None,
+            },
         )
     payload["run_id"] = run_id
     return payload
@@ -2058,6 +2107,21 @@ async def tag_anomalies(
         payload=payload,
     )
 
+    await store.record_audit(
+        action="anomaly.tag",
+        actor=user,
+        case_id=case_id,
+        target_type="detector_run",
+        target_id=run_id,
+        detail={
+            "detector": body.detector,
+            "timeline_id": timeline_id,
+            "tagged": tagged,
+            "temporal": body.temporal,
+            "baseline_end": body.baseline_end.isoformat() if body.baseline_end else None,
+        },
+    )
+
     return {
         "status": "ok",
         "detector": result.detector,
@@ -2122,4 +2186,12 @@ async def persist_anomaly_finding(
         detector=body.detector,
     )
     publish_annotation_change(case_id, None, event_id, user)
+    await store.record_audit(
+        action="anomaly.persist_finding",
+        actor=user,
+        case_id=case_id,
+        target_type="event",
+        target_id=event_id,
+        detail={"detector": body.detector, "source_id": source_id},
+    )
     return {"annotation": annotation.to_dict()}

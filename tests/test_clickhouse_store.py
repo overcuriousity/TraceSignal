@@ -165,3 +165,60 @@ class TestDeleteSourceEventsErrors:
     def test_missing_table_is_benign_noop(self, store):
         store.client = _FailingClient("Code: 60. DB::Exception: UNKNOWN_TABLE")
         store.delete_source_events("case-1", "src-1")  # must not raise
+
+
+class TestParseUrl:
+    """URL forms accepted by ClickHouseStore._parse_url."""
+
+    def test_plain_http(self):
+        assert ClickHouseStore._parse_url("http://localhost:8123") == (
+            "localhost",
+            8123,
+            False,
+            None,
+            None,
+        )
+
+    def test_http_default_port(self):
+        assert ClickHouseStore._parse_url("http://ch.internal") == (
+            "ch.internal",
+            8123,
+            False,
+            None,
+            None,
+        )
+
+    def test_https_secure_and_default_port(self):
+        assert ClickHouseStore._parse_url("https://ch.internal") == (
+            "ch.internal",
+            8443,
+            True,
+            None,
+            None,
+        )
+
+    def test_https_explicit_port(self):
+        host, port, secure, _, _ = ClickHouseStore._parse_url("https://ch.internal:9443")
+        assert (host, port, secure) == ("ch.internal", 9443, True)
+
+    def test_credentials_in_url(self):
+        assert ClickHouseStore._parse_url("http://alice:s3cret@ch:8123") == (
+            "ch",
+            8123,
+            False,
+            "alice",
+            "s3cret",
+        )
+
+    def test_bare_host_port(self):
+        assert ClickHouseStore._parse_url("ch.internal:8124") == (
+            "ch.internal",
+            8124,
+            False,
+            None,
+            None,
+        )
+
+    def test_trailing_slash_and_path(self):
+        host, port, secure, _, _ = ClickHouseStore._parse_url("http://ch:8123/")
+        assert (host, port, secure) == ("ch", 8123, False)

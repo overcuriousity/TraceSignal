@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { X, Copy, Search, Filter, FilterX, Tag, MessageSquare, Trash2, Plus, Clock, ShieldCheck, AlertTriangle, Save, BarChart2, ChevronDown, ChevronRight } from "lucide-react";
+import { X, Copy, Search, Filter, FilterX, Tag, MessageSquare, Trash2, Plus, Clock, History, ShieldCheck, AlertTriangle, Save, BarChart2, ChevronDown, ChevronRight } from "lucide-react";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -9,6 +9,13 @@ import { fmtTimestampFull, fmtRelative } from "@/lib/time";
 import { truncateHash } from "@/lib/format";
 import { getAttributeDecoration } from "@/lib/enrichment";
 import { Tooltip } from "@/components/ui/Tooltip";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuTrigger,
+} from "@/components/ui/DropdownMenu";
 import { useAnnotationMutations } from "@/hooks/useAnnotationMutations";
 import { useUiStore } from "@/stores/ui";
 import { TagInput } from "@/components/explorer/TagInput";
@@ -29,6 +36,9 @@ interface Props {
   onShowFieldHistogram?: (fieldKey: string, value: string) => void;
   /** Scrolls the main grid to this event's position, clearing filters first. */
   onJumpToTime?: (ts: string, eventId?: string) => void;
+  /** Pivots the explorer to a ±minutes window around this event's timestamp,
+   * clearing all other filters (context query). */
+  onContextQuery?: (ts: string, minutes: number) => void;
   /** Existing annotation-tag labels for autocomplete. */
   tagSuggestions?: string[];
   /** Active, not-yet-tagged analysis findings that apply to this event. */
@@ -311,6 +321,7 @@ export function EventDetailPanel({
   onAddFilter,
   onShowFieldHistogram,
   onJumpToTime,
+  onContextQuery,
   tagSuggestions = [],
   liveFindings = [],
 }: Props) {
@@ -455,6 +466,28 @@ export function EventDetailPanel({
               <Clock size={14} />
             </Button>
           </Tooltip>
+        )}
+        {onContextQuery && event.timestamp && (
+          <DropdownMenu>
+            <Tooltip content="Context query — show all events around this one, across all sources">
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" size="icon">
+                  <History size={14} />
+                </Button>
+              </DropdownMenuTrigger>
+            </Tooltip>
+            <DropdownMenuContent>
+              <DropdownMenuLabel>Events within…</DropdownMenuLabel>
+              {[1, 5, 15, 60].map((m) => (
+                <DropdownMenuItem
+                  key={m}
+                  onSelect={() => onContextQuery(event.timestamp!, m)}
+                >
+                  ±{m} minute{m === 1 ? "" : "s"}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
         )}
         <Tooltip content="Find similar events (vector search)">
           <Button variant="ghost" size="icon" onClick={() => onFindSimilar(event)}>

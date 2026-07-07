@@ -309,3 +309,62 @@ def test_qdrant_config_mismatch_is_rejected() -> None:
 
     with pytest.raises(ValueError, match="exists with vector size 384"):
         qdrant.init_collection("case1", "hash1", vector_size=768)
+
+
+class DiscardingClickHouseStore(FakeClickHouseStore):
+    """Fake store that drops inserted events so retained-event memory can't
+    mask what the *pipeline* holds — only batch sizes are recorded."""
+
+    def insert_events(self, events: list[Event]) -> int:
+        self.insert_batch_sizes.append(len(events))
+        return len(events)
+
+
+def test_large_csv_ingest_memory_stays_bounded(tmp_path: Path) -> None:
+    """Regression test for the H1 fix: the CSV parser must stream.
+
+    Generates a multi-megabyte Timesketch CSV and asserts the pipeline's peak
+    Python heap allocation stays far below the file size. A regression to
+    whole-file materialization (``lines = list(fh)``) would allocate at least
+    the full file and trip the bound.
+    """
+    import tracemalloc
+
+    path = tmp_path / "large.csv"
+    row = (
+        "2024-01-01T00:00:00+00:00,Creation Time,LOG,Syslog,"
+        "User login from 10.0.0.1 with session token abcdef0123456789,"
+        "user,auth.log,login|success\n"
+    )
+    rows = 120_000  # ~16 MiB
+    with path.open("w") as fh:
+        fh.write("datetime,timestamp_desc,source,source_long,message,parser,display_name,tag\n")
+        for _ in range(rows):
+            fh.write(row)
+    file_size = path.stat().st_size
+    assert file_size > 15 * 1024 * 1024
+
+    clickhouse = DiscardingClickHouseStore()
+    pipeline = IngestionPipeline(
+        case_id="case1",
+        source_id="source1",
+        clickhouse=clickhouse,
+        batch_size=1_000,
+        source_name="large.csv",
+        file_hash="abc",
+    )
+
+    tracemalloc.start()
+    try:
+        result = pipeline.run(path)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert result.events_inserted == rows
+    assert sum(clickhouse.insert_batch_sizes) == rows
+    # Generous bound: one 1k-event batch is well under 8 MiB; the whole file
+    # (16 MiB) wouldn't fit. Loosen rather than tighten if this ever flakes.
+    assert peak < 8 * 1024 * 1024, (
+        f"peak heap {peak / 2**20:.1f} MiB for a {file_size / 2**20:.1f} MiB file"
+    )

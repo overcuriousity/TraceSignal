@@ -62,17 +62,6 @@ resolved — this file holds only the condensed, still-open action items.
 
 - [ ] Split `api/routers/events.py` (1500+ lines: query parsing, export streaming, anomaly
   orchestration, bulk annotation) opportunistically when next touched — not proactively.
-- [ ] `ClickHouseStore._host/_port` string-splitting breaks on `https://` and creds-in-URL
-  forms — use `urllib.parse`.
-- [ ] Startup config sanity report: log resolved offline mode, cookie security
-  (warn when `environment=production` and `auth_cookie_secure=false`), datastore targets.
-- [ ] Large-file ingest regression test: bound peak memory (or assert lazy yielding) over a
-  generated ~100 MB CSV, protecting the H1 fix.
-- [ ] **M18 — Return `access_level` from the case API.** PR #7 cleanup #9 follow-up:
-  `frontend/src/lib/caseAccess.ts` re-implements `resolve_case_access` client-side; the
-  backend already computes the level per request. Needs a bulk access-resolution path in
-  `list_cases_for_user` first to avoid introducing an N+1 (`docs/archive/PR7_REVIEW_FINDINGS.md`
-  cleanup 9).
 
 ## Milestone 4 — anomaly detector expansion (AMiner-inspired, field-agnostic)
 
@@ -118,21 +107,11 @@ expectations. Ordered: easy+high value first, then easy+low value, then hard+hig
 
 Easy, high value:
 
-- [ ] **W1 — Context query ("neighbors").** Button on an event (detail panel / grid row) that
-  pivots to all events across the timeline within ±N minutes of that event's timestamp,
-  regardless of source. One endpoint reusing the existing events-view filter path (time-window
-  filter around anchor timestamp) + UI affordance in `EventDetailPanel`. The single most
-  common analyst move after finding a hit.
 - [ ] **W2 — Per-source clock-skew correction.** Compromised/misconfigured hosts drift; master
   timeline lies without correction. Add `time_offset_seconds` to Source (Postgres), applied at
   **query time** (never mutate ingested events — evidence stays raw; offset is analyst-declared
   metadata and must appear in the audit trail and any export manifest). Applies to explorer,
   histogram, detectors, exports uniformly — route through the shared filter/query path.
-- [ ] **W3 — Audit coverage for analyst actions.** `record_audit` currently fires only in
-  auth/admin/cases routers. Extend to the actions that matter for "who discovered/extracted
-  what": event **exports** (with filter set + row count), **bulk annotation** operations, and
-  **anomaly run** launches (detector + params). Deliberately not per-page `list_events` calls —
-  query-level logging at browsing granularity is noise, not custody.
 
 Easy, low value (deferred, revisit on demand):
 
