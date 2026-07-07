@@ -5,7 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from tracesignal.ingestion.parser import JsonlParser, TimesketchCsvParser, detect_format, get_parser
+from tracesignal.ingestion.parser import (
+    JsonlParser,
+    TimesketchCsvParser,
+    _normalise_tag_field,
+    detect_format,
+    get_parser,
+)
 from tracesignal.models.event import Event, ParserConfig, content_hash
 
 
@@ -30,6 +36,25 @@ def jsonl_file(tmp_path: Path) -> Path:
         '{"timestamp":"2024-01-01T00:01:00+00:00","timestamp_desc":"created","message":"User logout","source":"auth","tags":"logout","extra_field":"value2"}\n'
     )
     return path
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("", []),
+        ("login", ["login"]),
+        ("login|success", ["login", "success"]),
+        ("login,success", ["login", "success"]),
+        ('["API Error", "Sensitive File"]', ["API Error", "Sensitive File"]),
+        ("['API Error', 'Sensitive File']", ["API Error", "Sensitive File"]),
+        ("[]", []),
+        ('["single"]', ["single"]),
+        # Malformed list literal falls back to comma splitting.
+        ('["broken", "list"', ['["broken"', '"list"']),
+    ],
+)
+def test_normalise_tag_field(value: str, expected: list[str]) -> None:
+    assert _normalise_tag_field(value) == expected
 
 
 def test_detect_format(tmp_path: Path) -> None:
