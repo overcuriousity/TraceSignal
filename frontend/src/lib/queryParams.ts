@@ -18,6 +18,25 @@ function sanitizeModes(raw: unknown): Record<string, FieldMatchMode> | undefined
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/** Sanitize an untrusted parsed object into a field→values map.
+ *
+ * Accepts both the current multi-value shape ({"k": ["v1", "v2"]}) and the
+ * legacy single-value shape ({"k": "v"}) from pre-multivalue URLs and saved
+ * views, coercing scalars to one-element lists and dropping empties. */
+function sanitizeValueMap(raw: unknown): Record<string, string[]> | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const out: Record<string, string[]> = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (typeof v === "string") {
+      out[k] = [v];
+    } else if (Array.isArray(v)) {
+      const values = v.filter((x): x is string => typeof x === "string");
+      if (values.length > 0) out[k] = values;
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 /** Scalar/comma-joined API fields shared by every request that carries
  * `EventFilters` — GET query params (events list, histogram) and JSON POST
  * bodies that mirror the same param names (bulk-annotate, export). */
@@ -197,14 +216,14 @@ export function paramsToFilters(params: URLSearchParams): EventFilters {
   if (end) filters.end = end;
   if (rawFilters) {
     try {
-      filters.filters = JSON.parse(rawFilters);
+      filters.filters = sanitizeValueMap(JSON.parse(rawFilters));
     } catch {
       // ignore malformed
     }
   }
   if (rawExclusions) {
     try {
-      filters.exclusions = JSON.parse(rawExclusions);
+      filters.exclusions = sanitizeValueMap(JSON.parse(rawExclusions));
     } catch {
       // ignore malformed
     }
@@ -300,20 +319,12 @@ export function viewPayloadToFilters(
   }
   if (typeof payload.start === "string" && payload.start) f.start = payload.start;
   if (typeof payload.end === "string" && payload.end) f.end = payload.end;
-  if (
-    payload.filters &&
-    typeof payload.filters === "object" &&
-    Object.keys(payload.filters).length > 0
-  ) {
-    f.filters = payload.filters as Record<string, string>;
-  }
-  if (
-    payload.exclusions &&
-    typeof payload.exclusions === "object" &&
-    Object.keys(payload.exclusions).length > 0
-  ) {
-    f.exclusions = payload.exclusions as Record<string, string[]>;
-  }
+  // Both maps go through sanitizeValueMap so legacy single-value payloads
+  // ({"k": "v"}) load as one-element lists.
+  const viewFilters = sanitizeValueMap(payload.filters);
+  if (viewFilters) f.filters = viewFilters;
+  const viewExclusions = sanitizeValueMap(payload.exclusions);
+  if (viewExclusions) f.exclusions = viewExclusions;
   // Legacy payloads predate match modes — absent means exact for every field.
   const viewFilterModes = sanitizeModes(payload.filterModes);
   if (viewFilterModes) f.filterModes = viewFilterModes;

@@ -100,10 +100,20 @@ describe("FilterRail field match modes", () => {
     fireEvent.keyDown(screen.getByPlaceholderText("e.g. 10.0.*"), { key: "Enter" });
     expect(onChange).toHaveBeenCalledWith(
       expect.objectContaining({
-        filters: { src_ip: "10.0.*" },
+        filters: { src_ip: ["10.0.*"] },
         filterModes: { src_ip: "wildcard" },
       }),
     );
+  });
+
+  it("appends a second value to the same field (OR), not overwrite", () => {
+    const { onChange } = renderRail({ filters: { src_port: ["22"] } });
+    const keyInputs = screen.getAllByPlaceholderText("field");
+    fireEvent.change(keyInputs[0], { target: { value: "src_port" } });
+    const valInput = screen.getAllByPlaceholderText("value")[0];
+    fireEvent.change(valInput, { target: { value: "23" } });
+    fireEvent.keyDown(valInput, { key: "Enter" });
+    expect(onChange.mock.calls[0][0].filters).toEqual({ src_port: ["22", "23"] });
   });
 
   it("adds an exact filter without a filterModes entry", () => {
@@ -114,7 +124,7 @@ describe("FilterRail field match modes", () => {
     fireEvent.change(valInput, { target: { value: "10.0.1.1" } });
     fireEvent.keyDown(valInput, { key: "Enter" });
     const arg = onChange.mock.calls[0][0];
-    expect(arg.filters).toEqual({ src_ip: "10.0.1.1" });
+    expect(arg.filters).toEqual({ src_ip: ["10.0.1.1"] });
     expect(arg.filterModes).toBeUndefined();
   });
 

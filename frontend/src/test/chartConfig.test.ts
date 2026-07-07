@@ -14,7 +14,7 @@ const fullConfig: ChartConfig = {
   scale: "nominal",
   chartType: "time",
   metric: "ratio",
-  compare: { mode: "custom", filters: { q: "error", filters: { artifact: "apache" } } },
+  compare: { mode: "custom", filters: { q: "error", filters: { artifact: ["apache"] } } },
   options: { orientation: "vertical", logScale: true, buckets: 90 },
 };
 

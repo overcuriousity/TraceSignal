@@ -16,7 +16,7 @@ from clickhouse_connect.driver.exceptions import DatabaseError
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from tracesignal.api.deps import (
     get_current_user,
@@ -185,12 +185,12 @@ def _parse_cursor(value: str | None, *, param_name: str) -> tuple[datetime, str]
     return ts, event_id
 
 
-def _parse_exclusions_object(value: str | None) -> dict[str, list[str]]:
-    """Parse a JSON string into a string-to-list[str] dict for exclusion filters.
+def _parse_multivalue_object(value: str | None) -> dict[str, list[str]]:
+    """Parse a JSON string into a string-to-list[str] dict for field filters/exclusions.
 
-    Accepts both ``{"key": "value"}`` (legacy single-value) and
-    ``{"key": ["v1", "v2"]}`` (multi-value distillation).
-    Returns an empty dict for ``None`` or empty input.
+    Accepts both ``{"key": "value"}`` (legacy single-value — pre-multivalue
+    URLs and saved views) and ``{"key": ["v1", "v2"]}`` (multi-value
+    distillation). Returns an empty dict for ``None`` or empty input.
     """
     if not value:
         return {}
@@ -563,8 +563,8 @@ async def list_events(
     if order not in ("asc", "desc"):
         order = "desc"
     _validate_regex(q, q_regex)
-    parsed_filters = _parse_json_object(filters)
-    parsed_exclusions = _parse_exclusions_object(exclusions)
+    parsed_filters = _parse_multivalue_object(filters)
+    parsed_exclusions = _parse_multivalue_object(exclusions)
     parsed_filter_modes = _parse_modes_object(filter_modes)
     parsed_exclusion_modes = _parse_modes_object(exclusion_modes)
     _validate_field_regexes(parsed_filters, parsed_filter_modes)
@@ -715,8 +715,8 @@ async def bulk_annotate_by_filter(
             detail=f"annotation_type must be one of {sorted(allowed_types)}",
         )
     _validate_regex(body.q, body.q_regex)
-    parsed_filters = _parse_json_object(body.filters)
-    parsed_exclusions = _parse_exclusions_object(body.exclusions)
+    parsed_filters = _parse_multivalue_object(body.filters)
+    parsed_exclusions = _parse_multivalue_object(body.exclusions)
     parsed_filter_modes = _parse_modes_object(body.filter_modes)
     parsed_exclusion_modes = _parse_modes_object(body.exclusion_modes)
     _validate_field_regexes(parsed_filters, parsed_filter_modes)
@@ -943,8 +943,8 @@ async def get_histogram(
     ``max(1, duration / buckets)`` seconds.
     """
     _validate_regex(q, q_regex)
-    parsed_filters = _parse_json_object(filters)
-    parsed_exclusions = _parse_exclusions_object(exclusions)
+    parsed_filters = _parse_multivalue_object(filters)
+    parsed_exclusions = _parse_multivalue_object(exclusions)
     parsed_filter_modes = _parse_modes_object(filter_modes)
     parsed_exclusion_modes = _parse_modes_object(exclusion_modes)
     _validate_field_regexes(parsed_filters, parsed_filter_modes)
@@ -1009,7 +1009,8 @@ class ExportFilter(BaseModel):
     start: datetime | None = None
     end: datetime | None = None
     # 'fields' / 'exclude' map to field_filters / field_exclusions in EventQuery.
-    fields: dict[str, str] = Field(default_factory=dict)
+    # Both accept legacy scalar values ({"k": "v"}) via the validator below.
+    fields: dict[str, list[str]] = Field(default_factory=dict)
     exclude: dict[str, list[str]] = Field(default_factory=dict)
     # Match-mode maps for fields/exclude ("exact" when absent) — structured
     # dicts like their siblings, unlike the JSON-string query params.
@@ -1018,6 +1019,13 @@ class ExportFilter(BaseModel):
     annotated: str | None = None
     annotation_tag_value: str | None = None
     run_id: str | None = None
+
+    @field_validator("fields", "exclude", mode="before")
+    @classmethod
+    def _coerce_scalar_values(cls, v: Any) -> Any:
+        if isinstance(v, dict):
+            return {k: val if isinstance(val, list) else [val] for k, val in v.items()}
+        return v
 
 
 class ExportRequest(BaseModel):

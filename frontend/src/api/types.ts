@@ -573,8 +573,9 @@ export interface EventFilters {
   tagsExclude?: string[];
   start?: string;
   end?: string;
-  /** key=value field equality filters */
-  filters?: Record<string, string>;
+  /** key=[values] field filters — multiple values per field are OR'd (IN);
+   * distinct fields are AND'ed with each other and every other restriction */
+  filters?: Record<string, string[]>;
   /** key=[values] field exclusion filters — multiple values per field are OR'd (NOT IN) */
   exclusions?: Record<string, string[]>;
   /**
@@ -802,7 +803,7 @@ export interface ExportRequest {
     ids?: string;
     start?: string;
     end?: string;
-    fields?: Record<string, string>;
+    fields?: Record<string, string[]>;
     exclude?: Record<string, string[]>;
     field_modes?: Record<string, FieldMatchMode>;
     exclude_modes?: Record<string, FieldMatchMode>;

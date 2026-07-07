@@ -35,7 +35,9 @@ export function CompareFilterEditor({ filters, onChange, fields }: Props) {
 
   const addFieldFilter = () => {
     if (!fieldKey || !fieldValue) return;
-    onChange({ ...filters, filters: { ...filters.filters, [fieldKey]: fieldValue } });
+    const prev = filters.filters?.[fieldKey] ?? [];
+    const next = prev.includes(fieldValue) ? prev : [...prev, fieldValue];
+    onChange({ ...filters, filters: { ...filters.filters, [fieldKey]: next } });
     setFieldValue("");
   };
 

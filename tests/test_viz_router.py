@@ -159,7 +159,7 @@ async def test_compare_baseline_clears_filters_keeps_scope_and_window(monkeypatc
     kind, primary, comparison = svc.calls[0]
     assert kind == "time"
     assert primary.q == "dos"
-    assert primary.field_filters == {"attr:src_ip": "203.0.113.7"}
+    assert primary.field_filters == {"attr:src_ip": ["203.0.113.7"]}
     # Baseline = "everything in this timeline and window": filters dropped,
     # timeline scope and time window kept.
     assert comparison.q is None

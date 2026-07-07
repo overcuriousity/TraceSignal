@@ -186,9 +186,20 @@ export function ExplorerPage() {
     (key: keyof EventFilters | string, fieldKey?: string, value?: string) => {
       const f = { ...filters };
       if (key === "filters" && fieldKey) {
-        const { [fieldKey]: _removed, ...rest } = f.filters ?? {};
-        f.filters = rest;
-        f.filterModes = dropMode(f.filterModes, fieldKey);
+        if (value !== undefined) {
+          const remaining = (f.filters?.[fieldKey] ?? []).filter((v) => v !== value);
+          if (remaining.length === 0) {
+            const { [fieldKey]: _removed, ...rest } = f.filters ?? {};
+            f.filters = rest;
+            f.filterModes = dropMode(f.filterModes, fieldKey);
+          } else {
+            f.filters = { ...(f.filters ?? {}), [fieldKey]: remaining };
+          }
+        } else {
+          const { [fieldKey]: _removed, ...rest } = f.filters ?? {};
+          f.filters = rest;
+          f.filterModes = dropMode(f.filterModes, fieldKey);
+        }
       } else if (key === "exclusions" && fieldKey) {
         if (value !== undefined) {
           const remaining = (f.exclusions?.[fieldKey] ?? []).filter((v) => v !== value);
@@ -270,7 +281,10 @@ export function ExplorerPage() {
           next.excludeTag = value;
         }
       } else if (include) {
-        next.filters = { ...(next.filters ?? {}), [fieldKey]: value };
+        const prev = next.filters?.[fieldKey] ?? [];
+        if (!prev.includes(value)) {
+          next.filters = { ...(next.filters ?? {}), [fieldKey]: [...prev, value] };
+        }
         // Grid-cell values are literal — reset any pattern mode on the key,
         // otherwise the cell text would be reinterpreted as glob/regex.
         next.filterModes = dropMode(next.filterModes, fieldKey);

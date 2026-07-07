@@ -27,9 +27,8 @@ from tracesignal.api.deps import (
 from tracesignal.api.routers.events import (
     _get_query_service,
     _get_stat_anomaly_service,
-    _parse_exclusions_object,
-    _parse_json_object,
     _parse_modes_object,
+    _parse_multivalue_object,
     _parse_str_list,
     _resolve_event_id_filters,
     _resolve_timeline_scope,
@@ -79,8 +78,8 @@ async def _resolve_event_query(
     keep in sync with ``list_events``/``get_histogram`` instead of three.
     """
     _validate_regex(q, q_regex)
-    parsed_filters = _parse_json_object(filters)
-    parsed_exclusions = _parse_exclusions_object(exclusions)
+    parsed_filters = _parse_multivalue_object(filters)
+    parsed_exclusions = _parse_multivalue_object(exclusions)
     parsed_filter_modes = _parse_modes_object(filter_modes)
     parsed_exclusion_modes = _parse_modes_object(exclusion_modes)
     _validate_field_regexes(parsed_filters, parsed_filter_modes)

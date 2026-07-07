@@ -85,7 +85,7 @@ export function FieldHistogramModal({
       ...filters,
       start: rangeStart,
       end: rangeEnd,
-      filters: { ...(filters.filters ?? {}), [fieldKey]: activeValue },
+      filters: { ...(filters.filters ?? {}), [fieldKey]: [activeValue] },
     }),
     [filters, fieldKey, activeValue, rangeStart, rangeEnd],
   );

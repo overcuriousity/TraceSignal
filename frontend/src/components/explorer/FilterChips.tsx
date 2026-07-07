@@ -99,14 +99,16 @@ export function FilterChips({ filters, onRemove }: Props) {
       variant: "neutral",
     });
 
-  for (const [k, v] of Object.entries(filters.filters ?? {})) {
-    chips.push({
-      label: k,
-      value: v,
-      onRemove: () => onRemove("filters", k),
-      variant: "include",
-      mode: filters.filterModes?.[k],
-    });
+  for (const [k, vs] of Object.entries(filters.filters ?? {})) {
+    for (const v of vs) {
+      chips.push({
+        label: k,
+        value: v,
+        onRemove: () => onRemove("filters", k, v),
+        variant: "include",
+        mode: filters.filterModes?.[k],
+      });
+    }
   }
   for (const [k, vs] of Object.entries(filters.exclusions ?? {})) {
     for (const v of vs) {

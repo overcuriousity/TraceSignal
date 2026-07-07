@@ -200,9 +200,14 @@ export function FilterRail({
     const modes = { ...(filters.filterModes ?? {}) };
     if (fieldMode === "exact") delete modes[key];
     else modes[key] = fieldMode;
+    // Append to the field's value list (src_port 22, then 23 → OR'd), skipping
+    // duplicates — mirrors addExclusion. Mode-per-key: this mode applies to
+    // ALL of the key's values.
+    const prevValues = filters.filters?.[key] ?? [];
+    const nextValues = prevValues.includes(v) ? prevValues : [...prevValues, v];
     onChange({
       ...filters,
-      filters: { ...(filters.filters ?? {}), [key]: v },
+      filters: { ...(filters.filters ?? {}), [key]: nextValues },
       filterModes: Object.keys(modes).length > 0 ? modes : undefined,
     });
     setFieldKey("");
