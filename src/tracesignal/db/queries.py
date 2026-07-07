@@ -6,7 +6,7 @@ import logging
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any, Literal
 
 from tracesignal.db._buckets import (
@@ -19,7 +19,15 @@ from tracesignal.db._columns import (
     TOP_LEVEL_NON_STRING_COLUMNS,
     resolve_column_token,
 )
-from tracesignal.db._dt import ensure_utc, ensure_utc_iso, to_clickhouse_utc
+from tracesignal.db._dt import (
+    NULL_TS_SENTINEL,
+    NULL_TS_SENTINEL_ISO,
+    TS_NOT_SENTINEL_SQL,
+    ensure_utc,
+    ensure_utc_iso,
+    is_null_ts_sentinel,
+    to_clickhouse_utc,
+)
 from tracesignal.db.clickhouse import ClickHouseStore
 from tracesignal.db.field_mappings import (
     apply_mappings_to_attribute_keys,
@@ -33,18 +41,11 @@ from tracesignal.db.field_recommend import (
     timeline_universal_cohesion,
 )
 
-# `timestamp` is `Nullable(DateTime64(3))` — unparsable/missing datetimes at
-# ingest genuinely produce NULL rows. ClickHouse sorts NULL after every real
-# value in `ORDER BY timestamp {ASC|DESC}` (empirically verified: NULLS LAST
-# regardless of direction), but a tuple predicate like `(timestamp, event_id)
-# > (:ts, :id)` evaluates to NULL — not true/false — whenever the `timestamp`
-# column itself is NULL, so those rows are silently unreachable by keyset
-# pagination. Cursors and predicates instead treat a NULL timestamp as this
-# sentinel: the maximum value DateTime64(3) can represent, guaranteed later
-# than any real forensic log timestamp, so NULL-timestamp rows sort/seek
-# exactly where they already land in ORDER BY (last).
-_NULL_TIMESTAMP_SENTINEL = datetime(2299, 12, 31, 23, 59, 59, 999000, tzinfo=UTC)
-_NULL_TIMESTAMP_SENTINEL_ISO = _NULL_TIMESTAMP_SENTINEL.isoformat()
+# Sentinel for "no parseable timestamp" — see the definition and rationale in
+# `db/_dt.py`. Local aliases keep the historical names used throughout this
+# module and its tests.
+_NULL_TIMESTAMP_SENTINEL = NULL_TS_SENTINEL
+_NULL_TIMESTAMP_SENTINEL_ISO = NULL_TS_SENTINEL_ISO
 
 # The minimum possible UUID sorts before every real event_id under native
 # UUID comparison — used as the synthetic "any event at this timestamp"
@@ -255,6 +256,12 @@ def _normalize_event_row(row: dict[str, Any]) -> dict[str, Any]:
     for key in ("timestamp", "ingest_time"):
         value = row.get(key)
         if isinstance(value, datetime):
+            # Storage sentinel for "no parseable timestamp" — present as null
+            # (never leak a fake 2299 date to clients). `ingest_time` is
+            # always real and can't carry the sentinel.
+            if key == "timestamp" and is_null_ts_sentinel(value):
+                row[key] = None
+                continue
             row[key] = ensure_utc_iso(value)
     if "event_id" in row:
         row["event_id"] = str(row["event_id"])
@@ -623,6 +630,12 @@ class EventQueryService:
                 "timestamp <= :name",
                 to_clickhouse_utc(query.end),
             )
+
+        if query.start is not None or query.end is not None:
+            # A time-range filter must never match sentinel (no-timestamp)
+            # rows — mirrors how NULL rows failed any >=/<= comparison when
+            # the column was Nullable.
+            builder.conditions.append(TS_NOT_SENTINEL_SQL)
 
         if query.event_ids is not None:
             builder.add_in_list("event_id", query.event_ids, cast_to_string=True)
@@ -1208,7 +1221,7 @@ class EventQueryService:
                 SELECT toStartOfInterval(timestamp, INTERVAL {interval} second) AS bucket,
                        count() AS c
                 FROM {database}.events
-                WHERE {where} AND timestamp IS NOT NULL
+                WHERE {where} AND {TS_NOT_SENTINEL_SQL}
                 GROUP BY bucket
                 ORDER BY bucket
                 """,
@@ -1239,7 +1252,7 @@ class EventQueryService:
             WITH (
                 SELECT (min(timestamp), max(timestamp))
                 FROM {database}.events
-                WHERE {where}
+                WHERE {where} AND {TS_NOT_SENTINEL_SQL}
             ) AS rng,
             greatest(
                 1, intDiv(toUnixTimestamp(rng.2) - toUnixTimestamp(rng.1), {int(buckets)})
@@ -1250,7 +1263,7 @@ class EventQueryService:
                    any(rng.1) AS min_ts,
                    any(rng.2) AS max_ts
             FROM {database}.events
-            WHERE {where} AND timestamp IS NOT NULL
+            WHERE {where} AND {TS_NOT_SENTINEL_SQL}
             GROUP BY bucket
             ORDER BY bucket
             """,
@@ -1489,7 +1502,7 @@ class EventQueryService:
                    {col_expr} AS val,
                    count() AS c
             FROM {database}.events
-            WHERE {where} AND timestamp IS NOT NULL
+            WHERE {where} AND {TS_NOT_SENTINEL_SQL}
                 AND has({{series_values:Array(String)}}, {col_expr})
             GROUP BY bucket, val
             ORDER BY bucket
@@ -1560,7 +1573,7 @@ class EventQueryService:
             SELECT toStartOfInterval(timestamp, INTERVAL {interval} second) AS bucket,
                    count() AS c
             FROM {self.store.database}.events
-            WHERE {where} AND timestamp IS NOT NULL
+            WHERE {where} AND {TS_NOT_SENTINEL_SQL}
             GROUP BY bucket
             ORDER BY bucket
             """,

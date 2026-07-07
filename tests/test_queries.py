@@ -8,7 +8,13 @@ from typing import Any
 
 import pytest
 
-from tracesignal.db.queries import EventQuery, EventQueryService, TagFilter
+from tracesignal.db._dt import NULL_TS_SENTINEL, TS_NOT_SENTINEL_SQL
+from tracesignal.db.queries import (
+    EventQuery,
+    EventQueryService,
+    TagFilter,
+    _normalize_event_row,
+)
 
 
 @dataclass
@@ -216,6 +222,35 @@ def test_time_range_filter_formats_datetime(service: EventQueryService) -> None:
     assert "timestamp <= {p2:String}" in query
     assert params.get("p1") == "2024-01-01 12:00:00"
     assert params.get("p2") == "2024-01-02 12:00:00"
+
+
+def test_time_range_filter_excludes_sentinel_rows(service: EventQueryService) -> None:
+    # A time-range filter must never match sentinel (no-timestamp) rows —
+    # mirrors how NULL rows failed any >=/<= comparison on the old Nullable
+    # column.
+    service.query(EventQuery(case_id="case-1", start=datetime(2024, 1, 1, tzinfo=UTC)))
+    query, _ = _last_query(service)
+    assert TS_NOT_SENTINEL_SQL in query
+
+
+def test_no_time_range_no_sentinel_guard(service: EventQueryService) -> None:
+    # Without a time filter, sentinel rows are regular grid citizens.
+    service.query(EventQuery(case_id="case-1"))
+    query, _ = _last_query(service)
+    assert TS_NOT_SENTINEL_SQL not in query
+
+
+def test_normalize_event_row_presents_sentinel_timestamp_as_null() -> None:
+    sentinel_naive = NULL_TS_SENTINEL.replace(tzinfo=None)
+    row = {
+        "event_id": "e1",
+        "timestamp": sentinel_naive,
+        "ingest_time": datetime(2024, 1, 1, 12, 0, 0),
+    }
+    normalized = _normalize_event_row(row)
+    assert normalized["timestamp"] is None
+    # ingest_time is always real — never nulled, just UTC-ISO'd.
+    assert normalized["ingest_time"] == "2024-01-01T12:00:00+00:00"
 
 
 def test_top_level_field_filter_uses_column(service: EventQueryService) -> None:
@@ -1042,6 +1077,25 @@ def test_histogram_respects_explicit_time_range() -> None:
     range_queries = [q for q, _ in svc.store.client.queries if "min(timestamp)" in q]  # type: ignore[union-attr]
     assert range_queries == []
     assert result["buckets"][0]["count"] == 7
+
+
+def test_histogram_queries_exclude_sentinel_rows() -> None:
+    # Both histogram branches must exclude no-timestamp sentinel rows — the
+    # derived-range CTE especially, where a sentinel would blow up
+    # max(timestamp) and stretch every bucket interval to ~275 years.
+    min_ts = datetime(2024, 1, 1, tzinfo=UTC)
+    max_ts = datetime(2024, 1, 2, tzinfo=UTC)
+    svc = _histogram_service(min_ts, max_ts, [[min_ts, 1]])
+    svc.histogram(EventQuery(case_id="c1", source_ids=["s1"]), buckets=60)
+    derived_sql = svc.store.client.queries[-1][0]  # type: ignore[union-attr]
+    assert derived_sql.count(TS_NOT_SENTINEL_SQL) == 2  # CTE range + bucket scan
+
+    svc2 = _histogram_service(min_ts, max_ts, [[min_ts, 1]])
+    svc2.histogram(
+        EventQuery(case_id="c1", source_ids=["s1"], start=min_ts, end=max_ts), buckets=60
+    )
+    explicit_sql = svc2.store.client.queries[-1][0]  # type: ignore[union-attr]
+    assert TS_NOT_SENTINEL_SQL in explicit_sql
 
 
 def test_histogram_empty_dataset_returns_empty_buckets() -> None:

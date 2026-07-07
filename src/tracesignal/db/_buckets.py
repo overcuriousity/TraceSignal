@@ -19,7 +19,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
-from tracesignal.db._dt import ensure_utc, ensure_utc_iso
+from tracesignal.db._dt import TS_NOT_SENTINEL_SQL, ensure_utc, ensure_utc_iso
 
 
 class _ChClient(Protocol):
@@ -31,11 +31,15 @@ def query_timestamp_range(
 ) -> tuple[datetime | None, datetime | None]:
     """Return the (min, max) UTC timestamp for rows matching *where*.
 
-    Returns ``(None, None)`` when there are no matching (non-NULL-timestamp)
-    rows — callers are expected to short-circuit on that.
+    Sentinel (no-timestamp) rows are excluded centrally here — without the
+    guard, ``max(timestamp)`` would return the year-2299 sentinel whenever
+    any undated row matches, stretching every derived bucket interval.
+    Returns ``(None, None)`` when there are no matching dated rows — callers
+    are expected to short-circuit on that.
     """
     result = client.query(
-        f"SELECT min(timestamp), max(timestamp) FROM {database}.events WHERE {where}",
+        f"SELECT min(timestamp), max(timestamp) FROM {database}.events "
+        f"WHERE {where} AND {TS_NOT_SENTINEL_SQL}",
         parameters=parameters,
     )
     row = result.result_rows[0] if result.result_rows else (None, None)

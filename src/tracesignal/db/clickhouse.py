@@ -30,6 +30,7 @@ from typing import Any
 import clickhouse_connect
 
 from tracesignal.core.config import get_settings
+from tracesignal.db._dt import is_null_ts_sentinel
 from tracesignal.models.event import Event
 
 logger = logging.getLogger(__name__)
@@ -44,10 +45,17 @@ def _normalize_event_datetimes(row: dict[str, Any]) -> dict[str, Any]:
     timezone offset — and a bare "YYYY-MM-DDTHH:MM:SS" string is ambiguous to
     JS's `Date` parser (browsers treat it as local time), silently shifting
     the displayed/compared timestamp by the browser's UTC offset.
+
+    A `timestamp` carrying the no-timestamp storage sentinel (see
+    `db/_dt.py`) is presented as ``None`` — clients never see the fake 2299
+    date. `ingest_time` is always real and can't carry the sentinel.
     """
     for key in ("timestamp", "ingest_time"):
         value = row.get(key)
         if value is None or isinstance(value, str):
+            continue
+        if key == "timestamp" and is_null_ts_sentinel(value):
+            row[key] = None
             continue
         if getattr(value, "tzinfo", None) is None:
             value = value.replace(tzinfo=UTC)

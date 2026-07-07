@@ -80,7 +80,13 @@ import numpy as np
 
 from tracesignal.db._buckets import bucket_interval_seconds, query_timestamp_range
 from tracesignal.db._columns import EVENT_SELECT_COLUMNS, resolve_column_token
-from tracesignal.db._dt import ensure_utc, ensure_utc_iso, to_clickhouse_utc
+from tracesignal.db._dt import (
+    TS_NOT_SENTINEL_SQL,
+    ensure_utc,
+    ensure_utc_iso,
+    is_null_ts_sentinel,
+    to_clickhouse_utc,
+)
 from tracesignal.db.clickhouse import ClickHouseStore
 from tracesignal.db.field_mappings import mapping_coalesce_expr, resolve_mapping
 
@@ -370,7 +376,7 @@ def _row_to_event(columns: tuple[str, ...], row: tuple) -> dict[str, Any]:
     for key in ("timestamp", "ingest_time"):
         v = d.get(key)
         if v is not None and not isinstance(v, str):
-            d[key] = ensure_utc_iso(v)
+            d[key] = None if key == "timestamp" and is_null_ts_sentinel(v) else ensure_utc_iso(v)
     for key in ("content_hash", "file_hash", "embedding_config_hash"):
         v = d.get(key)
         if isinstance(v, bytes):
@@ -378,6 +384,19 @@ def _row_to_event(columns: tuple[str, ...], row: tuple) -> dict[str, Any]:
     if "event_id" in d:
         d["event_id"] = str(d["event_id"])
     return d
+
+
+def _present_ts(value: Any) -> str | None:
+    """Serialize a first-seen/anchor timestamp for API payloads.
+
+    Maps falsy values and the no-timestamp storage sentinel (see
+    `db/_dt.py`) to ``None`` so findings never surface the fake 2299 date —
+    a group whose representative rows are all undated has no meaningful
+    first-seen time.
+    """
+    if not value or is_null_ts_sentinel(value):
+        return None
+    return ensure_utc(value).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -645,8 +664,7 @@ class StatisticalAnomalyService:
         min_dt, max_dt = query_timestamp_range(
             self.ch.client,
             db,
-            "case_id = {cid:String} AND has({src:Array(String)}, source_id)"
-            " AND timestamp IS NOT NULL",
+            "case_id = {cid:String} AND has({src:Array(String)}, source_id)",
             params,
         )
         if min_dt is None or max_dt is None:
@@ -786,7 +804,7 @@ class StatisticalAnomalyService:
                     WHERE case_id = {{cid:String}}
                       AND has({{src:Array(String)}}, source_id)
                       AND {col} != ''
-                      AND timestamp IS NOT NULL
+                      AND {TS_NOT_SENTINEL_SQL}
                     GROUP BY val
                     HAVING baseline_cnt = 0 AND detect_cnt > 0
                     ORDER BY detect_cnt ASC, first_seen ASC
@@ -817,7 +835,7 @@ class StatisticalAnomalyService:
                 # string is ambiguous to JS's Date parser (browsers treat it as
                 # local time), which silently shifted the histogram markers and
                 # event-grid anomaly matching by the browser's UTC offset.
-                first_seen_str = ensure_utc(first_seen).isoformat() if first_seen else None
+                first_seen_str = _present_ts(first_seen)
                 evt_id_str = str(evt_id) if evt_id else None
                 mini_event: dict[str, Any] | None = None
                 if evt_id:
@@ -1011,7 +1029,7 @@ class StatisticalAnomalyService:
                 WHERE case_id = {{cid:String}}
                   AND has({{src:Array(String)}}, source_id)
                   AND {non_empty}
-                  AND timestamp IS NOT NULL
+                  AND {TS_NOT_SENTINEL_SQL}
                 GROUP BY {group_by}
                 HAVING baseline_cnt = 0 AND detect_cnt > 0
                 ORDER BY detect_cnt ASC, first_seen ASC
@@ -1035,7 +1053,7 @@ class StatisticalAnomalyService:
                 continue
 
             score = -math.log(cnt / total_events) if cnt > 0 and total_events > 0 else 0.0
-            first_seen_str = ensure_utc(first_seen).isoformat() if first_seen else None
+            first_seen_str = _present_ts(first_seen)
             evt_id_str = str(evt_id) if evt_id else None
             mini_event: dict[str, Any] | None = None
             if evt_id:
@@ -1316,7 +1334,7 @@ class StatisticalAnomalyService:
                 direction = "below" if val_f < lower else "above"
                 excess = (lower - val_f) if val_f < lower else (val_f - upper)
                 score = round(excess / width, 4)
-                first_seen_str = ensure_utc(first_seen).isoformat() if first_seen else None
+                first_seen_str = _present_ts(first_seen)
                 evt_id_str = str(evt_id) if evt_id else None
                 mini_event: dict[str, Any] | None = None
                 if evt_id:
@@ -1435,8 +1453,7 @@ class StatisticalAnomalyService:
         min_ts, max_ts = query_timestamp_range(
             self.ch.client,
             db,
-            "case_id = {cid:String} AND has({src:Array(String)}, source_id)"
-            " AND timestamp IS NOT NULL",
+            "case_id = {cid:String} AND has({src:Array(String)}, source_id)",
             src_params,
         )
         if min_ts is None or max_ts is None:
@@ -1460,7 +1477,7 @@ class StatisticalAnomalyService:
             FROM {db}.events
             WHERE case_id = {{cid:String}}
               AND has({{src:Array(String)}}, source_id)
-              AND timestamp IS NOT NULL
+              AND {TS_NOT_SENTINEL_SQL}
               AND {col} != ''
             GROUP BY bucket, series_val
             ORDER BY bucket
@@ -1761,7 +1778,7 @@ class StatisticalAnomalyService:
             FROM {db}.events
             WHERE case_id = {{cid:String}}
               AND has({{src:Array(String)}}, source_id)
-              AND timestamp IS NOT NULL
+              AND {TS_NOT_SENTINEL_SQL}
             WINDOW w AS (
                 PARTITION BY source_id
                 ORDER BY byte_offset, line_number, event_id
@@ -1811,7 +1828,7 @@ class StatisticalAnomalyService:
             source_id, event_id, ts, prev_ts, skew, byte_offset, line_number, msg = row
             if not event_id:
                 continue
-            ts_str = ensure_utc(ts).isoformat() if ts else None
+            ts_str = _present_ts(ts)
             prev_str = ensure_utc(prev_ts).isoformat() if prev_ts else None
             n_viol, max_skew = source_summary.get(str(source_id), (0, 0.0))
             mini_event: dict[str, Any] = {
