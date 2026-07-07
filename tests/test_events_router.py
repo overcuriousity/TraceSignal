@@ -551,6 +551,7 @@ class _FakeStatAnomalyService:
         self.order_calls: list[dict] = []
         self.range_calls: list[dict] = []
         self.charset_calls: list[dict] = []
+        self.entropy_calls: list[dict] = []
 
     def get_timeline_midpoint(self, case_id, source_ids):
         return self._midpoint
@@ -578,6 +579,10 @@ class _FakeStatAnomalyService:
     def find_charset_novelty(self, **kwargs):
         self.charset_calls.append(kwargs)
         return "charset-result"
+
+    def find_entropy_outliers(self, **kwargs):
+        self.entropy_calls.append(kwargs)
+        return "entropy-result"
 
 
 @pytest.fixture()
@@ -754,6 +759,51 @@ async def test_run_stat_detector_dispatches_to_charset(patched_store, monkeypatc
     # Explicit fields → the field-stats cache inventory is not resolved.
     assert fake_svc.charset_calls[0]["inventory"] is None
     assert not fake_svc.value_novelty_calls
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_dispatches_to_entropy(patched_store, monkeypatch):
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    result = await events._run_stat_detector(
+        "c1",
+        ["s1"],
+        detector="entropy",
+        fields="attr:host",
+        series_field="artifact",
+        z_threshold=None,
+        baseline_end=None,
+        temporal=False,
+        limit=50,
+    )
+    assert result == "entropy-result"
+    assert fake_svc.entropy_calls[0]["fields"] == ["attr:host"]
+    assert fake_svc.entropy_calls[0]["inventory"] is None
+    assert not fake_svc.value_novelty_calls
+
+
+def test_serialize_finding_entropy_shape():
+    from tracesignal.db.anomaly_stats import EntropyFinding
+
+    f = EntropyFinding(
+        field="attr:host",
+        value="kq3v9xz2m8w1",
+        entropy=5.5,
+        count=3,
+        score=0.25,
+        direction="above",
+        lower=0.5,
+        upper=4.5,
+        first_seen="2024-01-01T00:00:00+00:00",
+        event_id="evt-1",
+        event=None,
+        details={"detector": "entropy"},
+    )
+    out = events._serialize_finding(f)
+    assert out["type"] == "entropy"
+    assert out["entropy"] == 5.5
+    assert out["direction"] == "above"
 
 
 def test_serialize_finding_charset_shape():

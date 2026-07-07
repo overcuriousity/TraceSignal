@@ -17,6 +17,7 @@ import {
   Activity,
   Rewind,
   Ruler,
+  Shuffle,
   Type,
   ShieldCheck,
   BarChart2,
@@ -247,6 +248,37 @@ export function MethodologyPanel({
             <Row label="Backend">
               ClickHouse extractAll + array functions over distinct values — no
               ML.
+            </Row>
+          </div>
+        </div>
+
+        {/* Entropy outliers */}
+        <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3 space-y-2">
+          <p className="flex items-center gap-1.5 font-medium text-[var(--color-fg-primary)]">
+            <Shuffle size={11} /> Entropy outliers (entropy)
+          </p>
+          <div className="space-y-1.5 text-[var(--color-fg-muted)]">
+            <Row label="Method">
+              Shannon character entropy of each distinct value, compared to a
+              Tukey fence [q1−1.5·IQR, q3+1.5·IQR] over the field's entropy
+              distribution — the whole corpus in self-baseline mode, the
+              baseline window in temporal mode.
+            </Row>
+            <Row label="Signal">
+              Above-band values look random (DGA domains, encoded payloads,
+              keys); below-band values look degenerate (padding, repeated
+              characters). Purely syntactic — computed from character
+              frequencies, never from what a value means.
+            </Row>
+            <Row label="Score">
+              Distance outside the band ÷ band width, like numeric range.
+              Entropy, band, and quartiles are carried in{" "}
+              <code className="font-mono text-xs">details</code>.
+            </Row>
+            <Row label="Backend">
+              ClickHouse array functions over distinct values — no ML. Values
+              shorter than 6 characters are excluded; fields with fewer than
+              20 qualifying baseline values are skipped.
             </Row>
           </div>
         </div>

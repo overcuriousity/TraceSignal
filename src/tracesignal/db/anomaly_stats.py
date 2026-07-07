@@ -68,6 +68,20 @@ already-ingested data.
     characters. Score = Σ per novel char ``-log(n_vals_with_char / n_vals)``
     (temporal: ``log(n_vals + 1)`` per char) — value_novelty's surprise family.
 
+**entropy** (``detector="entropy"``)
+    Per field, Shannon character entropy (bits) of each *distinct value*
+    compared against the field's baseline entropy distribution via a Tukey
+    fence — above-band values look random (DGA domains, encoded payloads),
+    below-band values look degenerate (padding, character stuffing). AMiner
+    ``EntropyDetector``, purely syntactic. Two modes: *self-baseline*
+    (``method="iqr"``, fence over the whole corpus — quantiles are not
+    degenerate over their own population, unlike min/max) and *temporal*
+    (``method="temporal-iqr"``, fence learned from the baseline window,
+    detection restricted to the detect window). Entropies are per distinct
+    value (frequency-independent); values shorter than
+    ``_MIN_ENTROPY_VALUE_LEN`` codepoints are excluded throughout. Score =
+    distance outside the band ÷ band width, like numeric_range.
+
 **timestamp_order** (``detector="timestamp_order"``)
     Flag events whose parsed timestamp jumps *backwards* relative to the
     previous record in the source file (record order = ``byte_offset``, then
@@ -153,6 +167,15 @@ _MIN_CHARSET_BASELINE = 20
 # the reference-set query parameter unreasonably large.
 _MAX_CHARSET_SIZE = 5000
 
+# Minimum distinct baseline values before the entropy detector trusts a
+# field's entropy distribution — quartiles over fewer points are noise.
+_MIN_ENTROPY_BASELINE = 20
+
+# Values shorter than this (in codepoints) are excluded from entropy scoring
+# entirely (baseline and detect): character entropy of a 3-char string is
+# degenerate and would swamp the band with false lows.
+_MIN_ENTROPY_VALUE_LEN = 6
+
 # Minimum buckets in a frequency series for z-scoring to be meaningful.
 _MIN_FREQUENCY_BUCKETS = 3
 
@@ -236,6 +259,26 @@ class CharsetFinding:
 
 
 @dataclass
+class EntropyFinding:
+    """One entropy-outlier value from the entropy detector."""
+
+    field: str
+    value: str
+    # Shannon character entropy of the value, in bits.
+    entropy: float
+    count: int
+    # excess distance beyond the entropy band, normalized by band width.
+    score: float
+    direction: str  # "below" | "above"
+    lower: float
+    upper: float
+    first_seen: str | None
+    event_id: str | None
+    event: dict[str, Any] | None
+    details: dict[str, Any]
+
+
+@dataclass
 class NumericFieldInfo:
     """A numeric-parseable field candidate for the range detector."""
 
@@ -288,14 +331,20 @@ class StatAnomalyResult:
 
     status: str  # "ok" | "no_data" | "insufficient_data"
     # "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range"
-    #  | "charset"
+    #  | "charset" | "entropy"
     detector: str
     # "self-baseline" | "temporal" | "z-score" | "temporal-z-score" | "sequential"
-    #  | "iqr" | "temporal-range" | "rare-chars" | "temporal-charset"
+    #  | "iqr" | "temporal-range" | "rare-chars" | "temporal-charset" | "temporal-iqr"
     method: str
     baseline_size: int  # total events (value_novelty) or event-count used for z-score
     results: list[
-        ValueFinding | FreqFinding | OrderFinding | ComboFinding | RangeFinding | CharsetFinding
+        ValueFinding
+        | FreqFinding
+        | OrderFinding
+        | ComboFinding
+        | RangeFinding
+        | CharsetFinding
+        | EntropyFinding
     ] = field(default_factory=list)
     # Effective |z| cutoff used by the frequency detector; None for value_novelty.
     z_threshold: float | None = None
@@ -1671,9 +1720,7 @@ class StatisticalAnomalyService:
                 }
                 if baseline_end is None:
                     details["rarity_floor"] = rarity_floor
-                    details["char_value_counts"] = {
-                        c: char_counts.get(c, 0) for c in novel_chars
-                    }
+                    details["char_value_counts"] = {c: char_counts.get(c, 0) for c in novel_chars}
                 all_findings.append(
                     CharsetFinding(
                         field=field_token,
@@ -1707,6 +1754,230 @@ class StatisticalAnomalyService:
         return StatAnomalyResult(
             status="ok",
             detector="charset",
+            method=method,
+            baseline_size=total_events,
+            results=results,
+        )
+
+    # ------------------------------------------------------------------
+    # Value entropy outliers
+    # ------------------------------------------------------------------
+
+    def find_entropy_outliers(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        fields: list[str] | None = None,
+        limit: int = 50,
+        per_field_limit: int = 25,
+        baseline_end: datetime | None = None,
+        exclude_event_ids: set[str] | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
+        inventory: list[tuple[str, int, int]] | None = None,
+        inventory_total: int | None = None,
+    ) -> StatAnomalyResult:
+        """Return values whose Shannon character entropy falls outside a learned band.
+
+        Per field, compute the character entropy (bits) of each *distinct
+        value* and compare it against the field's baseline entropy
+        distribution via a Tukey fence ``[q1 − 1.5·IQR, q3 + 1.5·IQR]``.
+        Values above the band look random (DGA domains, encoded payloads,
+        keys); values below it look degenerate (padding, repeated-character
+        stuffing). AMiner ``EntropyDetector`` — entropy is a property of the
+        characters, never of what the value means.
+
+        Two modes: *self-baseline* (``method="iqr"``) computes the fence over
+        the whole corpus's per-distinct-value entropies (unlike an exact
+        min/max, quartiles are not degenerate over their own population);
+        *temporal* (``method="temporal-iqr"``) learns the fence from the
+        baseline window and flags only detect-window values.
+
+        Entropies are weighted per distinct value, not per row — one hot
+        value repeated millions of times cannot drag the band toward itself.
+        Values shorter than ``_MIN_ENTROPY_VALUE_LEN`` codepoints are excluded
+        from baseline and detection alike. A field with fewer than
+        ``_MIN_ENTROPY_BASELINE`` qualifying baseline values is skipped; when
+        every scanned field skips the status is ``insufficient_data``.
+        """
+        self.ch.init_schema()
+        db = self.ch.database
+        base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        method = "iqr" if baseline_end is None else "temporal-iqr"
+
+        total_events = self._count_events(case_id, source_ids)
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data",
+                detector="entropy",
+                method=method,
+                baseline_size=0,
+            )
+
+        if fields is not None:
+            scan_fields = fields
+        else:
+            scan_fields = self._auto_string_fields(
+                case_id, source_ids, total_events, field_mappings, inventory, inventory_total
+            )
+
+        # Shannon character entropy in bits, computed from a `chars` array
+        # column produced by extractAll(val, '(?s).') one subquery below.
+        ent_expr = (
+            "arraySum(k -> -(k / length(chars)) * log2(k / length(chars)),"
+            " arrayMap(c -> countEqual(chars, c), arrayDistinct(chars)))"
+        )
+
+        bl_str = to_clickhouse_utc(baseline_end) if baseline_end is not None else None
+        all_findings: list[EntropyFinding] = []
+        evaluated_fields = 0
+
+        for field_token in scan_fields:
+            # --- Learn the entropy band from the baseline. ---
+            stat_params: dict[str, Any] = {**base_params, "minlen": _MIN_ENTROPY_VALUE_LEN}
+            col = _col_expr(field_token, stat_params, field_mappings)
+            baseline_clause = ""
+            if baseline_end is not None:
+                stat_params["bl"] = bl_str
+                # Sentinel rows sort after baseline_end, so `timestamp <`
+                # already excludes them from the baseline.
+                baseline_clause = " AND timestamp < {bl:String}"
+            stat_sql = f"""
+                SELECT quantile(0.25)(ent) AS q1, quantile(0.75)(ent) AS q3, count() AS n
+                FROM (
+                    SELECT {ent_expr} AS ent
+                    FROM (
+                        SELECT extractAll(val, '(?s).') AS chars
+                        FROM (
+                            SELECT DISTINCT {col} AS val
+                            FROM {db}.events
+                            WHERE case_id = {{cid:String}}
+                              AND has({{src:Array(String)}}, source_id)
+                              AND {col} != ''
+                              AND lengthUTF8({col}) >= {{minlen:UInt32}}{baseline_clause}
+                        )
+                    )
+                )
+                {_HEAVY_SCAN_SETTINGS}
+            """
+            srows = self.ch.client.query(stat_sql, parameters=stat_params).result_rows
+            if not srows or srows[0][2] is None:
+                continue
+            q1, q3, n = srows[0]
+            if int(n) < _MIN_ENTROPY_BASELINE or q1 is None or q3 is None:
+                continue
+
+            q1, q3 = float(q1), float(q3)
+            iqr = q3 - q1
+            lower = q1 - 1.5 * iqr
+            upper = q3 + 1.5 * iqr
+            # Degenerate (zero-width) band → same width floor as numeric_range.
+            width = max(upper - lower, 1e-9)
+            evaluated_fields += 1
+
+            # --- Flag values whose entropy falls outside the band. ---
+            viol_params: dict[str, Any] = {**base_params, "minlen": _MIN_ENTROPY_VALUE_LEN}
+            vcol = _col_expr(field_token, viol_params, field_mappings)
+            viol_params["lo"] = lower
+            viol_params["hi"] = upper
+            viol_params["plim"] = per_field_limit
+            detect_clause = ""
+            if baseline_end is not None:
+                viol_params["bl"] = bl_str
+                # Exclude sentinel/undated rows: they satisfy `>= bl` (year-2299
+                # sentinel) and would otherwise land in the detect window.
+                detect_clause = f" AND timestamp >= {{bl:String}} AND {TS_NOT_SENTINEL_SQL}"
+            viol_sql = f"""
+                SELECT val, ent, cnt, first_seen, evt_id
+                FROM (
+                    SELECT val, {ent_expr} AS ent, cnt, first_seen, evt_id
+                    FROM (
+                        SELECT val, extractAll(val, '(?s).') AS chars, cnt, first_seen, evt_id
+                        FROM (
+                            SELECT
+                                {vcol} AS val,
+                                count() AS cnt,
+                                min(timestamp) AS first_seen,
+                                toString(argMin(event_id, timestamp)) AS evt_id
+                            FROM {db}.events
+                            WHERE case_id = {{cid:String}}
+                              AND has({{src:Array(String)}}, source_id)
+                              AND {vcol} != ''
+                              AND lengthUTF8({vcol}) >= {{minlen:UInt32}}{detect_clause}
+                            GROUP BY val
+                        )
+                    )
+                )
+                WHERE ent < {{lo:Float64}} OR ent > {{hi:Float64}}
+                ORDER BY greatest({{lo:Float64}} - ent, ent - {{hi:Float64}}) DESC, first_seen ASC
+                LIMIT {{plim:UInt32}}
+                {_HEAVY_SCAN_SETTINGS}
+            """
+            vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
+
+            for vrow in vrows:
+                val, ent, cnt, first_seen, evt_id = vrow
+                if not val or ent is None:
+                    continue
+                ent_f = float(ent)
+                direction = "below" if ent_f < lower else "above"
+                excess = (lower - ent_f) if ent_f < lower else (ent_f - upper)
+                score = round(excess / width, 4)
+                first_seen_str = _present_ts(first_seen)
+                evt_id_str = str(evt_id) if evt_id else None
+                mini_event = _stub_event(evt_id_str, case_id, first_seen_str)
+
+                details: dict[str, Any] = {
+                    "detector": "entropy",
+                    "method": method,
+                    "field": field_token,
+                    "value": str(val),
+                    "entropy": round(ent_f, 4),
+                    "count": int(cnt),
+                    "lower": round(lower, 4),
+                    "upper": round(upper, 4),
+                    "direction": direction,
+                    "excess": round(excess, 4),
+                    "q1": round(q1, 4),
+                    "q3": round(q3, 4),
+                    "iqr": round(iqr, 4),
+                    "baseline_n": int(n),
+                }
+                all_findings.append(
+                    EntropyFinding(
+                        field=field_token,
+                        value=str(val),
+                        entropy=round(ent_f, 4),
+                        count=int(cnt),
+                        score=score,
+                        direction=direction,
+                        lower=round(lower, 4),
+                        upper=round(upper, 4),
+                        first_seen=first_seen_str,
+                        event_id=evt_id_str,
+                        event=mini_event,
+                        details=details,
+                    )
+                )
+
+        if evaluated_fields == 0:
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector="entropy",
+                method=method,
+                baseline_size=total_events,
+            )
+
+        if exclude_event_ids:
+            all_findings = [
+                f for f in all_findings if not f.event_id or f.event_id not in exclude_event_ids
+            ]
+
+        all_findings.sort(key=lambda f: f.score, reverse=True)
+        results = all_findings[:limit]
+        self._hydrate_finding_events(case_id, source_ids, results)
+        return StatAnomalyResult(
+            status="ok",
+            detector="entropy",
             method=method,
             baseline_size=total_events,
             results=results,

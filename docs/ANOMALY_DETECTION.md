@@ -9,21 +9,22 @@ file and the "Method" tab copy in the same commit — see
 [Reality check](#reality-check-2026-07) at the bottom for the audit that
 produced this file and what was fixed as part of it.
 
-There are six independent analysis tools in TraceSignal:
+There are seven independent analysis tools in TraceSignal:
 
 1. [Value novelty](#1-value-novelty-rare--first-seen-values) — rare/new field values, single field or [combinations](#value-combinations-the-value_combo-variant) (ClickHouse, no ML)
 2. [Frequency anomalies](#2-frequency-anomalies-volume-spikes--silences) — volume spikes/silences (ClickHouse, no ML)
 3. [Timestamp order](#3-timestamp-order-out-of-order-records) — timestamps running backwards in record order (ClickHouse, no ML)
 4. [Numeric range](#4-numeric-range-out-of-band-values) — numeric values outside a learned band (ClickHouse, no ML)
 5. [Charset novelty](#5-charset-novelty-never-seen-characters) — values containing characters outside a field's learned character set (ClickHouse, no ML)
-6. [Semantic similarity search](#6-semantic-similarity-search) — "find events like this one" (embeddings + Qdrant)
+6. [Entropy outliers](#6-entropy-outliers-random-looking-values) — values whose character entropy falls outside the field's learned band (ClickHouse, no ML)
+7. [Semantic similarity search](#7-semantic-similarity-search) — "find events like this one" (embeddings + Qdrant)
 
-The first five are **statistical detectors**: pure counting and arithmetic over
+The first six are **statistical detectors**: pure counting and arithmetic over
 already-ingested events, no machine learning, no network calls, work the
-instant ingestion finishes. The sixth needs an explicit embedding step first.
+instant ingestion finishes. The seventh needs an explicit embedding step first.
 
-Code: `src/tracesignal/db/anomaly_stats.py` (detectors 1–5),
-`src/tracesignal/db/similarity.py` (detector 6). UI: `frontend/src/components/analysis/`.
+Code: `src/tracesignal/db/anomaly_stats.py` (detectors 1–6),
+`src/tracesignal/db/similarity.py` (detector 7). UI: `frontend/src/components/analysis/`.
 
 ### Query-cost discipline (all statistical detectors)
 
@@ -542,7 +543,79 @@ invisible characters are visible in the report.
 
 ---
 
-## 6. Semantic similarity search
+## 6. Entropy outliers (random-looking values)
+
+**What it answers:** "Does any value of this field look *statistically unlike*
+the field's normal values — too random, or too repetitive?" A DGA domain
+(`kq3v9xz2m8w1.com`) among human-named hosts, a base64 payload in a field of
+plain words, a padding string of one repeated character.
+
+Adapted from AMiner's `EntropyDetector`.
+
+**Why it's useful:** Randomness is a fingerprint of machine-generated content
+— DGA domains, encoded/encrypted payloads, session keys dropped into the wrong
+field. None of these are "rare values" in a useful sense (every DGA domain is
+unique, so all of them are maximally rare) — what distinguishes them is
+*character-level* statistics. The inverse signal matters too: near-zero
+entropy means degenerate stuffing (`AAAA…`, `xxxxxxxx`) that often marks
+overflow padding or sanitizer artifacts.
+
+**The measurement: Shannon character entropy.** For one value, count how often
+each character occurs, turn the counts into frequencies, and sum
+`−f·log₂(f)` over the characters. The result is bits per character: English
+words sit around 2.5–4 bits, uniformly random alphanumerics near 5–6, a single
+repeated character at exactly 0. The detector never interprets the value —
+only its character histogram.
+
+**Entropies are per distinct value, not per row.** A hot value repeated a
+million times contributes one point to the field's entropy distribution, so
+traffic volume can't drag the band. Values shorter than 6 characters are
+excluded outright (baseline and detect): a 3-character string's entropy is
+degenerate and would flood the band with false lows.
+
+### Two modes
+
+| | Self-baseline (`iqr`) | Temporal (`temporal-iqr`) |
+|---|---|---|
+| Baseline population | entropies of every distinct value in the corpus | entropies of distinct values before `baseline_end` |
+| Band | Tukey fence `[q1 − 1.5·IQR, q3 + 1.5·IQR]` | same fence, learned from the baseline window |
+| Flags | statistical entropy outliers anywhere | detect-window values outside the baseline's band |
+
+Unlike the numeric-range detector, *both* modes can use the fence directly:
+quartiles are not degenerate over their own population the way an exact
+min/max is, so self-baseline mode needs no special construction.
+
+### The score
+
+```
+score = distance outside the band ÷ band width
+```
+
+Identical to the numeric-range score — a value one band-width past the fence
+scores 1.0. `direction` says which side: **above** = random-looking, **below**
+= degenerate/repetitive. Findings carry the entropy, band, quartiles, and
+baseline size in `details`.
+
+### Caveats
+
+- **Legitimate high-entropy fields.** Hashes, UUIDs, and tokens are *supposed*
+  to be random — a field of session IDs will produce a high, tight band and
+  flag nothing (good), but a mixed field (URLs that sometimes embed tokens)
+  will flag the tokens. That's usually the interesting case anyway; deselect
+  the field if not.
+- **Entropy is length-insensitive beyond the minimum.** A short random string
+  and a long random string score similarly; this detector finds *character
+  randomness*, not payload size — pair with numeric range over a length field
+  if size matters.
+- **Baseline size floor.** Fields with fewer than 20 qualifying distinct
+  baseline values are skipped; if every scanned field skips, the status is
+  `insufficient_data`.
+- Rare ≠ malicious, as everywhere: a CDN hostname and a DGA domain can score
+  identically. It ranks for triage.
+
+---
+
+## 7. Semantic similarity search
 
 Not a statistical anomaly detector — no baseline, no score threshold, no
 z-score — but it lives in the same Analysis tab and Method panel, so it's

@@ -1625,6 +1625,7 @@ def test_heavy_detector_scans_carry_memory_settings():
     svc.find_value_novelty("c1", ["s1"], fields=["artifact"])
     svc.find_value_combos("c1", ["s1"], fields=["artifact", "timestamp_desc"])
     svc.find_charset_novelty("c1", ["s1"], fields=["artifact"])
+    svc.find_entropy_outliers("c1", ["s1"], fields=["artifact"])
     svc.field_inventory("c1", ["s1"], total=100)
 
     scans = [
@@ -1686,9 +1687,7 @@ def test_charset_self_baseline_flags_rare_char():
     responses = [
         FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
         # 'a'/'b' common (90 distinct values each), NUL byte rare (1 value)
-        FakeQueryResult(
-            result_rows=[("a", 90), ("b", 85), ("\x00", 1)], column_names=["c", "n"]
-        ),
+        FakeQueryResult(result_rows=[("a", 90), ("b", 85), ("\x00", 1)], column_names=["c", "n"]),
         FakeQueryResult(result_rows=[(100,)], column_names=["u"]),
         FakeQueryResult(
             result_rows=[("ab\x00ab", ["\x00"], 2, fs, "evt-nul")],
@@ -1733,9 +1732,7 @@ def test_charset_temporal_flags_never_seen_chars_and_guards_sentinel():
     responses = [
         FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
         # baseline charset over 50 distinct baseline values
-        FakeQueryResult(
-            result_rows=[(list("abcdefghij"), 50)], column_names=["charset", "n"]
-        ),
+        FakeQueryResult(result_rows=[(list("abcdefghij"), 50)], column_names=["charset", "n"]),
         FakeQueryResult(
             result_rows=[("ab☃cd", ["☃"], 1, fs, "evt-snow")],
             column_names=["val", "novel", "cnt", "first_seen", "evt_id"],
@@ -1779,4 +1776,125 @@ def test_charset_excludes_normal_marked_events_and_limits():
     )
     assert [f.event_id for f in result.results] == ["evt-keep"]
     # Hydration happens once, on the surviving slice only.
+    assert svc.ch.hydration_calls == [["evt-keep"]]
+
+
+# ---------------------------------------------------------------------------
+# find_entropy_outliers — entropy detector (D5)
+# ---------------------------------------------------------------------------
+
+
+def test_entropy_no_data():
+    svc = _svc([FakeQueryResult(result_rows=[(0,)], column_names=["count()"])])
+    result = svc.find_entropy_outliers("c1", ["s1"], fields=["attr:host"])
+    assert result.status == "no_data"
+    assert result.detector == "entropy"
+
+
+def test_entropy_insufficient_when_baseline_too_small():
+    """A field with < _MIN_ENTROPY_BASELINE qualifying distinct values is skipped."""
+    responses = [
+        FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(2.0, 3.0, 5)], column_names=["q1", "q3", "n"]),
+    ]
+    svc = _svc(responses)
+    result = svc.find_entropy_outliers("c1", ["s1"], fields=["attr:host"])
+    assert result.status == "insufficient_data"
+
+
+def test_entropy_self_baseline_iqr_flags_both_directions():
+    """Self mode: Tukey fence over corpus entropies; score = excess / width."""
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    # q1=2.0, q3=3.0 → IQR=1.0 → band [0.5, 4.5], width 4.0.
+    responses = [
+        FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(2.0, 3.0, 200)], column_names=["q1", "q3", "n"]),
+        FakeQueryResult(
+            result_rows=[
+                ("kq3v9xz2m8w1", 5.5, 3, fs, "evt-dga"),
+                ("aaaaaaaaaaaa", 0.1, 7, fs, "evt-pad"),
+            ],
+            column_names=["val", "ent", "cnt", "first_seen", "evt_id"],
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_entropy_outliers("c1", ["s1"], fields=["attr:host"])
+    assert result.status == "ok"
+    assert result.method == "iqr"
+    hi, lo = result.results[0], result.results[1]
+    assert hi.direction == "above"
+    assert hi.entropy == 5.5
+    assert hi.lower == 0.5
+    assert hi.upper == 4.5
+    # excess = 5.5 - 4.5 = 1.0; width = 4.0 → 0.25
+    assert hi.score == 0.25
+    assert lo.direction == "below"
+    # excess = 0.5 - 0.1 = 0.4; width = 4.0 → 0.1
+    assert lo.score == 0.1
+    assert hi.details["q1"] == 2.0
+    assert hi.details["baseline_n"] == 200
+
+
+def test_entropy_temporal_learns_band_from_baseline_and_guards_sentinel():
+    """Temporal mode: fence from the baseline window only; detect window is
+    timestamp >= baseline_end with the sentinel excluded; min-length clause
+    applies to baseline and detect alike."""
+
+    from tracesignal.db._dt import TS_NOT_SENTINEL_SQL
+
+    class _RecordingClient(FakeClient):
+        def __init__(self, responses):
+            super().__init__(responses)
+            self.full_queries: list[str] = []
+
+        def query(self, sql, parameters=None):
+            self.full_queries.append(sql)
+            return super().query(sql, parameters)
+
+    bl = datetime(2024, 1, 2, tzinfo=UTC)
+    fs = datetime(2024, 1, 3, tzinfo=UTC)
+    responses = [
+        FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(2.0, 2.5, 100)], column_names=["q1", "q3", "n"]),
+        FakeQueryResult(
+            result_rows=[("x9k2q8vz", 4.9, 1, fs, "evt-hi")],
+            column_names=["val", "ent", "cnt", "first_seen", "evt_id"],
+        ),
+    ]
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    client = _RecordingClient(responses)
+    svc.ch = FakeClickHouseStore(FakeClient([]))
+    svc.ch.client = client
+    result = svc.find_entropy_outliers("c1", ["s1"], fields=["attr:host"], baseline_end=bl)
+    assert result.status == "ok"
+    assert result.method == "temporal-iqr"
+    f = result.results[0]
+    assert f.direction == "above"
+    baseline_sql = client.full_queries[1]
+    detect_sql = client.full_queries[2]
+    assert "timestamp < {bl:String}" in baseline_sql
+    assert "timestamp >= {bl:String}" in detect_sql
+    assert TS_NOT_SENTINEL_SQL in detect_sql
+    assert "lengthUTF8" in baseline_sql
+    assert "lengthUTF8" in detect_sql
+
+
+def test_entropy_excludes_normal_marked_events():
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    responses = [
+        FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(2.0, 3.0, 200)], column_names=["q1", "q3", "n"]),
+        FakeQueryResult(
+            result_rows=[
+                ("zzzz11119999", 5.9, 1, fs, "evt-drop"),
+                ("q8m2x7c4v1n6", 5.5, 1, fs, "evt-keep"),
+            ],
+            column_names=["val", "ent", "cnt", "first_seen", "evt_id"],
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_entropy_outliers(
+        "c1", ["s1"], fields=["attr:host"], exclude_event_ids={"evt-drop"}
+    )
+    assert [f.event_id for f in result.results] == ["evt-keep"]
     assert svc.ch.hydration_calls == [["evt-keep"]]

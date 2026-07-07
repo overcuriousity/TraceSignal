@@ -87,14 +87,11 @@ each detector.
 Prep landed: shared frontend detector scaffolding (`components/analysis/detector-shared.tsx`),
 a Radix `Select` detector switcher replacing the flat sub-tab strip, standardized
 `["anomalies", caseId, timelineId, ...]` query keys, and an `_col_expr(prefix=...)` param for
-multi-field queries. **D1 (value-combo), D2 (timestamp-order), and D4 (numeric-range)
-shipped.**
+multi-field queries. **D1 (value-combo), D2 (timestamp-order), D3 (charset), D4
+(numeric-range), and D5 (entropy) shipped.**
 
 High value first:
 
-- [ ] **D5 — Value entropy outliers** (AMiner `EntropyDetector`): per field, Shannon
-  character-entropy of each value vs. the field's baseline entropy distribution; flags
-  random-looking strings (DGA domains, encoded payloads) without interpreting them.
 - [ ] **D6 — Per-value silence** (AMiner `MissingMatchPathValueDetector`): a value that
   appeared regularly in the baseline stops appearing in the detect window (agent killed,
   log source suppressed). Complements the existing `frequency` detector's global silences.

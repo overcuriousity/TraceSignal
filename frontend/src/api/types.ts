@@ -331,6 +331,25 @@ export interface CharsetFinding {
   details: Record<string, unknown>;
 }
 
+/** One entropy-outlier value from the entropy detector. */
+export interface EntropyFinding {
+  type: "entropy";
+  field: string;
+  value: string;
+  /** Shannon character entropy of the value, in bits. */
+  entropy: number;
+  count: number;
+  /** excess distance beyond the entropy band ÷ band width. */
+  score: number;
+  direction: "below" | "above";
+  lower: number;
+  upper: number;
+  first_seen: string | null;
+  event_id: string | null;
+  event: Event | null;
+  details: Record<string, unknown>;
+}
+
 /** One out-of-order timestamp finding from the timestamp_order detector. */
 export interface TimestampOrderFinding {
   type: "timestamp_order";
@@ -356,7 +375,8 @@ export type AnomalyFinding =
   | FrequencyFinding
   | TimestampOrderFinding
   | NumericRangeFinding
-  | CharsetFinding;
+  | CharsetFinding
+  | EntropyFinding;
 
 export interface AnomaliesResponse {
   status: "ok" | "no_data" | "insufficient_data";
@@ -401,7 +421,8 @@ export interface AnomalyMarker {
     | "frequency"
     | "timestamp_order"
     | "numeric_range"
-    | "charset";
+    | "charset"
+    | "entropy";
   /** Raw structured finding data — stored verbatim on the persisted annotation. */
   rawDetails: Record<string, unknown>;
   /** End of the anomalous window, for frequency findings — enables a range highlight. */

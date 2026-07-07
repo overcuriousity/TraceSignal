@@ -29,6 +29,7 @@ from tracesignal.core.events_bus import publish_annotation_change
 from tracesignal.db.anomaly_stats import (
     CharsetFinding,
     ComboFinding,
+    EntropyFinding,
     FreqFinding,
     NoveltyFieldInfo,
     OrderFinding,
@@ -1345,6 +1346,21 @@ async def _run_stat_detector(
             inventory_total=inventory_total,
         )
 
+    if detector == "entropy":
+        return await run_in_threadpool(
+            svc.find_entropy_outliers,
+            case_id=case_id,
+            source_ids=source_ids,
+            fields=parsed_fields,
+            limit=limit,
+            per_field_limit=cfg.stat_per_field_limit,
+            baseline_end=effective_baseline_end,
+            exclude_event_ids=exclude_ids,
+            field_mappings=field_mappings,
+            inventory=inventory,
+            inventory_total=inventory_total,
+        )
+
     return await run_in_threadpool(
         svc.find_value_novelty,
         case_id=case_id,
@@ -1439,9 +1455,31 @@ async def semantic_search_events(
 
 
 def _serialize_finding(
-    r: ValueFinding | FreqFinding | OrderFinding | ComboFinding | RangeFinding | CharsetFinding,
+    r: ValueFinding
+    | FreqFinding
+    | OrderFinding
+    | ComboFinding
+    | RangeFinding
+    | CharsetFinding
+    | EntropyFinding,
 ) -> dict[str, Any]:
-    """Serialise a Value/Freq/Order/Combo/Range/Charset finding to a JSON-safe dict."""
+    """Serialise a Value/Freq/Order/Combo/Range/Charset/Entropy finding to a JSON-safe dict."""
+    if isinstance(r, EntropyFinding):
+        return {
+            "type": "entropy",
+            "field": r.field,
+            "value": r.value,
+            "entropy": r.entropy,
+            "count": r.count,
+            "score": r.score,
+            "direction": r.direction,
+            "lower": r.lower,
+            "upper": r.upper,
+            "first_seen": r.first_seen,
+            "event_id": r.event_id,
+            "event": r.event,
+            "details": r.details,
+        }
     if isinstance(r, CharsetFinding):
         return {
             "type": "charset",
@@ -1669,7 +1707,7 @@ async def list_anomalies(
     timeline_id: str,
     detector: str = Query(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', or 'charset'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', or 'entropy'.",
     ),
     fields: str | None = Query(
         default=None,
@@ -1741,6 +1779,10 @@ async def list_anomalies(
     **charset**: per field, learns a reference character set and flags values
     containing characters outside it (rare-character self-baseline, or
     never-seen-in-baseline temporal).
+
+    **entropy**: per field, flags values whose Shannon character entropy falls
+    outside a Tukey fence over the field's baseline entropy distribution
+    (random-looking or degenerate strings).
     """
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
     result = await _run_stat_detector(
@@ -1782,7 +1824,7 @@ class TagAnomaliesRequest(BaseModel):
 
     detector: str = Field(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', or 'charset'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', or 'entropy'.",
     )
     fields: str | None = Field(
         default=None,
@@ -1906,6 +1948,20 @@ async def tag_anomalies(
             content = (
                 f"Out-of-range value — {r.field}={r.value:g}: {r.direction} the "
                 f"learned band [{r.lower:g}, {r.upper:g}] ({band_desc})"
+            )
+        elif isinstance(r, EntropyFinding):
+            event_id = r.event_id or ""
+            src_id = r.event.get("source_id", "") if r.event else ""
+            band_desc = (
+                "baseline-window entropy IQR fence"
+                if result.method == "temporal-iqr"
+                else "corpus entropy IQR fence"
+            )
+            look = "random-looking" if r.direction == "above" else "degenerate/repetitive"
+            content = (
+                f"Entropy outlier — {r.field}={r.value!r}: character entropy "
+                f"{r.entropy:.2f} bits is {r.direction} the learned band "
+                f"[{r.lower:.2f}, {r.upper:.2f}] ({band_desc}; {look})"
             )
         elif isinstance(r, CharsetFinding):
             event_id = r.event_id or ""
