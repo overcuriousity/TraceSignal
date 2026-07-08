@@ -58,6 +58,17 @@ resolved — this file holds only the condensed, still-open action items.
   interaction — consider a `tokenbf_v1`-indexed fast path via `hasTokenCaseInsensitive`
   when `q` is a plain token (needs index DDL on existing tables).
 
+- [ ] **M24 — Visualize scan-avoidance (deferred from session 33).** Every viz chart
+  aggregation (`field_terms`, `field_numeric_stats`, `field_value_timeseries`, all compare
+  variants in `db/queries.py`) is a live full-column scan; the `db/field_stats.py` cache
+  (distinct/coverage + 3 samples per field) is consumed only by `viz/fields`. Follow-ups:
+  (a) seed first-load *unfiltered* top-values from the cache instead of a live `field_terms`
+  scan; (b) merge `field_value_timeseries`' ~3 scans (terms + range + bucket) into fewer
+  passes; (c) baseline-mode compare re-scans the whole timeline every render — cache or bound
+  it. Not `field_numeric_stats`: its two scans are a deliberate fixed-width-bin
+  reproducibility choice (documented in the method). Session 33 already removed the first-load
+  numeric probe and defaulted Visualize to the single-pass histogram.
+
 ## Milestone 3 — polish
 
 - [ ] Split `api/routers/events.py` (1500+ lines: query parsing, export streaming, anomaly

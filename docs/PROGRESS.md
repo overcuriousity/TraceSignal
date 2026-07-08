@@ -1,6 +1,41 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-08 (session 32 — Investigate panel: unified analysis+baseline UX).
+Last updated: 2026-07-08 (session 33 — UX polish sweep, issue #74).
+
+## Session 33 — 2026-07-08: UX polish sweep (issue #74 "fantastic UX")
+
+Screenshot review surfaced friction that made the app powerful-but-steep. Fixed four
+workstreams on `feat/baseline-windows`; no backend code changed (see B3 note).
+
+- **Readable timestamps.** Event-grid Timestamp column widened (170→195px, `minSize`
+  150) and the cell set `whitespace-nowrap tabular-nums` so the full
+  `YYYY-MM-DD HH:MM:SS` never ellipsizes (`components/explorer/EventGrid.tsx`).
+- **Custom UTC date picker.** New `ui/DateTimeField` (Popover + `date-fns`, month
+  calendar + HH:MM, typed `YYYY-MM-DD HH:MM` accepted, clear affordance) replaces every
+  native `datetime-local` — the raw German `tt.mm.jjjj` widget is gone. Used in the
+  Explorer time range (`FilterRail`) and baseline/suspect windows (`WindowsNormality`,
+  whose local `toInput/fromInput` were deleted for the shared `lib/time.ts` helpers;
+  added `fmtDatetimeInputUtc` / `parseDatetimeInputUtc`). UTC contract preserved (issue #9).
+- **Inline term help.** `lib/glossary.ts` (single source) + `ui/InfoHint` (Info icon +
+  existing `Tooltip`) on baseline / suspect-window / self-baseline / temporal / normal-values
+  / scan-all / compare-baseline (`FrameBar`, `WindowsNormality`, `detector-shared`,
+  `InvestigatePanel`). First-run explainer via the existing `ui/GuidancePanel` atop the
+  Anomalies tab (folds away permanently, localStorage-persisted).
+- **Visualize first paint.** Default chart type is now the field-free events-over-time
+  histogram (`chartConfig.ts`) — instant render on the already-optimized single-pass
+  histogram, never an empty canvas. The numeric-stats *probe* is skipped while the time
+  chart is shown (`VisualizePage.tsx`), avoiding the `field_numeric_stats` double-scan on
+  first load. Empty states (`ChartEmptyState`) now carry cause-aware copy + a hint,
+  including the sentinel-undated-events case for time-based charts.
+- **Calmer Anomalies panel.** The "New definition" builder collapses behind a
+  `+ New definition` button once saved definitions exist (`WindowsNormality`); definition
+  name input gets a guiding placeholder.
+- **B3 deferred (deliberate).** Did *not* rewrite `field_numeric_stats` to one scan — its
+  docstring documents the two-scan design as a forensic-reproducibility choice (fixed-width
+  bins). Deeper viz scan-avoidance moved to ROADMAP Milestone 2.
+- Verified: `tsc`, oxlint (no new errors), 179 frontend tests, prod build all green.
+
+## Session 32 — 2026-07-08: Investigate panel — unified analysis + baseline UX rework
 
 ## Session 32 — 2026-07-08: Investigate panel — unified analysis + baseline UX rework
 

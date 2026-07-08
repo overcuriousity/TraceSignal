@@ -53,7 +53,11 @@ export function NumericHistogram({
   const max = compare ? compare.max : stats?.max;
 
   if (bins.length === 0 || min == null || max == null) {
-    return <ChartEmptyState>No numeric values in the current filter range.</ChartEmptyState>;
+    return (
+      <ChartEmptyState hint="This field may not be numeric — try a Top-values (bar) chart instead.">
+        No numeric values for this field in range.
+      </ChartEmptyState>
+    );
   }
 
   const maxCount = Math.max(

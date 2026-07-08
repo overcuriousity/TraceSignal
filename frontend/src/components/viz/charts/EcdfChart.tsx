@@ -32,7 +32,11 @@ export function EcdfChart({ stats, svgRef, height = 220, color = "var(--color-ac
 
   const points = ecdfFromBins(stats.bins);
   if (stats.count === 0 || points.length === 0 || stats.min == null || stats.max == null) {
-    return <ChartEmptyState>No numeric values in the current filter range.</ChartEmptyState>;
+    return (
+      <ChartEmptyState hint="This field may not be numeric — try a Top-values (bar) chart instead.">
+        No numeric values for this field in range.
+      </ChartEmptyState>
+    );
   }
 
   return (

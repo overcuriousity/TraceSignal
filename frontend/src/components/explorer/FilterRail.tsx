@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Search, Clock, PlusCircle, MinusCircle, BookmarkCheck, PanelLeftClose, X, Tag, ShieldAlert, FileText, Database, Regex } from "lucide-react";
 import { Input } from "@/components/ui/Input";
+import { DateTimeField } from "@/components/ui/DateTimeField";
 import { Button } from "@/components/ui/Button";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { Spinner } from "@/components/ui/Spinner";
@@ -11,7 +12,7 @@ import { vizApi } from "@/api/viz";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { cn } from "@/lib/cn";
 import type { EventFilters, FieldMatchMode, View } from "@/api/types";
-import { datetimeLocalToUtcIso, fmtRelative, isoToDatetimeLocalUtc } from "@/lib/time";
+import { fmtRelative } from "@/lib/time";
 import { viewPayloadToFilters } from "@/lib/queryParams";
 
 /** Debounced top-N distinct values of `fieldKey`, for value autocomplete.
@@ -427,27 +428,17 @@ export function FilterRail({
             <Clock size={13} /> Time Range (UTC)
           </label>
           <div className="space-y-1.5">
-            <Input
-              type="datetime-local"
+            <DateTimeField
               placeholder="From"
-              value={isoToDatetimeLocalUtc(filters.start)}
-              onChange={(e) =>
-                onChange({
-                  ...filters,
-                  start: datetimeLocalToUtcIso(e.target.value),
-                })
-              }
+              ariaLabel="Time range start (UTC)"
+              value={filters.start}
+              onChange={(iso) => onChange({ ...filters, start: iso })}
             />
-            <Input
-              type="datetime-local"
+            <DateTimeField
               placeholder="To"
-              value={isoToDatetimeLocalUtc(filters.end)}
-              onChange={(e) =>
-                onChange({
-                  ...filters,
-                  end: datetimeLocalToUtcIso(e.target.value),
-                })
-              }
+              ariaLabel="Time range end (UTC)"
+              value={filters.end}
+              onChange={(iso) => onChange({ ...filters, end: iso })}
             />
           </div>
         </div>

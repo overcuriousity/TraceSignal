@@ -12,6 +12,8 @@ import { Layers, ScanLine } from "lucide-react";
 import { baselinesApi } from "@/api/baselines";
 import { useBaselineStore } from "@/stores/baseline";
 import { cn } from "@/lib/cn";
+import { InfoHint } from "@/components/ui/InfoHint";
+import { GLOSSARY } from "@/lib/glossary";
 
 interface Props {
   caseId: string;
@@ -39,23 +41,25 @@ export function FrameBar({ caseId, timelineId }: Props) {
       <div className="flex items-center gap-1">
         {(
           [
-            ["self", ScanLine, "Scan all events"],
-            ["baseline", Layers, "Compare baseline"],
+            ["self", ScanLine, "Scan all events", GLOSSARY.scanAllEvents],
+            ["baseline", Layers, "Compare baseline", GLOSSARY.compareBaseline],
           ] as const
-        ).map(([id, Icon, label]) => (
-          <button
-            key={id}
-            onClick={() => setFrame(id)}
-            className={cn(
-              "flex flex-1 items-center justify-center gap-1.5 rounded px-2 py-1.5 text-xs font-medium transition-colors",
-              frame === id
-                ? "bg-[var(--color-accent)] text-white"
-                : "bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)] hover:text-[var(--color-fg-secondary)]",
-            )}
-          >
-            <Icon size={12} />
-            {label}
-          </button>
+        ).map(([id, Icon, label, hint]) => (
+          <div key={id} className="flex flex-1 items-center gap-1">
+            <button
+              onClick={() => setFrame(id)}
+              className={cn(
+                "flex flex-1 items-center justify-center gap-1.5 rounded px-2 py-1.5 text-xs font-medium transition-colors",
+                frame === id
+                  ? "bg-[var(--color-accent)] text-white"
+                  : "bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)] hover:text-[var(--color-fg-secondary)]",
+              )}
+            >
+              <Icon size={12} />
+              {label}
+            </button>
+            <InfoHint content={hint} />
+          </div>
         ))}
       </div>
       <p className="text-[11px] text-[var(--color-fg-muted)]">{status}</p>

@@ -42,7 +42,13 @@ export function TimeHistogram({
   const ref = useChartRef(svgRef);
 
   if (buckets.length === 0) {
-    return <ChartEmptyState>No data in the current filter range.</ChartEmptyState>;
+    return (
+      <ChartEmptyState
+        hint="Events without a usable timestamp are excluded from time-based charts. Try a Top-values (bar) chart, or widen the time range."
+      >
+        No events over time here.
+      </ChartEmptyState>
+    );
   }
 
   // Domain spans whichever series covers more time — `contextBuckets` (the

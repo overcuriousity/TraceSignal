@@ -25,11 +25,14 @@ import {
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/Button";
+import { GuidancePanel } from "@/components/ui/GuidancePanel";
+import { InfoHint } from "@/components/ui/InfoHint";
 import { SimilarEvents } from "./SimilarEvents";
 import { SemanticSearch } from "./SemanticSearch";
 import { EmbeddingStatusBanner } from "./EmbeddingStatusBanner";
 import { MethodologyPanel } from "./MethodologyPanel";
 import { FrameBar } from "./FrameBar";
+import { GLOSSARY } from "@/lib/glossary";
 import { DetectorAccordion } from "./DetectorAccordion";
 import { BaselineSection, NormalValuesList } from "./WindowsNormality";
 import { timelinesApi } from "@/api/timelines";
@@ -177,6 +180,32 @@ export function InvestigatePanel({
       <div className="flex-1 overflow-y-auto p-4">
         {tab === "anomalies" && (
           <>
+            {/* First-run explainer — folds away permanently once dismissed. */}
+            <div className="mb-3">
+              <GuidancePanel id="investigate-anomalies" title="How anomaly scanning works">
+                <ol className="list-decimal space-y-1 pl-4">
+                  <li>
+                    <strong>Scope</strong> — <em>Scan all events</em> compares every event
+                    against the whole corpus; <em>Compare baseline</em> scores suspect
+                    windows against a period you declare normal.
+                  </li>
+                  <li>
+                    A <strong>baseline</strong> is a known-good time window; a{" "}
+                    <strong>suspect window</strong> is a period you investigate against it.
+                    Type UTC times or drag on the histogram to set them.
+                  </li>
+                  <li>
+                    <strong>Detectors</strong> each flag one kind of oddity (rare values,
+                    frequency spikes, …). Expand one to see its ranked findings.
+                  </li>
+                  <li>
+                    Mark a finding <strong>Normal</strong> to add its value to the
+                    allowlist, so it stops surfacing in future scans.
+                  </li>
+                </ol>
+              </GuidancePanel>
+            </div>
+
             {/* 1. Scope */}
             <FrameBar caseId={caseId} timelineId={timelineId} />
             {frame === "baseline" && (
@@ -207,6 +236,7 @@ export function InvestigatePanel({
                 {normalOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
                 <ShieldCheck size={12} />
                 Normal values
+                <InfoHint content={GLOSSARY.normalValues} />
               </button>
               {normalOpen && <NormalValuesList caseId={caseId} timelineId={timelineId} />}
             </div>

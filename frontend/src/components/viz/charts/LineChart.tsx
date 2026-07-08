@@ -83,7 +83,13 @@ export function LineChart({
   );
 
   if (isEmpty) {
-    return <ChartEmptyState>No data in the current filter range.</ChartEmptyState>;
+    return (
+      <ChartEmptyState
+        hint="Events without a usable timestamp are excluded from time-based charts. Try a Top-values (bar) chart, or widen the time range."
+      >
+        No values over time here.
+      </ChartEmptyState>
+    );
   }
 
   return (

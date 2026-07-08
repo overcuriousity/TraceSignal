@@ -16,9 +16,12 @@ import { Check, Crosshair, Pencil, Plus, Trash2, X } from "lucide-react";
 import { baselinesApi } from "@/api/baselines";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
+import { DateTimeField } from "@/components/ui/DateTimeField";
+import { InfoHint } from "@/components/ui/InfoHint";
 import { useBaselineStore } from "@/stores/baseline";
 import type { BaselineDefinition } from "@/api/types";
 import { cn } from "@/lib/cn";
+import { GLOSSARY } from "@/lib/glossary";
 
 interface Props {
   caseId: string;
@@ -42,15 +45,6 @@ interface Draft {
 type Armed = { kind: "baseline" } | { kind: "suspect"; index: number } | null;
 
 const EMPTY_DRAFT: Draft = { name: "", baseline: { start: "", end: "" }, suspects: [] };
-
-// datetime-local <-> ISO. The typed wall-clock is interpreted as UTC (the whole
-// UI shows UTC), so conversion is pure string slicing — no local-tz shift.
-function toInput(iso: string): string {
-  return iso ? iso.slice(0, 16) : "";
-}
-function fromInput(v: string): string {
-  return v ? `${v}:00.000Z` : "";
-}
 
 /** Client mirror of the router's _validate_windows — returns human errors. */
 function validate(draft: Draft): string[] {
@@ -92,6 +86,10 @@ export function BaselineSection({ caseId, timelineId }: Props) {
   const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [armed, setArmed] = useState<Armed>(null);
+  // The definition builder is a big form; once the analyst has saved baselines
+  // it collapses behind a "+ New definition" button so saved defs lead. It
+  // stays open while there's nothing saved yet, or whenever a build is active.
+  const [builderOpen, setBuilderOpen] = useState(false);
 
   const { data, isLoading } = useQuery({
     queryKey: ["baselines", caseId, timelineId],
@@ -145,10 +143,16 @@ export function BaselineSection({ caseId, timelineId }: Props) {
   const errors = useMemo(() => validate(draft), [draft]);
   const dirty = draft.baseline.start !== "" || draft.suspects.length > 0 || draft.name !== "";
 
+  // Show the builder form when explicitly opened, mid-edit/mid-build, or when
+  // there's nothing saved yet to lead with.
+  const showBuilder =
+    builderOpen || editingId !== null || dirty || markMode || definitions.length === 0;
+
   function resetDraft() {
     setDraft(EMPTY_DRAFT);
     setEditingId(null);
     setArmed(null);
+    setBuilderOpen(false);
     if (markMode) setMarkMode(false);
   }
 
@@ -164,6 +168,16 @@ export function BaselineSection({ caseId, timelineId }: Props) {
   return (
     <div className="space-y-4 text-sm">
       {/* ── Definition editor ─────────────────────────────────────────── */}
+      {!showBuilder ? (
+        <Button
+          size="sm"
+          variant="ghost"
+          className="w-full justify-center gap-1 text-xs"
+          onClick={() => setBuilderOpen(true)}
+        >
+          <Plus size={12} /> New definition
+        </Button>
+      ) : (
       <div className="space-y-2 rounded border border-[var(--color-border)] p-2.5">
         <div className="flex items-center gap-2">
           <span className="flex-1 text-xs font-semibold text-[var(--color-fg-secondary)]">
@@ -185,6 +199,7 @@ export function BaselineSection({ caseId, timelineId }: Props) {
         <WindowRow
           kind="baseline"
           label="Baseline"
+          hint={GLOSSARY.baseline}
           win={draft.baseline}
           armed={armed?.kind === "baseline"}
           onArm={() => armRow({ kind: "baseline" })}
@@ -197,6 +212,7 @@ export function BaselineSection({ caseId, timelineId }: Props) {
             key={i}
             kind="suspect"
             label={`Suspect ${i + 1}`}
+            hint={i === 0 ? GLOSSARY.suspectWindow : undefined}
             win={s}
             labelValue={s.label}
             armed={armed?.kind === "suspect" && armed.index === i}
@@ -222,7 +238,7 @@ export function BaselineSection({ caseId, timelineId }: Props) {
               <input
                 value={draft.name}
                 onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))}
-                placeholder="definition name"
+                placeholder='Name this baseline — e.g. "known-good week"'
                 className="h-6 flex-1 rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] px-1.5 text-xs"
               />
               <Button
@@ -250,6 +266,7 @@ export function BaselineSection({ caseId, timelineId }: Props) {
           </div>
         )}
       </div>
+      )}
 
       {/* ── Saved definitions ─────────────────────────────────────────── */}
       <div className="space-y-1">
@@ -356,6 +373,7 @@ export function NormalValuesList({ caseId, timelineId }: Props) {
 
 function WindowRow({
   label,
+  hint,
   labelValue,
   win,
   armed,
@@ -366,6 +384,7 @@ function WindowRow({
 }: {
   kind: "baseline" | "suspect";
   label: string;
+  hint?: string;
   labelValue?: string;
   win: WinDraft;
   armed: boolean;
@@ -382,7 +401,10 @@ function WindowRow({
       )}
     >
       <div className="flex items-center gap-1.5">
-        <span className="w-16 shrink-0 text-[11px] font-medium text-[var(--color-fg-secondary)]">{label}</span>
+        <span className="flex w-16 shrink-0 items-center gap-1 text-[11px] font-medium text-[var(--color-fg-secondary)]">
+          {label}
+          {hint && <InfoHint content={hint} size={11} />}
+        </span>
         {onLabelChange !== undefined ? (
           <input
             value={labelValue ?? ""}
@@ -416,20 +438,21 @@ function WindowRow({
         )}
       </div>
       <div className="flex items-center gap-1 pl-[4.25rem]">
-        <input
-          type="datetime-local"
-          value={toInput(win.start)}
-          onChange={(e) => onChange({ start: fromInput(e.target.value) })}
-          className="h-6 min-w-0 flex-1 rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] px-1 text-[11px]"
+        <DateTimeField
+          className="min-w-0 flex-1"
+          value={win.start}
+          onChange={(iso) => onChange({ start: iso ?? "" })}
+          placeholder="start"
+          ariaLabel={`${label} start (UTC)`}
         />
         <span className="text-[10px] text-[var(--color-fg-muted)]">→</span>
-        <input
-          type="datetime-local"
-          value={toInput(win.end)}
-          onChange={(e) => onChange({ end: fromInput(e.target.value) })}
-          className="h-6 min-w-0 flex-1 rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] px-1 text-[11px]"
+        <DateTimeField
+          className="min-w-0 flex-1"
+          value={win.end}
+          onChange={(iso) => onChange({ end: iso ?? "" })}
+          placeholder="end"
+          ariaLabel={`${label} end (UTC)`}
         />
-        <span className="text-[9px] uppercase tracking-wide text-[var(--color-fg-muted)]">utc</span>
       </div>
     </div>
   );

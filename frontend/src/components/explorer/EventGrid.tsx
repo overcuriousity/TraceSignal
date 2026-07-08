@@ -411,11 +411,13 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
             {sortDir === "desc" ? <ArrowDown size={10} /> : <ArrowUp size={10} />}
           </button>
         ),
-        size: 170,
-        minSize: 60,
+        size: 195,
+        // Full "YYYY-MM-DD HH:MM:SS" must always be readable — never let a resize
+        // clip the one value analysts scan by; min keeps the whole string visible.
+        minSize: 150,
         maxSize: 600,
         cell: ({ row }) => (
-          <span className="font-mono text-sm leading-snug text-[var(--color-fg-secondary)]">
+          <span className="font-mono text-sm leading-snug whitespace-nowrap tabular-nums text-[var(--color-fg-secondary)]">
             {fmtTimestamp(row.original.timestamp)}
           </span>
         ),

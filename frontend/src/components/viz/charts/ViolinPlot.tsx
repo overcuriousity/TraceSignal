@@ -28,7 +28,11 @@ export function ViolinPlot({
 }: ViolinPlotProps) {
   const density = kdeFromBins(stats.bins);
   if (stats.count === 0 || density.length === 0 || stats.min == null || stats.max == null) {
-    return <ChartEmptyState>No numeric values in the current filter range.</ChartEmptyState>;
+    return (
+      <ChartEmptyState hint="This field may not be numeric — try a Top-values (bar) chart instead.">
+        No numeric values for this field in range.
+      </ChartEmptyState>
+    );
   }
 
   const maxDensity = Math.max(1e-9, ...density.map((d) => d.density));

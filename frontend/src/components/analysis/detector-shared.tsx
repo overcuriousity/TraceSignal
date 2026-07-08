@@ -23,6 +23,8 @@ import type {
 } from "@/api/types";
 import { cn } from "@/lib/cn";
 import { tagResultLabel } from "@/lib/format";
+import { InfoHint } from "@/components/ui/InfoHint";
+import { GLOSSARY } from "@/lib/glossary";
 
 /**
  * Resolve the request params + queryKey fragment for the current global
@@ -186,7 +188,13 @@ export function DetectorStatusLine({
   return (
     <div className="space-y-1">
       <div className="flex items-center gap-2 text-xs text-[var(--color-fg-muted)]">
-        <span className="capitalize">{data.method}</span>
+        <span className="flex items-center gap-1">
+          <span className="capitalize">{data.method}</span>
+          <InfoHint
+            content={data.method === "temporal" ? GLOSSARY.temporal : GLOSSARY.selfBaseline}
+            size={11}
+          />
+        </span>
         {extra && (
           <>
             <span>·</span>
