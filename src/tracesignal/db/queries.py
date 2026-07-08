@@ -128,13 +128,16 @@ class EventQuery:
     exclude_tag: str | None = None
     start: datetime | None = None
     end: datetime | None = None
-    field_filters: dict[str, str] = field(default_factory=dict)
+    # Multiple values under one field key are OR'd (src_port 22 OR 23);
+    # distinct keys are AND'ed alongside every other restriction — same
+    # shape and semantics as field_exclusions, just non-negated.
+    field_filters: dict[str, list[str]] = field(default_factory=dict)
     field_exclusions: dict[str, list[str]] = field(default_factory=dict)
     # Match mode per field key ("exact" when absent): exact | wildcard | regex.
     # Wildcard: */? glob translated to ILIKE (case-insensitive, consistent
     # with the broad text search). Regex: RE2 via match(), case-sensitive
-    # with `(?i)` opt-in — same semantics as q_regex. One mode per key; for
-    # exclusions it applies to every value under that key.
+    # with `(?i)` opt-in — same semantics as q_regex. One mode per key,
+    # applying to every value under that key (filters and exclusions alike).
     filter_modes: dict[str, str] = field(default_factory=dict)
     exclusion_modes: dict[str, str] = field(default_factory=dict)
     # Optional event_id allowlist (e.g. resolved from an annotation filter).
@@ -422,20 +425,39 @@ class _ParameterizedQueryBuilder:
             field_mappings=self._field_mappings,
         )
 
-    def add_field_filter(self, key: str, value: str, mode: str = "exact") -> None:
+    def add_field_filter(self, key: str, values: list[str], mode: str = "exact") -> None:
         """Add a filter on a top-level column or attribute.
 
-        Mode: exact equality, wildcard (*/? glob via ILIKE, case-insensitive),
-        or regex (RE2 match(), case-sensitive). Routers validate mode strings
-        up front; the ValueError here is a defense-in-depth backstop.
+        Multiple values are OR'd — the event matches any of them (exact uses
+        `=`/`IN`; wildcard/regex OR one predicate per value). Mode: exact
+        equality, wildcard (*/? glob via ILIKE, case-insensitive), or regex
+        (RE2 match(), case-sensitive). Routers validate mode strings up
+        front; the ValueError here is a defense-in-depth backstop.
         """
+        if not values:
+            return
         column = self._match_column_expr(key, mode)
         if mode == "exact":
-            self.add_param(f"{column} = :name", value)
-        elif mode == "wildcard":
-            self.add_param(f"{column} ILIKE :name", _glob_to_like(value))
-        elif mode == "regex":
-            self.add_param(f"match({column}, :name)", value)
+            if len(values) == 1:
+                self.add_param(f"{column} = :name", values[0])
+            else:
+                name = self._param_name()
+                self.conditions.append(f"{column} IN {{{name}:Array(String)}}")
+                self.parameters[name] = values
+        elif mode in ("wildcard", "regex"):
+            clauses = []
+            for value in values:
+                name = self._param_name()
+                if mode == "wildcard":
+                    clauses.append(f"{column} ILIKE {{{name}:String}}")
+                    self.parameters[name] = _glob_to_like(value)
+                else:
+                    clauses.append(f"match({column}, {{{name}:String}})")
+                    self.parameters[name] = value
+            if len(clauses) == 1:
+                self.conditions.append(clauses[0])
+            else:
+                self.conditions.append("(" + " OR ".join(clauses) + ")")
         else:
             raise ValueError(f"invalid match mode: {mode!r}")
 
@@ -674,8 +696,8 @@ class EventQueryService:
             op = ">" if query.order == "desc" else "<"
             builder.add_cursor(op, ts, event_id)
 
-        for key, value in (query.field_filters or {}).items():
-            builder.add_field_filter(key, value, mode=(query.filter_modes or {}).get(key, "exact"))
+        for key, values in (query.field_filters or {}).items():
+            builder.add_field_filter(key, values, mode=(query.filter_modes or {}).get(key, "exact"))
 
         for key, values in (query.field_exclusions or {}).items():
             builder.add_field_exclusion(

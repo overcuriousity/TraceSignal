@@ -5,6 +5,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -183,8 +184,46 @@ async def _reconcile_orphaned_enrichment_jobs() -> list[EnrichmentJobRun]:
         return []
 
 
+def _redact_url(url: str | None) -> str:
+    """Strip credentials from a URL for logging."""
+    if not url:
+        return "(unset)"
+    parsed = urlsplit(url if "://" in url else f"//{url}")
+    if parsed.username or parsed.password:
+        host = parsed.hostname or ""
+        netloc = f"***@{host}" + (f":{parsed.port}" if parsed.port else "")
+        return urlunsplit(parsed._replace(netloc=netloc))
+    return url
+
+
+def _log_config_report() -> None:
+    """One startup block stating the resolved deployment-critical config."""
+    settings = get_settings()
+    logger.info(
+        "Config: environment=%s offline=%s (TS_ALLOW_ONLINE=%s%s) "
+        "postgres=%s clickhouse=%s qdrant=%s audit_enabled=%s oidc_enabled=%s "
+        "auth_cookie_secure=%s",
+        settings.environment,
+        not settings.allow_online,
+        settings.allow_online,
+        "" if settings.allow_online else ", HF_HUB_OFFLINE forced for embedding models",
+        _redact_url(settings.postgres_url),
+        _redact_url(settings.clickhouse_url),
+        settings.qdrant_path or _redact_url(settings.qdrant_url),
+        settings.audit_enabled,
+        settings.oidc_enabled,
+        settings.auth_cookie_secure,
+    )
+    if settings.environment == "production" and not settings.auth_cookie_secure:
+        logger.warning(
+            "environment=production but TS_AUTH_COOKIE_SECURE=false — session cookies "
+            "will be sent over plain HTTP. Set TS_AUTH_COOKIE_SECURE=1 behind TLS."
+        )
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    _log_config_report()
     store = get_store()
     await store.init_schema()
     await _seed_admin()
@@ -332,6 +371,14 @@ class AuthAuditMiddleware:
 
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
+    # Root logging was never configured anywhere, so every app-level
+    # logger.info (session purges, recovery sweeps, the config report below)
+    # silently vanished — only uvicorn's own loggers were visible. basicConfig
+    # is a no-op if the embedding process already configured logging.
+    logging.basicConfig(
+        level=get_settings().log_level.upper(),
+        format="%(levelname)s:     %(name)s — %(message)s",
+    )
     app = FastAPI(
         title="TraceSignal",
         description="Local-first forensic log investigation platform.",

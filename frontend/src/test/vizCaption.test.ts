@@ -15,7 +15,7 @@ describe("describeFilters", () => {
     expect(
       describeFilters({
         q: "dos",
-        filters: { "attr:src_ip": "203.0.113.7" },
+        filters: { "attr:src_ip": ["203.0.113.7"] },
         exclusions: { artifact: ["noise"] },
         tagsInclude: ["suspicious"],
       }),

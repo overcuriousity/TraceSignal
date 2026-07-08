@@ -15,7 +15,7 @@ interface Props {
 export function CaseCard({ case_ }: Props) {
   const user = useAuthStore((s) => s.user);
   const team = user?.teams?.find((t) => t.id === case_.team_id);
-  const canManage = canManageCase(case_, user);
+  const canManage = canManageCase(case_);
 
   return (
     <div className="group relative flex items-center gap-4 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-surface)] px-5 py-4 hover:border-[var(--color-border-strong)] hover:bg-[var(--color-bg-elevated)] transition-base">

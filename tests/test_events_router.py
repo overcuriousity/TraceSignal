@@ -997,6 +997,7 @@ def _call_list_anomalies(persist: bool = True):
         limit=50,
         persist=persist,
         case=Case(id="c1"),
+        user=_fake_user(),
     )
 
 

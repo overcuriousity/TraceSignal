@@ -8,6 +8,8 @@ export interface Case {
   owner_id: string | null;
   /** Investigation team this case belongs to, or null for a personal case. */
   team_id: string | null;
+  /** Caller's resolved access level, computed by the backend (api/deps.py). */
+  access_level: "none" | "read" | "contribute" | "manage";
   created_at: string;
   updated_at: string;
 }
@@ -571,8 +573,9 @@ export interface EventFilters {
   tagsExclude?: string[];
   start?: string;
   end?: string;
-  /** key=value field equality filters */
-  filters?: Record<string, string>;
+  /** key=[values] field filters — multiple values per field are OR'd (IN);
+   * distinct fields are AND'ed with each other and every other restriction */
+  filters?: Record<string, string[]>;
   /** key=[values] field exclusion filters — multiple values per field are OR'd (NOT IN) */
   exclusions?: Record<string, string[]>;
   /**
@@ -800,7 +803,7 @@ export interface ExportRequest {
     ids?: string;
     start?: string;
     end?: string;
-    fields?: Record<string, string>;
+    fields?: Record<string, string[]>;
     exclude?: Record<string, string[]>;
     field_modes?: Record<string, FieldMatchMode>;
     exclude_modes?: Record<string, FieldMatchMode>;

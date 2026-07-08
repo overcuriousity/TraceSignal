@@ -26,6 +26,7 @@ import re
 from collections.abc import Iterator
 from datetime import UTC
 from typing import Any
+from urllib.parse import urlparse
 
 import clickhouse_connect
 
@@ -163,11 +164,23 @@ class ClickHouseStore:
     def __init__(self) -> None:
         settings = get_settings()
         self.database = settings.clickhouse_database
+        host, port, secure, url_user, url_password = self._parse_url(settings.clickhouse_url)
+        # Explicit settings win; creds embedded in the URL are a fallback for
+        # the settings' defaults ("default" / empty password). Checking
+        # `model_fields_set` (not just `!= "default"`) so an *explicitly*
+        # configured `TS_CLICKHOUSE_USERNAME=default` isn't silently
+        # overridden by different creds embedded in the URL.
+        username_explicit = "clickhouse_username" in settings.model_fields_set
+        username = (
+            settings.clickhouse_username if username_explicit or url_user is None else url_user
+        )
+        password = settings.clickhouse_password or url_password or ""
         self.client = clickhouse_connect.get_client(
-            host=self._host(settings.clickhouse_url),
-            port=self._port(settings.clickhouse_url),
-            username=settings.clickhouse_username,
-            password=settings.clickhouse_password,
+            host=host,
+            port=port,
+            secure=secure,
+            username=username,
+            password=password,
             database="default",
             # This client is a process-wide singleton shared across FastAPI's
             # threadpool workers. clickhouse-connect auto-generates a
@@ -181,13 +194,18 @@ class ClickHouseStore:
         )
 
     @staticmethod
-    def _host(url: str) -> str:
-        return url.split("://")[-1].split(":")[0]
+    def _parse_url(url: str) -> tuple[str, int, bool, str | None, str | None]:
+        """Parse a ClickHouse URL into ``(host, port, secure, username, password)``.
 
-    @staticmethod
-    def _port(url: str) -> int:
-        parts = url.split("://")[-1].split(":")
-        return int(parts[1]) if len(parts) > 1 else 8123
+        Accepts ``http(s)://[user[:pass]@]host[:port][/...]`` as well as bare
+        ``host[:port]`` forms. ``https`` selects TLS and defaults the port to
+        8443; everything else defaults to 8123.
+        """
+        parsed = urlparse(url if "://" in url else f"//{url}")
+        secure = parsed.scheme == "https"
+        host = parsed.hostname or "localhost"
+        port = parsed.port or (8443 if secure else 8123)
+        return host, port, secure, parsed.username, parsed.password
 
     @staticmethod
     def _string_in_clause(prefix: str, values: list[str]) -> tuple[str, dict[str, str]]:

@@ -35,18 +35,34 @@ describe("filtersToParams / paramsToFilters round-trip", () => {
 
   it("round-trips field include/exclude filters", () => {
     const f: EventFilters = {
-      filters: { ip_address_city: "Falkenstein", status_code: "200" },
+      filters: { ip_address_city: ["Falkenstein"], status_code: ["200"] },
       exclusions: { user_agent: ["bot"] },
     };
     const p = filtersToParams(f);
     const out = paramsToFilters(p);
-    expect(out.filters).toEqual({ ip_address_city: "Falkenstein", status_code: "200" });
+    expect(out.filters).toEqual({ ip_address_city: ["Falkenstein"], status_code: ["200"] });
     expect(out.exclusions).toEqual({ user_agent: ["bot"] });
+  });
+
+  it("round-trips multiple values per field (OR semantics)", () => {
+    const f: EventFilters = {
+      filters: { src_port: ["22", "23"] },
+      exclusions: { user_agent: ["bot", "crawler"] },
+    };
+    const out = paramsToFilters(filtersToParams(f));
+    expect(out.filters).toEqual({ src_port: ["22", "23"] });
+    expect(out.exclusions).toEqual({ user_agent: ["bot", "crawler"] });
+  });
+
+  it("coerces a legacy scalar-valued filters URL to one-element lists", () => {
+    const p = new URLSearchParams();
+    p.set("filters", JSON.stringify({ src_ip: "10.0.0.1" }));
+    expect(paramsToFilters(p).filters).toEqual({ src_ip: ["10.0.0.1"] });
   });
 
   it("round-trips field match modes", () => {
     const f: EventFilters = {
-      filters: { src_ip: "10.0.*" },
+      filters: { src_ip: ["10.0.*"] },
       filterModes: { src_ip: "wildcard" },
       exclusions: { msg: ["^error"] },
       exclusionModes: { msg: "regex" },
@@ -57,7 +73,7 @@ describe("filtersToParams / paramsToFilters round-trip", () => {
   });
 
   it("legacy URL without mode params yields no mode maps", () => {
-    const p = filtersToParams({ filters: { a: "b" }, exclusions: { c: ["d"] } });
+    const p = filtersToParams({ filters: { a: ["b"] }, exclusions: { c: ["d"] } });
     const out = paramsToFilters(p);
     expect(out.filterModes).toBeUndefined();
     expect(out.exclusionModes).toBeUndefined();
@@ -118,13 +134,13 @@ describe("filtersToViewPayload / viewPayloadToFilters round-trip", () => {
   it("round-trips correctly", () => {
     const f: EventFilters = {
       q: "mimikatz",
-      filters: { event_id: "4624" },
+      filters: { event_id: ["4624"] },
       exclusions: { status: ["ok"] },
     };
     const payload = filtersToViewPayload(f);
     const out = viewPayloadToFilters(payload);
     expect(out.q).toBe("mimikatz");
-    expect(out.filters).toEqual({ event_id: "4624" });
+    expect(out.filters).toEqual({ event_id: ["4624"] });
     expect(out.exclusions).toEqual({ status: ["ok"] });
   });
 
@@ -150,7 +166,7 @@ describe("filtersToViewPayload / viewPayloadToFilters round-trip", () => {
 
   it("round-trips match modes so a saved view reproduces match semantics", () => {
     const f: EventFilters = {
-      filters: { src_ip: "10.0.*" },
+      filters: { src_ip: ["10.0.*"] },
       filterModes: { src_ip: "wildcard" },
       exclusions: { msg: ["^err"] },
       exclusionModes: { msg: "regex" },
@@ -173,9 +189,9 @@ describe("filtersToViewPayload / viewPayloadToFilters round-trip", () => {
 
 describe("serializeEventFilterParams match modes", () => {
   it("emits filter_modes/exclusion_modes JSON only when non-empty", () => {
-    expect(serializeEventFilterParams({ filters: { a: "b" } }).filter_modes).toBeUndefined();
+    expect(serializeEventFilterParams({ filters: { a: ["b"] } }).filter_modes).toBeUndefined();
     const out = serializeEventFilterParams({
-      filters: { src_ip: "10.0.*" },
+      filters: { src_ip: ["10.0.*"] },
       filterModes: { src_ip: "wildcard" },
       exclusions: { msg: ["x"] },
       exclusionModes: { msg: "regex" },
@@ -235,7 +251,7 @@ describe("serializeEventFilterFields (C17 — shared by list/histogram/bulk-anno
   });
 
   it("does not touch the object-shaped filters/exclusions fields", () => {
-    const f: EventFilters = { filters: { a: "b" }, exclusions: { c: ["d"] } };
+    const f: EventFilters = { filters: { a: ["b"] }, exclusions: { c: ["d"] } };
     const out = serializeEventFilterFields(f) as Record<string, unknown>;
     expect(out.filters).toBeUndefined();
     expect(out.exclusions).toBeUndefined();

@@ -119,26 +119,38 @@ async def require_password_current(user: User = Depends(get_current_user)) -> Us
     return user
 
 
-async def resolve_case_access(user: User, case: Case) -> AccessLevel:
-    """Return the caller's access level for a specific case.
+def access_level_from_team_role(case: Case, user: User, team_role: str | None) -> AccessLevel:
+    """Return access level given the caller's role on ``case.team_id`` (or None if not a member).
+
+    Shared by ``resolve_case_access`` (single-case, fetches the membership itself) and
+    callers that bulk-resolve access for many cases from one pre-fetched team→role map
+    (e.g. ``cases.py::list_cases``) — keeps the admin/team-role/owner rules in one place.
 
     - Admins: MANAGE on every case.
-    - Team case (``case.team_id`` set): membership role decides — team
-      managers get MANAGE, team members get CONTRIBUTE, non-members get NONE.
-    - Personal case (``case.team_id`` is None): the owner gets MANAGE;
-      everyone else gets NONE.
+    - Team case (``case.team_id`` set): ``team_role`` decides — "manager" gets MANAGE,
+      any other role gets CONTRIBUTE, ``None`` (non-member) gets NONE.
+    - Personal case (``case.team_id`` is None): the owner gets MANAGE; everyone else NONE.
     """
     if user.is_admin:
         return AccessLevel.MANAGE
     if case.team_id:
+        if team_role is None:
+            return AccessLevel.NONE
+        return AccessLevel.MANAGE if team_role == "manager" else AccessLevel.CONTRIBUTE
+    return AccessLevel.MANAGE if case.owner_id == user.id else AccessLevel.NONE
+
+
+async def resolve_case_access(user: User, case: Case) -> AccessLevel:
+    """Return the caller's access level for a specific case.
+
+    See ``access_level_from_team_role`` for the underlying rules.
+    """
+    team_role = None
+    if case.team_id and not user.is_admin:
         store = get_store()
         membership = await store.get_membership(case.team_id, user.id)
-        if membership is None:
-            return AccessLevel.NONE
-        return AccessLevel.MANAGE if membership.role == "manager" else AccessLevel.CONTRIBUTE
-    if case.owner_id == user.id:
-        return AccessLevel.MANAGE
-    return AccessLevel.NONE
+        team_role = membership.role if membership else None
+    return access_level_from_team_role(case, user, team_role)
 
 
 async def has_case_access(user: User, case: Case | None, level: AccessLevel) -> bool:

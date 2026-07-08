@@ -266,7 +266,7 @@ def test_top_level_field_filter_uses_column(service: EventQueryService) -> None:
     service.query(
         EventQuery(
             case_id="case-1",
-            field_filters={"display_name": "auth.log"},
+            field_filters={"display_name": ["auth.log"]},
         )
     )
     query, params = _last_query(service)
@@ -280,13 +280,54 @@ def test_unknown_field_filter_uses_attributes_map(
     service.query(
         EventQuery(
             case_id="case-1",
-            field_filters={"ip_address_city": "Falkenstein"},
+            field_filters={"ip_address_city": ["Falkenstein"]},
         )
     )
     query, params = _last_query(service)
     assert "attributes[{p1:String}] = {p2:String}" in query
     assert params.get("p1") == "ip_address_city"
     assert params.get("p2") == "Falkenstein"
+
+
+def test_field_filter_multiple_values_ors_with_in(service: EventQueryService) -> None:
+    """Two values under one field key OR together via IN (src_port 22 OR 23)."""
+    service.query(
+        EventQuery(
+            case_id="case-1",
+            field_filters={"attr:src_port": ["22", "23"]},
+        )
+    )
+    query, params = _last_query(service)
+    assert "attributes[{p1:String}] IN {p2:Array(String)}" in query
+    assert params.get("p2") == ["22", "23"]
+
+
+def test_field_filter_multiple_wildcard_values_or_clauses(service: EventQueryService) -> None:
+    service.query(
+        EventQuery(
+            case_id="case-1",
+            field_filters={"src_ip": ["10.0.*", "192.168.*"]},
+            filter_modes={"src_ip": "wildcard"},
+        )
+    )
+    query, params = _last_query(service)
+    assert "ILIKE {p2:String} OR" in query
+    assert params.get("p2") == "10.0.%"
+    assert params.get("p3") == "192.168.%"
+
+
+def test_field_filters_across_keys_are_anded(service: EventQueryService) -> None:
+    """Multiple values within a key OR; distinct keys AND."""
+    service.query(
+        EventQuery(
+            case_id="case-1",
+            field_filters={"attr:src_port": ["22", "23"], "display_name": ["auth.log"]},
+        )
+    )
+    query, params = _last_query(service)
+    assert "IN {p2:Array(String)}" in query
+    assert "display_name = {p3:String}" in query
+    assert " AND " in query
 
 
 def test_field_exclusion_uses_not_equals(service: EventQueryService) -> None:
@@ -307,7 +348,7 @@ def test_field_filter_wildcard_translates_glob(service: EventQueryService) -> No
     service.query(
         EventQuery(
             case_id="case-1",
-            field_filters={"src_ip": "10.0.*"},
+            field_filters={"src_ip": ["10.0.*"]},
             filter_modes={"src_ip": "wildcard"},
         )
     )
@@ -322,7 +363,7 @@ def test_field_filter_wildcard_escapes_like_metachars(service: EventQueryService
     service.query(
         EventQuery(
             case_id="case-1",
-            field_filters={"msg": "100%_a?*"},
+            field_filters={"msg": ["100%_a?*"]},
             filter_modes={"msg": "wildcard"},
         )
     )
@@ -334,7 +375,7 @@ def test_field_filter_regex_uses_match(service: EventQueryService) -> None:
     service.query(
         EventQuery(
             case_id="case-1",
-            field_filters={"src_ip": r"^10\.0\."},
+            field_filters={"src_ip": [r"^10\.0\."]},
             filter_modes={"src_ip": "regex"},
         )
     )
@@ -347,7 +388,7 @@ def test_field_filter_wildcard_casts_non_string_column(service: EventQueryServic
     service.query(
         EventQuery(
             case_id="case-1",
-            field_filters={"timestamp": "2024*"},
+            field_filters={"timestamp": ["2024*"]},
             filter_modes={"timestamp": "wildcard"},
         )
     )
@@ -391,7 +432,7 @@ def test_field_filter_pattern_modes_are_not_interpolated(service: EventQueryServ
         service.query(
             EventQuery(
                 case_id="case-1",
-                field_filters={"msg": injection},
+                field_filters={"msg": [injection]},
                 filter_modes={"msg": mode},
             )
         )
@@ -404,7 +445,7 @@ def test_invalid_match_mode_raises(service: EventQueryService) -> None:
         service.query(
             EventQuery(
                 case_id="case-1",
-                field_filters={"msg": "x"},
+                field_filters={"msg": ["x"]},
                 filter_modes={"msg": "glob"},
             )
         )
@@ -437,7 +478,7 @@ def test_combined_query_builds_single_where_clause(
             source_ids=["s1"],
             q="token",
             artifact="auth",
-            field_filters={"ip_address_city": "Falkenstein"},
+            field_filters={"ip_address_city": ["Falkenstein"]},
             field_exclusions={"status_code": ["200"]},
         )
     )
@@ -1293,7 +1334,7 @@ def test_field_terms_honors_field_filters() -> None:
         ]
     )
     svc.field_terms(
-        EventQuery(case_id="c1", source_ids=["s1"], field_filters={"artifact": "auth"}),
+        EventQuery(case_id="c1", source_ids=["s1"], field_filters={"artifact": ["auth"]}),
         "artifact",
     )
     query, params = svc.store.client.queries[0]  # type: ignore[union-attr]

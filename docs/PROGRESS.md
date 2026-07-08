@@ -1,6 +1,39 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-07 (session 29 — PR #75 review fixes).
+Last updated: 2026-07-07 (session 30 — W1 context query, W3 audit coverage, M3 polish).
+
+## Session 30 — 2026-07-07: context query, analyst-action audit, M3 polish batch
+
+Shipped the easy+high-value batch from the new Milestone 5 (post-mortem workflow parity)
+plus the remaining Milestone 3 polish items (all except the deliberately-opportunistic
+events.py split):
+
+- **W1 — Context query (frontend-only)**: `History` button in the event detail panel with
+  ±1/5/15/60 min presets pivots the explorer to a time window around the event across all
+  sources (`handleContextQuery` in `ExplorerPage`). Deliberately clears other filters
+  (Timesketch context semantics); the existing `preJumpFilters` breadcrumb restores the
+  prior view, and nested context queries keep the original breadcrumb. No backend change —
+  `start`/`end` already flowed through the whole filter path.
+- **W3 — Audit coverage for analyst actions**: `record_audit` added to `events.export`
+  (audited before streaming starts — the attempt is the custody-relevant fact),
+  `events.bulk_annotate` (matched/tagged counts + compact filter), `anomaly.run` (GETs are
+  skipped by the generic middleware, so persisted detector-run launches were previously
+  invisible), `anomaly.tag`, and `anomaly.persist_finding`. `export_events` and
+  `list_anomalies` gained a `get_current_user` actor dependency.
+- **M3 — ClickHouse URL parsing**: `_host`/`_port` string-splitting replaced by
+  `_parse_url` (urllib), handling `https` (TLS + port 8443 default, `secure=` passed to
+  clickhouse-connect), creds-in-URL (fallback when settings are at defaults), and bare
+  `host:port` forms. Unit-tested.
+- **M3 — Startup config sanity report**: `_lifespan` logs resolved offline mode, redacted
+  datastore targets, audit/OIDC flags; warns on `environment=production` with
+  `auth_cookie_secure=false`.
+- **M3 — Large-file ingest regression test**: generated ~16 MiB CSV through
+  `IngestionPipeline` with a discarding fake store; tracemalloc peak asserted < 8 MiB,
+  protecting the H1 streaming fix against whole-file materialization.
+- **M18 — `access_level` from the case API**: case list/detail responses now carry the
+  caller's resolved level; the list path resolves in bulk from one membership query
+  (`_bulk_access_level`), avoiding the feared N+1. Frontend `caseAccess.ts` reduced to a
+  field read (`canManageCase(case_)`), client-side `resolveCaseAccess` deleted.
 
 ## Session 29 — 2026-07-07: PR #75 review fixes (D3/D5 + embed-wizard)
 

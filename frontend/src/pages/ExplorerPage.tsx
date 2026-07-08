@@ -30,6 +30,7 @@ import { useUiStore, DEFAULT_COLUMNS } from "@/stores/ui";
 import { tourEvent } from "@/stores/tour";
 import { useScrollPositionStore } from "@/stores/scrollPosition";
 import { paramsToFilters, filtersToParams } from "@/lib/queryParams";
+import { contextWindow } from "@/lib/time";
 import { useCaseStream } from "@/hooks/useCaseStream";
 
 import { FilterRail } from "@/components/explorer/FilterRail";
@@ -186,9 +187,20 @@ export function ExplorerPage() {
     (key: keyof EventFilters | string, fieldKey?: string, value?: string) => {
       const f = { ...filters };
       if (key === "filters" && fieldKey) {
-        const { [fieldKey]: _removed, ...rest } = f.filters ?? {};
-        f.filters = rest;
-        f.filterModes = dropMode(f.filterModes, fieldKey);
+        if (value !== undefined) {
+          const remaining = (f.filters?.[fieldKey] ?? []).filter((v) => v !== value);
+          if (remaining.length === 0) {
+            const { [fieldKey]: _removed, ...rest } = f.filters ?? {};
+            f.filters = rest;
+            f.filterModes = dropMode(f.filterModes, fieldKey);
+          } else {
+            f.filters = { ...(f.filters ?? {}), [fieldKey]: remaining };
+          }
+        } else {
+          const { [fieldKey]: _removed, ...rest } = f.filters ?? {};
+          f.filters = rest;
+          f.filterModes = dropMode(f.filterModes, fieldKey);
+        }
       } else if (key === "exclusions" && fieldKey) {
         if (value !== undefined) {
           const remaining = (f.exclusions?.[fieldKey] ?? []).filter((v) => v !== value);
@@ -270,7 +282,10 @@ export function ExplorerPage() {
           next.excludeTag = value;
         }
       } else if (include) {
-        next.filters = { ...(next.filters ?? {}), [fieldKey]: value };
+        const prev = next.filters?.[fieldKey] ?? [];
+        if (!prev.includes(value)) {
+          next.filters = { ...(next.filters ?? {}), [fieldKey]: [...prev, value] };
+        }
         // Grid-cell values are literal — reset any pattern mode on the key,
         // otherwise the cell text would be reinterpreted as glob/regex.
         next.filterModes = dropMode(next.filterModes, fieldKey);
@@ -767,6 +782,29 @@ export function ExplorerPage() {
     [caseId, timelineId, filters, setFilters, sortDir, queryClient],
   );
 
+  /**
+   * Context query: pivot the whole explorer to a ±minutes window around an
+   * event's timestamp, across all sources. Unlike `handleJumpToTime` (which
+   * scrolls to the event, keeping the full timeline reachable) this *filters*
+   * to the window — grid, histogram, facets, and bulk actions all operate on
+   * exactly the neighborhood. All other filters are cleared deliberately:
+   * context means "everything that happened around this moment", not
+   * "matching events around this moment". The pre-context filter set lands in
+   * the same breadcrumb `handleJumpToTime` uses; nested context queries keep
+   * the original breadcrumb so "back" always restores the analyst's real view.
+   */
+  const handleContextQuery = useCallback(
+    (ts: string, minutes: number) => {
+      const window = contextWindow(ts, minutes);
+      if (!window) return;
+      setPreJumpFilters((prev) => prev ?? filters);
+      setRangeHighlight(null);
+      pendingJumpRef.current = null;
+      setFilters(window);
+    },
+    [filters, setFilters],
+  );
+
   const handleBackToFiltered = useCallback(() => {
     if (preJumpFilters) setFilters(preJumpFilters);
     setPreJumpFilters(null);
@@ -1085,6 +1123,7 @@ export function ExplorerPage() {
                     onAddFilter={handleAddFilter}
                     onShowFieldHistogram={handleShowFieldHistogram}
                     onJumpToTime={handleJumpToTime}
+                    onContextQuery={handleContextQuery}
                     tagSuggestions={tagSuggestions}
                   />
                 )}

@@ -49,7 +49,9 @@ export function describeFilters(filters: EventFilters): string {
   if (filters.tag) parts.push(`tag=${filters.tag}`);
   for (const t of filters.tagsInclude ?? []) parts.push(`tag=${t}`);
   for (const t of filters.tagsExclude ?? []) parts.push(`not tag=${t}`);
-  for (const [k, v] of Object.entries(filters.filters ?? {})) parts.push(`${k}=${v}`);
+  for (const [k, vs] of Object.entries(filters.filters ?? {})) {
+    for (const v of vs) parts.push(`${k}=${v}`);
+  }
   for (const [k, vs] of Object.entries(filters.exclusions ?? {})) {
     for (const v of vs) parts.push(`${k}≠${v}`);
   }

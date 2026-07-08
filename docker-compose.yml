@@ -64,53 +64,53 @@ services:
       timeout: 5s
       retries: 5
 
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        INSTALL_EMBEDDINGS: "1"
-    ports:
-      - "8080:8080"
-    environment:
-      TS_ENVIRONMENT: production
-      TS_LOG_LEVEL: INFO
-      TS_ALLOW_ONLINE: "false"
-      TS_POSTGRES_URL: postgresql+asyncpg://tracesignal:tracesignal@postgres:5432/tracesignal
-      TS_CLICKHOUSE_URL: http://clickhouse:8123
-      TS_CLICKHOUSE_DATABASE: tracesignal
-      TS_CLICKHOUSE_USERNAME: default
-      TS_CLICKHOUSE_PASSWORD: ""
-      TS_QDRANT_URL: http://qdrant:6333
-      # TS_QDRANT_API_KEY: change-me
-      TS_QDRANT_COLLECTION_PREFIX: tracesignal
-      TS_EMBEDDING_MODEL: all-MiniLM-L6-v2
-      TS_EMBEDDING_DEVICE: cpu
-      TS_EMBEDDING_BATCH_SIZE: 64
-      TS_INGEST_BATCH_SIZE: 20000
-      TS_MAX_UPLOAD_BYTES: 10737418240
-      # Change this before any real/shared deployment — it's a one-time
-      # bootstrap credential; the admin is forced to rotate it on first login.
-      TS_ADMIN_USERNAME: admin
-      TS_ADMIN_PASSWORD: change-me-on-first-login
-      TS_LOGIN_BACKOFF_THRESHOLD: 5
-      TS_LOGIN_BACKOFF_BASE_SECONDS: 2.0
-      TS_LOGIN_BACKOFF_MAX_SECONDS: 300.0
-      TS_SESSION_TTL_HOURS: 168
-      TS_AUTH_COOKIE_NAME: tv_session
-      # Set to true only when serving over HTTPS (e.g. behind a TLS reverse
-      # proxy) — the cookie won't be sent over plain HTTP otherwise.
-      TS_AUTH_COOKIE_SECURE: "false"
-      TS_AUTH_COOKIE_SAMESITE: lax
-      TS_AUDIT_ENABLED: "true"
-      TS_OIDC_ENABLED: "false"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      clickhouse:
-        condition: service_healthy
-      qdrant:
-        condition: service_healthy
+#  app:
+#    build:
+#      context: .
+#      dockerfile: Dockerfile
+#      args:
+#        INSTALL_EMBEDDINGS: "1"
+#    ports:
+#      - "8080:8080"
+#    environment:
+#      TS_ENVIRONMENT: production
+#      TS_LOG_LEVEL: INFO
+#      TS_ALLOW_ONLINE: "false"
+#      TS_POSTGRES_URL: postgresql+asyncpg://tracesignal:tracesignal@postgres:5432/tracesignal
+#      TS_CLICKHOUSE_URL: http://clickhouse:8123
+#      TS_CLICKHOUSE_DATABASE: tracesignal
+#      TS_CLICKHOUSE_USERNAME: default
+#      TS_CLICKHOUSE_PASSWORD: ""
+#      TS_QDRANT_URL: http://qdrant:6333
+#      # TS_QDRANT_API_KEY: change-me
+#      TS_QDRANT_COLLECTION_PREFIX: tracesignal
+#      TS_EMBEDDING_MODEL: all-MiniLM-L6-v2
+#      TS_EMBEDDING_DEVICE: cpu
+#      TS_EMBEDDING_BATCH_SIZE: 64
+#      TS_INGEST_BATCH_SIZE: 20000
+#      TS_MAX_UPLOAD_BYTES: 10737418240
+#      # Change this before any real/shared deployment — it's a one-time
+#      # bootstrap credential; the admin is forced to rotate it on first login.
+#      TS_ADMIN_USERNAME: admin
+#      TS_ADMIN_PASSWORD: change-me-on-first-login
+#      TS_LOGIN_BACKOFF_THRESHOLD: 5
+#      TS_LOGIN_BACKOFF_BASE_SECONDS: 2.0
+#      TS_LOGIN_BACKOFF_MAX_SECONDS: 300.0
+#      TS_SESSION_TTL_HOURS: 168
+#      TS_AUTH_COOKIE_NAME: tv_session
+#      # Set to true only when serving over HTTPS (e.g. behind a TLS reverse
+#      # proxy) — the cookie won't be sent over plain HTTP otherwise.
+#      TS_AUTH_COOKIE_SECURE: "false"
+#      TS_AUTH_COOKIE_SAMESITE: lax
+#      TS_AUDIT_ENABLED: "true"
+#      TS_OIDC_ENABLED: "false"
+#    depends_on:
+#      postgres:
+#        condition: service_healthy
+#      clickhouse:
+#        condition: service_healthy
+#      qdrant:
+#        condition: service_healthy
 
 volumes:
   postgres_data:

@@ -78,7 +78,7 @@ def _query(**kw) -> EventQuery:
 
 def test_filter_on_canonical_field_matches_both_sources(ch_store):
     service = EventQueryService(store=ch_store)
-    page = service.query(_query(field_filters={"ip_address": "10.0.0.1"}))
+    page = service.query(_query(field_filters={"ip_address": ["10.0.0.1"]}))
     assert page.total == 2
     assert {e["source_id"] for e in page.events} == {SRC_A, SRC_B}
 

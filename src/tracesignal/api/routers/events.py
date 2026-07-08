@@ -16,9 +16,10 @@ from clickhouse_connect.driver.exceptions import DatabaseError
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from tracesignal.api.deps import (
+    get_current_user,
     get_store,
     require_case_contribute,
     require_case_read,
@@ -184,12 +185,12 @@ def _parse_cursor(value: str | None, *, param_name: str) -> tuple[datetime, str]
     return ts, event_id
 
 
-def _parse_exclusions_object(value: str | None) -> dict[str, list[str]]:
-    """Parse a JSON string into a string-to-list[str] dict for exclusion filters.
+def _parse_multivalue_object(value: str | None) -> dict[str, list[str]]:
+    """Parse a JSON string into a string-to-list[str] dict for field filters/exclusions.
 
-    Accepts both ``{"key": "value"}`` (legacy single-value) and
-    ``{"key": ["v1", "v2"]}`` (multi-value distillation).
-    Returns an empty dict for ``None`` or empty input.
+    Accepts both ``{"key": "value"}`` (legacy single-value — pre-multivalue
+    URLs and saved views) and ``{"key": ["v1", "v2"]}`` (multi-value
+    distillation). Returns an empty dict for ``None`` or empty input.
     """
     if not value:
         return {}
@@ -562,8 +563,8 @@ async def list_events(
     if order not in ("asc", "desc"):
         order = "desc"
     _validate_regex(q, q_regex)
-    parsed_filters = _parse_json_object(filters)
-    parsed_exclusions = _parse_exclusions_object(exclusions)
+    parsed_filters = _parse_multivalue_object(filters)
+    parsed_exclusions = _parse_multivalue_object(exclusions)
     parsed_filter_modes = _parse_modes_object(filter_modes)
     parsed_exclusion_modes = _parse_modes_object(exclusion_modes)
     _validate_field_regexes(parsed_filters, parsed_filter_modes)
@@ -714,8 +715,8 @@ async def bulk_annotate_by_filter(
             detail=f"annotation_type must be one of {sorted(allowed_types)}",
         )
     _validate_regex(body.q, body.q_regex)
-    parsed_filters = _parse_json_object(body.filters)
-    parsed_exclusions = _parse_exclusions_object(body.exclusions)
+    parsed_filters = _parse_multivalue_object(body.filters)
+    parsed_exclusions = _parse_multivalue_object(body.exclusions)
     parsed_filter_modes = _parse_modes_object(body.filter_modes)
     parsed_exclusion_modes = _parse_modes_object(body.exclusion_modes)
     _validate_field_regexes(parsed_filters, parsed_filter_modes)
@@ -761,26 +762,41 @@ async def bulk_annotate_by_filter(
         ),
     )
 
-    if not refs:
-        return {"tagged": 0}
-
     store = get_store()
-    rows = [
-        {
-            "annotation_id": generate_id(f"{event_id}_{body.annotation_type}"),
-            "case_id": case_id,
-            "source_id": str(src_id),
-            "event_id": str(event_id),  # ClickHouse may return UUID objects
+    tagged = 0
+    if refs:
+        rows = [
+            {
+                "annotation_id": generate_id(f"{event_id}_{body.annotation_type}"),
+                "case_id": case_id,
+                "source_id": str(src_id),
+                "event_id": str(event_id),  # ClickHouse may return UUID objects
+                "annotation_type": body.annotation_type,
+                "content": body.content.strip(),
+                "origin": "user",
+                "created_by": user.id,
+            }
+            for event_id, src_id in refs
+        ]
+        tagged = await store.bulk_create_annotations(rows)
+        if tagged:
+            publish_annotation_change(case_id, timeline_id, None, user)
+    await store.record_audit(
+        action="events.bulk_annotate",
+        actor=user,
+        case_id=case_id,
+        target_type="timeline",
+        target_id=timeline_id,
+        detail={
             "annotation_type": body.annotation_type,
             "content": body.content.strip(),
-            "origin": "user",
-            "created_by": user.id,
-        }
-        for event_id, src_id in refs
-    ]
-    tagged = await store.bulk_create_annotations(rows)
-    if tagged:
-        publish_annotation_change(case_id, timeline_id, None, user)
+            "matched": len(refs),
+            "tagged": tagged,
+            "filter": body.model_dump(
+                exclude={"annotation_type", "content"}, exclude_none=True, exclude_defaults=True
+            ),
+        },
+    )
     return {"tagged": tagged}
 
 
@@ -928,8 +944,8 @@ async def get_histogram(
     ``max(1, duration / buckets)`` seconds.
     """
     _validate_regex(q, q_regex)
-    parsed_filters = _parse_json_object(filters)
-    parsed_exclusions = _parse_exclusions_object(exclusions)
+    parsed_filters = _parse_multivalue_object(filters)
+    parsed_exclusions = _parse_multivalue_object(exclusions)
     parsed_filter_modes = _parse_modes_object(filter_modes)
     parsed_exclusion_modes = _parse_modes_object(exclusion_modes)
     _validate_field_regexes(parsed_filters, parsed_filter_modes)
@@ -994,7 +1010,8 @@ class ExportFilter(BaseModel):
     start: datetime | None = None
     end: datetime | None = None
     # 'fields' / 'exclude' map to field_filters / field_exclusions in EventQuery.
-    fields: dict[str, str] = Field(default_factory=dict)
+    # Both accept legacy scalar values ({"k": "v"}) via the validator below.
+    fields: dict[str, list[str]] = Field(default_factory=dict)
     exclude: dict[str, list[str]] = Field(default_factory=dict)
     # Match-mode maps for fields/exclude ("exact" when absent) — structured
     # dicts like their siblings, unlike the JSON-string query params.
@@ -1003,6 +1020,13 @@ class ExportFilter(BaseModel):
     annotated: str | None = None
     annotation_tag_value: str | None = None
     run_id: str | None = None
+
+    @field_validator("fields", "exclude", mode="before")
+    @classmethod
+    def _coerce_scalar_values(cls, v: Any) -> Any:
+        if isinstance(v, dict):
+            return {k: val if isinstance(val, list) else [val] for k, val in v.items()}
+        return v
 
 
 class ExportRequest(BaseModel):
@@ -1103,6 +1127,7 @@ async def export_events(
     timeline_id: str,
     body: ExportRequest,
     case: Case = Depends(require_case_read),
+    user: User = Depends(get_current_user),
 ) -> StreamingResponse:
     """Stream all events matching the given filters as CSV or JSONL.
 
@@ -1173,6 +1198,21 @@ async def export_events(
         media_type = "text/csv"
         ext = "csv"
         content = _stream_csv(eq, annotations_by_event)
+
+    # Audited before streaming starts: an export that fails mid-stream still
+    # extracted data up to the failure point, so the attempt itself is the
+    # custody-relevant fact.
+    await store.record_audit(
+        action="events.export",
+        actor=user,
+        case_id=case_id,
+        target_type="timeline",
+        target_id=timeline_id,
+        detail={
+            "format": body.format,
+            "filter": body.filter.model_dump(exclude_none=True, exclude_defaults=True),
+        },
+    )
 
     filename = f"{case_id}-{timeline_id}-events.{ext}"
     return StreamingResponse(
@@ -1748,6 +1788,7 @@ async def list_anomalies(
         ),
     ),
     case: Case = Depends(require_case_read),
+    user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Run a statistical anomaly detector on the timeline and return findings.
 
@@ -1808,6 +1849,26 @@ async def list_anomalies(
             min_skew_seconds=min_skew_seconds,
             payload=payload,
         )
+    # GETs are skipped by the generic audit middleware, so detector-run
+    # launches would otherwise leave no trace at all. Audited regardless of
+    # `persist` — unpersisted preview scans still read case data and should
+    # remain visible in the custody trail, just without a run_id to anchor to.
+    await get_store().record_audit(
+        action="anomaly.run",
+        actor=user,
+        case_id=case_id,
+        target_type="detector_run",
+        target_id=run_id,
+        detail={
+            "detector": detector,
+            "timeline_id": timeline_id,
+            "fields": fields,
+            "series_field": series_field,
+            "temporal": temporal,
+            "baseline_end": baseline_end.isoformat() if baseline_end else None,
+            "persist": persist,
+        },
+    )
     payload["run_id"] = run_id
     return payload
 
@@ -2058,6 +2119,21 @@ async def tag_anomalies(
         payload=payload,
     )
 
+    await store.record_audit(
+        action="anomaly.tag",
+        actor=user,
+        case_id=case_id,
+        target_type="detector_run",
+        target_id=run_id,
+        detail={
+            "detector": body.detector,
+            "timeline_id": timeline_id,
+            "tagged": tagged,
+            "temporal": body.temporal,
+            "baseline_end": body.baseline_end.isoformat() if body.baseline_end else None,
+        },
+    )
+
     return {
         "status": "ok",
         "detector": result.detector,
@@ -2122,4 +2198,12 @@ async def persist_anomaly_finding(
         detector=body.detector,
     )
     publish_annotation_change(case_id, None, event_id, user)
+    await store.record_audit(
+        action="anomaly.persist_finding",
+        actor=user,
+        case_id=case_id,
+        target_type="event",
+        target_id=event_id,
+        detail={"detector": body.detector, "source_id": source_id},
+    )
     return {"annotation": annotation.to_dict()}
