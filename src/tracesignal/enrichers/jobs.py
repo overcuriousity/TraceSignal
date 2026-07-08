@@ -390,9 +390,11 @@ async def run_enrichment_job(
 
     settings = get_settings()
     # Read paging over ClickHouse — enrichment is regex + lookup work per
-    # value, not model-bound like embedding, so page at least 1000 events per
-    # round-trip to keep HTTP overhead low on large sources.
-    batch_size = max(settings.embedding_batch_size, 1000)
+    # value, not model-bound like embedding, so page in large chunks
+    # (TS_ENRICHMENT_BATCH_SIZE, default 20k) to keep HTTP round-trip overhead
+    # low on large sources. On a 180M-event timeline this is ~9k round-trips
+    # instead of ~180k at the old 1000-row floor.
+    batch_size = settings.enrichment_batch_size
 
     await store.start_enrichment_job_run(job_id, timeline_id, case_id, enricher_key)
     job_store.update(job_id, status="running", progress={"processed": 0, "total": 0})
