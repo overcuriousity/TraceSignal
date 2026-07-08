@@ -662,6 +662,12 @@ def convert(
     """Convert filterlog entries at ``input_path`` into ``output`` (.parquet)."""
     import json
 
+    if not output.lower().endswith(".parquet"):
+        raise SystemExit(
+            f"error: output path must end with .parquet (got: {output}) — the "
+            "TraceSignal server detects the ingest parser strictly by file extension."
+        )
+
     files = find_log_files(input_path)
 
     if verbose:

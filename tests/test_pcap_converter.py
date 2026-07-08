@@ -59,6 +59,10 @@ class TestSpecParity:
         assert meta.converter_name == "pcap2tracesignal"
         assert meta.converter_version == converter.CONVERTER_VERSION
 
+    def test_rejects_non_parquet_output_extension(self, converter, tmp_path):
+        with pytest.raises(SystemExit, match=r"\.parquet"):
+            converter.convert(str(DATA / "sample.pcap"), str(tmp_path / "out.csv"), 1, False)
+
 
 class TestClassicPcap:
     def test_golden_packets(self, converter, tmp_path):

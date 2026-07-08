@@ -56,6 +56,10 @@ class TestSpecParity:
         assert meta.converter_name == "cloudtrail2tracesignal"
         assert meta.converter_version == converter.CONVERTER_VERSION
 
+    def test_rejects_non_parquet_output_extension(self, converter, tmp_path):
+        with pytest.raises(SystemExit, match=r"\.parquet"):
+            converter.convert(str(DATA / "cloudtrail.json"), str(tmp_path / "out.csv"), 1, False)
+
 
 class TestParsing:
     def test_golden_records(self, converter, tmp_path):

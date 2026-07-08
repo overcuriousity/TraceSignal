@@ -868,6 +868,12 @@ def convert(input_path: str, output: str, workers: int, verbose: bool) -> int:
     """Convert pcap/pcapng captures at ``input_path`` into ``output`` (.parquet)."""
     import json
 
+    if not output.lower().endswith(".parquet"):
+        raise SystemExit(
+            f"error: output path must end with .parquet (got: {output}) — the "
+            "TraceSignal server detects the ingest parser strictly by file extension."
+        )
+
     files = find_pcap_files(input_path)
 
     if verbose:

@@ -59,6 +59,10 @@ class TestSpecParity:
         assert meta.converter_name == "nginx2tracesignal"
         assert meta.converter_version == converter.CONVERTER_VERSION
 
+    def test_rejects_non_parquet_output_extension(self, converter, tmp_path):
+        with pytest.raises(SystemExit, match=r"\.parquet"):
+            converter.convert(str(DATA / "nginx_access.log"), str(tmp_path / "out.csv"), 1, False)
+
 
 class TestAccessLog:
     def test_golden_lines(self, converter, tmp_path):

@@ -668,6 +668,12 @@ def _convert_file_parallel(
 
 def convert(input_path: str, output: str, workers: int, verbose: bool) -> int:
     """Convert Suricata logs at ``input_path`` into ``output`` (.parquet)."""
+    if not output.lower().endswith(".parquet"):
+        raise SystemExit(
+            f"error: output path must end with .parquet (got: {output}) — the "
+            "TraceSignal server detects the ingest parser strictly by file extension."
+        )
+
     files = find_log_files(input_path)
 
     if verbose:
