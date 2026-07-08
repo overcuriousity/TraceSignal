@@ -191,7 +191,7 @@ export function DetectorStatusLine({
         <span className="flex items-center gap-1">
           <span className="capitalize">{data.method}</span>
           <InfoHint
-            content={data.method === "temporal" ? GLOSSARY.temporal : GLOSSARY.selfBaseline}
+            content={data.method.startsWith("temporal") ? GLOSSARY.temporal : GLOSSARY.selfBaseline}
             size={11}
           />
         </span>

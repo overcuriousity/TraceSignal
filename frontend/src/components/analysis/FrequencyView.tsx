@@ -258,8 +258,8 @@ export function FrequencyView({
   useAnomalyMarkers(
     findings,
     (f): AnomalyMarker => {
-      const label = `${f.series_field}=${f.series_value} spike`;
       const direction = f.z_score > 0 ? "spike" : "drop";
+      const label = `${f.series_field}=${f.series_value} ${direction}`;
       // In self-baseline (non-temporal) z-score mode, "expected" comes from a
       // leave-one-out mean/std over the rest of the series — the flagged
       // window itself is excluded from its own baseline (see

@@ -17,7 +17,7 @@ export const GLOSSARY = {
   selfBaseline:
     "The detector learns 'normal' from all scanned events themselves — there is no separate reference window.",
   temporal:
-    "The detector splits time into a baseline window and a detect window, learning from the baseline and flagging deviations after it.",
+    "The detector learns 'normal' from a baseline window, then flags deviations in each suspect window scored against it. Suspect windows need not be adjacent to the baseline.",
   normalValues:
     "An allowlist of field values you've confirmed as expected. Matching events are suppressed from findings so real anomalies stand out.",
 } as const;

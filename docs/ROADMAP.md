@@ -156,11 +156,36 @@ Hard, high value:
   investigation. Building blocks (Views, annotations, saved charts, RBAC) all exist; this is
   mostly a new Postgres model + frontend editor. Timesketch's most-loved feature.
 
+## Legacy-removal suspects (flagged 2026-07-08, verify before cutting)
+
+Code kept only for backward compatibility with older runs/clients. Each is a
+**candidate** for removal — confirm nothing still depends on it, then delete in
+one commit that also updates `docs/ANOMALY_DETECTION.md`.
+
+- [ ] **L1 — Single-`baseline_end` split point + `temporal=true` midpoint fallback.**
+  Superseded by explicit baseline definitions (baseline + 1..N suspect windows).
+  Still accepted at the API and converted via `windows_from_split`
+  (`db/anomaly_stats.py`), so old persisted runs and any pre-window client keep
+  working with exactly one internal temporal code path. Remove the `baseline_end`
+  / `temporal` request params and `windows_from_split` once no stored `DetectorRun`
+  relies on the legacy shape and the CLI/clients all send `baseline_id`.
+- [ ] **L2 — Per-event `normal` annotation for suppression.** Superseded by the
+  value-level detector allowlist (D11). Now created **only** for timestamp-order
+  findings (positional, no value key); honored read-only everywhere else. Cut once
+  timestamp-order gets a positional-allowlist equivalent — then the `normal`
+  annotation origin can be dropped from the mark-normal path entirely.
+- [ ] **L3 — `AnalysisPanel` / `BaselineManager` naming remnants (cosmetic).** The
+  components are gone (replaced by `InvestigatePanel` + `WindowsNormality` this PR);
+  no dangling imports remain. Leftover: stale comment mentions in `ExplorerPage.tsx`
+  / `stores/scrollPosition.ts` and the `analysisPanelWidth` ui-store key still named
+  after the old panel. Rename to `investigatePanelWidth` and fix comments when next
+  touching that store.
+
 ## Explicitly out of scope (decided during the audit)
 
 - Persistent job store — in-memory is a documented deliberate choice for the single-process
   deployment model.
 - CSRF tokens — SameSite=Lax cookies plus the LAN threat model are adequate for now.
-- Alembic adoption — hand-rolled additive migration works at the current schema churn;
-  revisit at v1.0.
+- ~~Alembic adoption~~ — **done** (this PR): Postgres schema is now Alembic-managed
+  (`db/migrations`), with pre-Alembic databases auto-stamped at `0001` on startup.
 - Proactive router/query-builder splits — churn risk outweighs payoff at current velocity.

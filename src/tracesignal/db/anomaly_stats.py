@@ -2727,9 +2727,18 @@ class StatisticalAnomalyService:
             std_val = max(float(bl_counts.std(ddof=1)), _MIN_FREQUENCY_STD)
             evaluated_series += 1
 
+            # Overlapping suspect windows (allowed) share epoch-aligned buckets;
+            # a bucket scored once per window would emit duplicate findings for
+            # the same (series, bucket). Dedupe on bucket start — the first
+            # suspect window covering it wins the attribution.
+            scored_buckets: set[str] = set()
             for w, full in zip(windows.suspects, suspect_full, strict=False):
                 for b in full:
-                    cnt = cmap.get(b.isoformat(), 0)
+                    b_iso = b.isoformat()
+                    if b_iso in scored_buckets:
+                        continue
+                    scored_buckets.add(b_iso)
+                    cnt = cmap.get(b_iso, 0)
                     z = (cnt - mean_val) / std_val
                     if abs(z) >= z_threshold:
                         findings.append(

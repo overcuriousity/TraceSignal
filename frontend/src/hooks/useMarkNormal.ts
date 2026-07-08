@@ -37,10 +37,12 @@ export function useMarkNormal(caseId: string, timelineId: string) {
     mutationFn: async (t: MarkNormalTarget): Promise<void> => {
       if (t.field === undefined || t.value === undefined) {
         // Positional / value-less: keep the per-event annotation. Requires the
-        // owning source + event to scope it.
-        if (t.sourceId && t.eventId) {
-          await annotationsApi.create(caseId, t.sourceId, t.eventId, "normal", "normal operation");
+        // owning source + event to scope it — without them there is nothing to
+        // mark, so surface that as an error rather than a false success.
+        if (!t.sourceId || !t.eventId) {
+          throw new Error("Cannot mark normal: no value key and no owning event to annotate.");
         }
+        await annotationsApi.create(caseId, t.sourceId, t.eventId, "normal", "normal operation");
         return;
       }
       await baselinesApi.addAllowlist(caseId, timelineId, {
