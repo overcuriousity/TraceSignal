@@ -536,6 +536,137 @@ class SavedChart(Base):
         }
 
 
+def _windows_config_hash(payload: dict[str, Any]) -> str:
+    """SHA-256 over the canonical JSON of a window payload.
+
+    Same canonicalization convention as ``models/event.py`` config hashes —
+    derived, never stored, so an edited definition can't desync from it.
+    """
+    import hashlib
+    import json
+
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+class BaselineDefinition(Base):
+    """A named baseline + suspect-window definition for temporal anomaly detection.
+
+    Timeline-scoped: one baseline time range (the "known-normal" reference
+    period) plus 1..N labeled suspect windows (the ranges under
+    investigation). Detectors resolve a ``baseline_id`` to this row at scan
+    time; forensic reproducibility does **not** depend on this row surviving —
+    every ``DetectorRun`` snapshots the resolved windows into its ``params``,
+    so definitions stay freely editable/deletable (see ``windows_hash`` in
+    ``api/routers/events.py::_persist_detector_run``).
+
+    ``suspect_windows`` is a JSON list of ``{"id", "label", "start", "end"}``
+    with ISO-8601 UTC timestamps; window semantics are half-open
+    ``[start, end)`` everywhere (matching ``anomaly_stats.TimeWindow``).
+    """
+
+    __tablename__ = "baseline_definitions"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    timeline_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    baseline_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    baseline_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    suspect_windows: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    created_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def windows_payload(self) -> dict[str, Any]:
+        """The window ranges alone — the hash input and DetectorRun snapshot shape."""
+        return {
+            "baseline": {
+                "start": self.baseline_start.isoformat() if self.baseline_start else None,
+                "end": self.baseline_end.isoformat() if self.baseline_end else None,
+            },
+            "suspect_windows": self.suspect_windows or [],
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary, including the derived ``config_hash``."""
+        return {
+            "id": self.id,
+            "case_id": self.case_id,
+            "timeline_id": self.timeline_id,
+            "name": self.name,
+            **self.windows_payload(),
+            "config_hash": _windows_config_hash(self.windows_payload()),
+            "created_by": self.created_by,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class DetectorAllowlistEntry(Base):
+    """A value-level "this is normal" declaration for the anomaly detectors.
+
+    Analyst-declared metadata (roadmap D11, AMiner-style whitelist rule):
+    the value of *field* is never an anomaly for *detector* on this timeline,
+    regardless of which event carries it. Consumed as a post-detection
+    exclusion in finding assembly — unlike the legacy per-event ``normal``
+    annotation, which only suppressed one representative event's finding.
+    ``detector`` uses the detector key (``value_novelty``, ``frequency``, …);
+    for ``frequency`` the *field* is the series field and the entry
+    suppresses the whole series.
+    """
+
+    __tablename__ = "detector_allowlist"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    timeline_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    detector: Mapped[str] = mapped_column(String(32), nullable=False)
+    field: Mapped[str] = mapped_column(String(255), nullable=False)
+    value: Mapped[str] = mapped_column(String(4096), nullable=False)
+    note: Mapped[str | None] = mapped_column(String(4096), nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary."""
+        return {
+            "id": self.id,
+            "case_id": self.case_id,
+            "timeline_id": self.timeline_id,
+            "detector": self.detector,
+            "field": self.field,
+            "value": self.value,
+            "note": self.note,
+            "created_by": self.created_by,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+def allowlist_hash(entries: Iterable[DetectorAllowlistEntry]) -> str:
+    """Deterministic SHA-256 over an allowlist's (detector, field, value) triples.
+
+    Stamped into ``DetectorRun.params`` so a run records exactly which
+    suppression set it was filtered through ("why is this value not
+    flagged?" stays answerable after the allowlist changes).
+    """
+    triples = sorted((e.detector, e.field, e.value) for e in entries)
+    return _windows_config_hash({"allowlist": [list(t) for t in triples]})
+
+
 class DetectorRun(Base):
     """A persisted statistical-anomaly-detector scan result.
 
@@ -896,9 +1027,7 @@ def _pre_alembic_fixups(sync_conn: Any) -> None:
     user_columns = {col["name"] for col in insp.get_columns("users")}
     if "onboarding_completed" not in user_columns:
         sync_conn.execute(
-            text(
-                "ALTER TABLE users ADD COLUMN onboarding_completed BOOLEAN NOT NULL DEFAULT false"
-            )
+            text("ALTER TABLE users ADD COLUMN onboarding_completed BOOLEAN NOT NULL DEFAULT false")
         )
     source_columns = {col["name"] for col in insp.get_columns("sources")}
     if "status" not in source_columns:
@@ -1888,6 +2017,10 @@ class PostgresStore:
             timeline = result.scalar_one_or_none()
             if timeline is None or timeline.is_default:
                 return False
+            for model in (BaselineDefinition, DetectorAllowlistEntry, SavedChart):
+                await session.execute(
+                    delete(model).where(model.case_id == case_id, model.timeline_id == timeline_id)
+                )
             await session.delete(timeline)
             await session.commit()
             return True
@@ -1917,6 +2050,13 @@ class PostgresStore:
             await session.execute(delete(View).where(View.case_id == case_id))
             await session.execute(delete(Annotation).where(Annotation.case_id == case_id))
             await session.execute(delete(DetectorRun).where(DetectorRun.case_id == case_id))
+            await session.execute(delete(SavedChart).where(SavedChart.case_id == case_id))
+            await session.execute(
+                delete(BaselineDefinition).where(BaselineDefinition.case_id == case_id)
+            )
+            await session.execute(
+                delete(DetectorAllowlistEntry).where(DetectorAllowlistEntry.case_id == case_id)
+            )
             await session.execute(
                 delete(SourceEnrichment).where(SourceEnrichment.case_id == case_id)
             )
@@ -2074,6 +2214,204 @@ class PostgresStore:
             if chart is None:
                 return False
             await session.delete(chart)
+            await session.commit()
+            return True
+
+    # ------------------------------------------------------------------
+    # Baseline definitions
+    # ------------------------------------------------------------------
+
+    async def list_baseline_definitions(
+        self, case_id: str, timeline_id: str
+    ) -> list[BaselineDefinition]:
+        """Return a timeline's baseline definitions, newest first."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(BaselineDefinition)
+                .where(
+                    BaselineDefinition.case_id == case_id,
+                    BaselineDefinition.timeline_id == timeline_id,
+                )
+                .order_by(BaselineDefinition.created_at.desc())
+            )
+            return list(result.scalars().all())
+
+    async def get_baseline_definition(
+        self, case_id: str, timeline_id: str, baseline_id: str
+    ) -> BaselineDefinition | None:
+        """Return one baseline definition, scoped by case and timeline."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(BaselineDefinition).where(
+                    BaselineDefinition.case_id == case_id,
+                    BaselineDefinition.timeline_id == timeline_id,
+                    BaselineDefinition.id == baseline_id,
+                )
+            )
+            return result.scalar_one_or_none()
+
+    async def create_baseline_definition(
+        self,
+        case_id: str,
+        timeline_id: str,
+        name: str,
+        baseline_start: datetime,
+        baseline_end: datetime,
+        suspect_windows: list[dict],
+        created_by: str | None = None,
+    ) -> BaselineDefinition:
+        """Create a baseline definition within a timeline."""
+        definition = BaselineDefinition(
+            id=generate_id(name),
+            case_id=case_id,
+            timeline_id=timeline_id,
+            name=name,
+            baseline_start=baseline_start,
+            baseline_end=baseline_end,
+            suspect_windows=suspect_windows,
+            created_by=created_by,
+        )
+        async with self.session_factory() as session:
+            session.add(definition)
+            await session.commit()
+            await session.refresh(definition)
+            return definition
+
+    async def update_baseline_definition(
+        self,
+        case_id: str,
+        timeline_id: str,
+        baseline_id: str,
+        *,
+        name: str | None = None,
+        baseline_start: datetime | None = None,
+        baseline_end: datetime | None = None,
+        suspect_windows: list[dict] | None = None,
+    ) -> BaselineDefinition | None:
+        """Update a baseline definition; returns the row or None if missing.
+
+        Editing is safe for reproducibility because every DetectorRun
+        snapshots the windows it actually used (see class docstring).
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(BaselineDefinition).where(
+                    BaselineDefinition.case_id == case_id,
+                    BaselineDefinition.timeline_id == timeline_id,
+                    BaselineDefinition.id == baseline_id,
+                )
+            )
+            definition = result.scalar_one_or_none()
+            if definition is None:
+                return None
+            if name is not None:
+                definition.name = name
+            if baseline_start is not None:
+                definition.baseline_start = baseline_start
+            if baseline_end is not None:
+                definition.baseline_end = baseline_end
+            if suspect_windows is not None:
+                definition.suspect_windows = suspect_windows
+            await session.commit()
+            await session.refresh(definition)
+            return definition
+
+    async def delete_baseline_definition(
+        self, case_id: str, timeline_id: str, baseline_id: str
+    ) -> bool:
+        """Delete a baseline definition row. Returns True if it existed."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(BaselineDefinition).where(
+                    BaselineDefinition.case_id == case_id,
+                    BaselineDefinition.timeline_id == timeline_id,
+                    BaselineDefinition.id == baseline_id,
+                )
+            )
+            definition = result.scalar_one_or_none()
+            if definition is None:
+                return False
+            await session.delete(definition)
+            await session.commit()
+            return True
+
+    # ------------------------------------------------------------------
+    # Detector allowlist
+    # ------------------------------------------------------------------
+
+    async def list_allowlist_entries(
+        self, case_id: str, timeline_id: str, detector: str | None = None
+    ) -> list[DetectorAllowlistEntry]:
+        """Return a timeline's allowlist entries (optionally one detector's), newest first."""
+        stmt = select(DetectorAllowlistEntry).where(
+            DetectorAllowlistEntry.case_id == case_id,
+            DetectorAllowlistEntry.timeline_id == timeline_id,
+        )
+        if detector is not None:
+            stmt = stmt.where(DetectorAllowlistEntry.detector == detector)
+        async with self.session_factory() as session:
+            result = await session.execute(stmt.order_by(DetectorAllowlistEntry.created_at.desc()))
+            return list(result.scalars().all())
+
+    async def create_allowlist_entry(
+        self,
+        case_id: str,
+        timeline_id: str,
+        detector: str,
+        field: str,
+        value: str,
+        note: str | None = None,
+        created_by: str | None = None,
+    ) -> DetectorAllowlistEntry:
+        """Create an allowlist entry, or return the existing identical one.
+
+        Deduplication is by exact (detector, field, value) within the
+        timeline — declaring the same value normal twice is a no-op rather
+        than an error, so the UI action stays idempotent.
+        """
+        async with self.session_factory() as session:
+            existing = (
+                await session.execute(
+                    select(DetectorAllowlistEntry).where(
+                        DetectorAllowlistEntry.case_id == case_id,
+                        DetectorAllowlistEntry.timeline_id == timeline_id,
+                        DetectorAllowlistEntry.detector == detector,
+                        DetectorAllowlistEntry.field == field,
+                        DetectorAllowlistEntry.value == value,
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                return existing
+            entry = DetectorAllowlistEntry(
+                id=generate_id(f"allow_{detector}"),
+                case_id=case_id,
+                timeline_id=timeline_id,
+                detector=detector,
+                field=field,
+                value=value,
+                note=note,
+                created_by=created_by,
+            )
+            session.add(entry)
+            await session.commit()
+            await session.refresh(entry)
+            return entry
+
+    async def delete_allowlist_entry(self, case_id: str, timeline_id: str, entry_id: str) -> bool:
+        """Delete an allowlist entry row. Returns True if it existed."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(DetectorAllowlistEntry).where(
+                    DetectorAllowlistEntry.case_id == case_id,
+                    DetectorAllowlistEntry.timeline_id == timeline_id,
+                    DetectorAllowlistEntry.id == entry_id,
+                )
+            )
+            entry = result.scalar_one_or_none()
+            if entry is None:
+                return False
+            await session.delete(entry)
             await session.commit()
             return True
 

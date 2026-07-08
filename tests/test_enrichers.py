@@ -365,6 +365,9 @@ async def test_init_schema_drops_legacy_staging_table(tmp_path):
     s = PostgresStore(url=f"sqlite+aiosqlite:///{db_path}")
     async with s.engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # A real pre-Alembic database has only the revision-0001 tables.
+        await conn.execute(text("DROP TABLE baseline_definitions"))
+        await conn.execute(text("DROP TABLE detector_allowlist"))
         await conn.execute(text("DROP TABLE enrichment_results_staging"))
         await conn.execute(
             text(

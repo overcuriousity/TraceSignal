@@ -207,6 +207,10 @@ async def test_init_schema_adopts_pre_alembic_db(tmp_path):
     s = PostgresStore(url=f"sqlite+aiosqlite:///{tmp_path}/legacy.db")
     async with s.engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # A real pre-Alembic database has only the revision-0001 tables —
+        # drop everything later revisions add, or the upgrade would collide.
+        await conn.execute(text("DROP TABLE baseline_definitions"))
+        await conn.execute(text("DROP TABLE detector_allowlist"))
         # Simulate a database from before two of the hand-rolled ALTERs.
         await conn.execute(text("ALTER TABLE annotations DROP COLUMN pinned"))
         await conn.execute(text("ALTER TABLE users DROP COLUMN onboarding_completed"))
@@ -223,3 +227,82 @@ async def test_init_schema_adopts_pre_alembic_db(tmp_path):
     assert "pinned" in ann_cols
     assert "onboarding_completed" in user_cols
     await s.engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# BaselineDefinition / DetectorAllowlistEntry store CRUD + cascades
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_baseline_definition_crud_and_timeline_scoping(store):
+    from datetime import UTC, datetime
+
+    await store.create_case("c1", "Case One")
+    d = await store.create_baseline_definition(
+        "c1",
+        "t1",
+        "def1",
+        baseline_start=datetime(2026, 1, 1, tzinfo=UTC),
+        baseline_end=datetime(2026, 1, 15, tzinfo=UTC),
+        suspect_windows=[
+            {
+                "id": "w0",
+                "label": "x",
+                "start": "2026-02-01T00:00:00+00:00",
+                "end": "2026-02-02T00:00:00+00:00",
+            }
+        ],
+        created_by="u1",
+    )
+    assert (await store.get_baseline_definition("c1", "t1", d.id)) is not None
+    # Wrong timeline or case: not visible.
+    assert (await store.get_baseline_definition("c1", "t2", d.id)) is None
+    assert (await store.get_baseline_definition("c2", "t1", d.id)) is None
+    assert await store.list_baseline_definitions("c1", "t2") == []
+
+    updated = await store.update_baseline_definition("c1", "t1", d.id, name="renamed")
+    assert updated is not None and updated.name == "renamed"
+    # The derived hash only depends on the windows, not the name.
+    assert updated.to_dict()["config_hash"] == d.to_dict()["config_hash"]
+
+    assert await store.delete_baseline_definition("c1", "t1", d.id) is True
+    assert await store.delete_baseline_definition("c1", "t1", d.id) is False
+
+
+@pytest.mark.asyncio
+async def test_allowlist_dedupe_and_detector_filter(store):
+    await store.create_case("c1", "Case One")
+    e1 = await store.create_allowlist_entry("c1", "t1", "value_novelty", "attr:user", "svc")
+    e2 = await store.create_allowlist_entry("c1", "t1", "value_novelty", "attr:user", "svc")
+    assert e1.id == e2.id
+    await store.create_allowlist_entry("c1", "t1", "frequency", "artifact", "cron")
+    assert len(await store.list_allowlist_entries("c1", "t1")) == 2
+    assert len(await store.list_allowlist_entries("c1", "t1", detector="frequency")) == 1
+
+
+@pytest.mark.asyncio
+async def test_timeline_and_case_delete_cascade_baseline_rows(store):
+    from datetime import UTC, datetime
+
+    case = await store.create_case("c1", "Case One")
+    assert case is not None
+    tl = await store.create_timeline("c1", "tl-extra", "extra")
+    await store.create_baseline_definition(
+        "c1",
+        tl.id,
+        "def1",
+        baseline_start=datetime(2026, 1, 1, tzinfo=UTC),
+        baseline_end=datetime(2026, 1, 2, tzinfo=UTC),
+        suspect_windows=[],
+    )
+    await store.create_allowlist_entry("c1", tl.id, "value_novelty", "artifact", "x")
+    assert await store.delete_timeline("c1", tl.id) is True
+    assert await store.list_baseline_definitions("c1", tl.id) == []
+    assert await store.list_allowlist_entries("c1", tl.id) == []
+
+    # Case delete cascades rows on the default timeline too.
+    default_tl = (await store.list_timelines("c1"))[0]
+    await store.create_allowlist_entry("c1", default_tl.id, "value_novelty", "artifact", "y")
+    assert await store.delete_case("c1") is True
+    assert await store.list_allowlist_entries("c1", default_tl.id) == []
