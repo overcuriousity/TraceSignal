@@ -14,13 +14,15 @@ import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
 import {
   DetectorStatusLine,
   FindingShell,
-  ModeToggle,
+  NeedsBaselinePrompt,
+  ResultsBar,
+  useCappedFindings,
+  useBaselineRequest,
   RefreshButton,
   TagFindingsBar,
   useAnomalyMarkers,
   useDetectorRunId,
   useOpenEvent,
-  type DetectorMode,
 } from "./detector-shared";
 import { Spinner } from "@/components/ui/Spinner";
 import type { AnomalyMarker, Event, ValueComboFinding } from "@/api/types";
@@ -154,7 +156,7 @@ export function ComboNoveltyView({
   onRunIdChange,
   onJumpToTime,
 }: Props) {
-  const [mode, setMode] = useState<DetectorMode>("self");
+  const { params: blParams, key: blKey, needsBaseline } = useBaselineRequest();
   // null = auto (top-2 recommended); string[] = explicit selection (≥ 2 to run).
   const [selectedFields, setSelectedFields] = useState<string[] | null>(null);
   const qc = useQueryClient();
@@ -163,16 +165,16 @@ export function ComboNoveltyView({
   const fieldsParam = selectedFields !== null ? selectedFields.join(",") : undefined;
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "combo", mode, fieldsParam ?? "__auto__"],
+    queryKey: ["anomalies", caseId, timelineId, "combo", blKey, fieldsParam ?? "__auto__"],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "value_combo",
         limit: 50,
-        temporal: mode === "temporal",
+        ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     // Don't fire while the explicit selection is below the two-field minimum.
-    enabled: !explicitTooFew,
+    enabled: !explicitTooFew && !needsBaseline,
     staleTime: 60_000,
   });
 
@@ -181,7 +183,7 @@ export function ComboNoveltyView({
       anomaliesApi.tag(caseId, timelineId, {
         detector: "value_combo",
         limit: 50,
-        temporal: mode === "temporal",
+        ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     onSuccess: () => {
@@ -225,11 +227,14 @@ export function ComboNoveltyView({
 
   useDetectorRunId(data?.run_id, onRunIdChange);
 
+  const cap = useCappedFindings(findings);
+
+  if (needsBaseline) return <NeedsBaselinePrompt />;
+
   return (
     <div className="space-y-3">
       {/* Toolbar */}
       <div className="flex items-center gap-2 flex-wrap">
-        <ModeToggle mode={mode} onChange={setMode} />
         <span className="flex-1" />
         <AnomalyFieldPicker
           caseId={caseId}
@@ -275,7 +280,8 @@ export function ComboNoveltyView({
       {/* Findings list */}
       {findings.length > 0 && (
         <div className="space-y-1.5">
-          {findings.map((f, i) => (
+          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} />
+          {cap.shown.map((f, i) => (
             <ComboRow
               key={`${f.values.join("|")}:${i}`}
               caseId={caseId}

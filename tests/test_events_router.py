@@ -8,7 +8,7 @@ spinning up a FastAPI TestClient.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
@@ -543,8 +543,16 @@ class _FakeStatAnomalyService:
 
     ch = None  # accessed by the router's field-stats cache resolution
 
-    def __init__(self, midpoint=None):
+    def __init__(self, midpoint=None, ts_range=None):
         self._midpoint = midpoint
+        # (min, max) timeline range used by the legacy split shim. Defaults to
+        # a window whose midpoint equals `midpoint` when one is supplied.
+        if ts_range is None and midpoint is not None:
+            ts_range = (midpoint - timedelta(hours=12), midpoint + timedelta(hours=12))
+        self._ts_range = ts_range or (
+            datetime(2024, 1, 1, tzinfo=UTC),
+            datetime(2024, 1, 31, tzinfo=UTC),
+        )
         self.frequency_calls: list[dict] = []
         self.value_novelty_calls: list[dict] = []
         self.combo_calls: list[dict] = []
@@ -555,6 +563,9 @@ class _FakeStatAnomalyService:
 
     def get_timeline_midpoint(self, case_id, source_ids):
         return self._midpoint
+
+    def get_timeline_range(self, case_id, source_ids):
+        return self._ts_range
 
     def find_frequency_anomalies(self, **kwargs):
         self.frequency_calls.append(kwargs)
@@ -605,8 +616,9 @@ async def test_run_stat_detector_dispatches_to_frequency(patched_store, monkeypa
     fake_svc = _FakeStatAnomalyService()
     monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
 
-    result = await events._run_stat_detector(
+    result, _resolution = await events._run_stat_detector(
         "c1",
+        "t1",
         ["s1"],
         detector="frequency",
         fields=None,
@@ -628,8 +640,9 @@ async def test_run_stat_detector_dispatches_to_value_novelty(patched_store, monk
     fake_svc = _FakeStatAnomalyService()
     monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
 
-    result = await events._run_stat_detector(
+    result, _resolution = await events._run_stat_detector(
         "c1",
+        "t1",
         ["s1"],
         detector="value_novelty",
         fields="artifact,attr:user_agent",
@@ -660,6 +673,7 @@ async def test_run_stat_detector_auto_fields_resolves_cache_inventory(
 
     await events._run_stat_detector(
         "c1",
+        "t1",
         ["s1"],
         detector="value_novelty",
         fields=None,
@@ -680,8 +694,9 @@ async def test_run_stat_detector_dispatches_to_value_combo(patched_store, monkey
     fake_svc = _FakeStatAnomalyService()
     monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
 
-    result = await events._run_stat_detector(
+    result, _resolution = await events._run_stat_detector(
         "c1",
+        "t1",
         ["s1"],
         detector="value_combo",
         fields="attr:action,attr:hour",
@@ -704,6 +719,7 @@ async def test_run_stat_detector_value_combo_rejects_single_field(patched_store,
     with pytest.raises(HTTPException) as exc:
         await events._run_stat_detector(
             "c1",
+            "t1",
             ["s1"],
             detector="value_combo",
             fields="artifact",
@@ -722,8 +738,9 @@ async def test_run_stat_detector_dispatches_to_numeric_range(patched_store, monk
     fake_svc = _FakeStatAnomalyService()
     monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
 
-    result = await events._run_stat_detector(
+    result, _resolution = await events._run_stat_detector(
         "c1",
+        "t1",
         ["s1"],
         detector="numeric_range",
         fields="attr:bytes",
@@ -743,8 +760,9 @@ async def test_run_stat_detector_dispatches_to_charset(patched_store, monkeypatc
     fake_svc = _FakeStatAnomalyService()
     monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
 
-    result = await events._run_stat_detector(
+    result, _resolution = await events._run_stat_detector(
         "c1",
+        "t1",
         ["s1"],
         detector="charset",
         fields="attr:user",
@@ -766,8 +784,9 @@ async def test_run_stat_detector_dispatches_to_entropy(patched_store, monkeypatc
     fake_svc = _FakeStatAnomalyService()
     monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
 
-    result = await events._run_stat_detector(
+    result, _resolution = await events._run_stat_detector(
         "c1",
+        "t1",
         ["s1"],
         detector="entropy",
         fields="attr:host",
@@ -832,8 +851,9 @@ async def test_run_stat_detector_dispatches_to_timestamp_order(patched_store, mo
     fake_svc = _FakeStatAnomalyService(midpoint=datetime(2024, 6, 15, 12, 0, 0))
     monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
 
-    result = await events._run_stat_detector(
+    result, _resolution = await events._run_stat_detector(
         "c1",
+        "t1",
         ["s1"],
         detector="timestamp_order",
         fields=None,
@@ -856,15 +876,15 @@ async def test_run_stat_detector_dispatches_to_timestamp_order(patched_store, mo
 async def test_run_stat_detector_resolves_timeline_midpoint_when_temporal_and_no_baseline(
     patched_store, monkeypatch
 ):
-    """temporal=True with no explicit baseline_end must fall back to the
-    timeline midpoint — shared behavior list_anomalies and tag_anomalies
-    both relied on before the extraction (C16)."""
-    midpoint = datetime(2024, 6, 15, 12, 0, 0)
+    """temporal=True with no explicit baseline_end falls back to the timeline
+    midpoint, converted to a baseline+suspect window pair via the legacy shim."""
+    midpoint = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
     fake_svc = _FakeStatAnomalyService(midpoint=midpoint)
     monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
 
-    await events._run_stat_detector(
+    _, resolution = await events._run_stat_detector(
         "c1",
+        "t1",
         ["s1"],
         detector="frequency",
         fields=None,
@@ -874,19 +894,25 @@ async def test_run_stat_detector_resolves_timeline_midpoint_when_temporal_and_no
         temporal=True,
         limit=50,
     )
-    assert fake_svc.frequency_calls[0]["baseline_end"] == midpoint
+    windows = fake_svc.frequency_calls[0]["windows"]
+    # Baseline ends at the midpoint; a single "detect" suspect window follows.
+    assert windows.baseline.end == midpoint
+    assert len(windows.suspects) == 1
+    assert windows.suspects[0].start == midpoint
+    assert resolution["windows"]["baseline"]["end"] == midpoint.isoformat()
 
 
 @pytest.mark.asyncio
 async def test_run_stat_detector_explicit_baseline_end_wins_over_midpoint(
     patched_store, monkeypatch
 ):
-    explicit = datetime(2024, 1, 1, 0, 0, 0)
-    fake_svc = _FakeStatAnomalyService(midpoint=datetime(2024, 6, 15, 12, 0, 0))
+    explicit = datetime(2024, 1, 10, 0, 0, 0, tzinfo=UTC)
+    fake_svc = _FakeStatAnomalyService(midpoint=datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC))
     monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
 
     await events._run_stat_detector(
         "c1",
+        "t1",
         ["s1"],
         detector="frequency",
         fields=None,
@@ -896,7 +922,8 @@ async def test_run_stat_detector_explicit_baseline_end_wins_over_midpoint(
         temporal=True,
         limit=50,
     )
-    assert fake_svc.frequency_calls[0]["baseline_end"] == explicit
+    windows = fake_svc.frequency_calls[0]["windows"]
+    assert windows.baseline.end == explicit
 
 
 @pytest.mark.asyncio
@@ -917,6 +944,7 @@ async def test_run_stat_detector_excludes_normal_annotated_events(
 
     await events._run_stat_detector(
         "c1",
+        "t1",
         ["s1"],
         detector="value_novelty",
         fields=None,
@@ -994,6 +1022,7 @@ def _call_list_anomalies(persist: bool = True):
         min_skew_seconds=None,
         baseline_end=None,
         temporal=False,
+        baseline_id=None,
         limit=50,
         persist=persist,
         case=Case(id="c1"),
@@ -1053,6 +1082,202 @@ async def test_tag_anomalies_always_persists_a_run(
     assert response["run_id"] is not None
     run = await timeline_setup.get_detector_run("c1", response["run_id"])
     assert run is not None
+
+
+# ---------------------------------------------------------------------------
+# baseline_id resolution + forensic snapshot (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+async def _make_baseline(store) -> str:
+    definition = await store.create_baseline_definition(
+        "c1",
+        "t1",
+        "incident",
+        baseline_start=datetime(2024, 1, 1, tzinfo=UTC),
+        baseline_end=datetime(2024, 1, 15, tzinfo=UTC),
+        suspect_windows=[
+            {
+                "id": "w0",
+                "label": "exfil",
+                "start": "2024-02-01T00:00:00+00:00",
+                "end": "2024-02-05T00:00:00+00:00",
+            }
+        ],
+    )
+    return definition.id
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_baseline_id_builds_windows(
+    timeline_setup, monkeypatch, stub_field_stats_cache
+):
+    """A baseline_id resolves the saved definition into detector windows and
+    snapshots them (id + hash) into the resolution for the run params."""
+    bid = await _make_baseline(timeline_setup)
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    _, resolution = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="value_novelty",
+        fields="artifact",
+        series_field="artifact",
+        z_threshold=None,
+        baseline_end=None,
+        temporal=False,
+        baseline_id=bid,
+        limit=50,
+    )
+    windows = fake_svc.value_novelty_calls[0]["windows"]
+    assert windows.baseline.start == datetime(2024, 1, 1, tzinfo=UTC)
+    assert [w.label for w in windows.suspects] == ["exfil"]
+    assert resolution["baseline_id"] == bid
+    assert len(resolution["windows_hash"]) == 64
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_unknown_baseline_id_404s(
+    timeline_setup, monkeypatch, stub_field_stats_cache
+):
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+    with pytest.raises(HTTPException) as exc:
+        await events._run_stat_detector(
+            "c1",
+            "t1",
+            ["s1"],
+            detector="value_novelty",
+            fields="artifact",
+            series_field="artifact",
+            z_threshold=None,
+            baseline_end=None,
+            temporal=False,
+            baseline_id="no-such-baseline",
+            limit=50,
+        )
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_applies_allowlist(
+    timeline_setup, monkeypatch, stub_field_stats_cache
+):
+    """An allowlist entry for the detector is passed through as a (field,
+    value) suppression set, and its hash is snapshotted."""
+    await timeline_setup.create_allowlist_entry(
+        "c1", "t1", "value_novelty", "artifact", "known_good"
+    )
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    _, resolution = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="value_novelty",
+        fields="artifact",
+        series_field="artifact",
+        z_threshold=None,
+        baseline_end=None,
+        temporal=False,
+        limit=50,
+    )
+    assert fake_svc.value_novelty_calls[0]["allowlist"] == {("artifact", "known_good")}
+    assert resolution["allowlist_count"] == 1
+    assert len(resolution["allowlist_hash"]) == 64
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_applies_wildcard_allowlist_across_detectors(
+    timeline_setup, monkeypatch, stub_field_stats_cache
+):
+    """A detector-agnostic (`"*"`) entry suppresses its (field, value) for every
+    value detector, while a detector-scoped entry only affects its own."""
+    # Wildcard: normal for all value detectors. Scoped: charset only.
+    await timeline_setup.create_allowlist_entry("c1", "t1", "*", "artifact", "wild")
+    await timeline_setup.create_allowlist_entry("c1", "t1", "charset", "artifact", "cs_only")
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    async def run(detector):
+        return await events._run_stat_detector(
+            "c1",
+            "t1",
+            ["s1"],
+            detector=detector,
+            fields="artifact",
+            series_field="artifact",
+            z_threshold=None,
+            baseline_end=None,
+            temporal=False,
+            limit=50,
+        )
+
+    await run("value_novelty")
+    # value_novelty sees the wildcard but not the charset-scoped entry.
+    assert fake_svc.value_novelty_calls[0]["allowlist"] == {("artifact", "wild")}
+
+    _, charset_resolution = await run("charset")
+    charset_allowlist = fake_svc.charset_calls[0]["allowlist"]
+    assert charset_allowlist == {("artifact", "wild"), ("artifact", "cs_only")}
+    assert charset_resolution["allowlist_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_detector_run_replays_after_baseline_deleted(
+    timeline_setup, monkeypatch, stub_field_stats_cache
+):
+    """A persisted run stays self-describing after its baseline definition is
+    deleted — the window snapshot rides in the run params."""
+    bid = await _make_baseline(timeline_setup)
+    fake_svc = _FakeStatAnomalyServiceWithResult(_make_stat_result())
+    fake_svc.get_timeline_range = lambda c, s: (  # type: ignore[attr-defined]
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2024, 3, 1, tzinfo=UTC),
+    )
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    response = await events.list_anomalies(
+        "c1",
+        "t1",
+        detector="value_novelty",
+        fields="artifact",
+        series_field="artifact",
+        z_threshold=None,
+        min_skew_seconds=None,
+        baseline_end=None,
+        temporal=False,
+        baseline_id=bid,
+        limit=50,
+        persist=True,
+        case=Case(id="c1"),
+        user=_fake_user(),
+    )
+    run_id = response["run_id"]
+    assert await timeline_setup.delete_baseline_definition("c1", "t1", bid) is True
+
+    fetched = await events.get_detector_run("c1", run_id, case=Case(id="c1"))
+    assert fetched["params"]["baseline_id"] == bid
+    assert fetched["params"]["windows"]["suspect_windows"][0]["label"] == "exfil"
+
+
+def test_window_phrase_names_window():
+    """_window_phrase renders the finding's attributed suspect window."""
+    phrase = events._window_phrase(
+        {
+            "window_label": "exfil",
+            "window_start": "2024-02-01T00:00:00+00:00",
+            "window_end": "2024-02-05T00:00:00+00:00",
+        }
+    )
+    assert "exfil" in phrase
+    assert "2024-02-01" in phrase
+    # Frequency findings use the suspect_window_* keys.
+    assert "incident" in events._window_phrase({"suspect_window_label": "incident"})
+    assert events._window_phrase({}) == ""
 
 
 @pytest.mark.asyncio

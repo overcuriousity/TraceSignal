@@ -1,6 +1,113 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-07 (session 30 — W1 context query, W3 audit coverage, M3 polish).
+Last updated: 2026-07-08 (session 33 — UX polish sweep, issue #74).
+
+## Session 33 — 2026-07-08: UX polish sweep (issue #74 "fantastic UX")
+
+Screenshot review surfaced friction that made the app powerful-but-steep. Fixed four
+workstreams on `feat/baseline-windows`; no backend code changed (see B3 note).
+
+- **Readable timestamps.** Event-grid Timestamp column widened (170→195px, `minSize`
+  150) and the cell set `whitespace-nowrap tabular-nums` so the full
+  `YYYY-MM-DD HH:MM:SS` never ellipsizes (`components/explorer/EventGrid.tsx`).
+- **Custom UTC date picker.** New `ui/DateTimeField` (Popover + `date-fns`, month
+  calendar + HH:MM, typed `YYYY-MM-DD HH:MM` accepted, clear affordance) replaces every
+  native `datetime-local` — the raw German `tt.mm.jjjj` widget is gone. Used in the
+  Explorer time range (`FilterRail`) and baseline/suspect windows (`WindowsNormality`,
+  whose local `toInput/fromInput` were deleted for the shared `lib/time.ts` helpers;
+  added `fmtDatetimeInputUtc` / `parseDatetimeInputUtc`). UTC contract preserved (issue #9).
+- **Inline term help.** `lib/glossary.ts` (single source) + `ui/InfoHint` (Info icon +
+  existing `Tooltip`) on baseline / suspect-window / self-baseline / temporal / normal-values
+  / scan-all / compare-baseline (`FrameBar`, `WindowsNormality`, `detector-shared`,
+  `InvestigatePanel`). First-run explainer via the existing `ui/GuidancePanel` atop the
+  Anomalies tab (folds away permanently, localStorage-persisted).
+- **Visualize first paint.** Default chart type is now the field-free events-over-time
+  histogram (`chartConfig.ts`) — instant render on the already-optimized single-pass
+  histogram, never an empty canvas. The numeric-stats *probe* is skipped while the time
+  chart is shown (`VisualizePage.tsx`), avoiding the `field_numeric_stats` double-scan on
+  first load. Empty states (`ChartEmptyState`) now carry cause-aware copy + a hint,
+  including the sentinel-undated-events case for time-based charts.
+- **Calmer Anomalies panel.** The "New definition" builder collapses behind a
+  `+ New definition` button once saved definitions exist (`WindowsNormality`); definition
+  name input gets a guiding placeholder.
+- **B3 deferred (deliberate).** Did *not* rewrite `field_numeric_stats` to one scan — its
+  docstring documents the two-scan design as a forensic-reproducibility choice (fixed-width
+  bins). Deeper viz scan-avoidance moved to ROADMAP Milestone 2.
+- Verified: `tsc`, oxlint (no new errors), 179 frontend tests, prod build all green.
+
+## Session 32 — 2026-07-08: Investigate panel — unified analysis + baseline UX rework
+
+## Session 32 — 2026-07-08: Investigate panel — unified analysis + baseline UX rework
+
+The session-31 backend (explicit baseline definitions + value allowlist) was sound, but the
+UI exposed it as two sibling panels (Analysis + Baselines) coordinating invisibly through a
+store and the histogram, plus a per-detector self/temporal `ModeToggle` whose meaning shifted
+with the active baseline. Fresh users had no mental model. Reworked the frontend into one
+coherent surface with an aminer-shaped normality model (learned baseline window + manual
+value allowlist = `learn_mode` + `allowlist_event`).
+
+- **One `InvestigatePanel`** (`components/analysis/InvestigatePanel.tsx`) replaces
+  `AnalysisPanel` + `BaselineManager` (both deleted). Reads top-to-bottom: frame → detectors
+  → Windows & normality. Single `investigatePanelOpen` toolbar toggle (`stores/ui.ts`).
+- **Global frame** (`stores/baseline.ts` gains `frame: "self" | "baseline"`). `FrameBar`
+  sets the one scope every detector obeys; `useBaselineRequest()` reads it from the store,
+  and the per-view `ModeToggle` is gone from all five value detectors + frequency. Baseline
+  frame without a definition shows `NeedsBaselinePrompt` instead of silently running self.
+- **Window editor** (`WindowsNormality.tsx`): baseline + N suspect rows with typed UTC
+  datetime inputs *and* histogram-drag (arm a row → brush fills it via `pendingRange`).
+  Client-side validation mirrors the router's `_validate_windows`. Create/edit/delete.
+- **Allowlist made usable + clarified.** Value-based, aminer-aligned. Two entry points, one
+  `useMarkNormal` hook: field-value rows in `EventDetailPanel` write a detector-agnostic
+  `"*"` entry (all value detectors); analysis finding rows (`FindingRowActions`) write a
+  detector-scoped entry. Backend: `_run_stat_detector` now applies entries whose detector is
+  its own **or** `"*"` (`events.py`; no schema change — `"*"` is just a detector value).
+  "Normal values" list shows scope per entry.
+- Verified: `tsc`, oxlint, 179 frontend tests, 160 backend tests, prod build all green; two
+  new backend tests cover the `"*"` wildcard suppressing across detectors vs. scoped entries.
+  Live browser drive not run (dev stack not serving in this environment).
+
+## Session 31 — 2026-07-08: explicit baseline + suspect windows for temporal anomaly detection
+
+Replaced the single-`baseline_end` split point (which the UI never even exposed — it
+silently used the timeline midpoint) with explicit, persistent **baseline definitions**:
+a named baseline window plus 1..N labeled suspect windows per timeline. This is the USP
+detailed-investigation workflow — "mark what was normal, mark what's suspicious, tell me
+what diverges and why."
+
+- **Alembic adopted** (`src/tracesignal/db/migrations`). Schema was previously
+  `create_all` + hand-rolled inspector ALTERs; prod now has real data, so revision `0001`
+  snapshots the full existing schema and `init_schema` stamps-then-upgrades (pre-Alembic
+  databases get the legacy fixups one last time, then `stamp 0001`, then `upgrade head` —
+  zero manual deploy steps). Revision `0002` adds `baseline_definitions` +
+  `detector_allowlist`. Future schema changes are revisions, never inspector ALTERs.
+- **New entities** (`db/postgres.py`, router `api/routers/baselines.py`): `BaselineDefinition`
+  (baseline range + suspect windows JSON, derived `config_hash`, freely editable) and
+  `DetectorAllowlistEntry` (`(detector, field, value)` never-anomalous). RBAC + audit;
+  window-geometry validation (baseline/suspect overlap = 422, suspect/suspect = warning,
+  ≤10 windows). Timeline/case deletes cascade both (and `SavedChart`, previously orphaned).
+- **All six temporal detectors reworked** (`db/anomaly_stats.py`) onto a frozen
+  `AnalysisWindows` contract; `windows_from_split` preserves the legacy split at the API
+  edge so old runs/clients keep working. Statistics fixed: surprise denominators are the
+  suspect window's own event count (per window); frequency derives its interval from the
+  baseline window, zero-fills baseline buckets, scores only full suspect buckets, and warns
+  on windows too short. Findings carry `window_label`. Verified end-to-end against the dev
+  ClickHouse (caught two real SQL bugs the fakes couldn't: a `GROUP BY`/`any()` collision
+  and a `-0.0` surprise).
+- **D11 merged in** (roadmap item removed): "mark normal" on a finding now writes a
+  value-level allowlist entry consumed as post-detection suppression, unifying with the
+  time-based baseline model. The standalone per-event Normal toggle is gone from the grid
+  and detail panel (legacy `normal` annotations still honored, read-only); timestamp-order
+  findings keep the per-event path.
+- **Forensic reproducibility**: `DetectorRun.params` snapshots `baseline_id`, the full
+  window payload + `windows_hash`, and `allowlist_hash` + count — a run stays
+  self-describing after the definition/allowlist is edited or deleted.
+- **Frontend**: histogram baseline (blue) + suspect (amber) bands + a zoom/mark cursor
+  toggle; `BaselineManager` (mark ranges → set baseline / add suspect, select/delete,
+  allowlist list); `baseline_id` threaded through every detector view via a small store;
+  run warnings surfaced; a "run all detectors" summary strip. `docs/ANOMALY_DETECTION.md`
+  rewritten for the new model.
+
+## Session 30 — 2026-07-07: context query, analyst-action audit, M3 polish batch
 
 ## Session 30 — 2026-07-07: context query, analyst-action audit, M3 polish batch
 

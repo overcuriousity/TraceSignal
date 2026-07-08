@@ -94,7 +94,11 @@ export function BarChart({
   }
 
   if (rows.length === 0) {
-    return <ChartEmptyState size="sm">No values in the current filter range.</ChartEmptyState>;
+    return (
+      <ChartEmptyState size="sm" hint="Pick a different field, or clear the active filters.">
+        No values for this field in range.
+      </ChartEmptyState>
+    );
   }
 
   const grouped = compare != null;

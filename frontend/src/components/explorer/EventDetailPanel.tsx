@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { X, Copy, Search, Filter, FilterX, Tag, MessageSquare, Trash2, Plus, Clock, History, ShieldCheck, AlertTriangle, Save, BarChart2, ChevronDown, ChevronRight } from "lucide-react";
+import { X, Copy, Search, Filter, FilterX, Tag, MessageSquare, Trash2, Plus, Clock, History, AlertTriangle, Save, CircleCheck, BarChart2, ChevronDown, ChevronRight } from "lucide-react";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -17,6 +17,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/DropdownMenu";
 import { useAnnotationMutations } from "@/hooks/useAnnotationMutations";
+import { useMarkNormal } from "@/hooks/useMarkNormal";
 import { useUiStore } from "@/stores/ui";
 import { TagInput } from "@/components/explorer/TagInput";
 import { anomaliesApi } from "@/api/anomalies";
@@ -26,6 +27,7 @@ interface Props {
   event: Event;
   annotations: Annotation[];
   caseId: string;
+  timelineId: string;
   sourceId: string;
   onClose: () => void;
   onFindSimilar: (event: Event) => void;
@@ -77,6 +79,7 @@ function FieldRow({
   filterKey,
   onAddFilter,
   onShowHistogram,
+  onMarkNormal,
   flag,
   dataTour,
 }: {
@@ -88,6 +91,13 @@ function FieldRow({
   filterKey?: string | null;
   onAddFilter?: (fieldKey: string, value: string, include: boolean) => void;
   onShowHistogram?: (fieldKey: string, value: string) => void;
+  /**
+   * Marks this field:value normal for every value detector (detector "*").
+   * Receives only the value — the caller closes over the correct allowlist
+   * field token (e.g. `attr:<name>` for dynamic attributes), which need not
+   * equal `filterKey`.
+   */
+  onMarkNormal?: (value: string) => void;
   flag?: { flag: string; label: string } | null;
   /** Onboarding-tour anchor on the action-buttons cluster. */
   dataTour?: string;
@@ -162,6 +172,19 @@ function FieldRow({
                 </button>
               </Tooltip>
             )}
+            {onMarkNormal && (
+              <Tooltip content={`Mark normal: treat ${label} = ${value} as normal — no detector flags it again`} side="top">
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onMarkNormal(value);
+                  }}
+                  className="rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-success)] transition-base"
+                >
+                  <CircleCheck size={11} />
+                </button>
+              </Tooltip>
+            )}
           </>
         )}
         <CopyButton value={value} />
@@ -170,51 +193,6 @@ function FieldRow({
   );
 }
 
-/** Button to toggle "normal operation" annotation on an event. */
-function NormalToggleButton({
-  event,
-  annotations,
-  add,
-  remove,
-}: {
-  event: Event;
-  annotations: Annotation[];
-  add: ReturnType<typeof useAnnotationMutations>["add"];
-  remove: ReturnType<typeof useAnnotationMutations>["remove"];
-}) {
-  const normalAnn = annotations.find(
-    (a) => a.annotation_type === "normal" && a.origin === "user",
-  );
-  const isNormal = !!normalAnn;
-
-  const handleClick = () => {
-    if (isNormal && normalAnn) {
-      remove.mutate({ eventId: event.event_id, annotationId: normalAnn.id });
-    } else {
-      add.mutate({ eventId: event.event_id, type: "normal", content: "normal operation" });
-    }
-  };
-
-  return (
-    <Tooltip
-      content={
-        isNormal
-          ? "Unmark — event will re-appear in anomaly results"
-          : "Excludes this event from anomaly detection results"
-      }
-    >
-      <Button
-        variant={isNormal ? "accent" : "outline"}
-        size="sm"
-        onClick={handleClick}
-        disabled={add.isPending || remove.isPending}
-      >
-        <ShieldCheck size={11} />
-        {isNormal ? "Normal ✓" : "Mark Normal"}
-      </Button>
-    </Tooltip>
-  );
-}
 
 /** Inline add-annotation form (tag or comment). */
 function AddAnnotationForm({
@@ -315,6 +293,7 @@ export function EventDetailPanel({
   event,
   annotations,
   caseId,
+  timelineId,
   sourceId,
   onClose,
   onFindSimilar,
@@ -348,6 +327,25 @@ export function EventDetailPanel({
       qc.invalidateQueries({ queryKey: ["annotations"] });
     },
   });
+
+  // "Mark normal" = value-level normality: the detector never flags this value
+  // again (see docs/ANOMALY_DETECTION.md). Shared with the analysis finding
+  // rows via useMarkNormal. From a *finding* it is detector-scoped; from a
+  // *field:value* row (below) it is detector-agnostic ("*"). timestamp_order
+  // findings are positional, so they fall back to a per-event annotation.
+  const markNormal = useMarkNormal(caseId, timelineId);
+  const markFindingNormal = (finding: AnomalyMarker) => {
+    const d = (finding.rawDetails ?? {}) as Record<string, unknown>;
+    markNormal.mutate({
+      detector: finding.detector,
+      field: d.allowlist_field as string | undefined,
+      value: d.allowlist_value as string | undefined,
+      sourceId: finding.sourceId ?? sourceId,
+      eventId: finding.eventId ?? event.event_id,
+    });
+  };
+  const markFieldNormal = (fieldKey: string, value: string) =>
+    markNormal.mutate({ detector: "*", field: fieldKey, value });
 
   // ── Resize drag ────────────────────────────────────────────────────────
   const { detailPanelWidth, setDetailPanelWidth } = useUiStore();
@@ -563,6 +561,7 @@ export function EventDetailPanel({
             filterKey="artifact"
             onAddFilter={onAddFilter}
             onShowHistogram={onShowFieldHistogram}
+            onMarkNormal={(v) => markFieldNormal("artifact", v)}
           />
           <FieldRow
             label="artifact_long"
@@ -571,6 +570,7 @@ export function EventDetailPanel({
             filterKey="artifact_long"
             onAddFilter={onAddFilter}
             onShowHistogram={onShowFieldHistogram}
+            onMarkNormal={(v) => markFieldNormal("artifact_long", v)}
           />
           <FieldRow
             label="display_name"
@@ -578,6 +578,7 @@ export function EventDetailPanel({
             filterKey="display_name"
             onAddFilter={onAddFilter}
             onShowHistogram={onShowFieldHistogram}
+            onMarkNormal={(v) => markFieldNormal("display_name", v)}
           />
         </Section>
 
@@ -625,6 +626,7 @@ export function EventDetailPanel({
                 filterKey={k}
                 onAddFilter={onAddFilter}
                 onShowHistogram={onShowFieldHistogram}
+                onMarkNormal={(val) => markFieldNormal(`attr:${k}`, val)}
                 flag={getAttributeDecoration(event.attributes ?? {}, k)}
               />
             ))}
@@ -701,16 +703,35 @@ export function EventDetailPanel({
                 {finding.detail}
                 <span className="ml-1 text-xs text-[var(--color-fg-muted)]">(not yet tagged)</span>
               </span>
-              <Tooltip content="Persist this finding as a system annotation" side="top">
-                <button
-                  onClick={() => persistMutation.mutate(finding)}
-                  disabled={persistMutation.isPending}
-                  className="shrink-0 flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium text-[var(--color-anomaly)] hover:bg-[var(--color-anomaly-dim)] transition-base"
+              <div className="shrink-0 flex items-center gap-1">
+                <Tooltip content="Persist this finding as a system annotation" side="top">
+                  <button
+                    onClick={() => persistMutation.mutate(finding)}
+                    disabled={persistMutation.isPending}
+                    className="flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium text-[var(--color-anomaly)] hover:bg-[var(--color-anomaly-dim)] transition-base"
+                  >
+                    {persistMutation.isPending ? <Spinner size={10} /> : <Save size={10} />}
+                    Persist
+                  </button>
+                </Tooltip>
+                <Tooltip
+                  content={
+                    finding.detector === "timestamp_order"
+                      ? "Mark this event as normal"
+                      : "Never flag this value again for this detector"
+                  }
+                  side="top"
                 >
-                  {persistMutation.isPending ? <Spinner size={10} /> : <Save size={10} />}
-                  Persist
-                </button>
-              </Tooltip>
+                  <button
+                    onClick={() => markFindingNormal(finding)}
+                    disabled={markNormal.isPending}
+                    className="flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-success)] transition-base"
+                  >
+                    {markNormal.isPending ? <Spinner size={10} /> : <CircleCheck size={10} />}
+                    Normal
+                  </button>
+                </Tooltip>
+              </div>
             </div>
           ))}
 
@@ -743,12 +764,6 @@ export function EventDetailPanel({
                 <MessageSquare size={11} />
                 Comment
               </Button>
-              <NormalToggleButton
-                event={event}
-                annotations={annotations}
-                add={add}
-                remove={remove}
-              />
             </div>
           )}
         </Section>

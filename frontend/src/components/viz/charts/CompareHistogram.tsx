@@ -48,7 +48,13 @@ export function CompareHistogram({
 
   const buckets = data.buckets;
   if (buckets.length === 0) {
-    return <ChartEmptyState>No data in the current filter range.</ChartEmptyState>;
+    return (
+      <ChartEmptyState
+        hint="Events without a usable timestamp are excluded from time-based charts. Try widening the time range, or turn off compare."
+      >
+        No events over time here.
+      </ChartEmptyState>
+    );
   }
 
   const primaryCounts = buckets.map((b) => b.primary);

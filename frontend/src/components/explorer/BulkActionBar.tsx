@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Tag, MessageSquare, ShieldCheck, X, AlertCircle } from "lucide-react";
+import { Tag, MessageSquare, X, AlertCircle } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Spinner } from "@/components/ui/Spinner";
@@ -42,7 +42,7 @@ export function BulkActionBar({
   // Confirm-dialog state for "all" mode writes
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [pendingAction, setPendingAction] = useState<{
-    annotation_type: "tag" | "comment" | "normal";
+    annotation_type: "tag" | "comment";
     content: string;
   } | null>(null);
 
@@ -51,7 +51,7 @@ export function BulkActionBar({
   };
 
   /** Execute the actual write — called either directly (ids mode) or after confirm (all mode). */
-  async function execute(annotation_type: "tag" | "comment" | "normal", content: string) {
+  async function execute(annotation_type: "tag" | "comment", content: string) {
     setError(null);
     setIsPending(true);
     try {
@@ -86,7 +86,7 @@ export function BulkActionBar({
   }
 
   /** Guard: for "all" mode show confirm dialog; for "ids" execute immediately. */
-  function requestAction(annotation_type: "tag" | "comment" | "normal", content: string) {
+  function requestAction(annotation_type: "tag" | "comment", content: string) {
     if (selectionMode === "all") {
       setPendingAction({ annotation_type, content });
       setConfirmOpen(true);
@@ -101,10 +101,6 @@ export function BulkActionBar({
     requestAction(annotation_type, value.trim());
   }
 
-  function markAllNormal() {
-    requestAction("normal", "normal operation");
-  }
-
   if (selectionCount === 0) return null;
 
   return (
@@ -115,7 +111,7 @@ export function BulkActionBar({
           title="Apply to all matching events?"
           description={
             pendingAction
-              ? `${pendingAction.annotation_type === "normal" ? "Mark" : `Apply ${pendingAction.annotation_type}`} "${pendingAction.content}" on all ${selectionCount.toLocaleString()} events matching the current filter. This cannot be undone easily.`
+              ? `Apply ${pendingAction.annotation_type} "${pendingAction.content}" on all ${selectionCount.toLocaleString()} events matching the current filter. This cannot be undone easily.`
               : undefined
           }
         >
@@ -162,15 +158,6 @@ export function BulkActionBar({
               </Button>
               <Button variant="outline" size="sm" onClick={() => setMode("comment")}>
                 <MessageSquare size={13} /> Comment
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={isPending}
-                onClick={markAllNormal}
-              >
-                {isPending ? <Spinner size={13} /> : <ShieldCheck size={13} />}
-                Mark Normal
               </Button>
               <Button
                 variant="ghost"

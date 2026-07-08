@@ -17,14 +17,16 @@ import {
   DetectorStatusLine,
   FindingRowActions,
   FindingShell,
-  ModeToggle,
+  NeedsBaselinePrompt,
+  ResultsBar,
+  useCappedFindings,
+  useBaselineRequest,
   RefreshButton,
   TagFindingsBar,
   fieldsParamOf,
   useAnomalyMarkers,
   useDetectorRunId,
   useOpenEvent,
-  type DetectorMode,
 } from "./detector-shared";
 import { Spinner } from "@/components/ui/Spinner";
 import type { AnomalyMarker, CharsetFinding, Event } from "@/api/types";
@@ -88,6 +90,13 @@ function CharsetRow({
           eventId={finding.event_id}
           onDrillField={onDrillField}
           onJumpToTime={onJumpToTime}
+          markNormal={{
+            caseId,
+            timelineId,
+            detector: "charset",
+            details: finding.details,
+            sourceId: finding.event?.source_id,
+          }}
         />
       }
     >
@@ -139,22 +148,23 @@ export function CharsetNoveltyView({
   onRunIdChange,
   onJumpToTime,
 }: Props) {
-  const [mode, setMode] = useState<DetectorMode>("self");
+  const { params: blParams, key: blKey, needsBaseline } = useBaselineRequest();
   const [selectedFields, setSelectedFields] = useState<string[] | null>(null);
   const qc = useQueryClient();
 
   const fieldsParam = fieldsParamOf(selectedFields);
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "charset", mode, fieldsParam ?? "__auto__"],
+    queryKey: ["anomalies", caseId, timelineId, "charset", blKey, fieldsParam ?? "__auto__"],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "charset",
         limit: 50,
-        temporal: mode === "temporal",
+        ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     staleTime: 60_000,
+    enabled: !needsBaseline,
   });
 
   const tagMutation = useMutation({
@@ -162,7 +172,7 @@ export function CharsetNoveltyView({
       anomaliesApi.tag(caseId, timelineId, {
         detector: "charset",
         limit: 50,
-        temporal: mode === "temporal",
+        ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     onSuccess: () => {
@@ -205,11 +215,16 @@ export function CharsetNoveltyView({
 
   useDetectorRunId(data?.run_id, onRunIdChange);
 
+  const cap = useCappedFindings(findings);
+
+  if (needsBaseline) return <NeedsBaselinePrompt />;
+
+  const isTemporal = data?.method === "temporal-charset";
+
   return (
     <div className="space-y-3">
       {/* Toolbar */}
       <div className="flex items-center gap-2 flex-wrap">
-        <ModeToggle mode={mode} onChange={setMode} />
         <span className="flex-1" />
         <AnomalyFieldPicker
           caseId={caseId}
@@ -237,7 +252,7 @@ export function CharsetNoveltyView({
               ? "No charset novelties. No events ingested yet."
               : data?.status === "insufficient_data"
                 ? "No fields with enough distinct baseline values (or the alphabet is too large). Pick fields explicitly above."
-                : mode === "temporal"
+                : isTemporal
                   ? "No values with characters absent from the baseline window."
                   : "No values with rare characters."}
           </span>
@@ -247,7 +262,8 @@ export function CharsetNoveltyView({
       {/* Findings list */}
       {findings.length > 0 && (
         <div className="space-y-1.5">
-          {findings.map((f, i) => (
+          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} />
+          {cap.shown.map((f, i) => (
             <CharsetRow
               key={`${f.field}:${f.value}:${i}`}
               caseId={caseId}
@@ -270,9 +286,9 @@ export function CharsetNoveltyView({
       <div className="flex items-start gap-1.5 text-xs text-[var(--color-fg-muted)] pt-1">
         <AlertTriangle size={10} className="mt-0.5 shrink-0" />
         <span>
-          {mode === "temporal"
-            ? "Temporal mode learns every character seen in the baseline window's values and flags detect-window values containing never-seen characters."
-            : "Self-baseline mode flags values containing characters that appear in almost no other distinct value of the field (rare-character set)."}{" "}
+          {isTemporal
+            ? "Comparing windows: learns every character seen in the baseline window's values and flags suspect-window values containing never-seen characters."
+            : "Scanning all events: flags values containing characters that appear in almost no other distinct value of the field (rare-character set)."}{" "}
           Purely syntactic — null bytes, homoglyphs, and injection metacharacters are detected by character identity, never by meaning.
         </span>
       </div>

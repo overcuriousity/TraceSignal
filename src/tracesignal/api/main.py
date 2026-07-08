@@ -18,6 +18,7 @@ from tracesignal.api.deps import get_store, resolve_user_optional
 from tracesignal.api.routers import (
     admin,
     auth,
+    baselines,
     cases,
     converters,
     enrichers,
@@ -419,6 +420,7 @@ def create_app() -> FastAPI:
     app.include_router(admin.router)
     app.include_router(enrichers.router)
     app.include_router(cases.router)
+    app.include_router(baselines.router)
     app.include_router(events.router)
     app.include_router(viz.router)
     app.include_router(jobs.router)

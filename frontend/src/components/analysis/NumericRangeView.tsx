@@ -15,14 +15,16 @@ import {
   DetectorStatusLine,
   FindingRowActions,
   FindingShell,
-  ModeToggle,
+  NeedsBaselinePrompt,
+  ResultsBar,
+  useCappedFindings,
+  useBaselineRequest,
   RefreshButton,
   TagFindingsBar,
   fieldsParamOf,
   useAnomalyMarkers,
   useDetectorRunId,
   useOpenEvent,
-  type DetectorMode,
 } from "./detector-shared";
 import { Spinner } from "@/components/ui/Spinner";
 import type { AnomalyMarker, Event, NumericRangeFinding } from "@/api/types";
@@ -78,6 +80,13 @@ function RangeRow({
           eventId={finding.event_id}
           onDrillField={onDrillField}
           onJumpToTime={onJumpToTime}
+          markNormal={{
+            caseId,
+            timelineId,
+            detector: "numeric_range",
+            details: finding.details,
+            sourceId: finding.event?.source_id,
+          }}
         />
       }
     >
@@ -128,22 +137,23 @@ export function NumericRangeView({
   onRunIdChange,
   onJumpToTime,
 }: Props) {
-  const [mode, setMode] = useState<DetectorMode>("self");
+  const { params: blParams, key: blKey, needsBaseline } = useBaselineRequest();
   const [selectedFields, setSelectedFields] = useState<string[] | null>(null);
   const qc = useQueryClient();
 
   const fieldsParam = fieldsParamOf(selectedFields);
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "range", mode, fieldsParam ?? "__auto__"],
+    queryKey: ["anomalies", caseId, timelineId, "range", blKey, fieldsParam ?? "__auto__"],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "numeric_range",
         limit: 50,
-        temporal: mode === "temporal",
+        ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     staleTime: 60_000,
+    enabled: !needsBaseline,
   });
 
   const tagMutation = useMutation({
@@ -151,7 +161,7 @@ export function NumericRangeView({
       anomaliesApi.tag(caseId, timelineId, {
         detector: "numeric_range",
         limit: 50,
-        temporal: mode === "temporal",
+        ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     onSuccess: () => {
@@ -192,11 +202,16 @@ export function NumericRangeView({
 
   useDetectorRunId(data?.run_id, onRunIdChange);
 
+  const cap = useCappedFindings(findings);
+
+  if (needsBaseline) return <NeedsBaselinePrompt />;
+
+  const isTemporal = data?.method === "temporal-range";
+
   return (
     <div className="space-y-3">
       {/* Toolbar */}
       <div className="flex items-center gap-2 flex-wrap">
-        <ModeToggle mode={mode} onChange={setMode} />
         <span className="flex-1" />
         <AnomalyFieldPicker
           caseId={caseId}
@@ -225,7 +240,7 @@ export function NumericRangeView({
               ? "No numeric out-of-range values. No events ingested yet."
               : data?.status === "insufficient_data"
                 ? "No numeric fields with enough baseline samples. Pick fields explicitly above."
-                : mode === "temporal"
+                : isTemporal
                   ? "No values outside the baseline window's min/max range."
                   : "No numeric outliers outside the IQR fence."}
           </span>
@@ -235,7 +250,8 @@ export function NumericRangeView({
       {/* Findings list */}
       {findings.length > 0 && (
         <div className="space-y-1.5">
-          {findings.map((f, i) => (
+          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} />
+          {cap.shown.map((f, i) => (
             <RangeRow
               key={`${f.field}:${f.value}:${i}`}
               caseId={caseId}
@@ -258,10 +274,10 @@ export function NumericRangeView({
       <div className="flex items-start gap-1.5 text-xs text-[var(--color-fg-muted)] pt-1">
         <AlertTriangle size={10} className="mt-0.5 shrink-0" />
         <span>
-          {mode === "temporal"
-            ? "Temporal mode learns the exact min/max of the baseline window and flags detect-window values outside it."
-            : "Self-baseline mode flags values outside the Tukey fence [q1−1.5·IQR, q3+1.5·IQR] over the whole corpus."}{" "}
-          Numeric-looking ids (status codes, ports) qualify syntactically — prefer temporal mode for those.
+          {isTemporal
+            ? "Comparing windows: learns the exact min/max of the baseline window and flags suspect-window values outside it."
+            : "Scanning all events: flags values outside the Tukey fence [q1−1.5·IQR, q3+1.5·IQR] over the whole corpus."}{" "}
+          Numeric-looking ids (status codes, ports) qualify syntactically — prefer comparing against a baseline for those.
         </span>
       </div>
     </div>

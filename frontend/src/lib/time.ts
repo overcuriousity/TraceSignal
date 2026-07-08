@@ -86,6 +86,28 @@ export function isoToDatetimeLocalUtc(value: string | null | undefined): string 
   return d.toISOString().slice(0, 16);
 }
 
+/** Render a UTC ISO string as a compact `"YYYY-MM-DD HH:MM"` for the
+ * `DateTimeField` trigger/text input (UTC, space separator). "" for empty. */
+export function fmtDatetimeInputUtc(value: string | null | undefined): string {
+  if (!value) return "";
+  const d = parseISO(value);
+  if (!isValid(d)) return "";
+  return d.toISOString().slice(0, 16).replace("T", " ");
+}
+
+/** Parse a typed `"YYYY-MM-DD HH:MM"` (or with `T`, and optional seconds),
+ * interpreted as UTC (the app-wide standard), into a UTC ISO string. Returns
+ * `undefined` for blank or unparseable input so callers can clear the value. */
+export function parseDatetimeInputUtc(text: string): string | undefined {
+  const t = text.trim();
+  if (!t) return undefined;
+  const m = t.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (!m) return undefined;
+  const [, y, mo, day, h, mi, s] = m;
+  const d = new Date(`${y}-${mo}-${day}T${h}:${mi}:${s ?? "00"}.000Z`);
+  return isValid(d) ? d.toISOString() : undefined;
+}
+
 /** Compute the `[start, end]` ISO bounds of a ±`minutes` window around `ts`,
  * for the Explorer's "context query" pivot. Returns `null` for an
  * unparseable `ts` so callers can no-op instead of filtering to "Invalid

@@ -15,14 +15,16 @@ import {
   DetectorStatusLine,
   FindingRowActions,
   FindingShell,
-  ModeToggle,
+  NeedsBaselinePrompt,
+  ResultsBar,
+  useBaselineRequest,
+  useCappedFindings,
   RefreshButton,
   TagFindingsBar,
   fieldsParamOf,
   useAnomalyMarkers,
   useDetectorRunId,
   useOpenEvent,
-  type DetectorMode,
 } from "./detector-shared";
 import { Spinner } from "@/components/ui/Spinner";
 import type { Event, ValueNoveltyFinding } from "@/api/types";
@@ -85,6 +87,13 @@ function FindingRow({
           eventId={finding.event_id}
           onDrillField={onDrillField}
           onJumpToTime={onJumpToTime}
+          markNormal={{
+            caseId,
+            timelineId,
+            detector: "value_novelty",
+            details: finding.details,
+            sourceId: finding.event?.source_id,
+          }}
         />
       }
     >
@@ -133,7 +142,7 @@ export function ValueNoveltyView({
   onRunIdChange,
   onJumpToTime,
 }: Props) {
-  const [mode, setMode] = useState<DetectorMode>("self");
+  const { params: blParams, key: blKey, needsBaseline } = useBaselineRequest();
   // null = use backend smart default; string[] = explicit analyst selection.
   const [selectedFields, setSelectedFields] = useState<string[] | null>(null);
   const qc = useQueryClient();
@@ -145,15 +154,16 @@ export function ValueNoveltyView({
   const fieldsParam = fieldsParamOf(selectedFields);
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "novelty", mode, fieldsParam ?? "__auto__"],
+    queryKey: ["anomalies", caseId, timelineId, "novelty", blKey, fieldsParam ?? "__auto__"],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "value_novelty",
         limit: 50,
-        temporal: mode === "temporal",
+        ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     staleTime: 60_000,
+    enabled: !needsBaseline,
   });
 
   const tagMutation = useMutation({
@@ -161,7 +171,7 @@ export function ValueNoveltyView({
       anomaliesApi.tag(caseId, timelineId, {
         detector: "value_novelty",
         limit: 50,
-        temporal: mode === "temporal",
+        ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     onSuccess: () => {
@@ -213,11 +223,16 @@ export function ValueNoveltyView({
 
   useDetectorRunId(data?.run_id, onRunIdChange);
 
+  const cap = useCappedFindings(findings);
+
+  if (needsBaseline) return <NeedsBaselinePrompt />;
+
+  const isTemporal = data?.method === "temporal";
+
   return (
     <div className="space-y-3">
       {/* Toolbar */}
       <div className="flex items-center gap-2 flex-wrap">
-        <ModeToggle mode={mode} onChange={setMode} />
         <span className="flex-1" />
         <AnomalyFieldPicker
           caseId={caseId}
@@ -253,7 +268,8 @@ export function ValueNoveltyView({
       {/* Findings list */}
       {findings.length > 0 && (
         <div className="space-y-1.5">
-          {findings.map((f, i) => (
+          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} />
+          {cap.shown.map((f, i) => (
             <FindingRow
               key={`${f.field}:${f.value}:${i}`}
               caseId={caseId}
@@ -278,10 +294,9 @@ export function ValueNoveltyView({
         <AlertTriangle size={10} className="mt-0.5 shrink-0" />
         <span>
           Rare ≠ malicious.{" "}
-          {mode === "temporal"
-            ? "Temporal mode ignores the rarity floor — it flags any value absent from the baseline window but present in the detect window."
-            : "Self-baseline mode flags values that appear ≤ rarity floor times in the whole corpus."}{" "}
-          Score = −log(count/total); higher is rarer.
+          {isTemporal
+            ? "Comparing windows: flags any value absent from the baseline window but present in a suspect window. Score = −log(count / suspect-window events)."
+            : "Scanning all events: flags values that appear ≤ rarity floor times in the whole corpus. Score = −log(count/total); higher is rarer."}
         </span>
       </div>
     </div>

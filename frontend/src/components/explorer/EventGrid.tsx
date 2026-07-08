@@ -267,42 +267,27 @@ function CommentPopover({
   );
 }
 
-/** Mark-normal toggle button: adds/removes a "normal" user annotation. */
-function NormalToggle({ eventId, anns, caseId, sourceId }: AnnotationCellProps) {
-  const { add, remove } = useAnnotationMutations(caseId, sourceId);
-  const normalAnn = anns.find((a) => a.annotation_type === "normal" && a.origin === "user");
-  const isNormal = !!normalAnn;
-
-  const handleClick = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (isNormal && normalAnn) {
-      remove.mutate({ eventId, annotationId: normalAnn.id });
-    } else {
-      add.mutate({ eventId, type: "normal", content: "normal operation" });
-    }
-  };
-
+/** Read-only "normal" indicator for a legacy per-event normal annotation.
+ *
+ * Normality is now declared value-level (from a finding's "Mark normal" →
+ * detector allowlist) or time-based (baseline windows), not by an ad-hoc
+ * per-event toggle here — see docs/ANOMALY_DETECTION.md. Existing/legacy
+ * `normal` annotations are still shown and honored, just no longer created or
+ * cleared from the grid.
+ */
+function NormalIndicator({ anns }: AnnotationCellProps) {
+  const isNormal = anns.some((a) => a.annotation_type === "normal" && a.origin === "user");
+  if (!isNormal) return null;
   return (
-    <Tooltip
-      content={isNormal ? "Marked Normal — click to unmark" : "Mark as Normal operation"}
-      side="top"
-    >
-      <button
-        onClick={handleClick}
-        className={cn(
-          "rounded p-1 transition-base",
-          isNormal
-            ? "text-[var(--color-success)]"
-            : "text-[var(--color-fg-muted)] opacity-0 group-hover:opacity-100 hover:text-[var(--color-success)]",
-        )}
-      >
+    <Tooltip content="Marked normal (legacy per-event annotation)" side="top">
+      <span className="p-1 text-[var(--color-success)]">
         <ShieldCheck size={13} />
-      </button>
+      </span>
     </Tooltip>
   );
 }
 
-/** Combined annotation column: anomaly indicator + normal toggle + tag popover + comment popover. */
+/** Combined annotation column: anomaly indicator + normal indicator + tag popover + comment popover. */
 function AnnotationCell(props: AnnotationCellProps) {
   const persistedAnomalies = props.anns.filter((a) => a.annotation_type === "anomaly");
   // Once tagged, the persisted annotation is the durable record — suppress
@@ -328,7 +313,7 @@ function AnnotationCell(props: AnnotationCellProps) {
       ) : (
         <span className="p-1 w-[13px]" /> /* placeholder matching the icon's own box, to keep layout stable */
       )}
-      <NormalToggle {...props} />
+      <NormalIndicator {...props} />
       <TagPopover {...props} />
       <CommentPopover {...props} />
     </div>
@@ -426,11 +411,13 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
             {sortDir === "desc" ? <ArrowDown size={10} /> : <ArrowUp size={10} />}
           </button>
         ),
-        size: 170,
-        minSize: 60,
+        size: 195,
+        // Full "YYYY-MM-DD HH:MM:SS" must always be readable — never let a resize
+        // clip the one value analysts scan by; min keeps the whole string visible.
+        minSize: 150,
         maxSize: 600,
         cell: ({ row }) => (
-          <span className="font-mono text-sm leading-snug text-[var(--color-fg-secondary)]">
+          <span className="font-mono text-sm leading-snug whitespace-nowrap tabular-nums text-[var(--color-fg-secondary)]">
             {fmtTimestamp(row.original.timestamp)}
           </span>
         ),
@@ -649,6 +636,18 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
   const virtualItems = rowVirtualizer.getVirtualItems();
   const totalHeight = rowVirtualizer.getTotalSize();
 
+  // Force one remeasure whenever the grid holds rows but nothing is virtualized
+  // yet. This covers the remount race (e.g. returning from the Visualize route):
+  // if the scroll element's height settled before react-virtual's ResizeObserver
+  // observed it, the first paint yields zero virtual items and would otherwise
+  // stay empty until the user scrolls/resizes. measure() is cheap here (fixed
+  // row height) and the guard prevents any loop.
+  useEffect(() => {
+    if (rows.length > 0 && virtualItems.length === 0) {
+      rowVirtualizer.measure();
+    }
+  }, [rows.length, virtualItems.length, rowVirtualizer]);
+
   // Report the timestamp of the topmost visible row so the histogram can show
   // a "current position" indicator. Guarded against redundant calls.
   const lastReportedTsRef = useRef<string | null>(null);
@@ -766,13 +765,30 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
           hg.headers.map((h) => (
             <div
               key={h.id}
-              className="relative px-[var(--grid-cell-x)] py-2 text-xs font-semibold uppercase tracking-wider text-[var(--color-fg-secondary)] select-none"
+              className="relative min-w-0 overflow-hidden px-[var(--grid-cell-x)] py-2 text-xs font-semibold uppercase tracking-wider text-[var(--color-fg-secondary)] select-none"
               style={{
                 width: h.column.id === "message" ? undefined : h.getSize(),
                 flex: h.column.id === "message" ? "1 1 0" : `0 0 ${h.getSize()}px`,
               }}
             >
-              {flexRender(h.column.columnDef.header, h.getContext())}
+              {/* Clip a too-narrow header at its START (rtl) so the meaningful
+                * tail stays visible, and surface the full label on hover. The
+                * inner ltr wrapper keeps the text itself readable. */}
+              {(() => {
+                const raw = h.column.columnDef.header;
+                const label = typeof raw === "string" ? raw : undefined;
+                return (
+                  <span
+                    className="block truncate"
+                    style={{ direction: "rtl" }}
+                    title={label}
+                  >
+                    <span className="inline-block align-bottom" style={{ direction: "ltr" }}>
+                      {flexRender(raw, h.getContext())}
+                    </span>
+                  </span>
+                );
+              })()}
               {h.column.getCanResize() && (
                 <div
                   onMouseDown={(e) => { e.stopPropagation(); h.getResizeHandler()(e); }}

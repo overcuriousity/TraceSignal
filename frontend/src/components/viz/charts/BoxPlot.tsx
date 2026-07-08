@@ -20,7 +20,11 @@ interface BoxPlotProps {
 export function BoxPlot({ stats, svgRef, height = 260, color = "var(--color-accent)" }: BoxPlotProps) {
   const box = boxPlotStats(stats);
   if (!box) {
-    return <ChartEmptyState>No numeric values in the current filter range.</ChartEmptyState>;
+    return (
+      <ChartEmptyState hint="This field may not be numeric — try a Top-values (bar) chart instead.">
+        No numeric values for this field in range.
+      </ChartEmptyState>
+    );
   }
 
   return (

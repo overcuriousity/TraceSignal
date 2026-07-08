@@ -17,14 +17,16 @@ import {
   DetectorStatusLine,
   FindingRowActions,
   FindingShell,
-  ModeToggle,
+  NeedsBaselinePrompt,
+  ResultsBar,
+  useCappedFindings,
+  useBaselineRequest,
   RefreshButton,
   TagFindingsBar,
   fieldsParamOf,
   useAnomalyMarkers,
   useDetectorRunId,
   useOpenEvent,
-  type DetectorMode,
 } from "./detector-shared";
 import { Spinner } from "@/components/ui/Spinner";
 import type { AnomalyMarker, EntropyFinding, Event } from "@/api/types";
@@ -74,6 +76,13 @@ function EntropyRow({
           eventId={finding.event_id}
           onDrillField={onDrillField}
           onJumpToTime={onJumpToTime}
+          markNormal={{
+            caseId,
+            timelineId,
+            detector: "entropy",
+            details: finding.details,
+            sourceId: finding.event?.source_id,
+          }}
         />
       }
     >
@@ -125,22 +134,23 @@ export function EntropyView({
   onRunIdChange,
   onJumpToTime,
 }: Props) {
-  const [mode, setMode] = useState<DetectorMode>("self");
+  const { params: blParams, key: blKey, needsBaseline } = useBaselineRequest();
   const [selectedFields, setSelectedFields] = useState<string[] | null>(null);
   const qc = useQueryClient();
 
   const fieldsParam = fieldsParamOf(selectedFields);
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "entropy", mode, fieldsParam ?? "__auto__"],
+    queryKey: ["anomalies", caseId, timelineId, "entropy", blKey, fieldsParam ?? "__auto__"],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "entropy",
         limit: 50,
-        temporal: mode === "temporal",
+        ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     staleTime: 60_000,
+    enabled: !needsBaseline,
   });
 
   const tagMutation = useMutation({
@@ -148,7 +158,7 @@ export function EntropyView({
       anomaliesApi.tag(caseId, timelineId, {
         detector: "entropy",
         limit: 50,
-        temporal: mode === "temporal",
+        ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     onSuccess: () => {
@@ -191,11 +201,16 @@ export function EntropyView({
 
   useDetectorRunId(data?.run_id, onRunIdChange);
 
+  const cap = useCappedFindings(findings);
+
+  if (needsBaseline) return <NeedsBaselinePrompt />;
+
+  const isTemporal = data?.method === "temporal-iqr";
+
   return (
     <div className="space-y-3">
       {/* Toolbar */}
       <div className="flex items-center gap-2 flex-wrap">
-        <ModeToggle mode={mode} onChange={setMode} />
         <span className="flex-1" />
         <AnomalyFieldPicker
           caseId={caseId}
@@ -223,8 +238,8 @@ export function EntropyView({
               ? "No entropy outliers. No events ingested yet."
               : data?.status === "insufficient_data"
                 ? "No fields with enough distinct baseline values (min length 6 chars). Pick fields explicitly above."
-                : mode === "temporal"
-                  ? "No detect-window values outside the baseline entropy band."
+                : isTemporal
+                  ? "No suspect-window values outside the baseline entropy band."
                   : "No values outside the corpus entropy band."}
           </span>
         </div>
@@ -233,7 +248,8 @@ export function EntropyView({
       {/* Findings list */}
       {findings.length > 0 && (
         <div className="space-y-1.5">
-          {findings.map((f, i) => (
+          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} />
+          {cap.shown.map((f, i) => (
             <EntropyRow
               key={`${f.field}:${f.value}:${i}`}
               caseId={caseId}
@@ -256,9 +272,9 @@ export function EntropyView({
       <div className="flex items-start gap-1.5 text-xs text-[var(--color-fg-muted)] pt-1">
         <AlertTriangle size={10} className="mt-0.5 shrink-0" />
         <span>
-          {mode === "temporal"
-            ? "Temporal mode learns the entropy band [q1−1.5·IQR, q3+1.5·IQR] from the baseline window's distinct values and flags detect-window values outside it."
-            : "Self-baseline mode flags values outside the Tukey fence [q1−1.5·IQR, q3+1.5·IQR] over the entropy of every distinct value."}{" "}
+          {isTemporal
+            ? "Comparing windows: learns the entropy band [q1−1.5·IQR, q3+1.5·IQR] from the baseline window's distinct values and flags suspect-window values outside it."
+            : "Scanning all events: flags values outside the Tukey fence [q1−1.5·IQR, q3+1.5·IQR] over the entropy of every distinct value."}{" "}
           Entropy is computed per distinct value from character frequencies alone — high ≈ random-looking (DGA, encoded payloads), low ≈ repetitive — never from what a value means.
         </span>
       </div>

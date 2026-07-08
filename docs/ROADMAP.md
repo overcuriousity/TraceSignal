@@ -58,6 +58,17 @@ resolved — this file holds only the condensed, still-open action items.
   interaction — consider a `tokenbf_v1`-indexed fast path via `hasTokenCaseInsensitive`
   when `q` is a plain token (needs index DDL on existing tables).
 
+- [ ] **M24 — Visualize scan-avoidance (deferred from session 33).** Every viz chart
+  aggregation (`field_terms`, `field_numeric_stats`, `field_value_timeseries`, all compare
+  variants in `db/queries.py`) is a live full-column scan; the `db/field_stats.py` cache
+  (distinct/coverage + 3 samples per field) is consumed only by `viz/fields`. Follow-ups:
+  (a) seed first-load *unfiltered* top-values from the cache instead of a live `field_terms`
+  scan; (b) merge `field_value_timeseries`' ~3 scans (terms + range + bucket) into fewer
+  passes; (c) baseline-mode compare re-scans the whole timeline every render — cache or bound
+  it. Not `field_numeric_stats`: its two scans are a deliberate fixed-width-bin
+  reproducibility choice (documented in the method). Session 33 already removed the first-load
+  numeric probe and defaulted Visualize to the single-pass histogram.
+
 ## Milestone 3 — polish
 
 - [ ] Split `api/routers/events.py` (1500+ lines: query parsing, export streaming, anomaly
@@ -96,17 +107,6 @@ High value first:
 - [ ] **D10 — Event correlation rules** (AMiner `EventCorrelationDetector`): mine baseline
   implication rules "value A is followed by value B within Δt", flag violations in the detect
   window. Highest analytical payoff, heaviest lift (rule mining + hypothesis testing) — last.
-
-- [ ] **D11 — Value-level allowlist ("mark value as normal")** (AMiner whitelist rules): the
-  existing "normal" annotation suppresses one representative *event*'s finding but never
-  teaches the detector — the same rare value on another event is re-flagged, so noisy-but-known
-  values need finding-by-finding suppression. Add per-timeline (or per-case) allowlist entries
-  keyed `(detector, field, value)` — created from a finding's "not an anomaly, ever" action —
-  consumed as an exclusion in the detectors' finding assembly (post-detection filter like
-  `exclude_event_ids`, or SQL `NOT IN` pre-limit). Entries are analyst-declared metadata:
-  Postgres rows with `created_by`, surfaced in the methodology panel and audited, so a
-  suppressed detection stays explainable. Baselines stay untouched — this filters findings,
-  never re-weights evidence.
 
 Skipped deliberately: `TSAArimaDetector` (ARIMA forecasting — z-score `frequency` detector
 covers most of it and stays explainable).
@@ -156,11 +156,36 @@ Hard, high value:
   investigation. Building blocks (Views, annotations, saved charts, RBAC) all exist; this is
   mostly a new Postgres model + frontend editor. Timesketch's most-loved feature.
 
+## Legacy-removal suspects (flagged 2026-07-08, verify before cutting)
+
+Code kept only for backward compatibility with older runs/clients. Each is a
+**candidate** for removal — confirm nothing still depends on it, then delete in
+one commit that also updates `docs/ANOMALY_DETECTION.md`.
+
+- [ ] **L1 — Single-`baseline_end` split point + `temporal=true` midpoint fallback.**
+  Superseded by explicit baseline definitions (baseline + 1..N suspect windows).
+  Still accepted at the API and converted via `windows_from_split`
+  (`db/anomaly_stats.py`), so old persisted runs and any pre-window client keep
+  working with exactly one internal temporal code path. Remove the `baseline_end`
+  / `temporal` request params and `windows_from_split` once no stored `DetectorRun`
+  relies on the legacy shape and the CLI/clients all send `baseline_id`.
+- [ ] **L2 — Per-event `normal` annotation for suppression.** Superseded by the
+  value-level detector allowlist (D11). Now created **only** for timestamp-order
+  findings (positional, no value key); honored read-only everywhere else. Cut once
+  timestamp-order gets a positional-allowlist equivalent — then the `normal`
+  annotation origin can be dropped from the mark-normal path entirely.
+- [ ] **L3 — `AnalysisPanel` / `BaselineManager` naming remnants (cosmetic).** The
+  components are gone (replaced by `InvestigatePanel` + `WindowsNormality` this PR);
+  no dangling imports remain. Leftover: stale comment mentions in `ExplorerPage.tsx`
+  / `stores/scrollPosition.ts` and the `analysisPanelWidth` ui-store key still named
+  after the old panel. Rename to `investigatePanelWidth` and fix comments when next
+  touching that store.
+
 ## Explicitly out of scope (decided during the audit)
 
 - Persistent job store — in-memory is a documented deliberate choice for the single-process
   deployment model.
 - CSRF tokens — SameSite=Lax cookies plus the LAN threat model are adequate for now.
-- Alembic adoption — hand-rolled additive migration works at the current schema churn;
-  revisit at v1.0.
+- ~~Alembic adoption~~ — **done** (this PR): Postgres schema is now Alembic-managed
+  (`db/migrations`), with pre-Alembic databases auto-stamped at `0001` on startup.
 - Proactive router/query-builder splits — churn risk outweighs payoff at current velocity.

@@ -55,7 +55,10 @@ export const DEFAULT_CHART_CONFIG: ChartConfig = {
   v: 1,
   field: null,
   scale: "nominal",
-  chartType: "bar",
+  // Events-over-time is the fresh-load default: it needs no field, runs on the
+  // already-optimized single-pass histogram, and never lands on an empty canvas
+  // (a bar chart shows nothing until a field is picked and its live scan lands).
+  chartType: "time",
   metric: "count",
   compare: { mode: "off" },
   options: {},

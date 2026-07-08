@@ -168,9 +168,14 @@ export function VisualizePage() {
   const numericQuery = useQuery({
     queryKey: ["viz-field-numeric", caseId, timelineId, field, filters, bins],
     queryFn: () => vizApi.fieldNumeric(caseId!, timelineId!, field!, filters, bins),
+    // Run only when a numeric chart actually needs the data, or when a
+    // *field-dependent* chart needs its one-time scale probe. The field-free
+    // time chart (the fresh-load default) never needs it — skipping the probe
+    // there avoids the field_numeric_stats double-scan on first paint.
     enabled:
       !!(caseId && timelineId && field) &&
-      (dataKind === "numeric" || field !== autoProbedField.current),
+      (dataKind === "numeric" ||
+        (dataKind !== "time" && field !== autoProbedField.current)),
   });
 
   useEffect(() => {

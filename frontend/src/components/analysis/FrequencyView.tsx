@@ -21,9 +21,13 @@ import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { shouldInvalidate } from "@/hooks/useCaseStream";
 import {
   DetectorStatusLine,
+  NeedsBaselinePrompt,
+  ResultsBar,
+  useCappedFindings,
   RefreshButton,
   TagFindingsBar,
   useAnomalyMarkers,
+  useBaselineRequest,
   useDetectorRunId,
 } from "./detector-shared";
 import { Spinner } from "@/components/ui/Spinner";
@@ -180,6 +184,10 @@ export function FrequencyView({
   const [seriesField, setSeriesField] = useState("artifact");
   const [zThresholdInput, setZThresholdInput] = useState("2.5");
   const qc = useQueryClient();
+  // Frequency has no local mode: it follows the global frame like every other
+  // detector. `self` → whole-timeline z-score; `baseline` → score suspect
+  // windows against the active definition's baseline.
+  const { params: blParams, key: blKey, needsBaseline } = useBaselineRequest();
 
   // Debounce so a full detector scan doesn't fire on every keystroke
   // (including transient invalid states like a bare "-" or "").
@@ -210,15 +218,17 @@ export function FrequencyView({
   }, [fieldsData]);
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "frequency", seriesField, zThresholdParam],
+    queryKey: ["anomalies", caseId, timelineId, "frequency", seriesField, zThresholdParam, blKey],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "frequency",
         series_field: seriesField,
         z_threshold: zThresholdParam,
         limit: 30,
+        ...blParams,
       }),
     staleTime: 60_000,
+    enabled: !needsBaseline,
   });
 
   const tagMutation = useMutation({
@@ -228,6 +238,7 @@ export function FrequencyView({
         series_field: seriesField,
         z_threshold: zThresholdParam,
         limit: 30,
+        ...blParams,
       }),
     onSuccess: () => {
       qc.invalidateQueries({ predicate: (query) => shouldInvalidate(query.queryKey, caseId) });
@@ -247,8 +258,8 @@ export function FrequencyView({
   useAnomalyMarkers(
     findings,
     (f): AnomalyMarker => {
-      const label = `${f.series_field}=${f.series_value} spike`;
       const direction = f.z_score > 0 ? "spike" : "drop";
+      const label = `${f.series_field}=${f.series_value} ${direction}`;
       // In self-baseline (non-temporal) z-score mode, "expected" comes from a
       // leave-one-out mean/std over the rest of the series — the flagged
       // window itself is excluded from its own baseline (see
@@ -278,6 +289,10 @@ export function FrequencyView({
   );
 
   useDetectorRunId(data?.run_id, onRunIdChange);
+
+  const cap = useCappedFindings(findings);
+
+  if (needsBaseline) return <NeedsBaselinePrompt />;
 
   return (
     <div className="space-y-3">
@@ -353,7 +368,8 @@ export function FrequencyView({
       {/* Findings list */}
       {findings.length > 0 && (
         <div className="space-y-1.5">
-          {findings.map((f, i) => (
+          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} />
+          {cap.shown.map((f, i) => (
             <FreqFindingRow
               key={`${f.series_value}:${f.window_start}:${i}`}
               finding={f}

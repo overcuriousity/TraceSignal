@@ -58,7 +58,13 @@ export function Heatmap({ data, svgRef, height }: HeatmapProps) {
   const ref = useChartRef(svgRef);
 
   if (data.series.length === 0 || data.series[0].buckets.length === 0) {
-    return <ChartEmptyState>No data in the current filter range.</ChartEmptyState>;
+    return (
+      <ChartEmptyState
+        hint="Events without a usable timestamp are excluded from time-based charts. Try a Top-values (bar) chart, or widen the time range."
+      >
+        Nothing to plot over time here.
+      </ChartEmptyState>
+    );
   }
 
   const bucketStarts = data.series[0].buckets.map((b) => b.start);

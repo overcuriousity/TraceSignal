@@ -107,11 +107,10 @@ describe("chart smoke render", () => {
     const { container } = render(<BarChart terms={TERMS} />);
     expectSvg(container);
   });
-  it("BarChart renders empty state without an svg", () => {
-    const { container, getByText } = render(
+  it("BarChart renders the empty state", () => {
+    const { getByText } = render(
       <BarChart terms={{ ...TERMS, values: [], other_count: 0 }} />,
     );
-    expect(container.querySelector("svg")).toBeNull();
     getByText(/no values/i);
   });
 
@@ -125,10 +124,10 @@ describe("chart smoke render", () => {
     expectSvg(container);
   });
   it("NumericHistogram renders empty state for a non-numeric field", () => {
-    const { container } = render(
+    const { getByText } = render(
       <NumericHistogram stats={{ ...NUMERIC, count: 0, min: null, max: null, bins: [] }} />,
     );
-    expect(container.querySelector("svg")).toBeNull();
+    getByText(/no numeric values/i);
   });
 
   it("BoxPlot renders with numeric stats", () => {
@@ -160,8 +159,8 @@ describe("chart smoke render", () => {
     const { container } = render(<TimeHistogram buckets={HIST_BUCKETS} />);
     expectSvg(container);
   });
-  it("TimeHistogram renders empty state without an svg", () => {
-    const { container } = render(<TimeHistogram buckets={[]} />);
-    expect(container.querySelector("svg")).toBeNull();
+  it("TimeHistogram renders the empty state", () => {
+    const { getByText } = render(<TimeHistogram buckets={[]} />);
+    getByText(/no events over time/i);
   });
 });
