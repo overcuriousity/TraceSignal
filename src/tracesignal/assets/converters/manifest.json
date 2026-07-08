@@ -152,6 +152,21 @@
       ],
       "size_bytes": 27107,
       "sha256": "fce9ffe4e2c572f15786c0dc4490c4548f68a52ab83e883f8077b71e0e4b8475"
+    },
+    {
+      "name": "timesketch2parquet",
+      "filename": "timesketch2parquet.py",
+      "description": "Generic Timesketch-compatible CSV/JSONL (any column set, plain or .gz, file or directory) to a TraceSignal Parquet file for direct upload. Column requirements follow upstream google/timesketch's own import spec. Requires pyarrow.",
+      "inputs": [
+        "*.csv",
+        "*.jsonl"
+      ],
+      "native": true,
+      "requires": [
+        "pyarrow"
+      ],
+      "size_bytes": 27794,
+      "sha256": "7049091a50dc6a54e63753a1f8025f584f149a5c407e2e941ab8ce043233d979"
     }
   ]
 }

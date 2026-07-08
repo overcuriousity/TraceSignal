@@ -52,6 +52,9 @@ def test_list_and_download(client, admin_bootstrap) -> None:
     for stem in ("cloudtrail", "filterlog", "nginx", "pcap", "suricata"):
         assert f"{stem}2timesketch" in names
         assert f"{stem}2tracesignal" in names
+    # timesketch2parquet is a generic converter with no vendored counterpart
+    # to pair with (it's new, not a port of an existing *2timesketch script).
+    assert "timesketch2parquet" in names
 
     resp = client.get("/api/converters/nginx2tracesignal")
     assert resp.status_code == 200
@@ -69,6 +72,7 @@ def test_native_converter_entries_flagged() -> None:
         "filterlog2tracesignal",
         "pcap2tracesignal",
         "suricata2tracesignal",
+        "timesketch2parquet",
     ):
         assert by_name[name]["native"] is True
         assert "pyarrow" in by_name[name]["requires"]

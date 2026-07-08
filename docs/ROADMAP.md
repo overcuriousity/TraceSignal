@@ -51,6 +51,15 @@ resolved — this file holds only the condensed, still-open action items.
   multi-GB log; parallel `.gz` parsing (seek-point indexing) deferred; pcap intra-file
   parallelism (record-boundary chunking, analogous to nginx's newline chunking) deferred —
   `pcap2tracesignal.py` currently parallelizes only across files, one worker process per file.
+  Also added `timesketch2parquet.py` — a generic Timesketch-compatible CSV/JSONL converter (any
+  column set, no per-source parsing) with no vendored counterpart; column requirements follow
+  upstream `google/timesketch`'s own import spec exactly (`message`/`timestamp_desc`/`datetime`
+  mandatory, `timestamp` substitutable for `datetime` in CSV, `tag` the only other recognized
+  column), not TraceSignal's own server-side generic-CSV parser's extra recognized columns. CSV
+  parsing is single-process only (a logical record can span multiple physical lines via quoted
+  embedded newlines, unsafe to newline-chunk); JSONL gets full nginx-style chunked
+  multiprocessing. CSV intra-file parallelism (record-boundary-aware chunking) deferred,
+  same treatment as pcap's.
 
 - [ ] **M23 — detector-scan residue (post 300M-row overhaul, session 27).** Two follow-ups
   deliberately deferred: (a) `canonical_inventory` stays a live query — it only runs when a
