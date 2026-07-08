@@ -92,6 +92,36 @@ class EmbeddingConfig:
         }
 
 
+def derive_event_id(
+    *,
+    case_id: str,
+    source_id: str,
+    source_identity: str,
+    byte_offset: int,
+    content_hash: str,
+    parser_name: str,
+    parser_version: str,
+) -> uuid.UUID:
+    """Derive the deterministic UUIDv5 event identity.
+
+    The single place the identity digest is defined — used by
+    :meth:`Event._derive_id` and by bulk paths (the Parquet reader) that stamp
+    ``event_id`` columns without building ``Event`` objects.
+    ``source_identity`` is the sha256 of the original evidence file (or, as a
+    legacy fallback, its resolved path).
+    """
+    namespace = uuid.uuid5(uuid.NAMESPACE_URL, f"tracesignal:{case_id}")
+    digest_input = (
+        f"{source_id}\n"
+        f"{source_identity}\n"
+        f"{byte_offset}\n"
+        f"{content_hash}\n"
+        f"{parser_name}\n"
+        f"{parser_version}"
+    )
+    return uuid.uuid5(namespace, digest_input)
+
+
 @dataclass(slots=True)
 class Event:
     """A single forensic event produced by a parser.
@@ -157,19 +187,18 @@ class Event:
         IDs. A missing file hash is a forensic error; callers should ensure a
         real hash is supplied.
         """
-        namespace = uuid.uuid5(uuid.NAMESPACE_URL, f"tracesignal:{self.case_id}")
         source_identity = (
             self.file_hash if self.file_hash else self.source_file.resolve().as_posix()
         )
-        digest_input = (
-            f"{self.source_id}\n"
-            f"{source_identity}\n"
-            f"{self.byte_offset}\n"
-            f"{self.content_hash}\n"
-            f"{self.parser_name}\n"
-            f"{self.parser_version}"
+        return derive_event_id(
+            case_id=self.case_id,
+            source_id=self.source_id,
+            source_identity=source_identity,
+            byte_offset=self.byte_offset,
+            content_hash=self.content_hash,
+            parser_name=self.parser_name,
+            parser_version=self.parser_version,
         )
-        return uuid.uuid5(namespace, digest_input)
 
     def canonical_content(self) -> str:
         """Return the canonical content used for hashing and embedding."""

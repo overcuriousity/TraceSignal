@@ -29,8 +29,10 @@ from typing import Any
 from urllib.parse import urlparse
 
 import clickhouse_connect
+import pyarrow as pa
 
 from tracesignal.core.config import get_settings
+from tracesignal.db._arrow_schema import EVENT_ARROW_SCHEMA
 from tracesignal.db._dt import is_null_ts_sentinel
 from tracesignal.models.event import Event
 
@@ -158,6 +160,18 @@ SETTINGS index_granularity = 8192
 _ENRICH_SCRATCH_PREFIX = "tmp_enrich_"
 
 
+def _events_to_record_batch(events: list[Event]) -> pa.RecordBatch:
+    """Build an ``EVENT_ARROW_SCHEMA`` record batch from events.
+
+    Goes through :meth:`Event.to_clickhouse_row` — the single place that
+    encodes the null-timestamp sentinel and empty-attribute stripping — so the
+    Arrow path can never drift from the row-encoding rules.
+    """
+    rows = [event.to_clickhouse_row() for event in events]
+    columns = {column: [row[column] for row in rows] for column in _EVENT_COLUMNS}
+    return pa.RecordBatch.from_pydict(columns, schema=EVENT_ARROW_SCHEMA)
+
+
 class ClickHouseStore:
     """Sync ClickHouse client for event data."""
 
@@ -265,7 +279,7 @@ class ClickHouseStore:
             )
 
     def insert_events(self, events: list[Event]) -> int:
-        """Insert a batch of events into ClickHouse.
+        """Insert a batch of events into ClickHouse via the Arrow bulk path.
 
         Args:
             events: List of :py:class:`~tracesignal.models.event.Event` objects.
@@ -275,13 +289,22 @@ class ClickHouseStore:
         """
         if not events:
             return 0
-        rows = [event.to_clickhouse_row() for event in events]
-        data = [[row[column] for column in _EVENT_COLUMNS] for row in rows]
-        response = self.client.insert(
+        return self.insert_events_arrow(_events_to_record_batch(events))
+
+    def insert_events_arrow(self, batch: pa.RecordBatch) -> int:
+        """Insert a pre-built ``EVENT_ARROW_SCHEMA`` record batch.
+
+        For callers that already hold a schema-conformant batch (the Parquet
+        ingest path) and shouldn't round-trip through ``Event`` objects.
+
+        Returns:
+            Number of rows inserted.
+        """
+        if batch.num_rows == 0:
+            return 0
+        response = self.client.insert_arrow(
             table=f"{self.database}.events",
-            data=data,
-            column_names=_EVENT_COLUMNS,
-            database=self.database,
+            arrow_table=pa.Table.from_batches([batch]),
         )
         return response.written_rows
 

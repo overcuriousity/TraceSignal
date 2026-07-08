@@ -1,14 +1,22 @@
 """Unit tests for ClickHouseStore SQL construction — no live ClickHouse needed."""
 
+from pathlib import Path
+from types import SimpleNamespace
+
+import pyarrow as pa
 import pytest
 
+from tracesignal.db._arrow_schema import EVENT_ARROW_SCHEMA
 from tracesignal.db.clickhouse import (
+    _EVENT_COLUMNS,
     _EVENTS_TABLE_DDL,
     ClickHouseStore,
+    _events_to_record_batch,
     _partition_expr,
     _validate_partition_id,
 )
 from tracesignal.db.postgres import generate_id
+from tracesignal.models.event import Event
 
 
 class _FakeResult:
@@ -23,6 +31,7 @@ class _RecordingClient:
     def __init__(self):
         self.queries: list[tuple[str, dict | None]] = []
         self.commands: list[str] = []
+        self.arrow_inserts: list[tuple[str, pa.Table]] = []
 
     def query(self, query, parameters=None):
         self.queries.append((query, parameters))
@@ -30,6 +39,10 @@ class _RecordingClient:
 
     def command(self, cmd):
         self.commands.append(cmd)
+
+    def insert_arrow(self, table, arrow_table, **kwargs):
+        self.arrow_inserts.append((table, arrow_table))
+        return SimpleNamespace(written_rows=arrow_table.num_rows)
 
 
 @pytest.fixture()
@@ -154,6 +167,92 @@ class TestEventsSchema:
         store.client = _EmptyClient()
         store.init_schema()
         assert store._schema_ready is True
+
+
+def _make_event(i: int, **overrides) -> Event:
+    kwargs: dict = {
+        "case_id": "case-1",
+        "source_id": "src-1",
+        "source_file": Path("evidence.log"),
+        "byte_offset": i * 100,
+        "content_hash": f"{i:064d}",
+        "file_hash": "f" * 64,
+        "parser_name": "test",
+        "parser_version": "1.0.0",
+        "raw_line": f"raw {i}",
+        "message": f"event {i}",
+        "timestamp": "2026-01-01T10:00:00+00:00",
+        "timestamp_desc": "Test Time",
+        "artifact": "test:artifact",
+        "tags": ["t1"],
+        "attributes": {"key": "value", "empty": "", "none": None},
+    }
+    kwargs.update(overrides)
+    return Event(**kwargs)
+
+
+class TestArrowInsert:
+    def test_schema_columns_match_event_columns(self):
+        assert EVENT_ARROW_SCHEMA.names == _EVENT_COLUMNS
+
+    def test_schema_types_mirror_ddl(self):
+        # Every DDL column must have the Arrow dtype insert_arrow needs:
+        # numerics exact, DateTime64(3) as ms-UTC timestamps, UUID/FixedString
+        # as strings (server-side cast), Array/Map as list/map.
+        expected = {
+            "byte_offset": pa.uint64(),
+            "line_number": pa.uint64(),
+            "ingest_time": pa.timestamp("ms", tz="UTC"),
+            "timestamp": pa.timestamp("ms", tz="UTC"),
+            "tags": pa.list_(pa.string()),
+            "attributes": pa.map_(pa.string(), pa.string()),
+        }
+        for name in EVENT_ARROW_SCHEMA.names:
+            assert EVENT_ARROW_SCHEMA.field(name).type == expected.get(name, pa.string())
+
+    def test_record_batch_matches_clickhouse_rows(self):
+        events = [_make_event(1), _make_event(2, timestamp=None, tags=[], attributes={})]
+        batch = _events_to_record_batch(events)
+        assert batch.schema == EVENT_ARROW_SCHEMA
+        assert batch.num_rows == 2
+        rows = batch.to_pylist()
+        for row, event in zip(rows, events, strict=True):
+            expected = event.to_clickhouse_row()
+            assert row["event_id"] == str(event.event_id)
+            assert row["byte_offset"] == expected["byte_offset"]
+            assert row["content_hash"] == expected["content_hash"]
+            assert row["message"] == expected["message"]
+            assert row["timestamp"] == expected["timestamp"]
+            assert row["tags"] == expected["tags"]
+            # Arrow maps round-trip as key/value tuple lists.
+            assert dict(row["attributes"]) == expected["attributes"]
+
+    def test_sentinel_and_empty_attribute_encoding(self):
+        # to_clickhouse_row rules must survive the Arrow encoding: no nulls in
+        # timestamp (sentinel year 2299) and empty/None attributes dropped.
+        batch = _events_to_record_batch([_make_event(1, timestamp=None)])
+        row = batch.to_pylist()[0]
+        assert row["timestamp"] is not None
+        assert row["timestamp"].year == 2299
+        assert dict(row["attributes"]) == {"key": "value"}
+
+    def test_insert_events_goes_through_insert_arrow(self, store):
+        events = [_make_event(1), _make_event(2)]
+        assert store.insert_events(events) == 2
+        (table, arrow_table), *rest = store.client.arrow_inserts
+        assert not rest
+        assert table == "tracesignal.events"
+        assert arrow_table.num_rows == 2
+        assert arrow_table.schema == EVENT_ARROW_SCHEMA
+
+    def test_insert_events_empty_is_noop(self, store):
+        assert store.insert_events([]) == 0
+        assert store.client.arrow_inserts == []
+
+    def test_insert_events_arrow_passthrough(self, store):
+        batch = _events_to_record_batch([_make_event(7)])
+        assert store.insert_events_arrow(batch) == 1
+        assert store.client.arrow_inserts[0][0] == "tracesignal.events"
 
 
 class TestDeleteSourceEventsErrors:

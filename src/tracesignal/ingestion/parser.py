@@ -13,7 +13,7 @@ import ast
 import csv
 import json
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -119,6 +119,21 @@ class Parser(ABC):
     def parse(self, path: Path) -> Iterator[Event]:
         """Yield :py:class:`Event` records from ``path``."""
         raise NotImplementedError
+
+    def parse_arrow_batches(
+        self,
+        path: Path,
+        on_progress: Callable[[int], None] | None = None,
+    ) -> Iterator[Any] | None:
+        """Optional bulk path: yield ``EVENT_ARROW_SCHEMA`` record batches.
+
+        Parsers that can produce columnar batches directly (the Parquet
+        reader) override this; the pipeline then bulk-inserts each batch via
+        ``ClickHouseStore.insert_events_arrow`` instead of building ``Event``
+        objects. ``on_progress`` receives bytes consumed within ``path``.
+        Returning ``None`` (the default) selects the ``parse()`` event loop.
+        """
+        return None
 
     def _make_event(
         self,
@@ -382,6 +397,10 @@ def get_parser(
     Supported formats:
       - ``timesketch_csv`` / ``csv``: Timesketch-compatible CSV.
       - ``jsonl`` / ``json``: JSON Lines.
+      - ``tracesignal_parquet`` / ``parquet``: TraceSignal interchange Parquet
+        produced by a converter script; the effective parser identity
+        (name/version) comes from the file's footer metadata, not from this
+        config.
 
     Args:
         format_name: Parser format identifier.
@@ -405,6 +424,14 @@ def get_parser(
         )
     if name in {"jsonl", "json"}:
         return JsonlParser(case_id, source_id, config, file_hash=file_hash, source_name=source_name)
+    if name in {"tracesignal_parquet", "parquet"}:
+        # Imported lazily: parquet_reader pulls in pyarrow.parquet, which the
+        # common CSV/JSONL paths never need.
+        from tracesignal.ingestion.parquet_reader import ParquetEventsParser
+
+        return ParquetEventsParser(
+            case_id, source_id, config, file_hash=file_hash, source_name=source_name
+        )
     raise ValueError(f"Unsupported parser format: {format_name}")
 
 
@@ -418,4 +445,6 @@ def detect_format(path: Path) -> str:
         return "timesketch_csv"
     if suffix in {".jsonl", ".json", ".ndjson"}:
         return "jsonl"
+    if suffix == ".parquet":
+        return "tracesignal_parquet"
     raise ValueError(f"Cannot detect parser format for: {path}")

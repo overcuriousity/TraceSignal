@@ -88,6 +88,16 @@ in `db/queries.py:18`, just not yet exposed by any endpoint.
 Each Event additionally carries `content_hash` (SHA-256 of the raw record), `byte_offset`,
 and `line_number` so it can be located in the original file.
 
+**TraceSignal Parquet interchange uploads** (converter-produced `.parquet`, see
+`ingestion/parquet_format.py`) refine this split: the Source-level `file_hash` is the hash
+of the uploaded parquet (retention/dedup as usual), while each Event's `file_hash`,
+`byte_offset`, and `content_hash` refer to the **original raw evidence file** the converter
+parsed — embedded per row by the converter, along with per-file sha256 provenance and the
+converter name/version (which become the event's `parser_name`/`parser_version`) in the
+parquet footer. For gzipped raw inputs, `byte_offset` addresses the *decompressed* content
+stream; the sha256 covers the compressed file as it existed on disk. `line_number` is not
+populated by this path (it is not part of event identity).
+
 **Immutability lives on the original file, not the events table.** The ClickHouse `events`
 table is a normalized *derivative* of the hashed source file. Enrichers (see
 `enrichers/`) may amend an event's `attributes` map after ingest — derived keys follow the

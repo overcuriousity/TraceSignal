@@ -46,15 +46,19 @@
       "sha256": "c4b46abf2584042ff1718899b3f47d710ee0b13681d2e752f63b21b14fed9380"
     },
     {
-      "name": "nginx2timesketch",
-      "filename": "nginx2timesketch.py",
-      "description": "nginx access/error/redirect logs (plain or .gz) to Timesketch timeline.",
+      "name": "nginx2tracesignal",
+      "filename": "nginx2tracesignal.py",
+      "description": "nginx access/error/redirect logs (plain or .gz, file or directory) to a TraceSignal Parquet file for direct upload. Requires pyarrow.",
       "inputs": [
         "access.log*",
         "error.log*"
       ],
-      "size_bytes": 46588,
-      "sha256": "ff7cbd2f23395d680973aec1d92fd04d8e85c984125104173aa2fe83b2560ff5"
+      "native": true,
+      "requires": [
+        "pyarrow"
+      ],
+      "size_bytes": 21453,
+      "sha256": "5d68c8581ffbb5c8569a729527a0213cd16aca2f59f9d0c39808d1027fcde3dd"
     },
     {
       "name": "pcap2timesketch",

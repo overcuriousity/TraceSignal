@@ -37,12 +37,14 @@ resolved — this file holds only the condensed, still-open action items.
   merged `distinct` likewise deferred (max-across-sources approximation documented in the
   module).
 
-- [ ] **M20 — Ingest-throughput follow-ups.** Full design in
-  [`docs/archive/PLAN_FAST_NGINX_INGESTION.md`](./archive/PLAN_FAST_NGINX_INGESTION.md): bulk
-  Arrow-based `ClickHouseStore.insert_events`/`insert_events_arrow` (replacing the row-by-row
-  `client.insert()` path) plus a fix for the upload-receive double file-copy
-  (`shutil.copy2` after the temp-file hash pass). Benefits every ingestion path (CSV/JSONL/CLI/
-  web) immediately and is the prerequisite for the native nginx parser below.
+- [ ] **M25 — Port remaining converters to the Parquet interchange format.** M20 shipped the
+  bulk Arrow insert, the upload hardlink-retention fix, the TraceSignal Parquet interchange
+  format v1 (`ingestion/parquet_format.py`, `ingestion/parquet_reader.py`), and the
+  `nginx2tracesignal.py` converter (pilot). Remaining vendored `*2timesketch` scripts to
+  replace with in-repo `*2tracesignal` Parquet converters, then retire
+  `scripts/vendor_converters.py` entirely: filterlog, suricata, journal, cloudtrail, browser,
+  pcap. Follow-ups from the pilot: benchmark converter worker-count/parallel-threshold
+  defaults on a multi-GB log; parallel `.gz` parsing (seek-point indexing) deferred.
 
 - [ ] **M23 — detector-scan residue (post 300M-row overhaul, session 27).** Two follow-ups
   deliberately deferred: (a) `canonical_inventory` stays a live query — it only runs when a
@@ -150,11 +152,10 @@ Hard, high value:
   untouched. Natural extension of the field-mappings path (canonical field = regex extraction
   instead of only key rename) via ClickHouse `extractGroups()`; detectors consume it through
   the existing `_col_expr` field-expression mechanism. Prerequisite for making bespoke
-  unstructured logs first-class. The companion write half — a native, parallel raw-log
-  ingestion mode (starting with nginx access/error logs, bypassing the CSV/JSONL pre-conversion
-  step entirely) — now has a full design in
-  [`docs/archive/PLAN_FAST_NGINX_INGESTION.md`](./archive/PLAN_FAST_NGINX_INGESTION.md); not yet
-  scheduled for implementation.
+  unstructured logs first-class. (The old companion "write half" — server-side raw-log
+  parsing per [`docs/archive/PLAN_FAST_NGINX_INGESTION.md`](./archive/PLAN_FAST_NGINX_INGESTION.md)
+  — was superseded by the client-side Parquet converter architecture shipped with M20;
+  see M25 above.)
 - [ ] **W7 — Stories (investigative notebook).** Markdown document per case embedding live
   references to saved Views, charts, and tagged events — the report writes itself during the
   investigation. Building blocks (Views, annotations, saved charts, RBAC) all exist; this is

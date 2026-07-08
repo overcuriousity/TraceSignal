@@ -72,8 +72,12 @@ export function ConverterPanel() {
             </div>
           ))}
           <p className="text-[11px] text-[var(--color-fg-muted)]">
-            Stdlib-only Python, run offline: <span className="font-mono">python3 script.py -i input -o timeline.csv</span>.
-            Vendored from{" "}
+            Run offline: <span className="font-mono">python3 script.py -i input -o out</span>.{" "}
+            <span className="font-mono">*2tracesignal</span> scripts emit a compact{" "}
+            <span className="font-mono">.parquet</span> for direct upload (needs{" "}
+            <span className="font-mono">pyarrow</span>);{" "}
+            <span className="font-mono">*2timesketch</span> scripts are stdlib-only and emit
+            CSV/JSONL, vendored from{" "}
             <span className="font-mono">{data.upstream.replace("https://github.com/", "")}</span>{" "}
             @ <span className="font-mono">{data.commit.slice(0, 12)}</span>.
           </p>

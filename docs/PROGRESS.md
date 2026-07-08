@@ -1,6 +1,41 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-08 (session 34 — fast nginx ingestion plan).
+Last updated: 2026-07-08 (session 35 — M20: Arrow bulk insert + Parquet converter pipeline).
+
+## Session 35 — 2026-07-08: M20 — Arrow bulk insert, Parquet interchange format, nginx converter pilot
+
+Session 34's plan proposed *server-side* native raw-log parsing; discussion corrected the
+requirement: keep the downloadable-converter workflow, but converters emit **Parquet** instead
+of inflated Timesketch CSV, and the server bulk-ingests that via Arrow. Shipped:
+
+- **Bulk Arrow ClickHouse insert (M20).** `db/_arrow_schema.py::EVENT_ARROW_SCHEMA` mirrors the
+  events DDL; `insert_events()` now encodes through `_events_to_record_batch` (built strictly on
+  `Event.to_clickhouse_row()` — sentinel/attribute rules preserved) and `client.insert_arrow`;
+  new `insert_events_arrow()` pass-through for pre-built batches. Live round-trip verified
+  against a real ClickHouse (UUID/FixedString-from-string, Map, Array, DateTime64 sentinel) in
+  `tests/test_arrow_insert_clickhouse.py` (skip-if-unreachable). `pyarrow` is a core dependency.
+- **Upload retention hardlink fix (M20).** `cases.py::_retain_file` replaces the second full
+  `shutil.copy2` pass: exists short-circuit (content-addressed), `os.link`, copy fallback on
+  `EXDEV`. Fast path requires `TMPDIR` and `TS_SOURCE_RETENTION_PATH` on one filesystem.
+- **TraceSignal Parquet interchange format v1.** Spec + validation in
+  `ingestion/parquet_format.py`: per-row `source_file`/`file_hash`/`byte_offset`/`content_hash`
+  (all referring to the **original raw evidence file**) + event columns; footer metadata carries
+  format version, converter name/version, and per-file sha256 provenance. Converter identity
+  becomes `parser_name`/`parser_version`, so `event_id` is re-derivable from the raw log alone
+  (`models/event.py::derive_event_id`, extracted from `Event._derive_id`).
+- **Server Parquet ingest path.** `ingestion/parquet_reader.py::ParquetEventsParser` stamps
+  server-side columns onto each record batch (no `Event` objects) and feeds the pipeline's new
+  `parse_arrow_batches`/`_ingest_file_arrow` bulk branch; CSV/JSONL paths unchanged. Upload
+  validates the footer up front (400 on non-interchange parquet) and records
+  `converter@version` as the Source's parser. `.parquet` auto-detected; CLI works unchanged.
+- **nginx converter pilot.** `assets/converters/nginx2tracesignal.py` (in-repo, requires
+  pyarrow): access/error/redirect logs, plain/.gz, file or directory, multiprocessing chunk
+  parsing for large plain files, zstd Parquet output, embedded provenance. Replaces the vendored
+  `nginx2timesketch.py` (deleted; manifest entry marked `"native": true` and preserved across
+  `scripts/vendor_converters.py` re-runs). Remaining six converters: ROADMAP M25.
+- Frontend: copy-only tweaks (upload dialog formats, converter panel note, guidance). Docs:
+  ROADMAP M20→M25 rewrite, MODEL_REFINEMENT/CONCEPT provenance conventions, plan doc archived
+  as superseded.
 
 ## Session 34 — 2026-07-08: Fast end-to-end ingestion plan (nginx access logs)
 
