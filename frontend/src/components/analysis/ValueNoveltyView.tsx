@@ -15,7 +15,7 @@ import {
   DetectorStatusLine,
   FindingRowActions,
   FindingShell,
-  ModeToggle,
+  NeedsBaselinePrompt,
   useBaselineRequest,
   RefreshButton,
   TagFindingsBar,
@@ -23,7 +23,6 @@ import {
   useAnomalyMarkers,
   useDetectorRunId,
   useOpenEvent,
-  type DetectorMode,
 } from "./detector-shared";
 import { Spinner } from "@/components/ui/Spinner";
 import type { Event, ValueNoveltyFinding } from "@/api/types";
@@ -86,6 +85,13 @@ function FindingRow({
           eventId={finding.event_id}
           onDrillField={onDrillField}
           onJumpToTime={onJumpToTime}
+          markNormal={{
+            caseId,
+            timelineId,
+            detector: "value_novelty",
+            details: finding.details,
+            sourceId: finding.event?.source_id,
+          }}
         />
       }
     >
@@ -134,8 +140,7 @@ export function ValueNoveltyView({
   onRunIdChange,
   onJumpToTime,
 }: Props) {
-  const [mode, setMode] = useState<DetectorMode>("self");
-  const { params: blParams, key: blKey } = useBaselineRequest(mode);
+  const { params: blParams, key: blKey, needsBaseline } = useBaselineRequest();
   // null = use backend smart default; string[] = explicit analyst selection.
   const [selectedFields, setSelectedFields] = useState<string[] | null>(null);
   const qc = useQueryClient();
@@ -156,6 +161,7 @@ export function ValueNoveltyView({
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     staleTime: 60_000,
+    enabled: !needsBaseline,
   });
 
   const tagMutation = useMutation({
@@ -215,11 +221,14 @@ export function ValueNoveltyView({
 
   useDetectorRunId(data?.run_id, onRunIdChange);
 
+  if (needsBaseline) return <NeedsBaselinePrompt />;
+
+  const isTemporal = data?.method === "temporal";
+
   return (
     <div className="space-y-3">
       {/* Toolbar */}
       <div className="flex items-center gap-2 flex-wrap">
-        <ModeToggle mode={mode} onChange={setMode} />
         <span className="flex-1" />
         <AnomalyFieldPicker
           caseId={caseId}
@@ -280,9 +289,9 @@ export function ValueNoveltyView({
         <AlertTriangle size={10} className="mt-0.5 shrink-0" />
         <span>
           Rare ≠ malicious.{" "}
-          {mode === "temporal"
-            ? "Temporal mode flags any value absent from the baseline window but present in a suspect window (select a baseline definition, or it falls back to the timeline midpoint). Score = −log(count / suspect-window events)."
-            : "Self-baseline mode flags values that appear ≤ rarity floor times in the whole corpus. Score = −log(count/total); higher is rarer."}
+          {isTemporal
+            ? "Comparing windows: flags any value absent from the baseline window but present in a suspect window. Score = −log(count / suspect-window events)."
+            : "Scanning all events: flags values that appear ≤ rarity floor times in the whole corpus. Score = −log(count/total); higher is rarer."}
         </span>
       </div>
     </div>

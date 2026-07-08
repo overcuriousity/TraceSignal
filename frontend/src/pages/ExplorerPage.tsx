@@ -19,7 +19,6 @@ import {
   PanelLeftOpen,
   BarChart2,
   AreaChart,
-  CalendarRange,
 } from "lucide-react";
 
 import { eventsApi } from "@/api/events";
@@ -45,9 +44,8 @@ import { ExportDialog } from "@/components/explorer/ExportDialog";
 import { SaveViewDialog } from "@/components/explorer/SaveViewDialog";
 import { ColumnPicker } from "@/components/explorer/ColumnPicker";
 import { TimelineHistogram } from "@/components/explorer/TimelineHistogram";
-import { BaselineManager } from "@/components/explorer/BaselineManager";
 import { FieldHistogramModal } from "@/components/viz/FieldHistogramModal";
-import { AnalysisPanel } from "@/components/analysis/AnalysisPanel";
+import { InvestigatePanel } from "@/components/analysis/InvestigatePanel";
 import { TriageMeter } from "@/components/triage/TriageMeter";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
@@ -376,8 +374,8 @@ export function ExplorerPage() {
   // ── Panel visibility state ────────────────────────────────────────────
   const filterRailOpen = useUiStore((s) => s.filterRailOpen);
   const setFilterRailOpen = useUiStore((s) => s.setFilterRailOpen);
-  const analysisPanelOpen = useUiStore((s) => s.analysisPanelOpen);
-  const setAnalysisPanelOpen = useUiStore((s) => s.setAnalysisPanelOpen);
+  const investigatePanelOpen = useUiStore((s) => s.investigatePanelOpen);
+  const setInvestigatePanelOpen = useUiStore((s) => s.setInvestigatePanelOpen);
   const [expandedEvent, setExpandedEvent] = useState<Event | null>(null);
   const handleExpandEvent = useCallback((event: Event | null) => {
     if (event) tourEvent("event-expanded");
@@ -387,7 +385,6 @@ export function ExplorerPage() {
   const [similarAnchor, setSimilarAnchor] = useState<Event | null>(null);
   const [anomalyMarkers, setAnomalyMarkers] = useState<AnomalyMarker[]>([]);
   const [anomalyRunId, setAnomalyRunId] = useState<string | undefined>(undefined);
-  const [baselineManagerOpen, setBaselineManagerOpen] = useState(false);
   const {
     activeBaselineId,
     markMode: baselineMarkMode,
@@ -690,8 +687,8 @@ export function ExplorerPage() {
 
   const handleFindSimilar = useCallback((event: Event) => {
     setSimilarAnchor(event);
-    setAnalysisPanelOpen(true);
-  }, [setAnalysisPanelOpen]);
+    setInvestigatePanelOpen(true);
+  }, [setInvestigatePanelOpen]);
 
   const handleHistogramRange = useCallback(
     (start: string, end: string) => {
@@ -1024,25 +1021,14 @@ export function ExplorerPage() {
               </Button>
             </Tooltip>
 
-            <Tooltip content={analysisPanelOpen ? "Close analysis panel" : "Open analysis panel"}>
+            <Tooltip content={investigatePanelOpen ? "Close Investigate panel" : "Open Investigate panel"}>
               <Button
-                variant={analysisPanelOpen ? "accent" : "outline"}
+                variant={investigatePanelOpen || activeBaselineId ? "accent" : "outline"}
                 size="sm"
-                onClick={() => setAnalysisPanelOpen(!analysisPanelOpen)}
+                onClick={() => setInvestigatePanelOpen(!investigatePanelOpen)}
               >
                 <FlaskConical size={13} />
-                Analysis
-              </Button>
-            </Tooltip>
-
-            <Tooltip content="Baseline & suspect windows">
-              <Button
-                variant={baselineManagerOpen || activeBaselineId ? "accent" : "outline"}
-                size="sm"
-                onClick={() => setBaselineManagerOpen((v) => !v)}
-              >
-                <CalendarRange size={13} />
-                Baselines
+                Investigate
               </Button>
             </Tooltip>
           </div>
@@ -1055,14 +1041,14 @@ export function ExplorerPage() {
             timelineId={timelineId}
             filters={effectiveFilters}
             onRangeSelect={handleHistogramRange}
-            markers={analysisPanelOpen ? anomalyMarkers : []}
+            markers={investigatePanelOpen ? anomalyMarkers : []}
             highlightRange={rangeHighlight}
             baselineWindows={activeBaselineWindows}
             markMode={baselineMarkMode}
             onMarkModeChange={setBaselineMarkMode}
             onMarkRange={(start, end) => {
               setBaselinePendingRange({ start, end });
-              setBaselineManagerOpen(true);
+              setInvestigatePanelOpen(true);
             }}
           />
         )}
@@ -1183,16 +1169,17 @@ export function ExplorerPage() {
                   />
                 )}
 
-                {/* Analysis panel */}
-                {analysisPanelOpen && timeline && (
-                  <AnalysisPanel
+                {/* Investigate panel (frame + detectors + windows & normality) */}
+                {investigatePanelOpen && timeline && (
+                  <InvestigatePanel
                     caseId={caseId!}
                     timelineId={timelineId!}
                     hasVectors={hasVectors}
                     similarAnchor={similarAnchor}
                     onClose={() => {
-                      setAnalysisPanelOpen(false);
+                      setInvestigatePanelOpen(false);
                       setSimilarAnchor(null);
+                      setBaselineMarkMode(false);
                     }}
                     onSelectEvent={(ev) => handleExpandEvent(ev)}
                     onSimilarClose={() => setSimilarAnchor(null)}
@@ -1202,18 +1189,6 @@ export function ExplorerPage() {
                     onAnomalyMarkers={setAnomalyMarkers}
                     onAnomalyRunId={setAnomalyRunId}
                     onJumpToTime={handleJumpToTime}
-                  />
-                )}
-
-                {/* Baseline definition manager (baseline + suspect windows, allowlist) */}
-                {baselineManagerOpen && caseId && timelineId && (
-                  <BaselineManager
-                    caseId={caseId}
-                    timelineId={timelineId}
-                    onClose={() => {
-                      setBaselineManagerOpen(false);
-                      setBaselineMarkMode(false);
-                    }}
                   />
                 )}
               </div>

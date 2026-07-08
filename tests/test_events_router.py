@@ -1191,6 +1191,42 @@ async def test_run_stat_detector_applies_allowlist(
 
 
 @pytest.mark.asyncio
+async def test_run_stat_detector_applies_wildcard_allowlist_across_detectors(
+    timeline_setup, monkeypatch, stub_field_stats_cache
+):
+    """A detector-agnostic (`"*"`) entry suppresses its (field, value) for every
+    value detector, while a detector-scoped entry only affects its own."""
+    # Wildcard: normal for all value detectors. Scoped: charset only.
+    await timeline_setup.create_allowlist_entry("c1", "t1", "*", "artifact", "wild")
+    await timeline_setup.create_allowlist_entry("c1", "t1", "charset", "artifact", "cs_only")
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    async def run(detector):
+        return await events._run_stat_detector(
+            "c1",
+            "t1",
+            ["s1"],
+            detector=detector,
+            fields="artifact",
+            series_field="artifact",
+            z_threshold=None,
+            baseline_end=None,
+            temporal=False,
+            limit=50,
+        )
+
+    await run("value_novelty")
+    # value_novelty sees the wildcard but not the charset-scoped entry.
+    assert fake_svc.value_novelty_calls[0]["allowlist"] == {("artifact", "wild")}
+
+    _, charset_resolution = await run("charset")
+    charset_allowlist = fake_svc.charset_calls[0]["allowlist"]
+    assert charset_allowlist == {("artifact", "wild"), ("artifact", "cs_only")}
+    assert charset_resolution["allowlist_count"] == 2
+
+
+@pytest.mark.asyncio
 async def test_detector_run_replays_after_baseline_deleted(
     timeline_setup, monkeypatch, stub_field_stats_cache
 ):

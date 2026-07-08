@@ -1362,15 +1362,20 @@ async def _run_stat_detector(
     store = get_store()
     svc = _get_stat_anomaly_service()
 
-    # Value-level allowlist (analyst-declared "normal") for this detector, and
-    # the legacy per-event `normal` annotations still honored as an event-level
-    # exclusion. Both are independent of window resolution — fetch concurrently.
-    allow_task = store.list_allowlist_entries(case_id, timeline_id, detector=detector)
+    # Value-level allowlist (analyst-declared "normal"), and the legacy per-event
+    # `normal` annotations still honored as an event-level exclusion. Both are
+    # independent of window resolution — fetch concurrently. The allowlist covers
+    # entries declared for this detector *plus* detector-agnostic ones (the
+    # `"*"` wildcard, written from a field-value row where no detector context
+    # exists — see docs/ANOMALY_DETECTION.md), so a value marked normal anywhere
+    # suppresses it here too.
+    allow_task = store.list_allowlist_entries(case_id, timeline_id)
     normal_task = store.list_event_ids_by_annotation_type(case_id, source_ids, "normal")
     windows_task = _resolve_analysis_windows(
         store, svc, case_id, timeline_id, source_ids, baseline_id, baseline_end, temporal
     )
-    allow_entries, normal_ids, windows = await asyncio.gather(allow_task, normal_task, windows_task)
+    all_entries, normal_ids, windows = await asyncio.gather(allow_task, normal_task, windows_task)
+    allow_entries = [e for e in all_entries if e.detector in (detector, "*")]
     allowlist: set[tuple[str, str]] | None = {(e.field, e.value) for e in allow_entries} or None
     exclude_ids: set[str] | None = set(normal_ids) if normal_ids else None
 

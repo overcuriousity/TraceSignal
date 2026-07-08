@@ -9,7 +9,6 @@
  */
 import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { useBaselineStore } from "@/stores/baseline";
 import {
   AlertTriangle,
   Info,
@@ -22,9 +21,11 @@ import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { shouldInvalidate } from "@/hooks/useCaseStream";
 import {
   DetectorStatusLine,
+  NeedsBaselinePrompt,
   RefreshButton,
   TagFindingsBar,
   useAnomalyMarkers,
+  useBaselineRequest,
   useDetectorRunId,
 } from "./detector-shared";
 import { Spinner } from "@/components/ui/Spinner";
@@ -181,12 +182,10 @@ export function FrequencyView({
   const [seriesField, setSeriesField] = useState("artifact");
   const [zThresholdInput, setZThresholdInput] = useState("2.5");
   const qc = useQueryClient();
-  // Frequency has no self/temporal toggle: it runs self-baseline unless a
-  // baseline definition is active, in which case it scores suspect windows
-  // against that baseline. The active id both selects the mode and re-keys.
-  const activeBaselineId = useBaselineStore((s) => s.activeBaselineId);
-  const blParams = activeBaselineId ? { baseline_id: activeBaselineId } : {};
-  const blKey = activeBaselineId ?? "self";
+  // Frequency has no local mode: it follows the global frame like every other
+  // detector. `self` → whole-timeline z-score; `baseline` → score suspect
+  // windows against the active definition's baseline.
+  const { params: blParams, key: blKey, needsBaseline } = useBaselineRequest();
 
   // Debounce so a full detector scan doesn't fire on every keystroke
   // (including transient invalid states like a bare "-" or "").
@@ -227,6 +226,7 @@ export function FrequencyView({
         ...blParams,
       }),
     staleTime: 60_000,
+    enabled: !needsBaseline,
   });
 
   const tagMutation = useMutation({
@@ -287,6 +287,8 @@ export function FrequencyView({
   );
 
   useDetectorRunId(data?.run_id, onRunIdChange);
+
+  if (needsBaseline) return <NeedsBaselinePrompt />;
 
   return (
     <div className="space-y-3">

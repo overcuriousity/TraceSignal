@@ -14,14 +14,13 @@ import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
 import {
   DetectorStatusLine,
   FindingShell,
-  ModeToggle,
+  NeedsBaselinePrompt,
   useBaselineRequest,
   RefreshButton,
   TagFindingsBar,
   useAnomalyMarkers,
   useDetectorRunId,
   useOpenEvent,
-  type DetectorMode,
 } from "./detector-shared";
 import { Spinner } from "@/components/ui/Spinner";
 import type { AnomalyMarker, Event, ValueComboFinding } from "@/api/types";
@@ -155,8 +154,7 @@ export function ComboNoveltyView({
   onRunIdChange,
   onJumpToTime,
 }: Props) {
-  const [mode, setMode] = useState<DetectorMode>("self");
-  const { params: blParams, key: blKey } = useBaselineRequest(mode);
+  const { params: blParams, key: blKey, needsBaseline } = useBaselineRequest();
   // null = auto (top-2 recommended); string[] = explicit selection (≥ 2 to run).
   const [selectedFields, setSelectedFields] = useState<string[] | null>(null);
   const qc = useQueryClient();
@@ -174,7 +172,7 @@ export function ComboNoveltyView({
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     // Don't fire while the explicit selection is below the two-field minimum.
-    enabled: !explicitTooFew,
+    enabled: !explicitTooFew && !needsBaseline,
     staleTime: 60_000,
   });
 
@@ -227,11 +225,12 @@ export function ComboNoveltyView({
 
   useDetectorRunId(data?.run_id, onRunIdChange);
 
+  if (needsBaseline) return <NeedsBaselinePrompt />;
+
   return (
     <div className="space-y-3">
       {/* Toolbar */}
       <div className="flex items-center gap-2 flex-wrap">
-        <ModeToggle mode={mode} onChange={setMode} />
         <span className="flex-1" />
         <AnomalyFieldPicker
           caseId={caseId}

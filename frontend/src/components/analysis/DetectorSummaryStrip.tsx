@@ -33,12 +33,18 @@ interface Props {
 }
 
 export function DetectorSummaryStrip({ caseId, timelineId, onSelect }: Props) {
+  const frame = useBaselineStore((s) => s.frame);
   const activeBaselineId = useBaselineStore((s) => s.activeBaselineId);
+  // The sweep follows the global frame like the per-detector views. In the
+  // baseline frame without a definition there is nothing to compare against —
+  // disable the run rather than silently sweeping self.
+  const inBaselineFrame = frame === "baseline";
+  const needsBaseline = inBaselineFrame && !activeBaselineId;
   const [counts, setCounts] = useState<Record<SubTab, number> | null>(null);
 
   const sweep = useMutation({
     mutationFn: async () => {
-      const blParams = activeBaselineId ? { baseline_id: activeBaselineId } : {};
+      const blParams = inBaselineFrame && activeBaselineId ? { baseline_id: activeBaselineId } : {};
       const results = await Promise.all(
         SWEEP.map((d) =>
           anomaliesApi
@@ -62,9 +68,9 @@ export function DetectorSummaryStrip({ caseId, timelineId, onSelect }: Props) {
       <div className="mb-1.5 flex items-center gap-2">
         <Layers size={12} className="text-[var(--color-fg-muted)]" />
         <span className="flex-1 text-xs font-medium text-[var(--color-fg-secondary)]">
-          Run all detectors{activeBaselineId ? " (against active baseline)" : ""}
+          Run all detectors{inBaselineFrame && activeBaselineId ? " (against baseline)" : " (all events)"}
         </span>
-        <Button size="sm" variant="ghost" className="gap-1 text-xs" disabled={sweep.isPending} onClick={() => sweep.mutate()}>
+        <Button size="sm" variant="ghost" className="gap-1 text-xs" disabled={sweep.isPending || needsBaseline} onClick={() => sweep.mutate()} title={needsBaseline ? "Select a baseline definition first" : undefined}>
           {sweep.isPending ? <Spinner size={11} /> : <Play size={11} />}
           Run
         </Button>

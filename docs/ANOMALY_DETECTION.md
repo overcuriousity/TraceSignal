@@ -76,7 +76,12 @@ about which is which:
   dropped on *every* event, unlike the legacy per-event `normal` annotation it
   replaces (which only hid one representative event's finding). For the
   frequency detector the field is the series field, so an entry suppresses a
-  whole known-noisy series.
+  whole known-noisy series. An entry may use the wildcard detector `"*"` to
+  declare a `(field, value)` normal for **every** value-shaped detector at once
+  — this is what the field-value **Normal** action (on an event-detail attribute
+  row, where there is no detector context) writes, versus a finding row's Normal
+  which scopes the entry to that one detector. A detector run applies entries
+  whose detector is its own **or** `"*"`.
 
 **How a suspect window scores.** Each temporal detector restricts its scan to
 the union of the baseline and suspect windows (events outside every window are

@@ -1,6 +1,35 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-08 (session 31 — explicit baseline + suspect windows, Alembic, D11 allowlist).
+Last updated: 2026-07-08 (session 32 — Investigate panel: unified analysis+baseline UX).
+
+## Session 32 — 2026-07-08: Investigate panel — unified analysis + baseline UX rework
+
+The session-31 backend (explicit baseline definitions + value allowlist) was sound, but the
+UI exposed it as two sibling panels (Analysis + Baselines) coordinating invisibly through a
+store and the histogram, plus a per-detector self/temporal `ModeToggle` whose meaning shifted
+with the active baseline. Fresh users had no mental model. Reworked the frontend into one
+coherent surface with an aminer-shaped normality model (learned baseline window + manual
+value allowlist = `learn_mode` + `allowlist_event`).
+
+- **One `InvestigatePanel`** (`components/analysis/InvestigatePanel.tsx`) replaces
+  `AnalysisPanel` + `BaselineManager` (both deleted). Reads top-to-bottom: frame → detectors
+  → Windows & normality. Single `investigatePanelOpen` toolbar toggle (`stores/ui.ts`).
+- **Global frame** (`stores/baseline.ts` gains `frame: "self" | "baseline"`). `FrameBar`
+  sets the one scope every detector obeys; `useBaselineRequest()` reads it from the store,
+  and the per-view `ModeToggle` is gone from all five value detectors + frequency. Baseline
+  frame without a definition shows `NeedsBaselinePrompt` instead of silently running self.
+- **Window editor** (`WindowsNormality.tsx`): baseline + N suspect rows with typed UTC
+  datetime inputs *and* histogram-drag (arm a row → brush fills it via `pendingRange`).
+  Client-side validation mirrors the router's `_validate_windows`. Create/edit/delete.
+- **Allowlist made usable + clarified.** Value-based, aminer-aligned. Two entry points, one
+  `useMarkNormal` hook: field-value rows in `EventDetailPanel` write a detector-agnostic
+  `"*"` entry (all value detectors); analysis finding rows (`FindingRowActions`) write a
+  detector-scoped entry. Backend: `_run_stat_detector` now applies entries whose detector is
+  its own **or** `"*"` (`events.py`; no schema change — `"*"` is just a detector value).
+  "Normal values" list shows scope per entry.
+- Verified: `tsc`, oxlint, 179 frontend tests, 160 backend tests, prod build all green; two
+  new backend tests cover the `"*"` wildcard suppressing across detectors vs. scoped entries.
+  Live browser drive not run (dev stack not serving in this environment).
 
 ## Session 31 — 2026-07-08: explicit baseline + suspect windows for temporal anomaly detection
 

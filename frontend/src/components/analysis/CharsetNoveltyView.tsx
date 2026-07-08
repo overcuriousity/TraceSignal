@@ -17,7 +17,7 @@ import {
   DetectorStatusLine,
   FindingRowActions,
   FindingShell,
-  ModeToggle,
+  NeedsBaselinePrompt,
   useBaselineRequest,
   RefreshButton,
   TagFindingsBar,
@@ -25,7 +25,6 @@ import {
   useAnomalyMarkers,
   useDetectorRunId,
   useOpenEvent,
-  type DetectorMode,
 } from "./detector-shared";
 import { Spinner } from "@/components/ui/Spinner";
 import type { AnomalyMarker, CharsetFinding, Event } from "@/api/types";
@@ -89,6 +88,13 @@ function CharsetRow({
           eventId={finding.event_id}
           onDrillField={onDrillField}
           onJumpToTime={onJumpToTime}
+          markNormal={{
+            caseId,
+            timelineId,
+            detector: "charset",
+            details: finding.details,
+            sourceId: finding.event?.source_id,
+          }}
         />
       }
     >
@@ -140,8 +146,7 @@ export function CharsetNoveltyView({
   onRunIdChange,
   onJumpToTime,
 }: Props) {
-  const [mode, setMode] = useState<DetectorMode>("self");
-  const { params: blParams, key: blKey } = useBaselineRequest(mode);
+  const { params: blParams, key: blKey, needsBaseline } = useBaselineRequest();
   const [selectedFields, setSelectedFields] = useState<string[] | null>(null);
   const qc = useQueryClient();
 
@@ -157,6 +162,7 @@ export function CharsetNoveltyView({
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
       }),
     staleTime: 60_000,
+    enabled: !needsBaseline,
   });
 
   const tagMutation = useMutation({
@@ -207,11 +213,14 @@ export function CharsetNoveltyView({
 
   useDetectorRunId(data?.run_id, onRunIdChange);
 
+  if (needsBaseline) return <NeedsBaselinePrompt />;
+
+  const isTemporal = data?.method === "temporal-charset";
+
   return (
     <div className="space-y-3">
       {/* Toolbar */}
       <div className="flex items-center gap-2 flex-wrap">
-        <ModeToggle mode={mode} onChange={setMode} />
         <span className="flex-1" />
         <AnomalyFieldPicker
           caseId={caseId}
@@ -239,7 +248,7 @@ export function CharsetNoveltyView({
               ? "No charset novelties. No events ingested yet."
               : data?.status === "insufficient_data"
                 ? "No fields with enough distinct baseline values (or the alphabet is too large). Pick fields explicitly above."
-                : mode === "temporal"
+                : isTemporal
                   ? "No values with characters absent from the baseline window."
                   : "No values with rare characters."}
           </span>
@@ -272,9 +281,9 @@ export function CharsetNoveltyView({
       <div className="flex items-start gap-1.5 text-xs text-[var(--color-fg-muted)] pt-1">
         <AlertTriangle size={10} className="mt-0.5 shrink-0" />
         <span>
-          {mode === "temporal"
-            ? "Temporal mode learns every character seen in the baseline window's values and flags detect-window values containing never-seen characters."
-            : "Self-baseline mode flags values containing characters that appear in almost no other distinct value of the field (rare-character set)."}{" "}
+          {isTemporal
+            ? "Comparing windows: learns every character seen in the baseline window's values and flags suspect-window values containing never-seen characters."
+            : "Scanning all events: flags values containing characters that appear in almost no other distinct value of the field (rare-character set)."}{" "}
           Purely syntactic — null bytes, homoglyphs, and injection metacharacters are detected by character identity, never by meaning.
         </span>
       </div>

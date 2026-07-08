@@ -1,7 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { X, Copy, Search, Filter, FilterX, Tag, MessageSquare, Trash2, Plus, Clock, History, AlertTriangle, Save, CircleCheck, BarChart2, ChevronDown, ChevronRight } from "lucide-react";
-import { baselinesApi } from "@/api/baselines";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -18,6 +17,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/DropdownMenu";
 import { useAnnotationMutations } from "@/hooks/useAnnotationMutations";
+import { useMarkNormal } from "@/hooks/useMarkNormal";
 import { useUiStore } from "@/stores/ui";
 import { TagInput } from "@/components/explorer/TagInput";
 import { anomaliesApi } from "@/api/anomalies";
@@ -79,6 +79,7 @@ function FieldRow({
   filterKey,
   onAddFilter,
   onShowHistogram,
+  onMarkNormal,
   flag,
   dataTour,
 }: {
@@ -90,6 +91,13 @@ function FieldRow({
   filterKey?: string | null;
   onAddFilter?: (fieldKey: string, value: string, include: boolean) => void;
   onShowHistogram?: (fieldKey: string, value: string) => void;
+  /**
+   * Marks this field:value normal for every value detector (detector "*").
+   * Receives only the value — the caller closes over the correct allowlist
+   * field token (e.g. `attr:<name>` for dynamic attributes), which need not
+   * equal `filterKey`.
+   */
+  onMarkNormal?: (value: string) => void;
   flag?: { flag: string; label: string } | null;
   /** Onboarding-tour anchor on the action-buttons cluster. */
   dataTour?: string;
@@ -161,6 +169,19 @@ function FieldRow({
                   className="rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-fg-primary)] transition-base"
                 >
                   <BarChart2 size={11} />
+                </button>
+              </Tooltip>
+            )}
+            {onMarkNormal && (
+              <Tooltip content={`Mark normal: treat ${label} = ${value} as normal — no detector flags it again`} side="top">
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onMarkNormal(value);
+                  }}
+                  className="rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-success)] transition-base"
+                >
+                  <CircleCheck size={11} />
                 </button>
               </Tooltip>
             )}
@@ -307,36 +328,24 @@ export function EventDetailPanel({
     },
   });
 
-  // "Mark normal" on a finding = value-level normality: the detector will never
-  // flag this (detector, field, value) again on any event (unified with the
-  // baseline-window model, replacing the old per-event normal annotation — see
-  // docs/ANOMALY_DETECTION.md). timestamp_order findings are positional, not
-  // value-shaped, so they keep the per-event normal annotation instead.
-  const markNormalMutation = useMutation({
-    mutationFn: async (finding: AnomalyMarker): Promise<void> => {
-      const d = finding.rawDetails as Record<string, unknown>;
-      const field = d.allowlist_field as string | undefined;
-      const value = d.allowlist_value as string | undefined;
-      if (finding.detector === "timestamp_order" || field === undefined || value === undefined) {
-        await add.mutateAsync({
-          eventId: event.event_id,
-          type: "normal",
-          content: "normal operation",
-        });
-        return;
-      }
-      await baselinesApi.addAllowlist(caseId, timelineId, {
-        detector: finding.detector,
-        field,
-        value,
-      });
-    },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["annotations"] });
-      qc.invalidateQueries({ queryKey: ["allowlist", caseId, timelineId] });
-      qc.invalidateQueries({ queryKey: ["anomalies"] });
-    },
-  });
+  // "Mark normal" = value-level normality: the detector never flags this value
+  // again (see docs/ANOMALY_DETECTION.md). Shared with the analysis finding
+  // rows via useMarkNormal. From a *finding* it is detector-scoped; from a
+  // *field:value* row (below) it is detector-agnostic ("*"). timestamp_order
+  // findings are positional, so they fall back to a per-event annotation.
+  const markNormal = useMarkNormal(caseId, timelineId);
+  const markFindingNormal = (finding: AnomalyMarker) => {
+    const d = (finding.rawDetails ?? {}) as Record<string, unknown>;
+    markNormal.mutate({
+      detector: finding.detector,
+      field: d.allowlist_field as string | undefined,
+      value: d.allowlist_value as string | undefined,
+      sourceId: finding.sourceId ?? sourceId,
+      eventId: finding.eventId ?? event.event_id,
+    });
+  };
+  const markFieldNormal = (fieldKey: string, value: string) =>
+    markNormal.mutate({ detector: "*", field: fieldKey, value });
 
   // ── Resize drag ────────────────────────────────────────────────────────
   const { detailPanelWidth, setDetailPanelWidth } = useUiStore();
@@ -552,6 +561,7 @@ export function EventDetailPanel({
             filterKey="artifact"
             onAddFilter={onAddFilter}
             onShowHistogram={onShowFieldHistogram}
+            onMarkNormal={(v) => markFieldNormal("artifact", v)}
           />
           <FieldRow
             label="artifact_long"
@@ -560,6 +570,7 @@ export function EventDetailPanel({
             filterKey="artifact_long"
             onAddFilter={onAddFilter}
             onShowHistogram={onShowFieldHistogram}
+            onMarkNormal={(v) => markFieldNormal("artifact_long", v)}
           />
           <FieldRow
             label="display_name"
@@ -567,6 +578,7 @@ export function EventDetailPanel({
             filterKey="display_name"
             onAddFilter={onAddFilter}
             onShowHistogram={onShowFieldHistogram}
+            onMarkNormal={(v) => markFieldNormal("display_name", v)}
           />
         </Section>
 
@@ -614,6 +626,7 @@ export function EventDetailPanel({
                 filterKey={k}
                 onAddFilter={onAddFilter}
                 onShowHistogram={onShowFieldHistogram}
+                onMarkNormal={(val) => markFieldNormal(`attr:${k}`, val)}
                 flag={getAttributeDecoration(event.attributes ?? {}, k)}
               />
             ))}
@@ -710,11 +723,11 @@ export function EventDetailPanel({
                   side="top"
                 >
                   <button
-                    onClick={() => markNormalMutation.mutate(finding)}
-                    disabled={markNormalMutation.isPending}
+                    onClick={() => markFindingNormal(finding)}
+                    disabled={markNormal.isPending}
                     className="flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-success)] transition-base"
                   >
-                    {markNormalMutation.isPending ? <Spinner size={10} /> : <CircleCheck size={10} />}
+                    {markNormal.isPending ? <Spinner size={10} /> : <CircleCheck size={10} />}
                     Normal
                   </button>
                 </Tooltip>

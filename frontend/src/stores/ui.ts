@@ -16,9 +16,9 @@ interface UiState {
   visibleColumnsByTimeline: Record<string, string[]>;
   setVisibleColumns: (key: string, cols: string[]) => void;
 
-  /** Whether the analysis panel is open. */
-  analysisPanelOpen: boolean;
-  setAnalysisPanelOpen: (open: boolean) => void;
+  /** Whether the Investigate panel (frame + detectors + windows) is open. */
+  investigatePanelOpen: boolean;
+  setInvestigatePanelOpen: (open: boolean) => void;
 
   /** Whether the filter rail is collapsed on mobile. */
   filterRailOpen: boolean;
@@ -87,8 +87,8 @@ export const useUiStore = create<UiState>()(
           visibleColumnsByTimeline: { ...s.visibleColumnsByTimeline, [key]: cols },
         })),
 
-      analysisPanelOpen: false,
-      setAnalysisPanelOpen: (open) => set({ analysisPanelOpen: open }),
+      investigatePanelOpen: false,
+      setInvestigatePanelOpen: (open) => set({ investigatePanelOpen: open }),
 
       filterRailOpen: true,
       setFilterRailOpen: (open) => set({ filterRailOpen: open }),

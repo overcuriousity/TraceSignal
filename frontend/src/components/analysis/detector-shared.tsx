@@ -9,10 +9,11 @@
  */
 import { useEffect, useState } from "react";
 import { useMutation, type UseMutationResult } from "@tanstack/react-query";
-import { AlertTriangle, ChevronDown, ChevronsRight, ChevronUp, Clock, RefreshCw, Tag } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronsRight, ChevronUp, CircleCheck, Clock, RefreshCw, Tag } from "lucide-react";
 import { eventsApi } from "@/api/events";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
+import { useMarkNormal } from "@/hooks/useMarkNormal";
 import { useBaselineStore } from "@/stores/baseline";
 import type {
   AnomaliesResponse,
@@ -23,24 +24,25 @@ import type {
 import { cn } from "@/lib/cn";
 import { tagResultLabel } from "@/lib/format";
 
-export type DetectorMode = "self" | "temporal";
-
 /**
- * Resolve the request params + queryKey fragment for a detector's temporal
- * mode, honoring the active saved baseline definition (from the baseline
- * store) over the legacy midpoint split. Every detector view calls this
- * instead of hard-coding `temporal: mode === "temporal"` so a change to the
- * active baseline re-runs the scan and all seven views stay consistent.
+ * Resolve the request params + queryKey fragment for the current global
+ * detector frame, read from the baseline store (not a per-view arg). Every
+ * detector view calls this so a change to the frame or active baseline re-runs
+ * the scan and all views stay consistent. `needsBaseline` is true when the
+ * frame is `baseline` but no definition is active — the view should prompt to
+ * pick/build one rather than silently fall back to the legacy midpoint split.
  */
-export function useBaselineRequest(mode: DetectorMode): {
+export function useBaselineRequest(): {
   params: { temporal?: boolean; baseline_id?: string };
   key: string;
+  needsBaseline: boolean;
 } {
+  const frame = useBaselineStore((s) => s.frame);
   const activeBaselineId = useBaselineStore((s) => s.activeBaselineId);
-  if (mode !== "temporal") return { params: { temporal: false }, key: "self" };
+  if (frame !== "baseline") return { params: { temporal: false }, key: "self", needsBaseline: false };
   if (activeBaselineId)
-    return { params: { baseline_id: activeBaselineId }, key: `bl:${activeBaselineId}` };
-  return { params: { temporal: true }, key: "temporal" };
+    return { params: { baseline_id: activeBaselineId }, key: `bl:${activeBaselineId}`, needsBaseline: false };
+  return { params: { temporal: false }, key: "self", needsBaseline: true };
 }
 
 // Auto-scan field selection for the string detectors (charset/entropy). Mirrors
@@ -81,34 +83,22 @@ export function fieldsParamOf(selectedFields: string[] | null): string | undefin
   return selectedFields.length > 0 ? selectedFields.join(",") : "__none__";
 }
 
-/** Self-baseline / temporal pill pair, as used by the rare-values toolbar. */
-export function ModeToggle({
-  mode,
-  onChange,
-}: {
-  mode: DetectorMode;
-  onChange: (mode: DetectorMode) => void;
-}) {
+/**
+ * Shown in place of a detector's findings when the global frame is `baseline`
+ * but no definition is active — every view renders this instead of silently
+ * running a self-baseline scan, so "compare windows" always means an explicit
+ * baseline. The frame bar's definition dropdown / window editor is the fix.
+ */
+export function NeedsBaselinePrompt() {
   return (
-    <>
-      <span className="text-xs font-semibold uppercase tracking-wide text-[var(--color-fg-muted)]">
-        Mode
+    <div className="flex items-start gap-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3 text-xs text-[var(--color-fg-muted)]">
+      <AlertTriangle size={13} className="mt-0.5 shrink-0 text-[var(--color-warning)]" />
+      <span>
+        Comparing against a baseline, but none is selected. Pick or build a
+        baseline definition in <strong>Windows &amp; normality</strong> below,
+        or switch the frame to <strong>Scan all events</strong>.
       </span>
-      {(["self", "temporal"] as const).map((m) => (
-        <button
-          key={m}
-          className={cn(
-            "rounded px-2 py-0.5 text-xs font-medium transition-colors",
-            mode === m
-              ? "bg-[var(--color-accent)] text-white"
-              : "bg-[var(--color-bg-elevated)] text-[var(--color-fg-muted)] hover:text-[var(--color-fg-secondary)]",
-          )}
-          onClick={() => onChange(m)}
-        >
-          {m === "self" ? "Self-baseline" : "Temporal"}
-        </button>
-      ))}
-    </>
+    </div>
   );
 }
 
@@ -318,6 +308,7 @@ export function FindingRowActions({
   eventId,
   onDrillField,
   onJumpToTime,
+  markNormal,
 }: {
   /** Field/value for the drill button; omit for detectors without one (order). */
   field?: string;
@@ -326,9 +317,53 @@ export function FindingRowActions({
   eventId?: string | null;
   onDrillField?: (field: string, value: string) => void;
   onJumpToTime?: (ts: string, eventId?: string) => void;
+  /**
+   * Enables the detector-scoped "Normal" action on the row. `caseId`/
+   * `timelineId` locate the timeline; `detector` + the finding's `details`
+   * (carrying the precomputed `allowlist_field`/`allowlist_value`) form the
+   * suppression key. `sourceId` is only used for the positional fallback.
+   */
+  markNormal?: {
+    caseId: string;
+    timelineId: string;
+    detector: string;
+    details: Record<string, unknown>;
+    sourceId?: string | null;
+  };
 }) {
+  // Always instantiate (rules of hooks); it only fires when the button renders.
+  const markNormalMut = useMarkNormal(markNormal?.caseId ?? "", markNormal?.timelineId ?? "");
+  const allowlistField = markNormal?.details?.allowlist_field as string | undefined;
+  const allowlistValue = markNormal?.details?.allowlist_value as string | undefined;
+  const isPositional = markNormal?.detector === "timestamp_order";
+  const canMarkNormal =
+    markNormal !== undefined && (isPositional ? !!eventId : allowlistField !== undefined && allowlistValue !== undefined);
+
   return (
     <>
+      {canMarkNormal && markNormal && (
+        <button
+          title={
+            isPositional
+              ? "Mark this event OK — this one event is no longer flagged"
+              : `Treat ${allowlistField}=${allowlistValue} as normal — no longer flagged by ${markNormal.detector}`
+          }
+          className="rounded p-0.5 text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-success)]"
+          onClick={(e) => {
+            e.stopPropagation();
+            markNormalMut.mutate({
+              detector: markNormal.detector,
+              field: allowlistField,
+              value: allowlistValue,
+              sourceId: markNormal.sourceId ?? undefined,
+              eventId: eventId ?? undefined,
+            });
+          }}
+          disabled={markNormalMut.isPending}
+        >
+          {markNormalMut.isPending ? <Spinner size={11} /> : <CircleCheck size={12} />}
+        </button>
+      )}
       {onDrillField && field !== undefined && value !== undefined && (
         <button
           title={`Filter to ${field}=${value}`}
