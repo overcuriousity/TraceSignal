@@ -35,6 +35,13 @@ embeddings surface the needles in the haystack, without needing a cluster to run
   chain-of-custody.
 - A separate, user-triggered embedding job (`tsig embed` / the embed wizard) computes vectors
   after ingestion — ingestion itself stays fast and embedding-free until you ask for it.
+- Downloadable converter scripts (nginx, filterlog, suricata, cloudtrail, pcap, and more) parse
+  vendor-specific log formats client-side and emit typed, columnar **Parquet** files instead of
+  CSV/JSONL; the server bulk-inserts these via **Arrow** record batches, an order of magnitude
+  faster than row-by-row CSV parsing on multi-GB logs, while keeping the same per-row forensic
+  provenance (file hash, byte offset, content hash). See
+  [`docs/TECH_STACK.md`](docs/TECH_STACK.md) §3.4a for the full rationale. Stdlib-only vendored
+  converters remain available as a minimal-dependency (no pyarrow) alternative.
 
 ### Explorer
 - A virtualized, ELK-like event grid: resizable/pickable columns, comfortable/compact density,
