@@ -636,6 +636,18 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
   const virtualItems = rowVirtualizer.getVirtualItems();
   const totalHeight = rowVirtualizer.getTotalSize();
 
+  // Force one remeasure whenever the grid holds rows but nothing is virtualized
+  // yet. This covers the remount race (e.g. returning from the Visualize route):
+  // if the scroll element's height settled before react-virtual's ResizeObserver
+  // observed it, the first paint yields zero virtual items and would otherwise
+  // stay empty until the user scrolls/resizes. measure() is cheap here (fixed
+  // row height) and the guard prevents any loop.
+  useEffect(() => {
+    if (rows.length > 0 && virtualItems.length === 0) {
+      rowVirtualizer.measure();
+    }
+  }, [rows.length, virtualItems.length, rowVirtualizer]);
+
   // Report the timestamp of the topmost visible row so the histogram can show
   // a "current position" indicator. Guarded against redundant calls.
   const lastReportedTsRef = useRef<string | null>(null);
@@ -753,13 +765,30 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
           hg.headers.map((h) => (
             <div
               key={h.id}
-              className="relative px-[var(--grid-cell-x)] py-2 text-xs font-semibold uppercase tracking-wider text-[var(--color-fg-secondary)] select-none"
+              className="relative min-w-0 overflow-hidden px-[var(--grid-cell-x)] py-2 text-xs font-semibold uppercase tracking-wider text-[var(--color-fg-secondary)] select-none"
               style={{
                 width: h.column.id === "message" ? undefined : h.getSize(),
                 flex: h.column.id === "message" ? "1 1 0" : `0 0 ${h.getSize()}px`,
               }}
             >
-              {flexRender(h.column.columnDef.header, h.getContext())}
+              {/* Clip a too-narrow header at its START (rtl) so the meaningful
+                * tail stays visible, and surface the full label on hover. The
+                * inner ltr wrapper keeps the text itself readable. */}
+              {(() => {
+                const raw = h.column.columnDef.header;
+                const label = typeof raw === "string" ? raw : undefined;
+                return (
+                  <span
+                    className="block truncate"
+                    style={{ direction: "rtl" }}
+                    title={label}
+                  >
+                    <span className="inline-block align-bottom" style={{ direction: "ltr" }}>
+                      {flexRender(raw, h.getContext())}
+                    </span>
+                  </span>
+                );
+              })()}
               {h.column.getCanResize() && (
                 <div
                   onMouseDown={(e) => { e.stopPropagation(); h.getResizeHandler()(e); }}
