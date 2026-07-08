@@ -58,6 +58,13 @@ CONVERTERS = {
         "nginx access/error/redirect logs (plain or .gz) to Timesketch timeline.",
         ["access.log*", "error.log*"],
     ),
+    "pcap2timesketch": (
+        "pcap",
+        "pcap2timesketch.py",
+        "Packet captures (pcap/pcapng) to Timesketch timeline, decoded to "
+        "Ethernet/IPv4/IPv6/TCP/UDP/ICMP/ARP headers.",
+        ["*.pcap", "*.pcapng"],
+    ),
     "suricata2timesketch": (
         "suricata",
         "suricata2timesketch.py",

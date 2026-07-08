@@ -1,6 +1,6 @@
 {
   "upstream": "https://github.com/overcuriousity/2timesketch",
-  "commit": "c1c0f5ae33253e1ee0406ba8fe3bc86dface111a",
+  "commit": "303869e321a620e529eef116ef2cd787fd1ca4cb",
   "version": "1.0.0",
   "license": "MIT License",
   "converters": [
@@ -13,7 +13,7 @@
         "History (Chromium SQLite)"
       ],
       "size_bytes": 101161,
-      "sha256": "01bc24830aac86e407d555aa27d6921ed967b1575e358268a84d1831bb32416c"
+      "sha256": "9b8425726da2c46310b52211f7980c3b0243f1a022eb3996cd216cebc8c75c82"
     },
     {
       "name": "cloudtrail2timesketch",
@@ -23,7 +23,7 @@
         "CloudTrail .json / .json.gz"
       ],
       "size_bytes": 42610,
-      "sha256": "9bd4cb01e14c5eb4db19e3a88e25d375679140a7a77af36f8ba8bbb0f5a4cfcf"
+      "sha256": "98ed1120344c8a95d34e58f8d59164b5cca8974c43ebbaa6390e1079b51fcdb9"
     },
     {
       "name": "filterlog2timesketch",
@@ -33,7 +33,7 @@
         "filter.log (syslog filterlog lines)"
       ],
       "size_bytes": 51113,
-      "sha256": "1c62ad11252149d2f4a7825f36deebd2926f32c8ef0accfc01f871946aa2d372"
+      "sha256": "77e9be35c2706897f009f2e6c4bbde2a3dd5d0118e4aa51a51b64f1cb46a4bb8"
     },
     {
       "name": "journal2timesketch",
@@ -43,7 +43,7 @@
         "journal directory / journalctl -o json"
       ],
       "size_bytes": 38902,
-      "sha256": "7a9167f1c72c0cda63158dc29e3393ccf1ac9652b4658cac3779c1c2eca969b8"
+      "sha256": "c4b46abf2584042ff1718899b3f47d710ee0b13681d2e752f63b21b14fed9380"
     },
     {
       "name": "nginx2timesketch",
@@ -54,7 +54,18 @@
         "error.log*"
       ],
       "size_bytes": 46588,
-      "sha256": "7a9e20856a97884766861953a3662f9326ab6d6508cbdd4eb904b3bff7bab1bb"
+      "sha256": "ff7cbd2f23395d680973aec1d92fd04d8e85c984125104173aa2fe83b2560ff5"
+    },
+    {
+      "name": "pcap2timesketch",
+      "filename": "pcap2timesketch.py",
+      "description": "Packet captures (pcap/pcapng) to Timesketch timeline, decoded to Ethernet/IPv4/IPv6/TCP/UDP/ICMP/ARP headers.",
+      "inputs": [
+        "*.pcap",
+        "*.pcapng"
+      ],
+      "size_bytes": 62362,
+      "sha256": "9c0d7963ce8226464c032300a210189e7c86891fe3f1fe8b79e8628a3dd40388"
     },
     {
       "name": "suricata2timesketch",
@@ -66,7 +77,7 @@
         "OPNsense suricata syslog export"
       ],
       "size_bytes": 53516,
-      "sha256": "859bc01697715d3f1355b45426d604d703030f749f4f74ac2a926dca3a7bd526"
+      "sha256": "762f32313af78714ae35d3a1e9e8ac45ce310e9a6a3911436f99dedd8f37d0f2"
     }
   ]
 }
