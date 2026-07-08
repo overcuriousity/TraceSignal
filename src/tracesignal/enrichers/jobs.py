@@ -114,6 +114,7 @@ def _process_batch(
     job_id: str,
     enricher_key: str,
     enricher_config_hash: str,
+    value_cache: dict[str, dict[str, str] | None],
 ) -> list[dict[str, Any]]:
     """Regex-match attributes in a batch of events and run the enricher on matches.
 
@@ -122,6 +123,13 @@ def _process_batch(
     enricher failure propagates (with event context attached) and fails the
     whole job: partially-silently-enriched results are worse than a failed
     job in a forensic tool.
+
+    ``value_cache`` memoizes the (deterministic) enricher result per distinct
+    raw value across the whole job. The same IP typically recurs across
+    millions of events, so without dedup a GeoIP run does one mmdb lookup per
+    event; with it, one per *distinct* value — the histogram-style "list each
+    value once, apply in bulk" the user expects. Both resolved dicts and
+    ineligible/miss ``None`` are cached (misses are as repetitive as hits).
     """
     now = datetime.now(UTC)
     rows: list[dict[str, Any]] = []
@@ -138,15 +146,22 @@ def _process_batch(
             # any enricher whose output can match its own eligibility regex.
             if FIELD_KEY_SEPARATOR in attr_key:
                 continue
-            if not raw_value or not enricher.is_field_eligible(raw_value):
+            if not raw_value:
                 continue
-            try:
-                enriched = enricher.enrich_value(raw_value)
-            except Exception as exc:
-                # No raw value in the note — attribute values may be sensitive;
-                # event_id + attr_key is enough to reproduce.
-                exc.add_note(f"enricher={enricher_key} event_id={event_id} attr_key={attr_key}")
-                raise
+            if raw_value in value_cache:
+                enriched = value_cache[raw_value]
+            elif not enricher.is_field_eligible(raw_value):
+                value_cache[raw_value] = None
+                continue
+            else:
+                try:
+                    enriched = enricher.enrich_value(raw_value)
+                except Exception as exc:
+                    # No raw value in the note — attribute values may be
+                    # sensitive; event_id + attr_key is enough to reproduce.
+                    exc.add_note(f"enricher={enricher_key} event_id={event_id} attr_key={attr_key}")
+                    raise
+                value_cache[raw_value] = enriched
             if not enriched:
                 continue
             for output_field, value in enriched.items():
@@ -397,6 +412,12 @@ async def run_enrichment_job(
         )
         job_store.update(job_id, progress={"processed": 0, "total": total})
 
+        # Dedup lookups across the whole job: enricher output is deterministic
+        # per raw value (config pinned at spawn), so a value seen once need
+        # never be looked up again — collapses per-event lookups to per-
+        # distinct-value. Shared across sources; bounded by the number of
+        # distinct attribute values in the timeline.
+        value_cache: dict[str, dict[str, str] | None] = {}
         for source_id in source_ids:
             batches = ch_store.iter_source_events(case_id, source_id, batch_size)
             # Each next() runs one blocking ClickHouse query — keep it off the
@@ -412,6 +433,7 @@ async def run_enrichment_job(
                     job_id,
                     enricher_key,
                     config_hash,
+                    value_cache,
                 )
                 if rows:
                     await store.stage_enrichment_results(rows)
