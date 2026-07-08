@@ -2797,26 +2797,33 @@ class StatisticalAnomalyService:
                 windows=windows_payload,
             )
 
-        # Hydrate representative events (one batched query) and suppress
-        # allowlisted series / normal-marked events *before* ranking/limiting —
-        # filtering after the `[:limit]` slice would shrink the page below
-        # `limit` instead of backfilling from the next-ranked window.
-        findings = self._hydrate_freq_findings(
-            findings, case_id, source_ids, col, db, field_params, interval
-        )
+        # Rank first, then hydrate only a bounded candidate slice. Temporal
+        # mode can emit a finding per suspect-window bucket (every silent
+        # bucket is a valid drop vs the baseline), so the raw list can be
+        # thousands long — hydrating all of them builds a `vals`/`buckets`
+        # query whose HTTP params overflow ClickHouse's field-length limit
+        # ("Field value too long"). The allowlist filter needs no event id
+        # (it keys on series value in details), so apply it pre-hydration;
+        # the candidate buffer above `limit` leaves room for the
+        # normal-annotation `exclude_event_ids` pass to drop a few without
+        # shrinking the page below `limit`.
         findings = _apply_allowlist(findings, allowlist)
+        findings.sort(key=lambda f: f.score, reverse=True)
+        candidates = findings[: max(limit * 3, 100)]
+        candidates = self._hydrate_freq_findings(
+            candidates, case_id, source_ids, col, db, field_params, interval
+        )
         if exclude_event_ids:
-            findings = [
-                f for f in findings if not f.event_id or f.event_id not in exclude_event_ids
+            candidates = [
+                f for f in candidates if not f.event_id or f.event_id not in exclude_event_ids
             ]
 
-        findings.sort(key=lambda f: f.score, reverse=True)
         return StatAnomalyResult(
             status="ok",
             detector="frequency",
             method="z-score" if windows is None else "temporal-z-score",
             baseline_size=baseline_size,
-            results=findings[:limit],
+            results=candidates[:limit],
             z_threshold=z_threshold,
             warnings=warnings,
             windows=windows_payload,

@@ -704,6 +704,40 @@ def test_frequency_insufficient_buckets_series_skipped():
     assert result.results == []
 
 
+def test_frequency_windowed_bounds_hydration_input():
+    """Temporal frequency can emit a finding per suspect-window bucket (every
+    silent bucket is a drop vs the baseline). Hydration must run on a bounded
+    slice, not the full list, or its ClickHouse query params overflow the
+    field-length limit ("Field value too long") on a real cluster."""
+    # Baseline 6h → 6 full 1h buckets; a long suspect window (72h → 72 buckets)
+    # for a series that is silent throughout → ~72 drop findings.
+    windows = _one_suspect(
+        datetime(2024, 1, 1, 0, 0, tzinfo=UTC),
+        datetime(2024, 1, 1, 6, 0, tzinfo=UTC),
+        datetime(2024, 1, 1, 6, 0, tzinfo=UTC),
+        datetime(2024, 1, 4, 6, 0, tzinfo=UTC),
+        label="wide",
+    )
+    # Baseline buckets ~10/bucket so a silent (0) suspect bucket scores as a drop.
+    bucket_rows = [(_h(i), "LOG", 10) for i in range(6)]
+    svc = _svc([FakeQueryResult(result_rows=bucket_rows, column_names=["bucket", "sv", "cnt"])])
+
+    hydration_sizes: list[int] = []
+
+    def _spy(findings, *a, **kw):
+        hydration_sizes.append(len(findings))
+        return findings
+
+    svc._hydrate_freq_findings = _spy  # type: ignore[method-assign]
+    result = svc.find_frequency_anomalies(
+        "c1", ["s1"], windows=windows, bucket_count=6, z_threshold=2.0, limit=50
+    )
+    assert result.status == "ok"
+    assert len(result.results) <= 50
+    # Hydration saw at most the buffered cap (max(limit*3, 100)), not all ~72.
+    assert hydration_sizes and all(n <= max(50 * 3, 100) for n in hydration_sizes)
+
+
 def test_frequency_limit_applied():
     """Limit caps the number of findings returned."""
     from datetime import datetime
