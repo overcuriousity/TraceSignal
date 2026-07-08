@@ -27,7 +27,9 @@ from tracesignal.api.deps import (
 )
 from tracesignal.core.config import get_settings
 from tracesignal.core.events_bus import publish_annotation_change
+from tracesignal.db._dt import ensure_utc
 from tracesignal.db.anomaly_stats import (
+    AnalysisWindows,
     CharsetFinding,
     ComboFinding,
     EntropyFinding,
@@ -36,14 +38,23 @@ from tracesignal.db.anomaly_stats import (
     OrderFinding,
     RangeFinding,
     StatisticalAnomalyService,
+    TimeWindow,
     ValueFinding,
+    windows_from_split,
 )
 from tracesignal.db.field_stats import (
     ensure_source_field_stats,
     merged_inventory,
     merged_list_fields,
 )
-from tracesignal.db.postgres import Case, PostgresStore, User, generate_id
+from tracesignal.db.postgres import (
+    BaselineDefinition,
+    Case,
+    PostgresStore,
+    User,
+    allowlist_hash,
+    generate_id,
+)
 from tracesignal.db.queries import EventQuery, EventQueryService, TagFilter
 from tracesignal.db.similarity import EncoderUnavailableError, SimilarityService
 from tracesignal.models.embeddings import embeddings_available
@@ -1267,8 +1278,65 @@ async def _resolve_field_inventory(
     return inventory, total
 
 
+def _windows_from_definition(definition: BaselineDefinition) -> AnalysisWindows:
+    """Build detector ``AnalysisWindows`` from a persisted baseline definition."""
+    suspects = tuple(
+        TimeWindow(
+            label=w.get("label", f"window-{i}"),
+            start=ensure_utc(datetime.fromisoformat(w["start"])),
+            end=ensure_utc(datetime.fromisoformat(w["end"])),
+        )
+        for i, w in enumerate(definition.suspect_windows or [])
+    )
+    return AnalysisWindows(
+        baseline=TimeWindow(
+            "baseline",
+            ensure_utc(definition.baseline_start),
+            ensure_utc(definition.baseline_end),
+        ),
+        suspects=suspects,
+    )
+
+
+async def _resolve_analysis_windows(
+    store: PostgresStore,
+    svc: StatisticalAnomalyService,
+    case_id: str,
+    timeline_id: str,
+    source_ids: list[str],
+    baseline_id: str | None,
+    baseline_end: datetime | None,
+    temporal: bool,
+) -> AnalysisWindows | None:
+    """Resolve the temporal windows for a detector run.
+
+    Precedence: an explicit ``baseline_id`` (a saved definition) wins; else an
+    explicit legacy ``baseline_end`` split; else ``temporal=True`` falls back
+    to the timeline midpoint. The legacy split forms are converted to a single
+    baseline+suspect window pair via ``windows_from_split`` so the detectors
+    have one temporal code path. Returns None for self-baseline runs.
+    """
+    if baseline_id is not None:
+        definition = await store.get_baseline_definition(case_id, timeline_id, baseline_id)
+        if definition is None:
+            raise HTTPException(
+                status_code=404, detail=f"Unknown baseline definition: {baseline_id}"
+            )
+        return _windows_from_definition(definition)
+
+    if baseline_end is None and not temporal:
+        return None
+
+    min_ts, max_ts = await run_in_threadpool(svc.get_timeline_range, case_id, source_ids)
+    if min_ts is None or max_ts is None:
+        return None
+    split = ensure_utc(baseline_end) if baseline_end is not None else min_ts + (max_ts - min_ts) / 2
+    return windows_from_split(split, min_ts, max_ts)
+
+
 async def _run_stat_detector(
     case_id: str,
+    timeline_id: str,
     source_ids: list[str],
     *,
     detector: str,
@@ -1277,38 +1345,47 @@ async def _run_stat_detector(
     z_threshold: float | None,
     baseline_end: datetime | None,
     temporal: bool,
+    baseline_id: str | None = None,
     limit: int,
     min_skew_seconds: float | None = None,
     field_mappings: dict[str, list[str]] | None = None,
-) -> Any:
-    """Resolve the temporal split point and normal-annotation suppression
-    list, then dispatch to the requested detector.
+) -> tuple[Any, dict[str, Any]]:
+    """Resolve analysis windows + value allowlist, then dispatch to the detector.
 
-    Shared by ``list_anomalies`` (preview) and ``tag_anomalies`` (persist),
-    which previously duplicated this ~25-line pipeline verbatim — a drift
-    risk, since "Tag N anomalies" must persist the same set of findings the
-    preview showed the analyst.
+    Returns ``(result, resolution)`` where *resolution* carries the forensic
+    snapshot (baseline id/name, windows payload + hash, allowlist hash + count)
+    for :func:`_persist_detector_run`. Shared by ``list_anomalies`` (preview)
+    and ``tag_anomalies`` (persist) so "Tag N anomalies" persists exactly the
+    finding set the preview showed.
     """
     cfg = get_settings()
     store = get_store()
     svc = _get_stat_anomaly_service()
 
-    # Timeline-midpoint lookup and the normal-annotation fetch are independent
-    # of each other's result — run them concurrently instead of back-to-back.
-    # (timestamp_order is mode-less and sends temporal=False, so the midpoint
-    # branch never fires for it.)
-    normal_ids_task = store.list_event_ids_by_annotation_type(case_id, source_ids, "normal")
-    if temporal and baseline_end is None:
-        midpoint_task = run_in_threadpool(svc.get_timeline_midpoint, case_id, source_ids)
-        effective_baseline_end, normal_ids = await asyncio.gather(midpoint_task, normal_ids_task)
-    else:
-        effective_baseline_end = baseline_end
-        normal_ids = await normal_ids_task
+    # Value-level allowlist (analyst-declared "normal") for this detector, and
+    # the legacy per-event `normal` annotations still honored as an event-level
+    # exclusion. Both are independent of window resolution — fetch concurrently.
+    allow_task = store.list_allowlist_entries(case_id, timeline_id, detector=detector)
+    normal_task = store.list_event_ids_by_annotation_type(case_id, source_ids, "normal")
+    windows_task = _resolve_analysis_windows(
+        store, svc, case_id, timeline_id, source_ids, baseline_id, baseline_end, temporal
+    )
+    allow_entries, normal_ids, windows = await asyncio.gather(allow_task, normal_task, windows_task)
+    allowlist: set[tuple[str, str]] | None = {(e.field, e.value) for e in allow_entries} or None
     exclude_ids: set[str] | None = set(normal_ids) if normal_ids else None
 
+    resolution: dict[str, Any] = {
+        "baseline_id": baseline_id,
+        "windows": windows.payload() if windows is not None else None,
+        "windows_hash": windows.config_hash() if windows is not None else None,
+        "allowlist_hash": allowlist_hash(allow_entries),
+        "allowlist_count": len(allow_entries),
+    }
+
     if detector == "timestamp_order":
-        # Mode-less: no baseline/detect split, no temporal-midpoint resolution.
-        return await run_in_threadpool(
+        # Mode-less: no windows, and per-event (not value-level) so it keeps the
+        # legacy event-level `normal` suppression only.
+        result = await run_in_threadpool(
             svc.find_order_violations,
             case_id=case_id,
             source_ids=source_ids,
@@ -1318,9 +1395,10 @@ async def _run_stat_detector(
             limit=limit,
             exclude_event_ids=exclude_ids,
         )
+        return result, resolution
 
     if detector == "frequency":
-        return await run_in_threadpool(
+        result = await run_in_threadpool(
             svc.find_frequency_anomalies,
             case_id=case_id,
             source_ids=source_ids,
@@ -1328,24 +1406,29 @@ async def _run_stat_detector(
             limit=limit,
             bucket_count=cfg.stat_frequency_buckets,
             z_threshold=z_threshold if z_threshold is not None else cfg.stat_z_threshold,
-            baseline_end=effective_baseline_end,
+            windows=windows,
             exclude_event_ids=exclude_ids,
+            allowlist=allowlist,
             field_mappings=field_mappings,
         )
+        return result, resolution
+
     parsed_fields = _parse_novelty_fields(fields)
 
     if detector == "numeric_range":
-        return await run_in_threadpool(
+        result = await run_in_threadpool(
             svc.find_range_violations,
             case_id=case_id,
             source_ids=source_ids,
             fields=parsed_fields,
             limit=limit,
             per_field_limit=cfg.stat_per_field_limit,
-            baseline_end=effective_baseline_end,
+            windows=windows,
             exclude_event_ids=exclude_ids,
+            allowlist=allowlist,
             field_mappings=field_mappings,
         )
+        return result, resolution
 
     if detector == "value_combo":
         if parsed_fields is not None and len(parsed_fields) < 2:
@@ -1359,17 +1442,19 @@ async def _run_stat_detector(
                 detail="value_combo supports at most four fields.",
             )
         try:
-            return await run_in_threadpool(
+            result = await run_in_threadpool(
                 svc.find_value_combos,
                 case_id=case_id,
                 source_ids=source_ids,
                 fields=parsed_fields,
                 limit=limit,
                 rarity_floor=cfg.stat_rarity_floor,
-                baseline_end=effective_baseline_end,
+                windows=windows,
                 exclude_event_ids=exclude_ids,
+                allowlist=allowlist,
                 field_mappings=field_mappings,
             )
+            return result, resolution
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -1386,7 +1471,7 @@ async def _run_stat_detector(
         )
 
     if detector == "charset":
-        return await run_in_threadpool(
+        result = await run_in_threadpool(
             svc.find_charset_novelty,
             case_id=case_id,
             source_ids=source_ids,
@@ -1394,42 +1479,48 @@ async def _run_stat_detector(
             limit=limit,
             per_field_limit=cfg.stat_per_field_limit,
             rarity_floor=cfg.stat_charset_rarity_floor,
-            baseline_end=effective_baseline_end,
+            windows=windows,
             exclude_event_ids=exclude_ids,
+            allowlist=allowlist,
             field_mappings=field_mappings,
             inventory=inventory,
             inventory_total=inventory_total,
         )
+        return result, resolution
 
     if detector == "entropy":
-        return await run_in_threadpool(
+        result = await run_in_threadpool(
             svc.find_entropy_outliers,
             case_id=case_id,
             source_ids=source_ids,
             fields=parsed_fields,
             limit=limit,
             per_field_limit=cfg.stat_per_field_limit,
-            baseline_end=effective_baseline_end,
+            windows=windows,
             exclude_event_ids=exclude_ids,
+            allowlist=allowlist,
             field_mappings=field_mappings,
             inventory=inventory,
             inventory_total=inventory_total,
         )
+        return result, resolution
 
-    return await run_in_threadpool(
+    result = await run_in_threadpool(
         svc.find_value_novelty,
         case_id=case_id,
         source_ids=source_ids,
         fields=parsed_fields,
         limit=limit,
         rarity_floor=cfg.stat_rarity_floor,
-        baseline_end=effective_baseline_end,
+        windows=windows,
         per_field_limit=cfg.stat_per_field_limit,
         exclude_event_ids=exclude_ids,
+        allowlist=allowlist,
         field_mappings=field_mappings,
         inventory=inventory,
         inventory_total=inventory_total,
     )
+    return result, resolution
 
 
 async def _resolve_similarity_source_ids(case_id: str, timeline_id: str | None) -> list[str]:
@@ -1670,6 +1761,30 @@ async def list_numeric_anomaly_fields(
     }
 
 
+def _short_ts(value: Any) -> str:
+    """Trim an ISO timestamp to minute precision for human-readable reasons."""
+    if not value:
+        return "?"
+    return str(value).replace("T", " ")[:16]
+
+
+def _window_phrase(details: dict[str, Any], *, prefix: str = "suspect window") -> str:
+    """A short 'suspect window 'label' 〔start – end〕' phrase, or '' if absent.
+
+    Reads the window attribution the temporal detectors stamp into each
+    finding's ``details`` (``window_*`` for value-shaped detectors,
+    ``suspect_window_*`` for frequency), so the tag reason names exactly the
+    window the finding was attributed to.
+    """
+    label = details.get("window_label") or details.get("suspect_window_label")
+    if not label:
+        return ""
+    start = details.get("window_start") or details.get("suspect_window_start")
+    end = details.get("window_end") or details.get("suspect_window_end")
+    span = f" 〔{_short_ts(start)} – {_short_ts(end)}〕" if start and end else ""
+    return f"{prefix} {label!r}{span}"
+
+
 def _serialize_stat_result(result: Any) -> dict[str, Any]:
     """Serialize a StatAnomalyResult to the shape shared by list_anomalies/tag_anomalies."""
     return {
@@ -1679,6 +1794,8 @@ def _serialize_stat_result(result: Any) -> dict[str, Any]:
         "baseline_size": result.baseline_size,
         "results": [_serialize_finding(r) for r in result.results],
         "z_threshold": result.z_threshold,
+        "warnings": list(getattr(result, "warnings", []) or []),
+        "windows": getattr(result, "windows", None),
     }
 
 
@@ -1694,9 +1811,16 @@ async def _persist_detector_run(
     temporal: bool,
     limit: int,
     payload: dict[str, Any],
+    resolution: dict[str, Any],
     min_skew_seconds: float | None = None,
 ) -> str:
-    """Persist a detector scan's request params + serialized result, return the run_id."""
+    """Persist a detector scan's request params + serialized result, return the run_id.
+
+    *resolution* carries the forensic snapshot from :func:`_run_stat_detector`
+    (resolved baseline id, window ranges + hash, allowlist hash + count) so a
+    persisted run stays fully self-describing even after the baseline
+    definition or allowlist is later edited or deleted.
+    """
     store = get_store()
     run = await store.create_detector_run(
         case_id,
@@ -1710,6 +1834,11 @@ async def _persist_detector_run(
             "temporal": temporal,
             "limit": limit,
             "min_skew_seconds": min_skew_seconds,
+            "baseline_id": resolution.get("baseline_id"),
+            "windows": resolution.get("windows"),
+            "windows_hash": resolution.get("windows_hash"),
+            "allowlist_hash": resolution.get("allowlist_hash"),
+            "allowlist_count": resolution.get("allowlist_count"),
         },
         result=payload,
     )
@@ -1774,8 +1903,17 @@ async def list_anomalies(
     temporal: bool = Query(
         default=False,
         description=(
-            "Enable temporal mode.  When no baseline_end is given the timeline "
-            "midpoint is used as the baseline/detect split."
+            "Enable legacy temporal mode.  When no baseline_end is given the "
+            "timeline midpoint is used as the baseline/detect split.  Prefer "
+            "baseline_id for an explicit baseline + suspect windows."
+        ),
+    ),
+    baseline_id: str | None = Query(
+        default=None,
+        description=(
+            "ID of a saved baseline definition (baseline range + suspect windows) "
+            "to run temporal detection against. Takes precedence over "
+            "baseline_end/temporal."
         ),
     ),
     limit: int = Query(default=50, ge=1, le=500),
@@ -1819,8 +1957,9 @@ async def list_anomalies(
     (random-looking or degenerate strings).
     """
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
-    result = await _run_stat_detector(
+    result, resolution = await _run_stat_detector(
         case_id,
+        timeline_id,
         source_ids,
         detector=detector,
         fields=fields,
@@ -1828,6 +1967,7 @@ async def list_anomalies(
         z_threshold=z_threshold,
         baseline_end=baseline_end,
         temporal=temporal,
+        baseline_id=baseline_id,
         limit=limit,
         min_skew_seconds=min_skew_seconds,
         field_mappings=field_mappings,
@@ -1848,6 +1988,7 @@ async def list_anomalies(
             limit=limit,
             min_skew_seconds=min_skew_seconds,
             payload=payload,
+            resolution=resolution,
         )
     # GETs are skipped by the generic audit middleware, so detector-run
     # launches would otherwise leave no trace at all. Audited regardless of
@@ -1866,6 +2007,8 @@ async def list_anomalies(
             "series_field": series_field,
             "temporal": temporal,
             "baseline_end": baseline_end.isoformat() if baseline_end else None,
+            "baseline_id": resolution.get("baseline_id"),
+            "windows_hash": resolution.get("windows_hash"),
             "persist": persist,
         },
     )
@@ -1905,8 +2048,16 @@ class TagAnomaliesRequest(BaseModel):
     temporal: bool = Field(
         default=False,
         description=(
-            "Enable temporal mode.  When no baseline_end is given the timeline "
-            "midpoint is used as the baseline/detect split."
+            "Enable legacy temporal mode.  When no baseline_end is given the "
+            "timeline midpoint is used as the baseline/detect split.  Prefer "
+            "baseline_id."
+        ),
+    )
+    baseline_id: str | None = Field(
+        default=None,
+        description=(
+            "ID of a saved baseline definition to run temporal detection against. "
+            "Takes precedence over baseline_end/temporal."
         ),
     )
     limit: int = Field(default=50, ge=1, le=500)
@@ -1934,8 +2085,9 @@ async def tag_anomalies(
     """
     store = get_store()
     source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
-    result = await _run_stat_detector(
+    result, resolution = await _run_stat_detector(
         case_id,
+        timeline_id,
         source_ids,
         detector=body.detector,
         fields=body.fields,
@@ -1943,6 +2095,7 @@ async def tag_anomalies(
         z_threshold=body.z_threshold,
         baseline_end=body.baseline_end,
         temporal=body.temporal,
+        baseline_id=body.baseline_id,
         limit=body.limit,
         min_skew_seconds=body.min_skew_seconds,
         field_mappings=field_mappings,
@@ -1983,11 +2136,13 @@ async def tag_anomalies(
                 # the baseline window (backend filters on baseline_cnt = 0) —
                 # a materially stronger, more specific claim than "rare", so
                 # say exactly that rather than reusing the self-baseline text.
+                where = _window_phrase(r.details) or "the detect window"
+                wtot = r.details.get("window_total_events", result.baseline_size)
                 content = (
                     f"New value — {r.field}={r.value!r}: absent from the "
-                    f"{result.baseline_size:,}-event baseline window; first "
-                    f"appears in the detect window at {r.first_seen} "
-                    f"({r.count} occurrence(s) there; surprise {r.score:.2f})"
+                    f"{result.baseline_size:,}-event baseline; first appears in "
+                    f"{where} at {r.first_seen} ({r.count} of {wtot:,} window "
+                    f"events; surprise {r.score:.2f})"
                 )
             else:
                 content = (
@@ -1999,9 +2154,11 @@ async def tag_anomalies(
             event_id = r.event_id or ""
             src_id = r.event.get("source_id", "") if r.event else ""
             band_desc = "baseline min/max" if result.method == "temporal-range" else "IQR fence"
+            where = _window_phrase(r.details)
+            in_window = f" in {where}" if where else ""
             content = (
                 f"Out-of-range value — {r.field}={r.value:g}: {r.direction} the "
-                f"learned band [{r.lower:g}, {r.upper:g}] ({band_desc})"
+                f"learned band [{r.lower:g}, {r.upper:g}] ({band_desc}){in_window}"
             )
         elif isinstance(r, EntropyFinding):
             event_id = r.event_id or ""
@@ -2012,10 +2169,12 @@ async def tag_anomalies(
                 else "corpus entropy IQR fence"
             )
             look = "random-looking" if r.direction == "above" else "degenerate/repetitive"
+            where = _window_phrase(r.details)
+            in_window = f" in {where}" if where else ""
             content = (
                 f"Entropy outlier — {r.field}={r.value!r}: character entropy "
                 f"{r.entropy:.2f} bits is {r.direction} the learned band "
-                f"[{r.lower:.2f}, {r.upper:.2f}] ({band_desc}; {look})"
+                f"[{r.lower:.2f}, {r.upper:.2f}] ({band_desc}; {look}){in_window}"
             )
         elif isinstance(r, CharsetFinding):
             event_id = r.event_id or ""
@@ -2024,10 +2183,12 @@ async def tag_anomalies(
                 f"{c!r} (U+{ord(c):04X})" if len(c) == 1 else repr(c) for c in r.novel_chars
             )
             if result.method == "temporal-charset":
+                where = _window_phrase(r.details)
+                in_window = f" in {where}" if where else ""
                 content = (
                     f"Charset novelty — {r.field}={r.value!r}: contains "
                     f"character(s) {chars_desc} never seen in this field's "
-                    f"baseline-window values (surprise {r.score:.2f})"
+                    f"baseline-window values{in_window} (surprise {r.score:.2f})"
                 )
             else:
                 content = (
@@ -2040,11 +2201,13 @@ async def tag_anomalies(
             src_id = r.event.get("source_id", "") if r.event else ""
             combo = ", ".join(f"{f}={v!r}" for f, v in zip(r.fields, r.values, strict=False))
             if result.method == "temporal":
+                where = _window_phrase(r.details) or "the detect window"
+                wtot = r.details.get("window_total_events", result.baseline_size)
                 content = (
                     f"New combination — ({combo}): absent from the "
-                    f"{result.baseline_size:,}-event baseline window; first "
-                    f"appears in the detect window at {r.first_seen} "
-                    f"({r.count} occurrence(s) there; surprise {r.score:.2f})"
+                    f"{result.baseline_size:,}-event baseline; first appears in "
+                    f"{where} at {r.first_seen} ({r.count} of {wtot:,} window "
+                    f"events; surprise {r.score:.2f})"
                 )
             else:
                 content = (
@@ -2065,11 +2228,13 @@ async def tag_anomalies(
             event_id = r.event_id or ""
             src_id = r.event.get("source_id", "") if r.event else ""
             if result.method == "temporal-z-score":
+                where = _window_phrase(r.details)
+                in_window = f" in {where}" if where else ""
                 content = (
                     f"Frequency spike — {r.series_field}={r.series_value!r} "
                     f"at {r.window_start}: {r.observed} events observed vs "
-                    f"{r.expected:.1f} expected from the pre-baseline_end "
-                    f"event-count distribution (z={r.z_score:.2f})"
+                    f"{r.expected:.1f} expected from the baseline-window "
+                    f"event-count distribution (z={r.z_score:.2f}){in_window}"
                 )
             else:
                 content = (
@@ -2117,6 +2282,7 @@ async def tag_anomalies(
         limit=body.limit,
         min_skew_seconds=body.min_skew_seconds,
         payload=payload,
+        resolution=resolution,
     )
 
     await store.record_audit(

@@ -12,9 +12,12 @@ already-ingested data.
     * *self-baseline* — the full timeline is its own reference.  Values
       appearing ≤ ``rarity_floor`` times are flagged.  Works immediately after
       ingestion; no baseline window required.
-    * *temporal* — analyst supplies a ``baseline_end`` timestamp.  Values absent
-      from the baseline window but present in the detect window are flagged as
-      "first seen after incident start."  ``rarity_floor`` is ignored.
+    * *temporal* — analyst supplies an ``AnalysisWindows`` (a baseline range
+      plus 1..N labeled suspect windows). Values absent from the baseline
+      window but present in a suspect window are flagged as "first seen after
+      the incident start," one finding per suspect window they appear in,
+      scored against that window's own event count. Events outside every
+      window are ignored; ``rarity_floor`` is ignored.
 
 **frequency** (``detector="frequency"``)
     Detect event-count spikes and silences in time windows per ``series_field``
@@ -30,8 +33,15 @@ already-ingested data.
 
     * *z-score* — baseline = all buckets in the timeline; flag any window
       beyond ``z_threshold`` standard deviations from the series mean.
-    * *temporal-z-score* — baseline = buckets before ``baseline_end``; detect =
-      buckets after.  Mean/std computed from the baseline window only.
+    * *temporal-z-score* — an ``AnalysisWindows`` supplies the baseline range
+      and 1..N suspect windows. The bucket interval is derived from the
+      baseline window (so it keeps the full ``bucket_count`` resolution) and
+      the same epoch-aligned interval buckets every suspect window. Mean/std
+      are learned from the baseline window's zero-filled, fully-contained
+      buckets only; each suspect window's fully-contained buckets are scored
+      against that fixed baseline. Buckets cut by a window edge are excluded,
+      and a suspect window with no full bucket is warned about rather than
+      scored on a partial bucket.
 
 **value_combo** (``detector="value_combo"``)
     The multi-field extension of ``value_novelty`` (AMiner
@@ -100,7 +110,7 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import numpy as np
@@ -192,6 +202,153 @@ _MIN_FREQUENCY_BUCKETS = 3
 # excluded point (half an event-count unit — small enough to still flag any
 # real deviation, large enough to avoid blowing up the z-score to inf/NaN).
 _MIN_FREQUENCY_STD = 0.5
+
+# Suspect windows with fewer events than this get a warning attached to the
+# result: per-window surprise denominators over tiny samples are unstable.
+# Warning only — findings are never silently suppressed.
+_MIN_WINDOW_EVENTS = 50
+
+# Separators used to flatten a value_combo finding's field/value tuples into
+# the single (field, value) key the detector allowlist stores. The fields are
+# comma-joined (tokens never contain commas); the values are joined with the
+# ASCII unit separator, which cannot appear in parsed log values in practice
+# and keeps the key reversible. Mirrored in the finding's details
+# ("allowlist_field"/"allowlist_value") so clients never re-derive it.
+COMBO_FIELD_SEP = ","
+COMBO_VALUE_SEP = "\x1f"
+
+# ---------------------------------------------------------------------------
+# Analysis windows
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TimeWindow:
+    """A labeled half-open time range ``[start, end)``, UTC."""
+
+    label: str
+    start: datetime
+    end: datetime
+
+
+@dataclass(frozen=True)
+class AnalysisWindows:
+    """The temporal detectors' window contract: one baseline, 1..N suspects.
+
+    The baseline window is the known-normal reference period; suspect windows
+    are the ranges under investigation. Windows are half-open ``[start, end)``
+    and need not be adjacent — events outside every window are ignored by the
+    detectors entirely. Baseline and suspect windows must be disjoint (the
+    API validates this); suspect windows may overlap each other.
+    """
+
+    baseline: TimeWindow
+    suspects: tuple[TimeWindow, ...]
+
+    def payload(self) -> dict[str, Any]:
+        """Serializable snapshot (DetectorRun params / result echo shape)."""
+        return {
+            "baseline": {
+                "start": ensure_utc(self.baseline.start).isoformat(),
+                "end": ensure_utc(self.baseline.end).isoformat(),
+            },
+            "suspect_windows": [
+                {
+                    "label": w.label,
+                    "start": ensure_utc(w.start).isoformat(),
+                    "end": ensure_utc(w.end).isoformat(),
+                }
+                for w in self.suspects
+            ],
+        }
+
+    def config_hash(self) -> str:
+        """SHA-256 over the canonical window payload — the run's window identity."""
+        import hashlib
+        import json
+
+        canonical = json.dumps(
+            self.payload(), sort_keys=True, ensure_ascii=False, separators=(",", ":")
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def windows_from_split(
+    baseline_end: datetime, min_ts: datetime, max_ts: datetime
+) -> AnalysisWindows:
+    """Build the legacy split-point window pair from a single ``baseline_end``.
+
+    Preserves the original temporal contract — baseline = everything before
+    the split, detect = everything after, adjacent and exhaustive — as one
+    ``AnalysisWindows`` value, so detector internals have exactly one
+    temporal code path. Using the real ``min_ts``/``max_ts`` (instead of
+    ±infinity) keeps the year-2299 no-timestamp sentinel out of the detect
+    window by construction; the max is padded by 1 ms because windows are
+    half-open and ``max_ts`` itself must stay inside.
+    """
+    baseline_end = ensure_utc(baseline_end)
+    return AnalysisWindows(
+        baseline=TimeWindow("baseline", ensure_utc(min_ts), baseline_end),
+        suspects=(
+            TimeWindow("detect", baseline_end, ensure_utc(max_ts) + timedelta(milliseconds=1)),
+        ),
+    )
+
+
+def _window_preds(windows: AnalysisWindows, params: dict[str, Any]) -> tuple[str, list[str]]:
+    """Bind window bounds into *params* and return SQL predicates.
+
+    Returns ``(baseline_pred, [suspect_pred, ...])`` — each a self-contained
+    parenthesized ``timestamp`` range test. Parameter names are fixed
+    (``b0``/``b1``, ``w{i}s``/``w{i}e``), so one params dict must not be
+    reused for two different window sets.
+    """
+    params["b0"] = to_clickhouse_utc(windows.baseline.start)
+    params["b1"] = to_clickhouse_utc(windows.baseline.end)
+    baseline_pred = "(timestamp >= {b0:String} AND timestamp < {b1:String})"
+    suspect_preds = []
+    for i, w in enumerate(windows.suspects):
+        params[f"w{i}s"] = to_clickhouse_utc(w.start)
+        params[f"w{i}e"] = to_clickhouse_utc(w.end)
+        suspect_preds.append(f"(timestamp >= {{w{i}s:String}} AND timestamp < {{w{i}e:String}})")
+    return baseline_pred, suspect_preds
+
+
+def _suspect_multiif(suspect_preds: list[str]) -> str:
+    """A ``multiIf`` expression mapping timestamp → suspect-window index (or -1)."""
+    branches = ", ".join(f"{pred}, {i}" for i, pred in enumerate(suspect_preds))
+    return f"multiIf({branches}, -1)"
+
+
+def _full_bucket_starts(window: TimeWindow, interval: int) -> list[datetime]:
+    """Epoch-aligned bucket starts whose bucket lies fully inside *window*.
+
+    ``toStartOfInterval`` aligns buckets to the Unix epoch, so a window edge
+    can cut a bucket; partial buckets are excluded from frequency statistics
+    entirely (a half-covered bucket would read as a fake spike or drop). May
+    be empty when the window is shorter than one interval — callers must
+    warn, never score a partial bucket.
+    """
+    start_epoch = ensure_utc(window.start).timestamp()
+    end_epoch = ensure_utc(window.end).timestamp()
+    first = math.ceil(start_epoch / interval) * interval
+    out: list[datetime] = []
+    b = first
+    while b + interval <= end_epoch:
+        out.append(datetime.fromtimestamp(b, tz=UTC))
+        b += interval
+    return out
+
+
+def _window_size_warnings(windows: AnalysisWindows, suspect_totals: list[int]) -> list[str]:
+    """Warnings for suspect windows too small for stable surprise scores."""
+    return [
+        f"Suspect window {w.label!r} has only {total} events — "
+        f"surprise scores over samples below {_MIN_WINDOW_EVENTS} are unstable"
+        for w, total in zip(windows.suspects, suspect_totals, strict=False)
+        if total < _MIN_WINDOW_EVENTS
+    ]
+
 
 # ---------------------------------------------------------------------------
 # Result types
@@ -356,6 +513,13 @@ class StatAnomalyResult:
     ] = field(default_factory=list)
     # Effective |z| cutoff used by the frequency detector; None for value_novelty.
     z_threshold: float | None = None
+    # Non-fatal caveats about the run (tiny suspect windows, unscoreable
+    # windows, …). Surfaced verbatim to the analyst — findings are never
+    # silently suppressed for statistical-quality reasons.
+    warnings: list[str] = field(default_factory=list)
+    # Serialized AnalysisWindows.payload() snapshot for temporal runs driven
+    # by explicit windows; None for self-baseline runs.
+    windows: dict[str, Any] | None = None
 
 
 @dataclass
@@ -412,6 +576,24 @@ def _col_expr(
     return f"attributes[{{{prefix}:String}}]"
 
 
+def _apply_allowlist(findings: list[Any], allowlist: set[tuple[str, str]] | None) -> list[Any]:
+    """Drop findings whose (allowlist_field, allowlist_value) key is allowlisted.
+
+    Every value-shaped finding carries its own allowlist key in ``details``
+    (``allowlist_field``/``allowlist_value``) so the suppression key is
+    computed exactly once, here, and clients creating allowlist entries from
+    a finding never re-derive it. Value-level, unlike the legacy per-event
+    ``normal`` annotation: the same value is suppressed on every event.
+    """
+    if not allowlist:
+        return findings
+    return [
+        f
+        for f in findings
+        if (f.details.get("allowlist_field"), f.details.get("allowlist_value")) not in allowlist
+    ]
+
+
 def _freq_finding(
     series_field: str,
     series_value: Any,
@@ -421,9 +603,38 @@ def _freq_finding(
     mean_val: float,
     z: float,
     method: str,
+    suspect_window: TimeWindow | None = None,
 ) -> FreqFinding:
-    """Build a `FreqFinding` for one anomalous bucket."""
+    """Build a `FreqFinding` for one anomalous bucket.
+
+    *suspect_window* attributes the bucket to a named suspect window in
+    temporal mode (None in self-baseline mode).
+    """
     window_end_dt = bucket_dt + timedelta(seconds=interval)
+    details: dict[str, Any] = {
+        "detector": "frequency",
+        "method": method,
+        "series_field": series_field,
+        "series_value": str(series_value),
+        "window_start": bucket_dt.isoformat(),
+        "window_end": window_end_dt.isoformat(),
+        "observed": cnt,
+        "expected": round(mean_val, 2),
+        "z_score": round(z, 4),
+        "interval_seconds": interval,
+        # A frequency allowlist entry keyed on the series value suppresses the
+        # whole series ("known-noisy service") — the field is the series field.
+        "allowlist_field": series_field,
+        "allowlist_value": str(series_value),
+    }
+    if suspect_window is not None:
+        details.update(
+            {
+                "suspect_window_label": suspect_window.label,
+                "suspect_window_start": ensure_utc(suspect_window.start).isoformat(),
+                "suspect_window_end": ensure_utc(suspect_window.end).isoformat(),
+            }
+        )
     return FreqFinding(
         series_field=series_field,
         series_value=str(series_value),
@@ -435,18 +646,7 @@ def _freq_finding(
         score=round(abs(z), 4),
         event_id=None,
         event=None,
-        details={
-            "detector": "frequency",
-            "method": method,
-            "series_field": series_field,
-            "series_value": str(series_value),
-            "window_start": bucket_dt.isoformat(),
-            "window_end": window_end_dt.isoformat(),
-            "observed": cnt,
-            "expected": round(mean_val, 2),
-            "z_score": round(z, 4),
-            "interval_seconds": interval,
-        },
+        details=details,
     )
 
 
@@ -619,22 +819,30 @@ class StatisticalAnomalyService:
         limit: int,
         case_id: str,
         source_ids: list[str],
+        allowlist: set[tuple[str, str]] | None = None,
+        warnings: list[str] | None = None,
+        windows: AnalysisWindows | None = None,
     ) -> StatAnomalyResult:
         """Rank, suppress, cap and hydrate a per-field detector's findings.
 
         Shared tail for the field-scanning detectors: when no field yielded a
-        usable baseline the status is ``insufficient_data``; otherwise excluded
-        (user-marked-normal) events are dropped, findings are sorted by score
-        descending, capped to ``limit``, and their representative events are
-        hydrated in one batch before returning an ``ok`` result.
+        usable baseline the status is ``insufficient_data``; otherwise
+        allowlisted values and excluded (user-marked-normal) events are
+        dropped, findings are sorted by score descending, capped to
+        ``limit``, and their representative events are hydrated in one batch
+        before returning an ``ok`` result.
         """
+        windows_payload = windows.payload() if windows is not None else None
         if evaluated_fields == 0:
             return StatAnomalyResult(
                 status="insufficient_data",
                 detector=detector,
                 method=method,
                 baseline_size=total_events,
+                warnings=warnings or [],
+                windows=windows_payload,
             )
+        findings = _apply_allowlist(findings, allowlist)
         if exclude_event_ids:
             findings = [
                 f for f in findings if not f.event_id or f.event_id not in exclude_event_ids
@@ -648,6 +856,8 @@ class StatisticalAnomalyService:
             method=method,
             baseline_size=total_events,
             results=results,
+            warnings=warnings or [],
+            windows=windows_payload,
         )
 
     def field_inventory(
@@ -841,21 +1051,29 @@ class StatisticalAnomalyService:
     # Timeline range helper
     # ------------------------------------------------------------------
 
+    def get_timeline_range(
+        self,
+        case_id: str,
+        source_ids: list[str],
+    ) -> tuple[datetime | None, datetime | None]:
+        """Return the (min, max) UTC timestamp of the timeline, or (None, None)."""
+        self.ch.init_schema()
+        db = self.ch.database
+        params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        return query_timestamp_range(
+            self.ch.client,
+            db,
+            "case_id = {cid:String} AND has({src:Array(String)}, source_id)",
+            params,
+        )
+
     def get_timeline_midpoint(
         self,
         case_id: str,
         source_ids: list[str],
     ) -> datetime | None:
         """Return the midpoint timestamp of the timeline, or None if no events."""
-        self.ch.init_schema()
-        db = self.ch.database
-        params: dict[str, Any] = {"cid": case_id, "src": source_ids}
-        min_dt, max_dt = query_timestamp_range(
-            self.ch.client,
-            db,
-            "case_id = {cid:String} AND has({src:Array(String)}, source_id)",
-            params,
-        )
+        min_dt, max_dt = self.get_timeline_range(case_id, source_ids)
         if min_dt is None or max_dt is None:
             return None
         return min_dt + (max_dt - min_dt) / 2
@@ -864,6 +1082,33 @@ class StatisticalAnomalyService:
     # Value / combo novelty
     # ------------------------------------------------------------------
 
+    def _window_totals(
+        self, case_id: str, source_ids: list[str], windows: AnalysisWindows
+    ) -> tuple[int, list[int]]:
+        """Return ``(baseline_total, [suspect_total, ...])`` event counts.
+
+        One round-trip; these are the per-window surprise denominators (the
+        old whole-corpus denominator overstated rarity whenever the windows
+        covered only part of the timeline).
+        """
+        params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        bp, sps = _window_preds(windows, params)
+        parts = [f"countIf({bp}) AS bl_total"] + [
+            f"countIf({sp}) AS w{i}_total" for i, sp in enumerate(sps)
+        ]
+        sql = (
+            f"SELECT {', '.join(parts)}"
+            f" FROM {self.ch.database}.events"
+            f" WHERE case_id = {{cid:String}}"
+            f" AND has({{src:Array(String)}}, source_id)"
+            f" AND {TS_NOT_SENTINEL_SQL}"
+        )
+        rows = self.ch.client.query(sql, parameters=params).result_rows
+        if not rows:
+            return 0, [0] * len(windows.suspects)
+        row = rows[0]
+        return int(row[0]), [int(v) for v in row[1:]]
+
     def find_value_novelty(
         self,
         case_id: str,
@@ -871,9 +1116,10 @@ class StatisticalAnomalyService:
         fields: list[str] | None = None,
         limit: int = 50,
         rarity_floor: int = 3,
-        baseline_end: datetime | None = None,
+        windows: AnalysisWindows | None = None,
         per_field_limit: int = 25,
         exclude_event_ids: set[str] | None = None,
+        allowlist: set[tuple[str, str]] | None = None,
         field_mappings: dict[str, list[str]] | None = None,
         inventory: list[tuple[str, int, int]] | None = None,
         inventory_total: int | None = None,
@@ -895,13 +1141,18 @@ class StatisticalAnomalyService:
         *fields* is given.
 
         In *self-baseline* mode values appearing ≤ *rarity_floor* times are
-        flagged.  In *temporal* mode (``baseline_end`` provided) any value absent
-        from the baseline window but present in the detect window is flagged.
+        flagged, scored ``-log(count / total_events)``.  In *temporal* mode
+        (*windows* provided) any value absent from the baseline window but
+        present in a suspect window is flagged, once per suspect window it
+        appears in, scored against that window's own event count
+        (``-log(w_cnt / window_total)``); events outside every window are
+        ignored. *allowlist* suppresses findings whose (field, value) an
+        analyst declared never-anomalous.
         """
         self.ch.init_schema()
         db = self.ch.database
         base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
-        method = "self-baseline" if baseline_end is None else "temporal"
+        method = "self-baseline" if windows is None else "temporal"
 
         # Total event count for surprise score denominator.
         total_events = self._count_events(case_id, source_ids)
@@ -937,17 +1188,13 @@ class StatisticalAnomalyService:
                 baseline_size=0,
             )
 
-        # Baseline size (temporal only).
+        # Per-window event totals (surprise denominators) — temporal only.
         baseline_size = total_events
-        if baseline_end is not None:
-            bl_res = self.ch.client.query(
-                f"SELECT count() FROM {db}.events"
-                f" WHERE case_id = {{cid:String}}"
-                f" AND has({{src:Array(String)}}, source_id)"
-                f" AND timestamp < {{bl:String}}",
-                parameters={**base_params, "bl": to_clickhouse_utc(baseline_end)},
-            )
-            baseline_size = int(bl_res.result_rows[0][0]) if bl_res.result_rows else 0
+        suspect_totals: list[int] = []
+        run_warnings: list[str] = []
+        if windows is not None:
+            baseline_size, suspect_totals = self._window_totals(case_id, source_ids, windows)
+            run_warnings = _window_size_warnings(windows, suspect_totals)
 
         all_findings: list[ValueFinding] = []
 
@@ -955,7 +1202,7 @@ class StatisticalAnomalyService:
             params: dict[str, Any] = {**base_params}
             col = _col_expr(field_token, params, field_mappings)
 
-            if baseline_end is None:
+            if windows is None:
                 # Self-baseline: flag values with count ≤ rarity_floor.
                 params["floor"] = rarity_floor
                 params["lim"] = per_field_limit
@@ -976,24 +1223,36 @@ class StatisticalAnomalyService:
                     {HEAVY_SCAN_SETTINGS}
                 """
             else:
-                # Temporal: flag values seen in detect window but not in baseline.
-                params["bl"] = to_clickhouse_utc(baseline_end)
+                # Temporal: flag values absent from the baseline window but
+                # present in a suspect window — one countIf/minIf/argMinIf
+                # block per suspect window, so a single scan yields per-window
+                # counts and representatives. The WHERE union restricts the
+                # scan to the windows (events between/outside windows are
+                # ignored by construction).
+                bp, sps = _window_preds(windows, params)
                 params["lim"] = per_field_limit
+                w_blocks = ",\n                        ".join(
+                    f"countIf({sp}) AS w{i}_cnt,"
+                    f" minIf(timestamp, {sp}) AS w{i}_first,"
+                    f" toString(argMinIf(event_id, timestamp, {sp})) AS w{i}_evt"
+                    for i, sp in enumerate(sps)
+                )
+                w_sum = " + ".join(f"w{i}_cnt" for i in range(len(sps)))
+                union_pred = " OR ".join([bp, *sps])
                 sql = f"""
                     SELECT
                         {col} AS val,
-                        countIf(timestamp >= {{bl:String}}) AS detect_cnt,
-                        countIf(timestamp < {{bl:String}}) AS baseline_cnt,
-                        minIf(timestamp, timestamp >= {{bl:String}}) AS first_seen,
-                        toString(argMinIf(event_id, timestamp, timestamp >= {{bl:String}})) AS evt_id
+                        countIf({bp}) AS baseline_cnt,
+                        {w_blocks}
                     FROM {db}.events
                     WHERE case_id = {{cid:String}}
                       AND has({{src:Array(String)}}, source_id)
                       AND {col} != ''
                       AND {TS_NOT_SENTINEL_SQL}
+                      AND ({union_pred})
                     GROUP BY val
-                    HAVING baseline_cnt = 0 AND detect_cnt > 0
-                    ORDER BY detect_cnt ASC, first_seen ASC
+                    HAVING baseline_cnt = 0 AND ({w_sum}) > 0
+                    ORDER BY ({w_sum}) ASC
                     LIMIT {{lim:UInt32}}
                     {HEAVY_SCAN_SETTINGS}
                 """
@@ -1001,57 +1260,58 @@ class StatisticalAnomalyService:
             rows = self.ch.client.query(sql, parameters=params).result_rows
 
             for row in rows:
-                if baseline_end is None:
+                if windows is None:
                     val, cnt, first_seen, evt_id = row
-                    effective_cnt = int(cnt)
-                else:
-                    val, detect_cnt, _bl_cnt, first_seen, evt_id = row
-                    effective_cnt = int(detect_cnt)
-
-                if not val:
-                    continue
-
-                score = (
-                    -math.log(effective_cnt / total_events)
-                    if effective_cnt > 0 and total_events > 0
-                    else 0.0
-                )
-                # min(timestamp)/minIf(...) now return a native DateTime (not a
-                # ClickHouse-formatted string) so we can attach an explicit UTC
-                # offset before serializing — a bare "YYYY-MM-DD HH:MM:SS"
-                # string is ambiguous to JS's Date parser (browsers treat it as
-                # local time), which silently shifted the histogram markers and
-                # event-grid anomaly matching by the browser's UTC offset.
-                first_seen_str = _present_ts(first_seen)
-                evt_id_str = str(evt_id) if evt_id else None
-                mini_event = _stub_event(evt_id_str, case_id, first_seen_str)
-
-                details: dict[str, Any] = {
-                    "detector": "value_novelty",
-                    "method": method,
-                    "field": field_token,
-                    "value": str(val),
-                    "count": effective_cnt,
-                    "total_events": total_events,
-                    "surprise": round(score, 4),
-                }
-                if baseline_end is not None:
-                    details["baseline_size"] = baseline_size
-
-                all_findings.append(
-                    ValueFinding(
-                        field=field_token,
-                        value=str(val),
-                        count=effective_cnt,
-                        score=round(score, 4),
-                        first_seen=first_seen_str,
-                        event_id=evt_id_str,
-                        event=mini_event,
-                        details=details,
+                    if not val:
+                        continue
+                    all_findings.append(
+                        self._novelty_finding(
+                            case_id,
+                            field_token,
+                            str(val),
+                            int(cnt),
+                            total_events,
+                            first_seen,
+                            evt_id,
+                            method,
+                        )
                     )
-                )
+                else:
+                    val = row[0]
+                    if not val:
+                        continue
+                    # One finding per (value, suspect window with cnt > 0):
+                    # window attribution is part of the claim being made.
+                    for i, w in enumerate(windows.suspects):
+                        w_cnt = int(row[2 + i * 3])
+                        if w_cnt <= 0:
+                            continue
+                        first_seen, evt_id = row[3 + i * 3], row[4 + i * 3]
+                        finding = self._novelty_finding(
+                            case_id,
+                            field_token,
+                            str(val),
+                            w_cnt,
+                            suspect_totals[i] if i < len(suspect_totals) else 0,
+                            first_seen,
+                            evt_id,
+                            method,
+                        )
+                        finding.details.update(
+                            {
+                                "baseline_size": baseline_size,
+                                "window_label": w.label,
+                                "window_start": ensure_utc(w.start).isoformat(),
+                                "window_end": ensure_utc(w.end).isoformat(),
+                                "window_total_events": suspect_totals[i]
+                                if i < len(suspect_totals)
+                                else 0,
+                            }
+                        )
+                        all_findings.append(finding)
 
-        # Suppress findings whose representative event was marked normal.
+        # Value-level allowlist first, then the legacy per-event suppression.
+        all_findings = _apply_allowlist(all_findings, allowlist)
         if exclude_event_ids:
             all_findings = [
                 f for f in all_findings if not f.event_id or f.event_id not in exclude_event_ids
@@ -1068,6 +1328,55 @@ class StatisticalAnomalyService:
             method=method,
             baseline_size=baseline_size,
             results=results,
+            warnings=run_warnings,
+            windows=windows.payload() if windows is not None else None,
+        )
+
+    def _novelty_finding(
+        self,
+        case_id: str,
+        field_token: str,
+        val: str,
+        count: int,
+        denominator: int,
+        first_seen: Any,
+        evt_id: Any,
+        method: str,
+    ) -> ValueFinding:
+        """Build one value_novelty finding with its surprise score.
+
+        *denominator* is the corpus size in self-baseline mode and the
+        suspect window's own event count in temporal mode.
+        """
+        # `+ 0.0` normalizes IEEE -0.0 (count == denominator ⇒ -log(1)) to +0.0.
+        score = (-math.log(count / denominator) if count > 0 and denominator > 0 else 0.0) + 0.0
+        # min(timestamp)/minIf(...) return a native DateTime (not a
+        # ClickHouse-formatted string) so we can attach an explicit UTC
+        # offset before serializing — a bare "YYYY-MM-DD HH:MM:SS" string is
+        # ambiguous to JS's Date parser (browsers treat it as local time),
+        # which silently shifted the histogram markers and event-grid anomaly
+        # matching by the browser's UTC offset.
+        first_seen_str = _present_ts(first_seen)
+        evt_id_str = str(evt_id) if evt_id else None
+        return ValueFinding(
+            field=field_token,
+            value=val,
+            count=count,
+            score=round(score, 4),
+            first_seen=first_seen_str,
+            event_id=evt_id_str,
+            event=_stub_event(evt_id_str, case_id, first_seen_str),
+            details={
+                "detector": "value_novelty",
+                "method": method,
+                "field": field_token,
+                "value": val,
+                "count": count,
+                "total_events": denominator,
+                "surprise": round(score, 4),
+                "allowlist_field": field_token,
+                "allowlist_value": val,
+            },
         )
 
     def find_value_combos(
@@ -1077,8 +1386,9 @@ class StatisticalAnomalyService:
         fields: list[str] | None = None,
         limit: int = 50,
         rarity_floor: int = 3,
-        baseline_end: datetime | None = None,
+        windows: AnalysisWindows | None = None,
         exclude_event_ids: set[str] | None = None,
+        allowlist: set[tuple[str, str]] | None = None,
         field_mappings: dict[str, list[str]] | None = None,
     ) -> StatAnomalyResult:
         """Return rare or first-seen *combinations* of field values.
@@ -1095,8 +1405,12 @@ class StatisticalAnomalyService:
 
         Modes mirror :meth:`find_value_novelty`: *self-baseline* flags
         combinations appearing ≤ *rarity_floor* times in the whole corpus;
-        *temporal* flags combinations absent from the baseline window but
-        present after ``baseline_end``.
+        *temporal* (*windows* provided) flags combinations absent from the
+        baseline window but present in a suspect window, once per suspect
+        window, scored against that window's event count. The allowlist key
+        for a combo is the ``COMBO_FIELD_SEP``-joined field tokens and
+        ``COMBO_VALUE_SEP``-joined values (see the finding's
+        ``allowlist_field``/``allowlist_value`` details).
 
         Raises:
             ValueError: if fewer than two fields are resolved.
@@ -1104,7 +1418,7 @@ class StatisticalAnomalyService:
         self.ch.init_schema()
         db = self.ch.database
         base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
-        method = "self-baseline" if baseline_end is None else "temporal"
+        method = "self-baseline" if windows is None else "temporal"
 
         total_events = self._count_events(case_id, source_ids)
         if total_events == 0:
@@ -1148,19 +1462,15 @@ class StatisticalAnomalyService:
         group_by = ", ".join(f"v{i}" for i in range(len(exprs)))
         non_empty = " AND ".join(f"{expr} != ''" for expr in exprs)
 
-        # Baseline size (temporal only).
+        # Per-window event totals (surprise denominators) — temporal only.
         baseline_size = total_events
-        if baseline_end is not None:
-            bl_res = self.ch.client.query(
-                f"SELECT count() FROM {db}.events"
-                f" WHERE case_id = {{cid:String}}"
-                f" AND has({{src:Array(String)}}, source_id)"
-                f" AND timestamp < {{bl:String}}",
-                parameters={**base_params, "bl": to_clickhouse_utc(baseline_end)},
-            )
-            baseline_size = int(bl_res.result_rows[0][0]) if bl_res.result_rows else 0
+        suspect_totals: list[int] = []
+        run_warnings: list[str] = []
+        if windows is not None:
+            baseline_size, suspect_totals = self._window_totals(case_id, source_ids, windows)
+            run_warnings = _window_size_warnings(windows, suspect_totals)
 
-        if baseline_end is None:
+        if windows is None:
             params["floor"] = rarity_floor
             params["lim"] = limit
             sql = f"""
@@ -1180,23 +1490,30 @@ class StatisticalAnomalyService:
                 {HEAVY_SCAN_SETTINGS}
             """
         else:
-            params["bl"] = to_clickhouse_utc(baseline_end)
+            bp, sps = _window_preds(windows, params)
             params["lim"] = limit
+            w_blocks = ",\n                    ".join(
+                f"countIf({sp}) AS w{i}_cnt,"
+                f" minIf(timestamp, {sp}) AS w{i}_first,"
+                f" toString(argMinIf(event_id, timestamp, {sp})) AS w{i}_evt"
+                for i, sp in enumerate(sps)
+            )
+            w_sum = " + ".join(f"w{i}_cnt" for i in range(len(sps)))
+            union_pred = " OR ".join([bp, *sps])
             sql = f"""
                 SELECT
                     {val_cols},
-                    countIf(timestamp >= {{bl:String}}) AS detect_cnt,
-                    countIf(timestamp < {{bl:String}}) AS baseline_cnt,
-                    minIf(timestamp, timestamp >= {{bl:String}}) AS first_seen,
-                    toString(argMinIf(event_id, timestamp, timestamp >= {{bl:String}})) AS evt_id
+                    countIf({bp}) AS baseline_cnt,
+                    {w_blocks}
                 FROM {db}.events
                 WHERE case_id = {{cid:String}}
                   AND has({{src:Array(String)}}, source_id)
                   AND {non_empty}
                   AND {TS_NOT_SENTINEL_SQL}
+                  AND ({union_pred})
                 GROUP BY {group_by}
-                HAVING baseline_cnt = 0 AND detect_cnt > 0
-                ORDER BY detect_cnt ASC, first_seen ASC
+                HAVING baseline_cnt = 0 AND ({w_sum}) > 0
+                ORDER BY ({w_sum}) ASC
                 LIMIT {{lim:UInt32}}
                 {HEAVY_SCAN_SETTINGS}
             """
@@ -1204,49 +1521,64 @@ class StatisticalAnomalyService:
         rows = self.ch.client.query(sql, parameters=params).result_rows
         n_fields = len(exprs)
 
+        def _combo_finding(
+            values: list[str], cnt: int, denominator: int, first_seen: Any, evt_id: Any
+        ) -> ComboFinding:
+            score = (-math.log(cnt / denominator) if cnt > 0 and denominator > 0 else 0.0) + 0.0
+            first_seen_str = _present_ts(first_seen)
+            evt_id_str = str(evt_id) if evt_id else None
+            return ComboFinding(
+                fields=list(combo_fields),
+                values=values,
+                count=cnt,
+                score=round(score, 4),
+                first_seen=first_seen_str,
+                event_id=evt_id_str,
+                event=_stub_event(evt_id_str, case_id, first_seen_str),
+                details={
+                    "detector": "value_combo",
+                    "method": method,
+                    "fields": combo_fields,
+                    "values": values,
+                    "count": cnt,
+                    "total_events": denominator,
+                    "surprise": round(score, 4),
+                    "allowlist_field": COMBO_FIELD_SEP.join(combo_fields),
+                    "allowlist_value": COMBO_VALUE_SEP.join(values),
+                },
+            )
+
         all_findings: list[ComboFinding] = []
         for row in rows:
             values = [str(v) for v in row[:n_fields]]
-            if baseline_end is None:
-                cnt = int(row[n_fields])
-                first_seen, evt_id = row[n_fields + 1 : n_fields + 3]
-            else:
-                cnt = int(row[n_fields])  # detect_cnt
-                first_seen, evt_id = row[n_fields + 2 : n_fields + 4]
-
             if any(v == "" for v in values):
                 continue
+            if windows is None:
+                cnt = int(row[n_fields])
+                first_seen, evt_id = row[n_fields + 1 : n_fields + 3]
+                all_findings.append(_combo_finding(values, cnt, total_events, first_seen, evt_id))
+            else:
+                # row: values..., baseline_cnt, then (cnt, first, evt) per window.
+                for i, w in enumerate(windows.suspects):
+                    w_cnt = int(row[n_fields + 1 + i * 3])
+                    if w_cnt <= 0:
+                        continue
+                    first_seen = row[n_fields + 2 + i * 3]
+                    evt_id = row[n_fields + 3 + i * 3]
+                    w_total = suspect_totals[i] if i < len(suspect_totals) else 0
+                    finding = _combo_finding(values, w_cnt, w_total, first_seen, evt_id)
+                    finding.details.update(
+                        {
+                            "baseline_size": baseline_size,
+                            "window_label": w.label,
+                            "window_start": ensure_utc(w.start).isoformat(),
+                            "window_end": ensure_utc(w.end).isoformat(),
+                            "window_total_events": w_total,
+                        }
+                    )
+                    all_findings.append(finding)
 
-            score = -math.log(cnt / total_events) if cnt > 0 and total_events > 0 else 0.0
-            first_seen_str = _present_ts(first_seen)
-            evt_id_str = str(evt_id) if evt_id else None
-            mini_event = _stub_event(evt_id_str, case_id, first_seen_str)
-
-            details: dict[str, Any] = {
-                "detector": "value_combo",
-                "method": method,
-                "fields": combo_fields,
-                "values": values,
-                "count": cnt,
-                "total_events": total_events,
-                "surprise": round(score, 4),
-            }
-            if baseline_end is not None:
-                details["baseline_size"] = baseline_size
-
-            all_findings.append(
-                ComboFinding(
-                    fields=list(combo_fields),
-                    values=values,
-                    count=cnt,
-                    score=round(score, 4),
-                    first_seen=first_seen_str,
-                    event_id=evt_id_str,
-                    event=mini_event,
-                    details=details,
-                )
-            )
-
+        all_findings = _apply_allowlist(all_findings, allowlist)
         if exclude_event_ids:
             all_findings = [
                 f for f in all_findings if not f.event_id or f.event_id not in exclude_event_ids
@@ -1261,6 +1593,8 @@ class StatisticalAnomalyService:
             method=method,
             baseline_size=baseline_size,
             results=results,
+            warnings=run_warnings,
+            windows=windows.payload() if windows is not None else None,
         )
 
     # ------------------------------------------------------------------
@@ -1346,8 +1680,9 @@ class StatisticalAnomalyService:
         fields: list[str] | None = None,
         limit: int = 50,
         per_field_limit: int = 25,
-        baseline_end: datetime | None = None,
+        windows: AnalysisWindows | None = None,
         exclude_event_ids: set[str] | None = None,
+        allowlist: set[tuple[str, str]] | None = None,
         field_mappings: dict[str, list[str]] | None = None,
     ) -> StatAnomalyResult:
         """Return numeric values falling outside a field's learned range.
@@ -1355,9 +1690,10 @@ class StatisticalAnomalyService:
         For each numeric field, learn a baseline band and flag values outside
         it. *self-baseline* (``method="iqr"``) uses the Tukey fence
         ``[q1 − 1.5·IQR, q3 + 1.5·IQR]`` over the whole corpus; *temporal*
-        (``method="temporal-range"``) learns exact min/max from the baseline
-        window (``timestamp < baseline_end``) and flags detect-window values
-        outside it.
+        (``method="temporal-range"``, *windows* provided) learns exact
+        min/max from the baseline window and flags values inside the suspect
+        windows that fall outside it — findings carry which suspect window
+        the value appeared in, and events outside every window are ignored.
 
         When *fields* is ``None`` the numeric-field recommender selects
         candidates automatically. A field with fewer than ``_MIN_RANGE_BASELINE``
@@ -1367,7 +1703,7 @@ class StatisticalAnomalyService:
         self.ch.init_schema()
         db = self.ch.database
         base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
-        method = "iqr" if baseline_end is None else "temporal-range"
+        method = "iqr" if windows is None else "temporal-range"
 
         total_events = self._count_events(case_id, source_ids)
         if total_events == 0:
@@ -1386,7 +1722,6 @@ class StatisticalAnomalyService:
             )
             scan_fields = [f.token for f in rec if f.recommended][:_MAX_AUTO_SCAN_FIELDS]
 
-        bl_str = to_clickhouse_utc(baseline_end) if baseline_end is not None else None
         all_findings: list[RangeFinding] = []
         evaluated_fields = 0
 
@@ -1401,16 +1736,16 @@ class StatisticalAnomalyService:
                 f" AND has({{src:Array(String)}}, source_id)"
                 f" AND {col} != ''"
             )
-            if baseline_end is None:
+            if windows is None:
                 stat_sql = (
                     f"SELECT quantile(0.25)(num) AS q1, quantile(0.75)(num) AS q3, count() AS n"
                     f" FROM ({num_src}) WHERE num IS NOT NULL {HEAVY_SCAN_SETTINGS}"
                 )
             else:
-                stat_params["bl"] = bl_str
+                stat_bp, _ = _window_preds(windows, stat_params)
                 stat_sql = (
                     f"SELECT min(num) AS lo, max(num) AS hi, count() AS n"
-                    f" FROM ({num_src}) WHERE num IS NOT NULL AND timestamp < {{bl:String}}"
+                    f" FROM ({num_src}) WHERE num IS NOT NULL AND {stat_bp}"
                     f" {HEAVY_SCAN_SETTINGS}"
                 )
             srows = self.ch.client.query(stat_sql, parameters=stat_params).result_rows
@@ -1420,7 +1755,7 @@ class StatisticalAnomalyService:
             if int(n) < _MIN_RANGE_BASELINE or a is None or b is None:
                 continue
 
-            if baseline_end is None:
+            if windows is None:
                 q1, q3 = float(a), float(b)
                 iqr = q3 - q1
                 lower = q1 - 1.5 * iqr
@@ -1445,29 +1780,34 @@ class StatisticalAnomalyService:
             viol_params["lo"] = lower
             viol_params["hi"] = upper
             viol_params["plim"] = per_field_limit
+            win_idx_col = ""
+            win_idx_group = ""
             detect_clause = ""
-            if baseline_end is not None:
-                viol_params["bl"] = bl_str
-                # Exclude sentinel/undated rows: they satisfy `>= bl` (year-2299
-                # sentinel) and would otherwise attribute an undated event's
-                # numeric value to the detect window. Matches the sentinel guard
-                # value_combo/frequency apply.
-                detect_clause = f" AND timestamp >= {{bl:String}} AND {TS_NOT_SENTINEL_SQL}"
+            if windows is not None:
+                _, viol_sps = _window_preds(windows, viol_params)
+                # Restrict the scan to the suspect-window union (events outside
+                # every window are ignored), tag each row with its window index
+                # for attribution, and exclude sentinel/undated rows — the
+                # year-2299 sentinel would otherwise land in any open-ended
+                # window. Matches the sentinel guard value_combo/frequency apply.
+                win_idx_col = f", {_suspect_multiif(viol_sps)} AS win_idx"
+                win_idx_group = ", win_idx"
+                detect_clause = f" AND ({' OR '.join(viol_sps)}) AND {TS_NOT_SENTINEL_SQL}"
             viol_sql = f"""
                 SELECT
                     num AS val,
                     count() AS cnt,
                     min(timestamp) AS first_seen,
-                    toString(argMin(event_id, timestamp)) AS evt_id
+                    toString(argMin(event_id, timestamp)) AS evt_id{win_idx_group}
                 FROM (
-                    SELECT toFloat64OrNull({vcol}) AS num, timestamp, event_id
+                    SELECT toFloat64OrNull({vcol}) AS num, timestamp, event_id{win_idx_col}
                     FROM {db}.events
                     WHERE case_id = {{cid:String}}
                       AND has({{src:Array(String)}}, source_id)
-                      AND {vcol} != ''
+                      AND {vcol} != ''{detect_clause}
                 )
-                WHERE num IS NOT NULL AND (num < {{lo:Float64}} OR num > {{hi:Float64}}){detect_clause}
-                GROUP BY val
+                WHERE num IS NOT NULL AND (num < {{lo:Float64}} OR num > {{hi:Float64}})
+                GROUP BY val{win_idx_group}
                 ORDER BY greatest({{lo:Float64}} - val, val - {{hi:Float64}}) DESC, first_seen ASC
                 LIMIT {{plim:UInt32}}
                 {HEAVY_SCAN_SETTINGS}
@@ -1475,7 +1815,13 @@ class StatisticalAnomalyService:
             vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
 
             for vrow in vrows:
-                val, cnt, first_seen, evt_id = vrow
+                if windows is None:
+                    val, cnt, first_seen, evt_id = vrow
+                    window: TimeWindow | None = None
+                else:
+                    val, cnt, first_seen, evt_id, win_idx = vrow
+                    wi = int(win_idx)
+                    window = windows.suspects[wi] if 0 <= wi < len(windows.suspects) else None
                 if val is None:
                     continue
                 val_f = float(val)
@@ -1497,8 +1843,18 @@ class StatisticalAnomalyService:
                     "direction": direction,
                     "excess": round(excess, 4),
                     "baseline_n": int(n),
+                    "allowlist_field": field_token,
+                    "allowlist_value": str(val_f),
                     **band_extra,
                 }
+                if window is not None:
+                    details.update(
+                        {
+                            "window_label": window.label,
+                            "window_start": ensure_utc(window.start).isoformat(),
+                            "window_end": ensure_utc(window.end).isoformat(),
+                        }
+                    )
                 all_findings.append(
                     RangeFinding(
                         field=field_token,
@@ -1521,8 +1877,10 @@ class StatisticalAnomalyService:
                 detector="numeric_range",
                 method=method,
                 baseline_size=total_events,
+                windows=windows.payload() if windows is not None else None,
             )
 
+        all_findings = _apply_allowlist(all_findings, allowlist)
         if exclude_event_ids:
             all_findings = [
                 f for f in all_findings if not f.event_id or f.event_id not in exclude_event_ids
@@ -1537,6 +1895,7 @@ class StatisticalAnomalyService:
             method=method,
             baseline_size=total_events,
             results=results,
+            windows=windows.payload() if windows is not None else None,
         )
 
     # ------------------------------------------------------------------
@@ -1590,8 +1949,9 @@ class StatisticalAnomalyService:
         limit: int = 50,
         per_field_limit: int = 25,
         rarity_floor: int = 3,
-        baseline_end: datetime | None = None,
+        windows: AnalysisWindows | None = None,
         exclude_event_ids: set[str] | None = None,
+        allowlist: set[tuple[str, str]] | None = None,
         field_mappings: dict[str, list[str]] | None = None,
         inventory: list[tuple[str, int, int]] | None = None,
         inventory_total: int | None = None,
@@ -1613,10 +1973,11 @@ class StatisticalAnomalyService:
           all non-rare characters and any value containing a rare character is
           flagged (mirrors the IQR fallback the numeric_range detector uses
           for the same degeneracy).
-        * *temporal* (``method="temporal-charset"``) — reference set = every
-          character seen in baseline-window values (``timestamp <
-          baseline_end``); detect-window values containing characters absent
-          from it are flagged.
+        * *temporal* (``method="temporal-charset"``, *windows* provided) —
+          reference set = every character seen in baseline-window values;
+          suspect-window values containing characters absent from it are
+          flagged, attributed to the suspect window they appear in. Events
+          outside every window are ignored.
 
         Score = Σ over the value's novel characters of ``-log(n_vals_with_char
         / n_distinct_values)`` (self mode; temporal uses ``log(n_distinct + 1)``
@@ -1630,7 +1991,7 @@ class StatisticalAnomalyService:
         self.ch.init_schema()
         db = self.ch.database
         base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
-        method = "rare-chars" if baseline_end is None else "temporal-charset"
+        method = "rare-chars" if windows is None else "temporal-charset"
 
         total_events = self._count_events(case_id, source_ids)
         if total_events == 0:
@@ -1648,14 +2009,13 @@ class StatisticalAnomalyService:
                 case_id, source_ids, total_events, field_mappings, inventory, inventory_total
             )
 
-        bl_str = to_clickhouse_utc(baseline_end) if baseline_end is not None else None
         all_findings: list[CharsetFinding] = []
         evaluated_fields = 0
 
         for field_token in scan_fields:
             # --- Learn the reference charset. ---
             char_counts: dict[str, int] = {}
-            if baseline_end is None:
+            if windows is None:
                 # Per-character distinct-value counts over the whole corpus,
                 # plus the total distinct-value count in the same scan: a window
                 # `count() OVER ()` over the DISTINCT subquery yields n_vals on
@@ -1694,10 +2054,11 @@ class StatisticalAnomalyService:
                 # full baseline alphabet).
                 alphabet_size = len(char_counts)
             else:
-                # Charset of the baseline window (sentinel rows sort after
-                # baseline_end, so `timestamp <` already excludes them).
-                bs_params: dict[str, Any] = {**base_params, "bl": bl_str}
+                # Charset of the baseline window (a bounded range now, so the
+                # year-2299 sentinel can never fall inside it).
+                bs_params: dict[str, Any] = {**base_params}
                 col = _col_expr(field_token, bs_params, field_mappings)
+                bs_bp, _ = _window_preds(windows, bs_params)
                 bs_sql = f"""
                     SELECT
                         groupUniqArrayArray(arrayDistinct(extractAll(val, '(?s).'))) AS charset,
@@ -1708,7 +2069,7 @@ class StatisticalAnomalyService:
                         WHERE case_id = {{cid:String}}
                           AND has({{src:Array(String)}}, source_id)
                           AND {col} != ''
-                          AND timestamp < {{bl:String}}
+                          AND {bs_bp}
                     )
                     {HEAVY_SCAN_SETTINGS}
                 """
@@ -1729,14 +2090,20 @@ class StatisticalAnomalyService:
             vcol = _col_expr(field_token, viol_params, field_mappings)
             viol_params["base"] = reference
             viol_params["plim"] = per_field_limit
+            win_idx_sel = ""
+            win_idx_group = ""
             detect_clause = ""
-            if baseline_end is not None:
-                viol_params["bl"] = bl_str
-                # Exclude sentinel/undated rows: they satisfy `>= bl` (year-2299
-                # sentinel) and would otherwise land in the detect window.
-                detect_clause = f" AND timestamp >= {{bl:String}} AND {TS_NOT_SENTINEL_SQL}"
+            if windows is not None:
+                _, viol_sps = _window_preds(windows, viol_params)
+                # Restrict the scan to the suspect-window union, tag rows with
+                # their window index for attribution, and exclude sentinel/
+                # undated rows (the year-2299 sentinel would land in any
+                # open-ended range test).
+                win_idx_sel = f", {_suspect_multiif(viol_sps)} AS win_idx"
+                win_idx_group = ", win_idx"
+                detect_clause = f" AND ({' OR '.join(viol_sps)}) AND {TS_NOT_SENTINEL_SQL}"
             viol_sql = f"""
-                SELECT val, novel, cnt, first_seen, evt_id
+                SELECT val, novel, cnt, first_seen, evt_id{win_idx_group}
                 FROM (
                     SELECT
                         val,
@@ -1744,18 +2111,18 @@ class StatisticalAnomalyService:
                             c -> NOT has({{base:Array(String)}}, c),
                             arrayDistinct(extractAll(val, '(?s).'))
                         ) AS novel,
-                        cnt, first_seen, evt_id
+                        cnt, first_seen, evt_id{win_idx_group}
                     FROM (
                         SELECT
                             {vcol} AS val,
                             count() AS cnt,
                             min(timestamp) AS first_seen,
-                            toString(argMin(event_id, timestamp)) AS evt_id
+                            toString(argMin(event_id, timestamp)) AS evt_id{win_idx_sel}
                         FROM {db}.events
                         WHERE case_id = {{cid:String}}
                           AND has({{src:Array(String)}}, source_id)
                           AND {vcol} != ''{detect_clause}
-                        GROUP BY val
+                        GROUP BY val{win_idx_group}
                     )
                 )
                 WHERE length(novel) > 0
@@ -1766,7 +2133,13 @@ class StatisticalAnomalyService:
             vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
 
             for vrow in vrows:
-                val, novel, cnt, first_seen, evt_id = vrow
+                if windows is None:
+                    val, novel, cnt, first_seen, evt_id = vrow
+                    window: TimeWindow | None = None
+                else:
+                    val, novel, cnt, first_seen, evt_id, win_idx = vrow
+                    wi = int(win_idx)
+                    window = windows.suspects[wi] if 0 <= wi < len(windows.suspects) else None
                 novel_chars = [str(c) for c in (novel or [])]
                 if not val or not novel_chars:
                     continue
@@ -1791,10 +2164,20 @@ class StatisticalAnomalyService:
                     "codepoints": [f"U+{ord(c):04X}" for c in novel_chars if len(c) == 1],
                     "count": int(cnt),
                     "baseline_distinct_values": n_vals,
+                    "allowlist_field": field_token,
+                    "allowlist_value": str(val),
                 }
-                if baseline_end is None:
+                if windows is None:
                     details["rarity_floor"] = rarity_floor
                     details["char_value_counts"] = {c: char_counts.get(c, 0) for c in novel_chars}
+                if window is not None:
+                    details.update(
+                        {
+                            "window_label": window.label,
+                            "window_start": ensure_utc(window.start).isoformat(),
+                            "window_end": ensure_utc(window.end).isoformat(),
+                        }
+                    )
                 all_findings.append(
                     CharsetFinding(
                         field=field_token,
@@ -1819,6 +2202,8 @@ class StatisticalAnomalyService:
             limit=limit,
             case_id=case_id,
             source_ids=source_ids,
+            allowlist=allowlist,
+            windows=windows,
         )
 
     # ------------------------------------------------------------------
@@ -1832,8 +2217,9 @@ class StatisticalAnomalyService:
         fields: list[str] | None = None,
         limit: int = 50,
         per_field_limit: int = 25,
-        baseline_end: datetime | None = None,
+        windows: AnalysisWindows | None = None,
         exclude_event_ids: set[str] | None = None,
+        allowlist: set[tuple[str, str]] | None = None,
         field_mappings: dict[str, list[str]] | None = None,
         inventory: list[tuple[str, int, int]] | None = None,
         inventory_total: int | None = None,
@@ -1851,8 +2237,10 @@ class StatisticalAnomalyService:
         Two modes: *self-baseline* (``method="iqr"``) computes the fence over
         the whole corpus's per-distinct-value entropies (unlike an exact
         min/max, quartiles are not degenerate over their own population);
-        *temporal* (``method="temporal-iqr"``) learns the fence from the
-        baseline window and flags only detect-window values.
+        *temporal* (``method="temporal-iqr"``, *windows* provided) learns the
+        fence from the baseline window and flags only suspect-window values,
+        attributed to the window they appear in; events outside every window
+        are ignored.
 
         Entropies are weighted per distinct value, not per row — one hot
         value repeated millions of times cannot drag the band toward itself.
@@ -1864,7 +2252,7 @@ class StatisticalAnomalyService:
         self.ch.init_schema()
         db = self.ch.database
         base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
-        method = "iqr" if baseline_end is None else "temporal-iqr"
+        method = "iqr" if windows is None else "temporal-iqr"
 
         total_events = self._count_events(case_id, source_ids)
         if total_events == 0:
@@ -1887,7 +2275,6 @@ class StatisticalAnomalyService:
         # ARRAY JOIN-ed out one row each. This is linear in the value length;
         # the earlier `arrayMap(c -> countEqual(chars, c), ...)` form rescanned
         # the whole char array once per distinct character (quadratic).
-        bl_str = to_clickhouse_utc(baseline_end) if baseline_end is not None else None
         all_findings: list[EntropyFinding] = []
         evaluated_fields = 0
 
@@ -1896,11 +2283,11 @@ class StatisticalAnomalyService:
             stat_params: dict[str, Any] = {**base_params, "minlen": _MIN_ENTROPY_VALUE_LEN}
             col = _col_expr(field_token, stat_params, field_mappings)
             baseline_clause = ""
-            if baseline_end is not None:
-                stat_params["bl"] = bl_str
-                # Sentinel rows sort after baseline_end, so `timestamp <`
-                # already excludes them from the baseline.
-                baseline_clause = " AND timestamp < {bl:String}"
+            if windows is not None:
+                stat_bp, _ = _window_preds(windows, stat_params)
+                # The baseline window is a bounded range, so the year-2299
+                # sentinel can never fall inside it.
+                baseline_clause = f" AND {stat_bp}"
             stat_sql = f"""
                 SELECT quantile(0.25)(ent) AS q1, quantile(0.75)(ent) AS q3, count() AS n
                 FROM (
@@ -1941,38 +2328,44 @@ class StatisticalAnomalyService:
             viol_params["lo"] = lower
             viol_params["hi"] = upper
             viol_params["plim"] = per_field_limit
+            win_idx_sel = ""
+            win_idx_group = ""
             detect_clause = ""
-            if baseline_end is not None:
-                viol_params["bl"] = bl_str
-                # Exclude sentinel/undated rows: they satisfy `>= bl` (year-2299
-                # sentinel) and would otherwise land in the detect window.
-                detect_clause = f" AND timestamp >= {{bl:String}} AND {TS_NOT_SENTINEL_SQL}"
+            if windows is not None:
+                _, viol_sps = _window_preds(windows, viol_params)
+                # Restrict the scan to the suspect-window union, tag each row
+                # with its window index for attribution, and exclude sentinel/
+                # undated rows (year-2299 sentinel would land in any open range).
+                win_idx_sel = f", {_suspect_multiif(viol_sps)} AS win_idx"
+                win_idx_group = ", win_idx"
+                detect_clause = f" AND ({' OR '.join(viol_sps)}) AND {TS_NOT_SENTINEL_SQL}"
             viol_sql = f"""
-                SELECT val, ent, cnt, first_seen, evt_id
+                SELECT val, ent, cnt, first_seen, evt_id{win_idx_group}
                 FROM (
                     SELECT
                         val,
                         entropy(c) AS ent,
                         any(cnt) AS cnt,
                         any(first_seen) AS first_seen,
-                        any(evt_id) AS evt_id
+                        any(evt_id) AS evt_id{win_idx_group}
                     FROM (
-                        SELECT val, cnt, first_seen, evt_id, arrayJoin(extractAll(val, '(?s).')) AS c
+                        SELECT val, cnt, first_seen, evt_id{win_idx_group},
+                               arrayJoin(extractAll(val, '(?s).')) AS c
                         FROM (
                             SELECT
                                 {vcol} AS val,
                                 count() AS cnt,
                                 min(timestamp) AS first_seen,
-                                toString(argMin(event_id, timestamp)) AS evt_id
+                                toString(argMin(event_id, timestamp)) AS evt_id{win_idx_sel}
                             FROM {db}.events
                             WHERE case_id = {{cid:String}}
                               AND has({{src:Array(String)}}, source_id)
                               AND {vcol} != ''
                               AND lengthUTF8({vcol}) >= {{minlen:UInt32}}{detect_clause}
-                            GROUP BY val
+                            GROUP BY val{win_idx_group}
                         )
                     )
-                    GROUP BY val
+                    GROUP BY val{win_idx_group}
                 )
                 WHERE ent < {{lo:Float64}} OR ent > {{hi:Float64}}
                 ORDER BY greatest({{lo:Float64}} - ent, ent - {{hi:Float64}}) DESC, first_seen ASC
@@ -1982,7 +2375,13 @@ class StatisticalAnomalyService:
             vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
 
             for vrow in vrows:
-                val, ent, cnt, first_seen, evt_id = vrow
+                if windows is None:
+                    val, ent, cnt, first_seen, evt_id = vrow
+                    window: TimeWindow | None = None
+                else:
+                    val, ent, cnt, first_seen, evt_id, win_idx = vrow
+                    wi = int(win_idx)
+                    window = windows.suspects[wi] if 0 <= wi < len(windows.suspects) else None
                 if not val or ent is None:
                     continue
                 ent_f = float(ent)
@@ -2008,7 +2407,17 @@ class StatisticalAnomalyService:
                     "q3": round(q3, 4),
                     "iqr": round(iqr, 4),
                     "baseline_n": int(n),
+                    "allowlist_field": field_token,
+                    "allowlist_value": str(val),
                 }
+                if window is not None:
+                    details.update(
+                        {
+                            "window_label": window.label,
+                            "window_start": ensure_utc(window.start).isoformat(),
+                            "window_end": ensure_utc(window.end).isoformat(),
+                        }
+                    )
                 all_findings.append(
                     EntropyFinding(
                         field=field_token,
@@ -2032,6 +2441,8 @@ class StatisticalAnomalyService:
             method=method,
             total_events=total_events,
             evaluated_fields=evaluated_fields,
+            allowlist=allowlist,
+            windows=windows,
             exclude_event_ids=exclude_event_ids,
             limit=limit,
             case_id=case_id,
@@ -2050,31 +2461,57 @@ class StatisticalAnomalyService:
         limit: int = 20,
         bucket_count: int = 60,
         z_threshold: float = 2.5,
-        baseline_end: datetime | None = None,
+        windows: AnalysisWindows | None = None,
         exclude_event_ids: set[str] | None = None,
+        allowlist: set[tuple[str, str]] | None = None,
         field_mappings: dict[str, list[str]] | None = None,
     ) -> StatAnomalyResult:
         """Return time windows with anomalous event-count frequency.
 
-        Event counts per ``series_field`` value are windowed into
-        *bucket_count* time buckets.  For each series with at least
-        ``_MIN_FREQUENCY_BUCKETS`` data points, z-scores are computed and
-        windows with |z| ≥ *z_threshold* are returned ranked by |z| descending.
+        Event counts per ``series_field`` value are windowed into time
+        buckets.  For each series with at least ``_MIN_FREQUENCY_BUCKETS``
+        buckets, z-scores are computed and windows with |z| ≥ *z_threshold*
+        are returned ranked by |z| descending.
 
-        When ``baseline_end`` is provided, the mean/std are computed from
-        baseline-window buckets only; the detect window is then scored against
-        that baseline (temporal sub-mode).
+        *self-baseline* (``method="z-score"``): the whole timeline is bucketed
+        into *bucket_count* buckets and each bucket is scored leave-one-out
+        against the rest of its series.
+
+        *temporal* (``method="temporal-z-score"``, *windows* provided): the
+        bucket interval is derived from the **baseline** window (the reference
+        distribution, so it gets the full *bucket_count* resolution), and the
+        same epoch-aligned interval buckets every suspect window. Mean/std are
+        learned from the baseline window's buckets only (zero-filled — a silent
+        bucket contributes a real 0 to the baseline), and each suspect window's
+        buckets are scored against that fixed baseline. Only buckets lying
+        **fully** inside a window are used; a window edge cutting a bucket
+        would read as a fake spike/drop, so partial buckets are excluded, and a
+        suspect window with no full bucket yields a warning rather than a bogus
+        single-bucket z-score.
         """
-        if baseline_end is not None:
-            baseline_end = ensure_utc(baseline_end)
         self.ch.init_schema()
         db = self.ch.database
         field_params: dict[str, Any] = {}
         col = _col_expr(series_field, field_params, field_mappings)
-
         src_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        method = "z-score" if windows is None else "temporal-z-score"
 
-        # Resolve time range.
+        if windows is not None:
+            return self._frequency_windowed(
+                case_id,
+                source_ids,
+                series_field,
+                col,
+                field_params,
+                windows,
+                limit,
+                bucket_count,
+                z_threshold,
+                exclude_event_ids,
+                allowlist,
+            )
+
+        # --- Self-baseline: whole-timeline buckets, leave-one-out z-score. ---
         min_ts, max_ts = query_timestamp_range(
             self.ch.client,
             db,
@@ -2085,14 +2522,13 @@ class StatisticalAnomalyService:
             return StatAnomalyResult(
                 status="no_data",
                 detector="frequency",
-                method="z-score" if baseline_end is None else "temporal-z-score",
+                method=method,
                 baseline_size=0,
                 z_threshold=z_threshold,
             )
 
         interval = bucket_interval_seconds(min_ts, max_ts, bucket_count)
 
-        # Fetch per-bucket, per-series event counts.
         params: dict[str, Any] = {**src_params, **field_params, "iv": interval}
         bucket_sql = f"""
             SELECT
@@ -2114,157 +2550,276 @@ class StatisticalAnomalyService:
             return StatAnomalyResult(
                 status="no_data",
                 detector="frequency",
-                method="z-score" if baseline_end is None else "temporal-z-score",
+                method=method,
                 baseline_size=0,
                 z_threshold=z_threshold,
             )
 
-        # Build series dict: series_val → [(bucket_dt, cnt)].
         series: dict[str, list[tuple[Any, int]]] = defaultdict(list)
         for brow in brows:
             bucket, sv, cnt = brow
             if sv:
                 series[sv].append((bucket, int(cnt)))
 
-        method = "z-score" if baseline_end is None else "temporal-z-score"
-
-        # In temporal mode, "baseline" means the pre-baseline_end window only;
-        # in self-baseline mode the whole series is its own baseline.
         baseline_size = 0
-
-        # Z-score each bucket, collect anomalous windows.
         findings: list[FreqFinding] = []
         evaluated_series = 0
 
         for sv, pts in series.items():
             pts_aware = [(ensure_utc(b), c) for b, c in pts]
+            if len(pts_aware) < _MIN_FREQUENCY_BUCKETS:
+                continue
+            baseline_size += sum(c for _, c in pts_aware)
+            # Leave-one-out mean/std: score each bucket against the rest of
+            # the series, not against itself. Otherwise a single dominant
+            # spike inflates its own baseline and can suppress detection
+            # of the very spike being scored.
+            counts = np.array([c for _, c in pts_aware], dtype=np.float64)
+            n = len(counts)
+            total = float(counts.sum())
+            total_sq = float(np.square(counts).sum())
+            evaluated_series += 1
+            for (bucket_dt, cnt), c in zip(pts_aware, counts, strict=False):
+                n_loo = n - 1
+                mean_val = (total - c) / n_loo
+                var_loo = (total_sq - c * c - n_loo * mean_val * mean_val) / (n_loo - 1)
+                std_val = max(math.sqrt(max(var_loo, 0.0)), _MIN_FREQUENCY_STD)
+                z = (cnt - mean_val) / std_val
+                if abs(z) >= z_threshold:
+                    findings.append(
+                        _freq_finding(
+                            series_field, sv, bucket_dt, interval, int(cnt), mean_val, z, method
+                        )
+                    )
 
-            if baseline_end is not None:
-                bl_pts = [(b, c) for b, c in pts_aware if b < baseline_end]
-                detect_pts = [(b, c) for b, c in pts_aware if b >= baseline_end]
-                if not detect_pts:
-                    continue
-                if not bl_pts:
-                    # Series absent from the baseline entirely but active in
-                    # the detect window — no std can be computed from zero
-                    # points, so score against a zero baseline instead of
-                    # skipping (mirrors find_value_novelty's
-                    # baseline_cnt == 0 case: "new activity after the
-                    # incident start" is exactly what temporal mode should
-                    # surface, not silently drop).
-                    evaluated_series += 1
-                    for bucket_dt, cnt in detect_pts:
-                        z = cnt / _MIN_FREQUENCY_STD
-                        if abs(z) >= z_threshold:
-                            findings.append(
-                                _freq_finding(
-                                    series_field,
-                                    sv,
-                                    bucket_dt,
-                                    interval,
-                                    cnt,
-                                    0.0,
-                                    z,
-                                    method,
-                                )
-                            )
-                    continue
-                if len(bl_pts) < _MIN_FREQUENCY_BUCKETS:
-                    continue
-                baseline_size += sum(c for _, c in bl_pts)
-                counts_bl = np.array([c for _, c in bl_pts], dtype=np.float64)
-                mean_val = float(counts_bl.mean())
-                std_val = float(counts_bl.std(ddof=1))
-                if std_val < 1e-9:
-                    continue  # Perfectly constant baseline — no z-score possible.
-                evaluated_series += 1
-                for bucket_dt, cnt in detect_pts:
+        return self._finalize_freq(
+            findings,
+            case_id,
+            source_ids,
+            col,
+            db,
+            field_params,
+            interval,
+            baseline_size,
+            evaluated_series,
+            z_threshold,
+            exclude_event_ids,
+            allowlist,
+            limit=limit,
+            warnings=[],
+            windows=None,
+        )
+
+    def _frequency_windowed(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        series_field: str,
+        col: str,
+        field_params: dict[str, Any],
+        windows: AnalysisWindows,
+        limit: int,
+        bucket_count: int,
+        z_threshold: float,
+        exclude_event_ids: set[str] | None,
+        allowlist: set[tuple[str, str]] | None,
+    ) -> StatAnomalyResult:
+        """Temporal frequency detection over an explicit baseline + suspect windows.
+
+        See :meth:`find_frequency_anomalies` for the semantics; this is the
+        ``windows is not None`` branch, kept separate because its bucket math
+        (baseline-derived interval, full-bucket-only, zero-filled baseline)
+        shares nothing with the self-baseline leave-one-out path.
+        """
+        db = self.ch.database
+        method = "temporal-z-score"
+        warnings: list[str] = []
+
+        # Interval from the baseline window: it is the reference distribution,
+        # so it gets the full bucket_count resolution; the same epoch-aligned
+        # interval then buckets every suspect window for comparability.
+        interval = bucket_interval_seconds(
+            windows.baseline.start, windows.baseline.end, bucket_count
+        )
+
+        baseline_full = _full_bucket_starts(windows.baseline, interval)
+        if len(baseline_full) < _MIN_FREQUENCY_BUCKETS:
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector="frequency",
+                method=method,
+                baseline_size=0,
+                results=[],
+                z_threshold=z_threshold,
+                warnings=[
+                    "Baseline window spans fewer than "
+                    f"{_MIN_FREQUENCY_BUCKETS} full {interval}s buckets — widen it to "
+                    "build a frequency distribution"
+                ],
+                windows=windows.payload(),
+            )
+
+        suspect_full: list[list[datetime]] = []
+        for w in windows.suspects:
+            full = _full_bucket_starts(w, interval)
+            suspect_full.append(full)
+            if not full:
+                warnings.append(
+                    f"Suspect window {w.label!r} is shorter than the {interval}s bucket "
+                    "interval (derived from the baseline) — not scored; shrink the "
+                    "baseline or widen the window"
+                )
+
+        # One bucket scan over the union of all windows.
+        params: dict[str, Any] = {**{"cid": case_id, "src": source_ids}, **field_params}
+        _, sps = _window_preds(windows, params)
+        params["iv"] = interval
+        union_pred = " OR ".join(["(timestamp >= {b0:String} AND timestamp < {b1:String})", *sps])
+        bucket_sql = f"""
+            SELECT
+                toStartOfInterval(timestamp, INTERVAL {{iv:UInt32}} second) AS bucket,
+                {col} AS series_val,
+                count() AS cnt
+            FROM {db}.events
+            WHERE case_id = {{cid:String}}
+              AND has({{src:Array(String)}}, source_id)
+              AND {TS_NOT_SENTINEL_SQL}
+              AND {col} != ''
+              AND ({union_pred})
+            GROUP BY bucket, series_val
+            {HEAVY_SCAN_SETTINGS}
+        """
+        brows = self.ch.client.query(bucket_sql, parameters=params).result_rows
+        if not brows:
+            return StatAnomalyResult(
+                status="no_data",
+                detector="frequency",
+                method=method,
+                baseline_size=0,
+                results=[],
+                z_threshold=z_threshold,
+                warnings=warnings,
+                windows=windows.payload(),
+            )
+
+        # series_val → {bucket_start_iso: cnt}
+        counts_by_series: dict[str, dict[str, int]] = defaultdict(dict)
+        for bucket, sv, cnt in brows:
+            if sv:
+                counts_by_series[str(sv)][ensure_utc(bucket).isoformat()] = int(cnt)
+
+        baseline_iso = [b.isoformat() for b in baseline_full]
+        baseline_size = 0
+        findings: list[FreqFinding] = []
+        evaluated_series = 0
+
+        for sv, cmap in counts_by_series.items():
+            # Zero-fill the baseline: a bucket with no events for this series is
+            # a real 0 in the distribution, not a missing sample. A silence
+            # inflates the mean if dropped.
+            bl_counts = np.array([cmap.get(b, 0) for b in baseline_iso], dtype=np.float64)
+            baseline_size += int(bl_counts.sum())
+            mean_val = float(bl_counts.mean())
+            # Floor std at _MIN_FREQUENCY_STD: covers a series absent from the
+            # baseline (all-zero → mean 0) and a constant-baseline series
+            # alike, so a spike against either is still scored instead of
+            # dividing by ~0 or being silently skipped.
+            std_val = max(float(bl_counts.std(ddof=1)), _MIN_FREQUENCY_STD)
+            evaluated_series += 1
+
+            for w, full in zip(windows.suspects, suspect_full, strict=False):
+                for b in full:
+                    cnt = cmap.get(b.isoformat(), 0)
                     z = (cnt - mean_val) / std_val
                     if abs(z) >= z_threshold:
                         findings.append(
                             _freq_finding(
                                 series_field,
                                 sv,
-                                bucket_dt,
+                                b,
                                 interval,
                                 cnt,
                                 mean_val,
                                 z,
                                 method,
-                            )
-                        )
-            else:
-                if len(pts_aware) < _MIN_FREQUENCY_BUCKETS:
-                    continue
-                baseline_size += sum(c for _, c in pts_aware)
-                # Leave-one-out mean/std: score each bucket against the rest of
-                # the series, not against itself. Otherwise a single dominant
-                # spike inflates its own baseline and can suppress detection
-                # of the very spike being scored.
-                counts = np.array([c for _, c in pts_aware], dtype=np.float64)
-                n = len(counts)
-                total = float(counts.sum())
-                total_sq = float(np.square(counts).sum())
-                evaluated_series += 1
-                for (bucket_dt, cnt), c in zip(pts_aware, counts, strict=False):
-                    n_loo = n - 1
-                    mean_val = (total - c) / n_loo
-                    var_loo = (total_sq - c * c - n_loo * mean_val * mean_val) / (n_loo - 1)
-                    # Floor the leave-one-out std rather than skipping when the
-                    # rest of the series is constant (or near it) — otherwise a
-                    # single outlier bucket, scored against a baseline it was
-                    # excluded from, would divide by ~0 and either blow up or
-                    # (previously) get silently dropped instead of flagged.
-                    std_val = max(math.sqrt(max(var_loo, 0.0)), _MIN_FREQUENCY_STD)
-                    z = (cnt - mean_val) / std_val
-                    if abs(z) >= z_threshold:
-                        findings.append(
-                            _freq_finding(
-                                series_field,
-                                sv,
-                                bucket_dt,
-                                interval,
-                                int(cnt),
-                                mean_val,
-                                z,
-                                method,
+                                suspect_window=w,
                             )
                         )
 
+        return self._finalize_freq(
+            findings,
+            case_id,
+            source_ids,
+            col,
+            db,
+            field_params,
+            interval,
+            baseline_size,
+            evaluated_series,
+            z_threshold,
+            exclude_event_ids,
+            allowlist,
+            limit=limit,
+            warnings=warnings,
+            windows=windows,
+        )
+
+    def _finalize_freq(
+        self,
+        findings: list[FreqFinding],
+        case_id: str,
+        source_ids: list[str],
+        col: str,
+        db: str,
+        field_params: dict[str, Any],
+        interval: int,
+        baseline_size: int,
+        evaluated_series: int,
+        z_threshold: float,
+        exclude_event_ids: set[str] | None,
+        allowlist: set[tuple[str, str]] | None,
+        *,
+        limit: int,
+        warnings: list[str],
+        windows: AnalysisWindows | None,
+    ) -> StatAnomalyResult:
+        """Hydrate, suppress, rank and cap frequency findings; build the result."""
+        windows_payload = windows.payload() if windows is not None else None
         if not findings:
             return StatAnomalyResult(
                 status="ok" if evaluated_series > 0 else "insufficient_data",
                 detector="frequency",
-                method=method,
+                method="z-score" if windows is None else "temporal-z-score",
                 baseline_size=baseline_size,
                 results=[],
                 z_threshold=z_threshold,
+                warnings=warnings,
+                windows=windows_payload,
             )
 
-        # Hydrate representative events for every candidate finding (one
-        # batched query, not one per finding) and suppress any whose event
-        # was marked normal *before* ranking/limiting — filtering after the
-        # `[:limit]` slice would shrink the page below `limit` instead of
-        # backfilling from the next-ranked window (find_value_novelty
-        # filters before slicing for the same reason).
+        # Hydrate representative events (one batched query) and suppress
+        # allowlisted series / normal-marked events *before* ranking/limiting —
+        # filtering after the `[:limit]` slice would shrink the page below
+        # `limit` instead of backfilling from the next-ranked window.
         findings = self._hydrate_freq_findings(
             findings, case_id, source_ids, col, db, field_params, interval
         )
+        findings = _apply_allowlist(findings, allowlist)
         if exclude_event_ids:
             findings = [
                 f for f in findings if not f.event_id or f.event_id not in exclude_event_ids
             ]
 
         findings.sort(key=lambda f: f.score, reverse=True)
-        top = findings[:limit]
-
         return StatAnomalyResult(
             status="ok",
             detector="frequency",
-            method=method,
+            method="z-score" if windows is None else "temporal-z-score",
             baseline_size=baseline_size,
-            results=top,
+            results=findings[:limit],
             z_threshold=z_threshold,
+            warnings=warnings,
+            windows=windows_payload,
         )
 
     def _hydrate_freq_findings(

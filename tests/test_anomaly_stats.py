@@ -10,13 +10,32 @@ from datetime import UTC, datetime
 from typing import Any
 
 from tracesignal.db.anomaly_stats import (
+    AnalysisWindows,
     FreqFinding,
     NoveltyFieldInfo,
     StatisticalAnomalyService,
+    TimeWindow,
     ValueFinding,
     _classify_field,
     _col_expr,
+    _full_bucket_starts,
+    windows_from_split,
 )
+
+
+def _one_suspect(
+    baseline_start: datetime,
+    baseline_end: datetime,
+    suspect_start: datetime,
+    suspect_end: datetime,
+    label: str = "suspect",
+) -> AnalysisWindows:
+    """Build an AnalysisWindows with one baseline and one suspect window."""
+    return AnalysisWindows(
+        baseline=TimeWindow("baseline", baseline_start, baseline_end),
+        suspects=(TimeWindow(label, suspect_start, suspect_end),),
+    )
+
 
 # ---------------------------------------------------------------------------
 # Fake ClickHouse infrastructure
@@ -334,41 +353,30 @@ def test_value_novelty_skips_empty_values():
 
 
 def test_value_novelty_temporal_baseline_first_seen():
-    """Temporal mode flags values absent in baseline but present in detect window."""
-    baseline_end = datetime(2024, 1, 15, tzinfo=UTC)
+    """Temporal mode flags values absent in baseline but present in a suspect window."""
+    windows = _one_suspect(
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2024, 1, 15, tzinfo=UTC),
+        datetime(2024, 1, 16, tzinfo=UTC),
+        datetime(2024, 1, 20, tzinfo=UTC),
+        label="exfil-window",
+    )
     svc = _svc(
         [
             # Total events
             FakeQueryResult(result_rows=[(500,)], column_names=["count()"]),
-            # Baseline size
-            FakeQueryResult(result_rows=[(300,)], column_names=["count()"]),
-            # artifact field: one first-seen value
+            # Window totals: baseline_total, w0_total
+            FakeQueryResult(result_rows=[(300, 120)], column_names=["bl_total", "w0_total"]),
+            # artifact field: val, baseline_cnt, w0_cnt, w0_first, w0_evt
             FakeQueryResult(
                 result_rows=[
-                    (
-                        "first_time_process.exe",
-                        3,
-                        0,
-                        datetime(2024, 1, 16),
-                        "evt-9",
-                    ),
+                    ("first_time_process.exe", 0, 3, datetime(2024, 1, 16), "evt-9"),
                 ],
-                column_names=[
-                    "val",
-                    "detect_cnt",
-                    "baseline_cnt",
-                    "first_seen",
-                    "evt_id",
-                ],
+                column_names=["val", "baseline_cnt", "w0_cnt", "w0_first", "w0_evt"],
             ),
         ]
     )
-    result = svc.find_value_novelty(
-        "c1",
-        ["s1"],
-        fields=["artifact"],
-        baseline_end=baseline_end,
-    )
+    result = svc.find_value_novelty("c1", ["s1"], fields=["artifact"], windows=windows)
     assert result.status == "ok"
     assert result.method == "temporal"
     assert result.baseline_size == 300
@@ -377,43 +385,164 @@ def test_value_novelty_temporal_baseline_first_seen():
     assert r.value == "first_time_process.exe"
     assert r.count == 3
     assert r.details["method"] == "temporal"
-    assert "baseline_size" in r.details
+    # Surprise denominator is the suspect window's own event count, not the corpus.
+    assert r.details["window_total_events"] == 120
+    assert r.details["total_events"] == 120
+    assert r.details["window_label"] == "exfil-window"
+    assert result.windows["suspect_windows"][0]["label"] == "exfil-window"
 
 
-def test_value_novelty_temporal_baseline_converts_non_utc_offset_for_sql():
-    """A `baseline_end` with a non-UTC offset (e.g. FastAPI-parsed `+02:00`)
-    must be converted to the equivalent UTC instant before being spliced
-    into the ClickHouse SQL string literal — otherwise the temporal split
-    lands 2 hours later than intended (F8)."""
+def test_value_novelty_temporal_window_bounds_converted_to_utc_for_sql():
+    """Window bounds with a non-UTC offset (e.g. FastAPI-parsed `+02:00`) must
+    be converted to the equivalent UTC instant before being spliced into the
+    ClickHouse SQL string literals — otherwise the window lands 2h off (F8)."""
     from datetime import timedelta, timezone
 
     plus_two = timezone(timedelta(hours=2))
-    baseline_end = datetime(2024, 1, 15, 14, 0, 0, tzinfo=plus_two)
+    windows = _one_suspect(
+        datetime(2024, 1, 1, 2, 0, 0, tzinfo=plus_two),
+        datetime(2024, 1, 15, 14, 0, 0, tzinfo=plus_two),
+        datetime(2024, 1, 16, 2, 0, 0, tzinfo=plus_two),
+        datetime(2024, 1, 20, 2, 0, 0, tzinfo=plus_two),
+    )
     svc = _svc(
         [
             FakeQueryResult(result_rows=[(500,)], column_names=["count()"]),
-            FakeQueryResult(result_rows=[(300,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(300, 0)], column_names=["bl_total", "w0_total"]),
             FakeQueryResult(
                 result_rows=[],
+                column_names=["val", "baseline_cnt", "w0_cnt", "w0_first", "w0_evt"],
+            ),
+        ]
+    )
+    svc.find_value_novelty("c1", ["s1"], fields=["artifact"], windows=windows)
+    b1_values = [p["b1"] for p in svc.ch.client._all_parameters if "b1" in p]
+    assert b1_values
+    # 14:00 +02:00 == 12:00 UTC.
+    assert all(v == "2024-01-15 12:00:00" for v in b1_values)
+
+
+def test_value_novelty_two_suspect_windows_attributed_separately():
+    """A value present in two suspect windows yields one finding per window,
+    each scored against its own window's event count."""
+    windows = AnalysisWindows(
+        baseline=TimeWindow(
+            "baseline", datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 10, tzinfo=UTC)
+        ),
+        suspects=(
+            TimeWindow("w-a", datetime(2024, 1, 11, tzinfo=UTC), datetime(2024, 1, 12, tzinfo=UTC)),
+            TimeWindow("w-b", datetime(2024, 1, 20, tzinfo=UTC), datetime(2024, 1, 21, tzinfo=UTC)),
+        ),
+    )
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            # baseline_total, w0_total, w1_total
+            FakeQueryResult(result_rows=[(600, 100, 200)], column_names=["bl", "w0", "w1"]),
+            # val, baseline_cnt, w0_cnt, w0_first, w0_evt, w1_cnt, w1_first, w1_evt
+            FakeQueryResult(
+                result_rows=[
+                    (
+                        "svc_x",
+                        0,
+                        4,
+                        datetime(2024, 1, 11),
+                        "evt-a",
+                        6,
+                        datetime(2024, 1, 20),
+                        "evt-b",
+                    )
+                ],
                 column_names=[
                     "val",
-                    "detect_cnt",
                     "baseline_cnt",
-                    "first_seen",
-                    "evt_id",
+                    "w0_cnt",
+                    "w0_first",
+                    "w0_evt",
+                    "w1_cnt",
+                    "w1_first",
+                    "w1_evt",
                 ],
             ),
         ]
     )
-    svc.find_value_novelty(
+    result = svc.find_value_novelty("c1", ["s1"], fields=["attr:user"], windows=windows)
+    by_label = {r.details["window_label"]: r for r in result.results}
+    assert set(by_label) == {"w-a", "w-b"}
+    assert by_label["w-a"].count == 4
+    assert by_label["w-a"].details["window_total_events"] == 100
+    assert by_label["w-b"].count == 6
+    assert by_label["w-b"].details["window_total_events"] == 200
+
+
+def test_value_novelty_allowlist_suppresses_value_everywhere():
+    """An allowlisted (field, value) is dropped regardless of its event."""
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[
+                    ("keep_me", 1, datetime(2024, 1, 1), "evt-1"),
+                    ("known_good", 1, datetime(2024, 1, 1), "evt-2"),
+                ],
+                column_names=["val", "cnt", "first_seen", "evt_id"],
+            ),
+        ]
+    )
+    result = svc.find_value_novelty(
         "c1",
         ["s1"],
         fields=["artifact"],
-        baseline_end=baseline_end,
+        allowlist={("artifact", "known_good")},
     )
-    bl_values = [p["bl"] for p in svc.ch.client._all_parameters if "bl" in p]
-    assert bl_values
-    assert all(v == "2024-01-15 12:00:00" for v in bl_values)
+    assert [r.value for r in result.results] == ["keep_me"]
+
+
+def test_value_novelty_small_window_warns():
+    """A suspect window below _MIN_WINDOW_EVENTS gets a warning, not suppression."""
+    windows = _one_suspect(
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2024, 1, 10, tzinfo=UTC),
+        datetime(2024, 1, 11, tzinfo=UTC),
+        datetime(2024, 1, 12, tzinfo=UTC),
+        label="tiny",
+    )
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(600, 5)], column_names=["bl", "w0"]),
+            FakeQueryResult(
+                result_rows=[("svc_x", 0, 3, datetime(2024, 1, 11), "evt-a")],
+                column_names=["val", "baseline_cnt", "w0_cnt", "w0_first", "w0_evt"],
+            ),
+        ]
+    )
+    result = svc.find_value_novelty("c1", ["s1"], fields=["attr:user"], windows=windows)
+    assert len(result.results) == 1  # still surfaced
+    assert any("tiny" in w and "unstable" in w for w in result.warnings)
+
+
+def test_windows_from_split_reproduces_adjacent_split():
+    """The legacy shim yields baseline=[min, split), one suspect=[split, max+1ms)."""
+    min_ts = datetime(2024, 1, 1, tzinfo=UTC)
+    split = datetime(2024, 1, 15, tzinfo=UTC)
+    max_ts = datetime(2024, 1, 31, tzinfo=UTC)
+    w = windows_from_split(split, min_ts, max_ts)
+    assert w.baseline.start == min_ts
+    assert w.baseline.end == split
+    assert len(w.suspects) == 1
+    assert w.suspects[0].start == split
+    assert w.suspects[0].end > max_ts
+
+
+def test_full_bucket_starts_excludes_partial_edges():
+    """_full_bucket_starts only yields buckets fully inside the window."""
+    # Window [00:10, 02:00) with 1h buckets: only the 01:00 bucket is fully in.
+    w = TimeWindow(
+        "x", datetime(2024, 1, 1, 0, 10, tzinfo=UTC), datetime(2024, 1, 1, 2, 0, tzinfo=UTC)
+    )
+    starts = _full_bucket_starts(w, 3600)
+    assert starts == [datetime(2024, 1, 1, 1, 0, tzinfo=UTC)]
 
 
 # ---------------------------------------------------------------------------
@@ -615,79 +744,138 @@ def test_frequency_sorted_by_z_score():
     assert scores == sorted(scores, reverse=True)
 
 
-def test_frequency_temporal_baseline():
-    """Temporal mode uses only baseline-window buckets for mean/std."""
-    from datetime import datetime, timedelta
-
-    baseline_end = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
-    min_dt = datetime(2024, 1, 1, tzinfo=UTC)
-    max_dt = datetime(2024, 1, 2, tzinfo=UTC)
-    # 3 baseline buckets (slightly varied so std > 0) + 1 detect bucket (spike).
-    # Variation is small relative to the spike so the detect window is anomalous.
-    bucket_rows = [
-        (min_dt, "LOG", 10),
-        (min_dt + timedelta(hours=4), "LOG", 12),
-        (min_dt + timedelta(hours=8), "LOG", 11),
-        # Detect window (after baseline_end): massive spike.
-        (min_dt + timedelta(hours=14), "LOG", 200),
-    ]
-    svc = _svc(
-        [
-            FakeQueryResult(result_rows=[(min_dt, max_dt)], column_names=["min", "max"]),
-            FakeQueryResult(result_rows=bucket_rows, column_names=["bucket", "series_val", "cnt"]),
-        ]
+def _freq_windows() -> AnalysisWindows:
+    """6h baseline + 3h suspect window; with bucket_count=6 the interval is 1h,
+    giving 6 full baseline buckets and 3 full suspect buckets."""
+    return _one_suspect(
+        datetime(2024, 1, 1, 0, 0, tzinfo=UTC),
+        datetime(2024, 1, 1, 6, 0, tzinfo=UTC),
+        datetime(2024, 1, 1, 6, 0, tzinfo=UTC),
+        datetime(2024, 1, 1, 9, 0, tzinfo=UTC),
+        label="incident",
     )
+
+
+def _h(hour: int) -> datetime:
+    return datetime(2024, 1, 1, hour, 0, tzinfo=UTC)
+
+
+def test_frequency_temporal_baseline():
+    """Temporal mode learns mean/std from the baseline window's (zero-filled,
+    full-only) buckets and scores each suspect-window bucket against them.
+    The windowed path issues a single bucket scan — no min/max query."""
+    bucket_rows = [
+        (_h(0), "LOG", 10),
+        (_h(1), "LOG", 12),
+        (_h(2), "LOG", 11),
+        (_h(3), "LOG", 10),
+        (_h(4), "LOG", 9),
+        (_h(5), "LOG", 10),
+        # Suspect window buckets: a spike at 07:00, quiet otherwise.
+        (_h(6), "LOG", 10),
+        (_h(7), "LOG", 200),
+        (_h(8), "LOG", 10),
+    ]
+    svc = _svc([FakeQueryResult(result_rows=bucket_rows, column_names=["bucket", "sv", "cnt"])])
     svc._hydrate_freq_findings = lambda findings, *a, **kw: findings  # type: ignore[method-assign]
 
     result = svc.find_frequency_anomalies(
-        "c1",
-        ["s1"],
-        baseline_end=baseline_end,
-        z_threshold=2.0,
+        "c1", ["s1"], windows=_freq_windows(), bucket_count=6, z_threshold=2.0
     )
     assert result.status == "ok"
     assert result.method == "temporal-z-score"
-    assert len(result.results) >= 1
+    assert len(result.results) == 1
     spike = result.results[0]
     assert spike.observed == 200
     assert spike.z_score > 0
+    assert spike.details["suspect_window_label"] == "incident"
+    assert result.windows["suspect_windows"][0]["label"] == "incident"
 
 
-def test_frequency_temporal_baseline_zero_baseline_flagged():
-    """A series absent from the baseline but active in the detect window is flagged.
+def test_frequency_temporal_zero_baseline_flagged():
+    """A series absent from the baseline but active in a suspect window is flagged.
 
-    Regression test: previously any series with zero baseline buckets was
-    skipped outright (no std computable), silently missing exactly the
-    "brand-new activity after the incident start" case temporal mode exists
-    to surface.
+    Zero-fill makes its baseline mean 0; the std floor lets the suspect-window
+    activity score instead of dividing by ~0 — exactly the "brand-new activity
+    after the incident start" case temporal mode exists to surface.
     """
-    from datetime import datetime, timedelta
-
-    baseline_end = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
-    min_dt = datetime(2024, 1, 1, tzinfo=UTC)
-    max_dt = datetime(2024, 1, 2, tzinfo=UTC)
     bucket_rows = [
-        # "NEWPROC" never appears before baseline_end, only after.
-        (min_dt + timedelta(hours=13), "NEWPROC", 50),
-        (min_dt + timedelta(hours=14), "NEWPROC", 60),
+        (_h(6), "NEWPROC", 50),
+        (_h(7), "NEWPROC", 60),
     ]
-    svc = _svc(
-        [
-            FakeQueryResult(result_rows=[(min_dt, max_dt)], column_names=["min", "max"]),
-            FakeQueryResult(result_rows=bucket_rows, column_names=["bucket", "series_val", "cnt"]),
-        ]
-    )
+    svc = _svc([FakeQueryResult(result_rows=bucket_rows, column_names=["bucket", "sv", "cnt"])])
     svc._hydrate_freq_findings = lambda findings, *a, **kw: findings  # type: ignore[method-assign]
 
     result = svc.find_frequency_anomalies(
-        "c1",
-        ["s1"],
-        baseline_end=baseline_end,
-        z_threshold=2.0,
+        "c1", ["s1"], windows=_freq_windows(), bucket_count=6, z_threshold=2.0
     )
     assert result.status == "ok"
-    values = {r.series_value for r in result.results}
-    assert "NEWPROC" in values
+    assert {r.series_value for r in result.results} == {"NEWPROC"}
+
+
+def test_frequency_temporal_hand_computed_z():
+    """The suspect-window z-score matches a hand-computed mean/std over the
+    zero-filled baseline buckets."""
+    import numpy as np
+
+    baseline_counts = [10, 12, 11, 10, 9, 10]
+    bucket_rows = [(_h(i), "LOG", c) for i, c in enumerate(baseline_counts)]
+    bucket_rows.append((_h(7), "LOG", 200))
+    svc = _svc([FakeQueryResult(result_rows=bucket_rows, column_names=["bucket", "sv", "cnt"])])
+    svc._hydrate_freq_findings = lambda findings, *a, **kw: findings  # type: ignore[method-assign]
+
+    result = svc.find_frequency_anomalies(
+        "c1", ["s1"], windows=_freq_windows(), bucket_count=6, z_threshold=2.0
+    )
+    arr = np.array(baseline_counts, dtype=float)
+    mean = arr.mean()
+    std = max(arr.std(ddof=1), 0.5)
+    expected_z = (200 - mean) / std
+    spike = next(r for r in result.results if r.observed == 200)
+    assert abs(spike.z_score - round(expected_z, 4)) < 0.01
+
+
+def test_frequency_temporal_partial_buckets_excluded():
+    """Buckets cut by a window edge are excluded from scoring — a window
+    shorter than one interval yields a warning, never a bogus 1-bucket z."""
+    # Baseline 6h (6 full 1h buckets); suspect window only 30 min → no full bucket.
+    windows = _one_suspect(
+        datetime(2024, 1, 1, 0, 0, tzinfo=UTC),
+        datetime(2024, 1, 1, 6, 0, tzinfo=UTC),
+        datetime(2024, 1, 1, 6, 15, tzinfo=UTC),
+        datetime(2024, 1, 1, 6, 45, tzinfo=UTC),
+        label="tiny",
+    )
+    bucket_rows = [(_h(i), "LOG", 10) for i in range(6)]
+    svc = _svc([FakeQueryResult(result_rows=bucket_rows, column_names=["bucket", "sv", "cnt"])])
+    svc._hydrate_freq_findings = lambda findings, *a, **kw: findings  # type: ignore[method-assign]
+
+    result = svc.find_frequency_anomalies(
+        "c1", ["s1"], windows=windows, bucket_count=6, z_threshold=2.0
+    )
+    assert result.results == []
+    assert any("tiny" in w and "shorter than" in w for w in result.warnings)
+
+
+def test_frequency_temporal_baseline_too_short_warns():
+    """A baseline spanning fewer than _MIN_FREQUENCY_BUCKETS full buckets can't
+    build a distribution — insufficient_data with an explanatory warning."""
+    # Baseline 90 min, bucket_count=6 → interval 900s (15 min) → 6 buckets, ok.
+    # Force too-few by making the baseline only 20 min with a 15-min interval.
+    windows = _one_suspect(
+        datetime(2024, 1, 1, 0, 0, tzinfo=UTC),
+        datetime(2024, 1, 1, 0, 20, tzinfo=UTC),
+        datetime(2024, 1, 1, 1, 0, tzinfo=UTC),
+        datetime(2024, 1, 1, 2, 0, tzinfo=UTC),
+    )
+    svc = _svc([FakeQueryResult(result_rows=[], column_names=["bucket", "sv", "cnt"])])
+    # bucket_count=2 over a 20-min baseline → interval 600s (10 min) → only 2
+    # full buckets, below the _MIN_FREQUENCY_BUCKETS=3 floor.
+    result = svc.find_frequency_anomalies(
+        "c1", ["s1"], windows=windows, bucket_count=2, z_threshold=2.0
+    )
+    assert result.status == "insufficient_data"
+    assert any("Baseline window" in w for w in result.warnings)
 
 
 def test_frequency_exclude_event_ids_backfills_from_next_ranked():
@@ -1422,35 +1610,37 @@ def test_value_combo_binds_distinct_prefixes_for_attr_fields():
 
 
 def test_value_combo_temporal_flags_new_combos():
-    """Temporal mode flags combos absent from baseline, present after split."""
+    """Temporal mode flags combos absent from baseline, present in a suspect window."""
     total = 500
-    bl = datetime(2024, 1, 2, tzinfo=UTC)
     fs = datetime(2024, 1, 3, tzinfo=UTC)
+    windows = _one_suspect(
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2024, 1, 2, tzinfo=UTC),
+        datetime(2024, 1, 3, tzinfo=UTC),
+        datetime(2024, 1, 5, tzinfo=UTC),
+    )
     responses = [
         FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
-        FakeQueryResult(result_rows=[(300,)], column_names=["count()"]),  # baseline size
+        # window totals: baseline_total, w0_total
+        FakeQueryResult(result_rows=[(300, 80)], column_names=["bl_total", "w0_total"]),
         FakeQueryResult(
             result_rows=[
-                # v0, v1, detect_cnt, baseline_cnt, first_seen, evt_id
-                ("admin", "10.0.0.9", 2, 0, fs, "evt-x"),
+                # v0, v1, baseline_cnt, w0_cnt, w0_first, w0_evt
+                ("admin", "10.0.0.9", 0, 2, fs, "evt-x"),
             ],
-            column_names=[
-                "v0",
-                "v1",
-                "detect_cnt",
-                "baseline_cnt",
-                "first_seen",
-                "evt_id",
-            ],
+            column_names=["v0", "v1", "baseline_cnt", "w0_cnt", "w0_first", "w0_evt"],
         ),
     ]
     svc = _svc(responses)
-    result = svc.find_value_combos("c1", ["s1"], fields=["attr:user", "attr:ip"], baseline_end=bl)
+    result = svc.find_value_combos("c1", ["s1"], fields=["attr:user", "attr:ip"], windows=windows)
     assert result.method == "temporal"
     assert result.baseline_size == 300
     assert result.results[0].values == ["admin", "10.0.0.9"]
     assert result.results[0].count == 2
     assert result.results[0].details["baseline_size"] == 300
+    assert result.results[0].details["window_total_events"] == 80
+    # The combo's allowlist key flattens the tuple reversibly.
+    assert result.results[0].details["allowlist_value"] == "admin\x1f10.0.0.9"
 
 
 def test_value_combo_auto_insufficient_when_fewer_than_two_recommended():
@@ -1551,20 +1741,28 @@ def test_range_self_baseline_iqr_flags_outliers():
 
 
 def test_range_temporal_uses_baseline_minmax():
-    """Temporal mode learns exact min/max from the baseline window."""
-    bl = datetime(2024, 1, 2, tzinfo=UTC)
+    """Temporal mode learns exact min/max from the baseline window and
+    attributes the violation to the suspect window it fell in."""
+    windows = _one_suspect(
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2024, 1, 2, tzinfo=UTC),
+        datetime(2024, 1, 3, tzinfo=UTC),
+        datetime(2024, 1, 5, tzinfo=UTC),
+        label="spike",
+    )
     fs = datetime(2024, 1, 3, tzinfo=UTC)
     responses = [
         FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
         # baseline min=10, max=500, n=300
         FakeQueryResult(result_rows=[(10.0, 500.0, 300)], column_names=["lo", "hi", "n"]),
         FakeQueryResult(
-            result_rows=[(9999.0, 1, fs, "evt-x")],
-            column_names=["val", "cnt", "first_seen", "evt_id"],
+            # val, cnt, first_seen, evt_id, win_idx
+            result_rows=[(9999.0, 1, fs, "evt-x", 0)],
+            column_names=["val", "cnt", "first_seen", "evt_id", "win_idx"],
         ),
     ]
     svc = _svc(responses)
-    result = svc.find_range_violations("c1", ["s1"], fields=["attr:bytes"], baseline_end=bl)
+    result = svc.find_range_violations("c1", ["s1"], fields=["attr:bytes"], windows=windows)
     assert result.method == "temporal-range"
     f = result.results[0]
     assert f.lower == 10.0
@@ -1572,6 +1770,7 @@ def test_range_temporal_uses_baseline_minmax():
     assert f.direction == "above"
     assert f.details["baseline_min"] == 10.0
     assert f.details["baseline_max"] == 500.0
+    assert f.details["window_label"] == "spike"
 
 
 def test_range_excludes_normal_marked_events():
@@ -1728,38 +1927,47 @@ def test_charset_self_baseline_flags_rare_char():
 
 
 def test_charset_temporal_flags_never_seen_chars_and_guards_sentinel():
-    """Temporal mode: reference set = baseline-window charset; detect window
-    is timestamp >= baseline_end with the year-2299 sentinel excluded."""
+    """Temporal mode: reference set = baseline-window charset; suspect-window
+    values with never-seen chars flag, with the year-2299 sentinel excluded."""
     import math
 
     from tracesignal.db._dt import TS_NOT_SENTINEL_SQL
 
-    bl = datetime(2024, 1, 2, tzinfo=UTC)
+    windows = _one_suspect(
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2024, 1, 2, tzinfo=UTC),
+        datetime(2024, 1, 3, tzinfo=UTC),
+        datetime(2024, 1, 5, tzinfo=UTC),
+        label="win",
+    )
     fs = datetime(2024, 1, 3, tzinfo=UTC)
     responses = [
         FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
         # baseline charset over 50 distinct baseline values
         FakeQueryResult(result_rows=[(list("abcdefghij"), 50)], column_names=["charset", "n"]),
         FakeQueryResult(
-            result_rows=[("ab☃cd", ["☃"], 1, fs, "evt-snow")],
-            column_names=["val", "novel", "cnt", "first_seen", "evt_id"],
+            # val, novel, cnt, first_seen, evt_id, win_idx
+            result_rows=[("ab☃cd", ["☃"], 1, fs, "evt-snow", 0)],
+            column_names=["val", "novel", "cnt", "first_seen", "evt_id", "win_idx"],
         ),
     ]
     svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
     client = RecordingClient(responses)
     svc.ch = FakeClickHouseStore(FakeClient([]))
     svc.ch.client = client
-    result = svc.find_charset_novelty("c1", ["s1"], fields=["attr:user"], baseline_end=bl)
+    result = svc.find_charset_novelty("c1", ["s1"], fields=["attr:user"], windows=windows)
     assert result.status == "ok"
     assert result.method == "temporal-charset"
     f = result.results[0]
     assert f.novel_chars == ["☃"]
+    assert f.details["window_label"] == "win"
     # Never seen in baseline → +1-smoothed surprise over 50 distinct values.
     assert f.score == round(math.log(51), 4)
     baseline_sql = client.full_queries[1]
     detect_sql = client.full_queries[2]
-    assert "timestamp < {bl:String}" in baseline_sql
-    assert "timestamp >= {bl:String}" in detect_sql
+    # Baseline learns from the baseline window; detect scans the suspect union.
+    assert "{b1:String}" in baseline_sql
+    assert "{w0s:String}" in detect_sql
     assert TS_NOT_SENTINEL_SQL in detect_sql
 
 
@@ -1845,35 +2053,43 @@ def test_entropy_self_baseline_iqr_flags_both_directions():
 
 
 def test_entropy_temporal_learns_band_from_baseline_and_guards_sentinel():
-    """Temporal mode: fence from the baseline window only; detect window is
-    timestamp >= baseline_end with the sentinel excluded; min-length clause
-    applies to baseline and detect alike."""
+    """Temporal mode: fence from the baseline window only; suspect-window
+    values scored with the sentinel excluded; min-length clause applies to
+    baseline and detect alike."""
 
     from tracesignal.db._dt import TS_NOT_SENTINEL_SQL
 
-    bl = datetime(2024, 1, 2, tzinfo=UTC)
+    windows = _one_suspect(
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2024, 1, 2, tzinfo=UTC),
+        datetime(2024, 1, 3, tzinfo=UTC),
+        datetime(2024, 1, 5, tzinfo=UTC),
+        label="win",
+    )
     fs = datetime(2024, 1, 3, tzinfo=UTC)
     responses = [
         FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
         FakeQueryResult(result_rows=[(2.0, 2.5, 100)], column_names=["q1", "q3", "n"]),
         FakeQueryResult(
-            result_rows=[("x9k2q8vz", 4.9, 1, fs, "evt-hi")],
-            column_names=["val", "ent", "cnt", "first_seen", "evt_id"],
+            # val, ent, cnt, first_seen, evt_id, win_idx
+            result_rows=[("x9k2q8vz", 4.9, 1, fs, "evt-hi", 0)],
+            column_names=["val", "ent", "cnt", "first_seen", "evt_id", "win_idx"],
         ),
     ]
     svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
     client = RecordingClient(responses)
     svc.ch = FakeClickHouseStore(FakeClient([]))
     svc.ch.client = client
-    result = svc.find_entropy_outliers("c1", ["s1"], fields=["attr:host"], baseline_end=bl)
+    result = svc.find_entropy_outliers("c1", ["s1"], fields=["attr:host"], windows=windows)
     assert result.status == "ok"
     assert result.method == "temporal-iqr"
     f = result.results[0]
     assert f.direction == "above"
+    assert f.details["window_label"] == "win"
     baseline_sql = client.full_queries[1]
     detect_sql = client.full_queries[2]
-    assert "timestamp < {bl:String}" in baseline_sql
-    assert "timestamp >= {bl:String}" in detect_sql
+    assert "{b1:String}" in baseline_sql
+    assert "{w0s:String}" in detect_sql
     assert TS_NOT_SENTINEL_SQL in detect_sql
     assert "lengthUTF8" in baseline_sql
     assert "lengthUTF8" in detect_sql
