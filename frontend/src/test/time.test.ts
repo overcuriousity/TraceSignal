@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  contextWindow,
   datetimeLocalToUtcIso,
   fmtTimestamp,
   isoToDatetimeLocalUtc,
@@ -43,5 +44,25 @@ describe("datetime-local <-> UTC ISO round trip", () => {
     expect(isoToDatetimeLocalUtc("")).toBe("");
     expect(isoToDatetimeLocalUtc(undefined)).toBe("");
     expect(isoToDatetimeLocalUtc("garbage")).toBe("");
+  });
+});
+
+describe("contextWindow", () => {
+  it("returns a symmetric ±minutes window around the anchor timestamp", () => {
+    expect(contextWindow("2024-06-15T12:00:00.000Z", 5)).toEqual({
+      start: "2024-06-15T11:55:00.000Z",
+      end: "2024-06-15T12:05:00.000Z",
+    });
+  });
+
+  it("scales the window with the minutes argument", () => {
+    expect(contextWindow("2024-06-15T12:00:00.000Z", 60)).toEqual({
+      start: "2024-06-15T11:00:00.000Z",
+      end: "2024-06-15T13:00:00.000Z",
+    });
+  });
+
+  it("returns null for an unparseable timestamp instead of an Invalid Date window", () => {
+    expect(contextWindow("not-a-date", 15)).toBeNull();
   });
 });

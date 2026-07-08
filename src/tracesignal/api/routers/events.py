@@ -762,26 +762,25 @@ async def bulk_annotate_by_filter(
         ),
     )
 
-    if not refs:
-        return {"tagged": 0}
-
     store = get_store()
-    rows = [
-        {
-            "annotation_id": generate_id(f"{event_id}_{body.annotation_type}"),
-            "case_id": case_id,
-            "source_id": str(src_id),
-            "event_id": str(event_id),  # ClickHouse may return UUID objects
-            "annotation_type": body.annotation_type,
-            "content": body.content.strip(),
-            "origin": "user",
-            "created_by": user.id,
-        }
-        for event_id, src_id in refs
-    ]
-    tagged = await store.bulk_create_annotations(rows)
-    if tagged:
-        publish_annotation_change(case_id, timeline_id, None, user)
+    tagged = 0
+    if refs:
+        rows = [
+            {
+                "annotation_id": generate_id(f"{event_id}_{body.annotation_type}"),
+                "case_id": case_id,
+                "source_id": str(src_id),
+                "event_id": str(event_id),  # ClickHouse may return UUID objects
+                "annotation_type": body.annotation_type,
+                "content": body.content.strip(),
+                "origin": "user",
+                "created_by": user.id,
+            }
+            for event_id, src_id in refs
+        ]
+        tagged = await store.bulk_create_annotations(rows)
+        if tagged:
+            publish_annotation_change(case_id, timeline_id, None, user)
     await store.record_audit(
         action="events.bulk_annotate",
         actor=user,
@@ -793,7 +792,9 @@ async def bulk_annotate_by_filter(
             "content": body.content.strip(),
             "matched": len(refs),
             "tagged": tagged,
-            "filter": body.model_dump(exclude_none=True, exclude_defaults=True),
+            "filter": body.model_dump(
+                exclude={"annotation_type", "content"}, exclude_none=True, exclude_defaults=True
+            ),
         },
     )
     return {"tagged": tagged}
@@ -1848,23 +1849,26 @@ async def list_anomalies(
             min_skew_seconds=min_skew_seconds,
             payload=payload,
         )
-        # GETs are skipped by the generic audit middleware, so detector-run
-        # launches would otherwise leave no trace at all.
-        await get_store().record_audit(
-            action="anomaly.run",
-            actor=user,
-            case_id=case_id,
-            target_type="detector_run",
-            target_id=run_id,
-            detail={
-                "detector": detector,
-                "timeline_id": timeline_id,
-                "fields": fields,
-                "series_field": series_field,
-                "temporal": temporal,
-                "baseline_end": baseline_end.isoformat() if baseline_end else None,
-            },
-        )
+    # GETs are skipped by the generic audit middleware, so detector-run
+    # launches would otherwise leave no trace at all. Audited regardless of
+    # `persist` — unpersisted preview scans still read case data and should
+    # remain visible in the custody trail, just without a run_id to anchor to.
+    await get_store().record_audit(
+        action="anomaly.run",
+        actor=user,
+        case_id=case_id,
+        target_type="detector_run",
+        target_id=run_id,
+        detail={
+            "detector": detector,
+            "timeline_id": timeline_id,
+            "fields": fields,
+            "series_field": series_field,
+            "temporal": temporal,
+            "baseline_end": baseline_end.isoformat() if baseline_end else None,
+            "persist": persist,
+        },
+    )
     payload["run_id"] = run_id
     return payload
 

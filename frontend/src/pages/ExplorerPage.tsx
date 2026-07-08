@@ -30,6 +30,7 @@ import { useUiStore, DEFAULT_COLUMNS } from "@/stores/ui";
 import { tourEvent } from "@/stores/tour";
 import { useScrollPositionStore } from "@/stores/scrollPosition";
 import { paramsToFilters, filtersToParams } from "@/lib/queryParams";
+import { contextWindow } from "@/lib/time";
 import { useCaseStream } from "@/hooks/useCaseStream";
 
 import { FilterRail } from "@/components/explorer/FilterRail";
@@ -794,15 +795,12 @@ export function ExplorerPage() {
    */
   const handleContextQuery = useCallback(
     (ts: string, minutes: number) => {
-      const anchor = new Date(ts).getTime();
-      if (Number.isNaN(anchor)) return;
+      const window = contextWindow(ts, minutes);
+      if (!window) return;
       setPreJumpFilters((prev) => prev ?? filters);
       setRangeHighlight(null);
       pendingJumpRef.current = null;
-      setFilters({
-        start: new Date(anchor - minutes * 60_000).toISOString(),
-        end: new Date(anchor + minutes * 60_000).toISOString(),
-      });
+      setFilters(window);
     },
     [filters, setFilters],
   );

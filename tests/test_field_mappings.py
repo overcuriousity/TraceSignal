@@ -156,7 +156,7 @@ def test_field_filter_on_canonical_field_generates_coalesce_sql():
         EventQuery(
             case_id="c1",
             source_ids=["s1", "s2"],
-            field_filters={"ip_address": "10.0.0.1"},
+            field_filters={"ip_address": ["10.0.0.1"]},
             field_mappings=MAPPINGS,
         )
     )
@@ -174,7 +174,7 @@ def test_field_exclusion_and_raw_attr_filter_bypass():
         EventQuery(
             case_id="c1",
             source_ids=["s1"],
-            field_filters={"attr:src_ip": "10.0.0.1"},
+            field_filters={"attr:src_ip": ["10.0.0.1"]},
             field_exclusions={"ip_address": ["10.9.9.9"]},
             field_mappings=MAPPINGS,
         )

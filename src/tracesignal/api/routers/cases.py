@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 
 from tracesignal.api.deps import (
     AccessLevel,
+    access_level_from_team_role,
     get_current_user,
     get_store,
     require_case_contribute,
@@ -142,14 +143,8 @@ def _bulk_access_level(case: Case, user: User, role_by_team: dict[str, str]) -> 
     The caller supplies the user's team→role map once, so listing N cases
     stays at one membership query total instead of N.
     """
-    if user.is_admin:
-        return AccessLevel.MANAGE
-    if case.team_id:
-        role = role_by_team.get(case.team_id)
-        if role is None:
-            return AccessLevel.NONE
-        return AccessLevel.MANAGE if role == "manager" else AccessLevel.CONTRIBUTE
-    return AccessLevel.MANAGE if case.owner_id == user.id else AccessLevel.NONE
+    team_role = role_by_team.get(case.team_id) if case.team_id else None
+    return access_level_from_team_role(case, user, team_role)
 
 
 @router.get("/")

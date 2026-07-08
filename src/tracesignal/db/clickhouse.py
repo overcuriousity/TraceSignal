@@ -166,11 +166,13 @@ class ClickHouseStore:
         self.database = settings.clickhouse_database
         host, port, secure, url_user, url_password = self._parse_url(settings.clickhouse_url)
         # Explicit settings win; creds embedded in the URL are a fallback for
-        # the settings' defaults ("default" / empty password).
+        # the settings' defaults ("default" / empty password). Checking
+        # `model_fields_set` (not just `!= "default"`) so an *explicitly*
+        # configured `TS_CLICKHOUSE_USERNAME=default` isn't silently
+        # overridden by different creds embedded in the URL.
+        username_explicit = "clickhouse_username" in settings.model_fields_set
         username = (
-            settings.clickhouse_username
-            if settings.clickhouse_username != "default" or url_user is None
-            else url_user
+            settings.clickhouse_username if username_explicit or url_user is None else url_user
         )
         password = settings.clickhouse_password or url_password or ""
         self.client = clickhouse_connect.get_client(

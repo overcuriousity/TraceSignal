@@ -85,3 +85,16 @@ export function isoToDatetimeLocalUtc(value: string | null | undefined): string 
   if (!isValid(d)) return "";
   return d.toISOString().slice(0, 16);
 }
+
+/** Compute the `[start, end]` ISO bounds of a ±`minutes` window around `ts`,
+ * for the Explorer's "context query" pivot. Returns `null` for an
+ * unparseable `ts` so callers can no-op instead of filtering to "Invalid
+ * Date". */
+export function contextWindow(ts: string, minutes: number): { start: string; end: string } | null {
+  const anchor = new Date(ts).getTime();
+  if (Number.isNaN(anchor)) return null;
+  return {
+    start: new Date(anchor - minutes * 60_000).toISOString(),
+    end: new Date(anchor + minutes * 60_000).toISOString(),
+  };
+}
