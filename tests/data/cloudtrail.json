@@ -1,0 +1,85 @@
+{
+  "Records": [
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-07-08T09:46:41Z",
+      "eventSource": "s3.amazonaws.com",
+      "eventName": "GetObject",
+      "awsRegion": "eu-central-1",
+      "sourceIPAddress": "192.168.1.10",
+      "userAgent": "aws-cli/2.15.0",
+      "eventType": "AwsApiCall",
+      "readOnly": true,
+      "managementEvent": false,
+      "recipientAccountId": "123456789012",
+      "requestID": "req-1",
+      "eventID": "evt-1",
+      "eventCategory": "Data",
+      "userIdentity": {
+        "type": "IAMUser",
+        "principalId": "AIDAEXAMPLE",
+        "arn": "arn:aws:iam::123456789012:user/alice",
+        "userName": "alice"
+      },
+      "requestParameters": {
+        "bucketName": "example-bucket",
+        "key": "path/to/object.txt"
+      },
+      "resources": [
+        {"ARN": "arn:aws:s3:::example-bucket/path/to/object.txt", "type": "AWS::S3::Object"}
+      ]
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-07-08T09:47:12Z",
+      "eventSource": "iam.amazonaws.com",
+      "eventName": "DeleteUser",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "203.0.113.5",
+      "userAgent": "console.amazonaws.com",
+      "eventType": "AwsApiCall",
+      "readOnly": false,
+      "managementEvent": true,
+      "recipientAccountId": "123456789012",
+      "requestID": "req-2",
+      "eventID": "evt-2",
+      "eventCategory": "Management",
+      "errorCode": "AccessDenied",
+      "errorMessage": "User is not authorized",
+      "userIdentity": {
+        "type": "AssumedRole",
+        "principalId": "AROAEXAMPLE:session",
+        "arn": "arn:aws:sts::123456789012:assumed-role/AdminRole/session",
+        "sessionContext": {
+          "sessionIssuer": {
+            "userName": "AdminRole",
+            "arn": "arn:aws:iam::123456789012:role/AdminRole"
+          }
+        }
+      },
+      "requestParameters": {
+        "userName": "bob"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-07-08T09:48:03Z",
+      "eventSource": "config.amazonaws.com",
+      "eventName": "PutConfigRule",
+      "awsRegion": "eu-central-1",
+      "sourceIPAddress": "config.amazonaws.com",
+      "userAgent": "config.amazonaws.com",
+      "eventType": "AwsServiceEvent",
+      "readOnly": false,
+      "managementEvent": true,
+      "recipientAccountId": "123456789012",
+      "requestID": "req-3",
+      "eventID": "evt-3",
+      "eventCategory": "Management",
+      "userIdentity": {
+        "type": "AWSService",
+        "invokedBy": "config.amazonaws.com"
+      }
+    }
+  ]
+}

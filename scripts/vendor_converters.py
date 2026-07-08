@@ -52,9 +52,12 @@ CONVERTERS = {
         "systemd journal (via journalctl JSON export) to Timesketch timeline.",
         ["journal directory / journalctl -o json"],
     ),
-    # nginx is no longer vendored: replaced by the native Parquet converter
-    # nginx2tracesignal.py (developed in this repo, marked "native" in the
-    # manifest and preserved across re-vendor runs).
+    "nginx2timesketch": (
+        "nginx",
+        "nginx2timesketch.py",
+        "nginx access/error/redirect logs to Timesketch timeline.",
+        ["access.log*", "error.log*"],
+    ),
     "pcap2timesketch": (
         "pcap",
         "pcap2timesketch.py",

@@ -40,11 +40,17 @@ resolved — this file holds only the condensed, still-open action items.
 - [ ] **M25 — Port remaining converters to the Parquet interchange format.** M20 shipped the
   bulk Arrow insert, the upload hardlink-retention fix, the TraceSignal Parquet interchange
   format v1 (`ingestion/parquet_format.py`, `ingestion/parquet_reader.py`), and the
-  `nginx2tracesignal.py` converter (pilot). Remaining vendored `*2timesketch` scripts to
-  replace with in-repo `*2tracesignal` Parquet converters, then retire
-  `scripts/vendor_converters.py` entirely: filterlog, suricata, journal, cloudtrail, browser,
-  pcap. Follow-ups from the pilot: benchmark converter worker-count/parallel-threshold
-  defaults on a multi-GB log; parallel `.gz` parsing (seek-point indexing) deferred.
+  `nginx2tracesignal.py` converter (pilot). This session added native `*2tracesignal.py`
+  Parquet converters for filterlog, suricata, cloudtrail, and pcap, each with its own
+  `tests/test_<name>_converter.py`. Decision (mid-session, user request): the vendored
+  `*2timesketch` scripts stay vendored **permanently** as a minimal-dependency (stdlib-only,
+  no pyarrow) alternative — `scripts/vendor_converters.py` is not retired, and native/vendored
+  converters are listed side by side in `manifest.json`/`/api/converters`. Remaining:
+  journal, browser (still vendored-only, not yet ported to native). Follow-ups from the nginx
+  pilot, still open: benchmark converter worker-count/parallel-threshold defaults on a
+  multi-GB log; parallel `.gz` parsing (seek-point indexing) deferred; pcap intra-file
+  parallelism (record-boundary chunking, analogous to nginx's newline chunking) deferred —
+  `pcap2tracesignal.py` currently parallelizes only across files, one worker process per file.
 
 - [ ] **M23 — detector-scan residue (post 300M-row overhaul, session 27).** Two follow-ups
   deliberately deferred: (a) `canonical_inventory` stays a live query — it only runs when a

@@ -1,0 +1,6 @@
+{"timestamp":"2026-07-08T09:46:41.123456+00:00","event_type":"alert","src_ip":"192.168.1.10","src_port":52345,"dest_ip":"8.8.8.8","dest_port":443,"proto":"TCP","alert":{"action":"blocked","gid":1,"signature_id":2010935,"rev":2,"signature":"ET POLICY Test Signature","category":"Potential Corporate Privacy Violation","severity":2}}
+{"timestamp":"2026-07-08T09:47:00.000000+00:00","event_type":"http","src_ip":"192.168.1.11","src_port":40000,"dest_ip":"93.184.216.34","dest_port":80,"proto":"TCP","http":{"hostname":"example.com","url":"/index.html","http_method":"GET","http_user_agent":"curl/8.0"}}
+03/21/2026-20:24:02.524057 [**] [1:2006380:14] ET POLICY Test Alert [**] [Classification: Potential Corporate Privacy Violation] [Priority: 1] {TCP} 192.168.10.14:48820 -> 192.168.10.18:8086
+2026-07-02T19:51:58	Notice	suricata	 [wDrop] [1:2101129:10] GPL WEB_SERVER Test Alert [Classification: Attempted Information Leak] [Priority: 2] {TCP} 10.0.0.5:5000 -> 10.0.0.6:80
+2026-07-02T19:52:10	Notice	suricata	 [102042] <Notice> -- rule reload complete
+not a valid line at all

@@ -46,9 +46,12 @@ def test_list_and_download(client, admin_bootstrap) -> None:
     body = resp.json()
     names = [c["name"] for c in body["converters"]]
     assert "browser2timesketch" in names
-    # nginx is served as the native Parquet converter, not the vendored one.
-    assert "nginx2tracesignal" in names
-    assert "nginx2timesketch" not in names
+    # cloudtrail/filterlog/nginx/pcap/suricata are served both ways: the
+    # vendored stdlib-only script stays available as a minimal-dependency
+    # alternative alongside the native pyarrow-based Parquet converter.
+    for stem in ("cloudtrail", "filterlog", "nginx", "pcap", "suricata"):
+        assert f"{stem}2timesketch" in names
+        assert f"{stem}2tracesignal" in names
 
     resp = client.get("/api/converters/nginx2tracesignal")
     assert resp.status_code == 200
@@ -60,10 +63,22 @@ def test_list_and_download(client, admin_bootstrap) -> None:
 def test_native_converter_entries_flagged() -> None:
     manifest = json.loads((ASSETS_DIR / "manifest.json").read_text(encoding="utf-8"))
     by_name = {c["name"]: c for c in manifest["converters"]}
-    assert by_name["nginx2tracesignal"]["native"] is True
-    assert "pyarrow" in by_name["nginx2tracesignal"]["requires"]
+    for name in (
+        "nginx2tracesignal",
+        "cloudtrail2tracesignal",
+        "filterlog2tracesignal",
+        "pcap2tracesignal",
+        "suricata2tracesignal",
+    ):
+        assert by_name[name]["native"] is True
+        assert "pyarrow" in by_name[name]["requires"]
     # Vendored entries carry no native flag.
     assert "native" not in by_name["browser2timesketch"]
+    assert "native" not in by_name["cloudtrail2timesketch"]
+    assert "native" not in by_name["filterlog2timesketch"]
+    assert "native" not in by_name["nginx2timesketch"]
+    assert "native" not in by_name["pcap2timesketch"]
+    assert "native" not in by_name["suricata2timesketch"]
 
 
 def test_download_unknown_converter_404(client, admin_bootstrap) -> None:

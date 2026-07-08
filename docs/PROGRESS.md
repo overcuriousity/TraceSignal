@@ -1,6 +1,40 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-08 (session 35 — M20: Arrow bulk insert + Parquet converter pipeline).
+Last updated: 2026-07-08 (session 36 — M25: filterlog/suricata/cloudtrail/pcap native converters).
+
+## Session 36 — 2026-07-08: M25 — native Parquet converters for filterlog, suricata, cloudtrail, pcap
+
+Ported four of the six remaining vendored `*2timesketch` scripts to native, standalone
+`*2tracesignal.py` Parquet converters, following the `nginx2tracesignal.py` pilot's structure
+(embedded schema/metadata constants verified by a parity test, stdlib + pyarrow only, minimal
+CLI `-i/-o/-w/-v`). Each reuses its vendored counterpart's field-naming conventions
+(attribute keys, artifact/message formats) so existing Timesketch muscle memory carries over;
+new tests live in `tests/test_{filterlog,suricata,cloudtrail,pcap}_converter.py` with hand-built
+fixtures under `tests/data/` (including `tests/data/gen_pcap_fixtures.py`, a one-off byte-level
+pcap/pcapng generator — no scapy/dpkt dependency).
+
+- **filterlog2tracesignal.py / suricata2tracesignal.py** — line-oriented, so both get full
+  nginx-style intra-file chunked multiprocessing (newline-boundary chunking via
+  `find_chunk_boundaries` + `ProcessPoolExecutor`).
+- **cloudtrail2tracesignal.py** — a CloudTrail file holds one JSON `Records` array rather than
+  one record per line, so `byte_offset`/`content_hash` are computed by re-scanning the array
+  with `json.JSONDecoder.raw_decode` one object at a time
+  (`iter_json_records_with_offsets`), giving each row an exact byte span in the original file
+  without re-serializing. Parallelism is cross-file only (one worker process per input file).
+- **pcap2tracesignal.py** — ports the from-scratch pcap/pcapng dissector unchanged (Ethernet/
+  Linux-SLL/raw-IP, IPv4/IPv6, TCP/UDP/ICMP/ARP). Two deliberate simplifications vs. the
+  vendored version: (1) parallelism is cross-file only, not the record-boundary chunking a
+  line-oriented file would get — noted as a deferred follow-up in `ROADMAP.md`; (2) dropped the
+  `heapq.merge` k-way global chronological sort across input files (a CSV/JSONL-timeline
+  concern) — packets are written in file order since the server sorts on query.
+- **Mid-session decision (user request):** the vendored `*2timesketch` scripts stay vendored
+  **permanently** as a minimal-dependency (stdlib-only, no pyarrow) alternative. Re-added
+  `nginx2timesketch` to `scripts/vendor_converters.py`'s `CONVERTERS` dict (it had been dropped
+  when the nginx pilot shipped) and re-ran the vendor script against a local
+  `overcuriousity/2timesketch` checkout, so nginx now also has both a vendored and a native
+  entry, matching cloudtrail/filterlog/pcap/suricata. Native and vendored converters for the
+  same source appear side by side in `manifest.json`/`/api/converters`
+  (`test_converters_api.py` updated accordingly).
 
 ## Session 35 — 2026-07-08: M20 — Arrow bulk insert, Parquet interchange format, nginx converter pilot
 
