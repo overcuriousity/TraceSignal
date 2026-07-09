@@ -76,7 +76,7 @@ export const TOUR_STEPS: TourStep[] = [
     id: "converter-hint",
     routePattern: CASE,
     selector: '[data-tour="converter-hint"]',
-    side: "left",
+    side: "right",
     title: "Raw logs? Normalize them first",
     body: "If your logs aren't in Timesketch format yet (nginx, firewall, CloudTrail, browser history, journald …), this panel has offline converter scripts to normalize them — optimized Parquet parsers or plain CSV/JSONL ones.",
     advance: { type: "next" },

@@ -22,11 +22,11 @@ export const guidance = {
         title: "Normalize your input data",
         body:
           "TraceSignal ingests Timesketch-compatible CSV/JSONL (and Plaso exports) plus " +
-          "TraceSignal Parquet files produced by the converter scripts in the upload " +
-          "dialog. nginx logs convert to compact Parquet with full provenance " +
-          "(nginx2tracesignal); other raw formats — firewall, CloudTrail, browser " +
-          "history, systemd journal, pcap — still convert to CSV/JSONL. All converters " +
-          "run offline with plain Python.",
+          "TraceSignal Parquet files produced by the converter scripts in the Parser " +
+          "downloads panel. Common raw formats — nginx, firewall, CloudTrail, Suricata, " +
+          "pcap — convert to compact Parquet with full provenance; the remaining " +
+          "stdlib-only scripts emit CSV/JSONL. All converters run offline with plain " +
+          "Python.",
       },
       {
         title: "Upload & ingest",
