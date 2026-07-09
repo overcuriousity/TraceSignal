@@ -1967,10 +1967,9 @@ async def _persist_detector_run(
             # proportion_shift / interval_periodicity: effective
             # (request-or-default) thresholds; the keys are disjoint per
             # detector, None for every other one.
-            "fdr_q": resolution.get("shift_fdr_q", resolution.get("interval_fdr_q")),
-            "min_ratio": resolution.get(
-                "shift_min_ratio", resolution.get("interval_min_rate_ratio")
-            ),
+            "fdr_q": resolution.get("shift_fdr_q") or resolution.get("interval_fdr_q"),
+            "min_ratio": resolution.get("shift_min_ratio")
+            or resolution.get("interval_min_rate_ratio"),
             "baseline_id": resolution.get("baseline_id"),
             "windows": resolution.get("windows"),
             "windows_hash": resolution.get("windows_hash"),
