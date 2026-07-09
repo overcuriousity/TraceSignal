@@ -13,6 +13,7 @@ import {
   Info,
   Hash,
   Layers,
+  ListOrdered,
   Cpu,
   Activity,
   Percent,
@@ -370,6 +371,45 @@ export function MethodologyPanel({
               conservative for genuinely periodic values (their counts vary
               less than Poisson), so a flagged deficit is at least as
               significant.
+            </Row>
+          </div>
+        </div>
+
+        {/* Event sequences */}
+        <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3 space-y-2">
+          <p className="flex items-center gap-1.5 font-medium text-[var(--color-fg-primary)]">
+            <ListOrdered size={11} /> Event sequences (sequence_novelty)
+          </p>
+          <div className="space-y-1.5 text-[var(--color-fg-muted)]">
+            <Row label="Method">
+              Temporal-only — per source, events are ordered by time and every
+              run of n consecutive values of the chosen field (default 3
+              artifact types) forms one sequence. A sequence that occurs in a
+              suspect window but never in the baseline window is flagged.
+            </Row>
+            <Row label="Signal">
+              An <em>ordering</em> of events never seen before — e.g. login →
+              privilege change → log clear — even when every individual event
+              type is common. Complements Rare values, which only sees single
+              values, never their order.
+            </Row>
+            <Row label="Score">
+              −log of the sequence's share of its window's sequences (rarer =
+              higher), same surprise scale as Rare values. The representative
+              event is the first event of the sequence's earliest occurrence in
+              the window.
+            </Row>
+            <Row label="Fields">
+              One grouping field (like Frequency's group-by), not the
+              multi-field picker. Sequences never mix sources or span a window
+              edge; sources interleaving several independent streams can
+              produce interleaving artifacts.
+            </Row>
+            <Row label="Backend">
+              Sequences are assembled entirely in ClickHouse (
+              <code className="font-mono text-xs">lagInFrame</code> chains
+              partitioned by source and window), so a run is reproducible from
+              the recorded query.
             </Row>
           </div>
         </div>

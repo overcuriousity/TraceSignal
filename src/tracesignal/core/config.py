@@ -113,6 +113,12 @@ class Settings(BaseSettings):
     # Per-field cap on candidate values the interval scan fetches (highest
     # total volume first); same warning semantics as the proportion-shift cap.
     stat_interval_max_candidates_per_field: int = 2000
+    # Sequence-novelty detector: default n-gram length (AMiner
+    # EventSequenceDetector's default sequence length).
+    stat_sequence_ngram: int = 3
+    # Cap on novel n-grams fetched per run (lowest suspect volume first —
+    # rarest sequences are the detector's point); hitting it carries a warning.
+    stat_sequence_max_candidates: int = 2000
     # Guardrails for whole-corpus detector/inventory scans (the shared SETTINGS
     # clause every heavy GROUP BY carries). Defaults sized for the session-27
     # 300M-row incident; tune per ClickHouse host RAM/cores. See db/_scan.py.

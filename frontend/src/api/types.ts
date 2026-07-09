@@ -417,6 +417,27 @@ export interface IntervalPeriodicityFinding {
   details: Record<string, unknown>;
 }
 
+/** One never-seen-in-baseline event-order n-gram from the sequence_novelty detector. */
+export interface SequenceNoveltyFinding {
+  type: "sequence_novelty";
+  /** Field token the sequence was built over (e.g. "artifact"). */
+  field: string;
+  /** The n-gram's values, oldest → newest. */
+  values: string[];
+  /** " → ".join(values) — display form and the allowlist key. */
+  value: string;
+  /** Occurrences of the n-gram in the suspect window. */
+  count: number;
+  /** −log(count ÷ window_ngram_total) — used for ranking. */
+  score: number;
+  /** Timestamp of the first event of the earliest occurrence in the window. */
+  first_seen: string | null;
+  /** First event of that earliest occurrence. */
+  event_id: string | null;
+  event: Event | null;
+  details: Record<string, unknown>;
+}
+
 /** One out-of-order timestamp finding from the timestamp_order detector. */
 export interface TimestampOrderFinding {
   type: "timestamp_order";
@@ -445,7 +466,8 @@ export type AnomalyFinding =
   | CharsetFinding
   | EntropyFinding
   | ProportionShiftFinding
-  | IntervalPeriodicityFinding;
+  | IntervalPeriodicityFinding
+  | SequenceNoveltyFinding;
 
 export interface AnomaliesResponse {
   status: "ok" | "no_data" | "insufficient_data";
@@ -551,7 +573,8 @@ export interface AnomalyMarker {
     | "charset"
     | "entropy"
     | "proportion_shift"
-    | "interval_periodicity";
+    | "interval_periodicity"
+    | "sequence_novelty";
   /** Raw structured finding data — stored verbatim on the persisted annotation. */
   rawDetails: Record<string, unknown>;
   /** End of the anomalous window, for frequency findings — enables a range highlight. */

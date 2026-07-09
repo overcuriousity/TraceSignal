@@ -3233,3 +3233,288 @@ def test_interval_periodicity_offset_uses_effective_ts_for_gaps():
     # on the corrected timeline.
     assert "addSeconds(timestamp, transform(source_id" in candidate_sql
     assert "AS ts" in candidate_sql
+
+
+# ---------------------------------------------------------------------------
+# sequence_novelty — detector
+# ---------------------------------------------------------------------------
+
+# Query order: count, window totals, per-window n-gram totals, novel n-grams.
+# Novel-gram row layout: gram (list of values), baseline_cnt, then 3 columns
+# per suspect window (cnt, first_ts, first_evt).
+
+_SEQ_TOTALS_COLS = ["w_idx", "n"]
+_SEQ_NOVEL_COLS = ["gram", "baseline_cnt", "w0_cnt", "w0_first", "w0_evt"]
+
+
+def _seq_windows() -> AnalysisWindows:
+    return _one_suspect(
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2024, 1, 15, tzinfo=UTC),
+        datetime(2024, 1, 16, tzinfo=UTC),
+        datetime(2024, 1, 20, tzinfo=UTC),
+        label="incident",
+    )
+
+
+def _seq_responses(
+    total: int,
+    window_totals: tuple[int, int],
+    ngram_totals: list[tuple[int, int]],
+    novel_rows: list[tuple],
+) -> list[FakeQueryResult]:
+    return [
+        FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[window_totals], column_names=["bl_total", "w0_total"]),
+        FakeQueryResult(result_rows=ngram_totals, column_names=_SEQ_TOTALS_COLS),
+        FakeQueryResult(result_rows=novel_rows, column_names=_SEQ_NOVEL_COLS),
+    ]
+
+
+def test_sequence_insufficient_data_without_windows():
+    """Temporal-only: no windows → insufficient_data without touching ClickHouse."""
+    svc = _svc([])
+    result = svc.find_sequence_novelty("c1", ["s1"])
+    assert result.status == "insufficient_data"
+    assert result.detector == "sequence_novelty"
+    assert result.method == "ngram"
+    assert any("temporal-only" in w for w in result.warnings)
+    assert svc.ch.client._calls == []
+
+
+def test_sequence_ngram_validation():
+    svc = _svc([])
+    for bad in (1, 6):
+        try:
+            svc.find_sequence_novelty("c1", ["s1"], ngram=bad, windows=_seq_windows())
+        except ValueError as exc:
+            assert "between 2 and 5" in str(exc)
+        else:
+            raise AssertionError(f"ngram={bad} did not raise")
+    assert svc.ch.client._calls == []
+
+
+def test_sequence_no_data():
+    svc = _svc([FakeQueryResult(result_rows=[(0,)], column_names=["count()"])])
+    result = svc.find_sequence_novelty("c1", ["s1"], windows=_seq_windows())
+    assert result.status == "no_data"
+    assert result.windows is not None
+
+
+def test_sequence_baseline_without_ngrams_insufficient():
+    """A baseline window with no complete n-grams cannot vouch for anything."""
+    responses = [
+        FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(2, 500)], column_names=["bl_total", "w0_total"]),
+        # Only the suspect window has complete n-grams.
+        FakeQueryResult(result_rows=[(0, 498)], column_names=_SEQ_TOTALS_COLS),
+    ]
+    svc = _svc(responses)
+    result = svc.find_sequence_novelty("c1", ["s1"], windows=_seq_windows())
+    assert result.status == "insufficient_data"
+    assert any("no complete sequences of length 3" in w for w in result.warnings)
+    # The novel-gram query must not have run.
+    assert len(svc.ch.client._calls) == 3
+
+
+def test_sequence_novel_ngram_flagged():
+    first_ts = datetime(2024, 1, 17, 12, 0, tzinfo=UTC)
+    responses = _seq_responses(
+        total=10_000,
+        window_totals=(8000, 2000),
+        ngram_totals=[(-1, 7998), (0, 1998)],
+        novel_rows=[(["login", "priv_esc", "wipe"], 0, 2, first_ts, "evt-1")],
+    )
+    svc = _svc(responses)
+    result = svc.find_sequence_novelty("c1", ["s1"], windows=_seq_windows())
+    assert result.status == "ok"
+    assert result.detector == "sequence_novelty"
+    assert result.method == "ngram"
+    assert result.baseline_size == 8000
+    assert len(result.results) == 1
+    r = result.results[0]
+    assert r.field == "artifact"
+    assert r.values == ["login", "priv_esc", "wipe"]
+    assert r.value == "login → priv_esc → wipe"
+    assert r.count == 2
+    assert abs(r.score - (-np.log(2 / 1998))) < 1e-3
+    assert r.event_id == "evt-1"
+    assert r.first_seen is not None and r.first_seen.startswith("2024-01-17T12:00")
+    assert r.details["n"] == 3
+    assert r.details["window_ngram_total"] == 1998
+    assert r.details["baseline_ngram_total"] == 7998
+    assert r.details["window_label"] == "incident"
+    assert r.details["allowlist_field"] == "artifact"
+    assert r.details["allowlist_value"] == "login → priv_esc → wipe"
+    assert result.windows is not None
+
+
+def test_sequence_multiple_suspect_windows():
+    """One finding per (gram, suspect window with cnt > 0)."""
+    windows = AnalysisWindows(
+        baseline=TimeWindow(
+            "baseline", datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 15, tzinfo=UTC)
+        ),
+        suspects=(
+            TimeWindow("w-a", datetime(2024, 1, 16, tzinfo=UTC), datetime(2024, 1, 18, tzinfo=UTC)),
+            TimeWindow("w-b", datetime(2024, 1, 19, tzinfo=UTC), datetime(2024, 1, 21, tzinfo=UTC)),
+        ),
+    )
+    ts_a = datetime(2024, 1, 16, 1, 0, tzinfo=UTC)
+    ts_b = datetime(2024, 1, 19, 1, 0, tzinfo=UTC)
+    responses = [
+        FakeQueryResult(result_rows=[(10_000,)], column_names=["count()"]),
+        FakeQueryResult(
+            result_rows=[(8000, 1000, 1000)], column_names=["bl_total", "w0_total", "w1_total"]
+        ),
+        FakeQueryResult(
+            result_rows=[(-1, 7998), (0, 998), (1, 998)], column_names=_SEQ_TOTALS_COLS
+        ),
+        FakeQueryResult(
+            result_rows=[(["a", "b", "c"], 0, 3, ts_a, "evt-a", 1, ts_b, "evt-b")],
+            column_names=[
+                "gram",
+                "baseline_cnt",
+                "w0_cnt",
+                "w0_first",
+                "w0_evt",
+                "w1_cnt",
+                "w1_first",
+                "w1_evt",
+            ],
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_sequence_novelty("c1", ["s1"], windows=windows)
+    assert result.status == "ok"
+    assert len(result.results) == 2
+    by_label = {r.details["window_label"]: r for r in result.results}
+    assert by_label["w-a"].count == 3 and by_label["w-a"].event_id == "evt-a"
+    assert by_label["w-b"].count == 1 and by_label["w-b"].event_id == "evt-b"
+    # Rarer (count 1) window scores higher.
+    assert by_label["w-b"].score > by_label["w-a"].score
+
+
+def test_sequence_allowlist_suppression():
+    first_ts = datetime(2024, 1, 17, tzinfo=UTC)
+    responses = _seq_responses(
+        total=10_000,
+        window_totals=(8000, 2000),
+        ngram_totals=[(-1, 7998), (0, 1998)],
+        novel_rows=[
+            (["a", "b", "c"], 0, 2, first_ts, "evt-1"),
+            (["x", "y", "z"], 0, 5, first_ts, "evt-2"),
+        ],
+    )
+    svc = _svc(responses)
+    result = svc.find_sequence_novelty(
+        "c1",
+        ["s1"],
+        windows=_seq_windows(),
+        allowlist={("artifact", "a → b → c")},
+    )
+    assert result.status == "ok"
+    assert [r.value for r in result.results] == ["x → y → z"]
+
+
+def test_sequence_exclude_event_ids():
+    first_ts = datetime(2024, 1, 17, tzinfo=UTC)
+    responses = _seq_responses(
+        total=10_000,
+        window_totals=(8000, 2000),
+        ngram_totals=[(-1, 7998), (0, 1998)],
+        novel_rows=[(["a", "b", "c"], 0, 2, first_ts, "evt-normal")],
+    )
+    svc = _svc(responses)
+    result = svc.find_sequence_novelty(
+        "c1", ["s1"], windows=_seq_windows(), exclude_event_ids={"evt-normal"}
+    )
+    assert result.status == "ok"
+    assert result.results == []
+
+
+def test_sequence_tiny_window_and_cap_warnings():
+    first_ts = datetime(2024, 1, 17, tzinfo=UTC)
+    novel_rows = [([f"v{i}", "b", "c"], 0, 1, first_ts, f"evt-{i}") for i in range(3)]
+    responses = _seq_responses(
+        total=10_000,
+        window_totals=(8000, 30),
+        ngram_totals=[(-1, 7998), (0, 28)],
+        novel_rows=novel_rows,
+    )
+    svc = _svc(responses)
+    result = svc.find_sequence_novelty("c1", ["s1"], windows=_seq_windows(), max_candidates=3)
+    assert result.status == "ok"
+    assert any("only 28 complete sequences" in w for w in result.warnings)
+    assert any("candidate cap" in w for w in result.warnings)
+
+
+def test_sequence_limit_applied():
+    first_ts = datetime(2024, 1, 17, tzinfo=UTC)
+    novel_rows = [([f"v{i}", "b", "c"], 0, i + 1, first_ts, f"evt-{i}") for i in range(5)]
+    responses = _seq_responses(
+        total=10_000,
+        window_totals=(8000, 2000),
+        ngram_totals=[(-1, 7998), (0, 1998)],
+        novel_rows=novel_rows,
+    )
+    svc = _svc(responses)
+    result = svc.find_sequence_novelty("c1", ["s1"], windows=_seq_windows(), limit=2)
+    assert len(result.results) == 2
+    # Sorted by surprise descending — lowest counts first.
+    assert [r.count for r in result.results] == [1, 2]
+
+
+def test_sequence_sql_shape():
+    """The generated SQL is the explainable per-(source, window) lag chain."""
+    first_ts = datetime(2024, 1, 17, tzinfo=UTC)
+    client = RecordingClient(
+        _seq_responses(
+            total=10_000,
+            window_totals=(8000, 2000),
+            ngram_totals=[(-1, 7998), (0, 1998)],
+            novel_rows=[(["a", "b", "c"], 0, 2, first_ts, "evt-1")],
+        )
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_sequence_novelty(
+        "c1", ["s1"], series_field="attr:proc", ngram=3, windows=_seq_windows()
+    )
+    assert result.status == "ok"
+    totals_sql = client.full_queries[2]
+    novel_sql = client.full_queries[3]
+    for sql in (totals_sql, novel_sql):
+        assert "PARTITION BY source_id, w_idx" in sql
+        assert "ORDER BY ets, byte_offset, line_number, event_id" in sql
+        assert "ROWS BETWEEN 2 PRECEDING AND CURRENT ROW" in sql
+        assert "lagInFrame(val, 2) OVER w" in sql
+        assert "lagInFrame(val, 1) OVER w" in sql
+        assert "lagInFrame(toNullable(val), 2) OVER w AS guard" in sql
+        assert "guard IS NOT NULL" in sql
+        assert "attributes[{fk:String}]" in sql
+        assert "multiIf(" in sql
+    assert "HAVING baseline_cnt = 0 AND (w0_cnt) > 0" in novel_sql
+    # Window bounds bound as parameters (forensic reproducibility).
+    params = client._all_parameters[3]
+    assert params["b0"] == "2024-01-01 00:00:00"
+    assert params["w0s"] == "2024-01-16 00:00:00"
+
+
+def test_sequence_offset_uses_effective_ts():
+    """W2: active source offsets switch ordering and windows to effective ts."""
+    first_ts = datetime(2024, 1, 17, tzinfo=UTC)
+    client = RecordingClient(
+        _seq_responses(
+            total=10_000,
+            window_totals=(8000, 2000),
+            ngram_totals=[(-1, 7998), (0, 1998)],
+            novel_rows=[(["a", "b", "c"], 0, 2, first_ts, "evt-1")],
+        )
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_sequence_novelty("c1", ["s1"], windows=_seq_windows(), source_offsets={"s1": 3600})
+    novel_sql = client.full_queries[3]
+    assert "addSeconds(timestamp, transform(source_id" in novel_sql
+    assert "AS ets" in novel_sql
