@@ -1,6 +1,22 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-09 (session 38 — PR #81 review hardening: Parquet/pcap converter pipeline).
+Last updated: 2026-07-09 (session 39 — enricher recovery must not block startup).
+
+## Session 39 — 2026-07-09: startup no longer blocks on ClickHouse recovery (502 fix)
+
+Prod returned **502 Bad Gateway** because the ASGI lifespan awaited all recovery + housekeeping
+work *before* `yield`: `_reconcile_orphaned_ingests`, `_reconcile_orphaned_enrichment_jobs`
+(which applies staged rows to `events.attributes` per orphaned run), the enrichment re-run
+scheduling, and the session purge — every one of them touching ClickHouse. With ClickHouse slow
+or unreachable the lifespan never completes, uvicorn never starts accepting connections, and the
+reverse proxy has nothing to talk to → 502.
+
+Fix (`api/main.py`): only the two fast, required Postgres steps (`init_schema`, `_seed_admin`)
+stay blocking before `yield`. Everything ClickHouse-dependent moved into a background
+`_startup_recovery(store)` task spawned right before `yield`, wrapped in broad exception handling
+(each step already self-heals on the next restart) and cancelled cleanly on shutdown. Booting the
+HTTP server no longer depends on ClickHouse reachability. No behavioral change to the recovery
+logic itself — same functions, just off the startup-critical path.
 
 ## Session 38 — 2026-07-09: PR #81 review hardening (Parquet converter pipeline)
 

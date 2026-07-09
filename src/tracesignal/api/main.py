@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -29,7 +29,7 @@ from tracesignal.api.routers import (
 )
 from tracesignal.core.config import get_settings
 from tracesignal.core.security import hash_password
-from tracesignal.db.postgres import EnrichmentJobRun, generate_id
+from tracesignal.db.postgres import EnrichmentJobRun, PostgresStore, generate_id
 from tracesignal.models.embeddings import embeddings_available
 
 logger = logging.getLogger(__name__)
@@ -222,36 +222,64 @@ def _log_config_report() -> None:
         )
 
 
+async def _startup_recovery(store: PostgresStore) -> None:
+    """Best-effort recovery + housekeeping, run *after* the app is serving.
+
+    Deliberately not awaited inside the lifespan before ``yield``: every step
+    here touches ClickHouse (orphan reconciliation applies staged rows, re-runs
+    query timelines), and a slow or unreachable ClickHouse would otherwise wedge
+    the ASGI lifespan startup — uvicorn never begins accepting connections and
+    the reverse proxy returns 502. Booting the HTTP server must not depend on
+    ClickHouse being reachable; each step below already self-heals on the next
+    restart if it fails, so running them in the background is safe.
+    """
+    try:
+        await _reconcile_orphaned_ingests()
+        enrichment_reruns = await _reconcile_orphaned_enrichment_jobs()
+
+        from tracesignal.enrichers.registry import refresh_availability
+
+        # Re-runs are scheduled only after availability is refreshed — they skip
+        # enrichers whose runtime requirements (e.g. GeoIP database) are missing.
+        await asyncio.to_thread(refresh_availability)
+        if enrichment_reruns:
+            from tracesignal.core.jobs import get_job_store
+            from tracesignal.enrichers.jobs import schedule_enrichment_reruns
+
+            try:
+                await schedule_enrichment_reruns(enrichment_reruns, get_job_store(), store)
+            except Exception:
+                logger.exception("Failed to schedule enrichment re-runs after recovery.")
+        # No cron/scheduler in this single-process deployment (see JobStore),
+        # so a startup-only sweep is the simple option — good enough to keep
+        # `sessions` from growing unbounded across restarts without adding a
+        # background task loop for a purely housekeeping concern.
+        purged = await store.purge_expired_sessions()
+        if purged:
+            logger.info("Purged %d expired session(s) on startup.", purged)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Startup recovery failed; it retries on the next restart.")
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     _log_config_report()
     store = get_store()
+    # Only Postgres schema + admin seeding block startup — both are fast and
+    # required before the first request. Everything ClickHouse-dependent is
+    # deferred to a background task so booting can't hang behind it (502s).
     await store.init_schema()
     await _seed_admin()
-    await _reconcile_orphaned_ingests()
-    enrichment_reruns = await _reconcile_orphaned_enrichment_jobs()
 
-    from tracesignal.enrichers.registry import refresh_availability
-
-    # Re-runs are scheduled only after availability is refreshed — they skip
-    # enrichers whose runtime requirements (e.g. GeoIP database) are missing.
-    await asyncio.to_thread(refresh_availability)
-    if enrichment_reruns:
-        from tracesignal.core.jobs import get_job_store
-        from tracesignal.enrichers.jobs import schedule_enrichment_reruns
-
-        try:
-            await schedule_enrichment_reruns(enrichment_reruns, get_job_store(), store)
-        except Exception:
-            logger.exception("Failed to schedule enrichment re-runs after recovery.")
-    # No cron/scheduler in this single-process deployment (see JobStore),
-    # so a startup-only sweep is the simple option — good enough to keep
-    # `sessions` from growing unbounded across restarts without adding a
-    # background task loop for a purely housekeeping concern.
-    purged = await store.purge_expired_sessions()
-    if purged:
-        logger.info("Purged %d expired session(s) on startup.", purged)
-    yield
+    recovery_task = asyncio.create_task(_startup_recovery(store))
+    try:
+        yield
+    finally:
+        recovery_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await recovery_task
 
 
 class AuthAuditMiddleware:
