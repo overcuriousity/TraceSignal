@@ -4,6 +4,8 @@ import { casesApi } from "@/api/cases";
 import { sourcesApi } from "@/api/sources";
 import { TimelineList } from "@/components/timelines/TimelineList";
 import { SourceList } from "@/components/sources/SourceList";
+import { ParserDownloadsPanel } from "@/components/sources/ParserDownloadsPanel";
+import { CaseJobsPanel } from "@/components/jobs/CaseJobsPanel";
 import { Spinner } from "@/components/ui/Spinner";
 import { Badge } from "@/components/ui/Badge";
 import { GuidancePanel } from "@/components/ui/GuidancePanel";
@@ -57,7 +59,7 @@ export function CaseOverviewPage() {
 
   return (
     <div className="h-full overflow-y-auto">
-      <div className="mx-auto max-w-3xl px-6 py-8">
+      <div className="mx-auto max-w-5xl px-6 py-8">
         {/* Case header */}
         <div className="mb-8 flex items-start gap-4">
           <FolderOpen
@@ -83,25 +85,32 @@ export function CaseOverviewPage() {
           </div>
         </div>
 
-        <div className="space-y-8">
-          <SourceList caseId={caseId!} />
-          <TimelineList caseId={caseId!} />
+        <div className="grid grid-cols-1 gap-8 lg:grid-cols-[minmax(0,1fr)_320px]">
+          <div className="space-y-8">
+            <SourceList caseId={caseId!} />
+            <TimelineList caseId={caseId!} />
+          </div>
 
-          <GuidancePanel id="case-overview" title={guidance.caseOverview.title}>
-            <ol className="space-y-2">
-              {guidance.caseOverview.steps.map((step, i) => (
-                <li key={step.title} className="flex gap-2">
-                  <span className="shrink-0 font-mono opacity-60">{i + 1}.</span>
-                  <span>
-                    <span className="font-medium text-[var(--color-fg-secondary)]">
-                      {step.title}.
-                    </span>{" "}
-                    {step.body}
-                  </span>
-                </li>
-              ))}
-            </ol>
-          </GuidancePanel>
+          <div className="space-y-6">
+            <CaseJobsPanel caseId={caseId!} />
+            <ParserDownloadsPanel />
+
+            <GuidancePanel id="case-overview" title={guidance.caseOverview.title}>
+              <ol className="space-y-2">
+                {guidance.caseOverview.steps.map((step, i) => (
+                  <li key={step.title} className="flex gap-2">
+                    <span className="shrink-0 font-mono opacity-60">{i + 1}.</span>
+                    <span>
+                      <span className="font-medium text-[var(--color-fg-secondary)]">
+                        {step.title}.
+                      </span>{" "}
+                      {step.body}
+                    </span>
+                  </li>
+                ))}
+              </ol>
+            </GuidancePanel>
+          </div>
         </div>
       </div>
     </div>
