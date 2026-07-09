@@ -39,4 +39,4 @@ Thumbs.db
 postgres_data/
 clickhouse_data/
 qdrant_data/
-data/
+/data/

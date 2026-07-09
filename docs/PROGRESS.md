@@ -1,6 +1,139 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-08 (session 34 — fast nginx ingestion plan).
+Last updated: 2026-07-09 (session 38 — PR #81 review hardening: Parquet/pcap converter pipeline).
+
+## Session 38 — 2026-07-09: PR #81 review hardening (Parquet converter pipeline)
+
+Review of the M20/M25 Parquet-converter pipeline PR (#81) surfaced six issues; all fixed in
+this session, with regression tests for the two behavioral ones.
+
+- **Null-provenance guard (forensic, medium).** `parquet_reader.py::_stamp_batch` now rejects
+  any batch with a null in `file_hash`/`byte_offset`/`content_hash`/`source_file`. Previously a
+  null in these columns would be filled to `""` (or, for `byte_offset`, pass through and either
+  crash the insert or collapse to `0` and collide with a real offset-0 row) **after** `event_id`
+  was already derived from the pre-fill value — silently diverging the stored provenance from the
+  id that certifies it. The interchange schema declares these fields nullable, so nothing rejected
+  such a file upfront; now the reader does.
+- **Sentinel comparison (low).** `parquet_reader.py::parse` used a hardcoded `.year == 2299` to
+  map the null-timestamp sentinel back to `None`; replaced with `is_null_ts_sentinel()` from
+  `db/_dt.py` so the check can't go stale if the sentinel value changes.
+- **pcap unbounded-read DoS (medium).** `pcap2tracesignal.py` read attacker-controlled length
+  fields (`incl_len` for classic pcap; section-header and generic block `block_total_length` for
+  pcapng — each up to ~4 GiB) straight into a single `fh.read()`. Added a 256 MiB
+  `_MAX_RECORD_BYTES` cap on all three paths so a crafted/corrupt capture raises `PcapParseError`
+  instead of forcing a multi-GB allocation.
+- **pcap docstring (nit).** Spelled out that `content_hash` covers a different on-disk byte span
+  per format (classic = 16-byte record header + captured data; pcapng = whole block incl. trailer)
+  so an examiner re-verifying by hand hashes the matching span.
+- **`cases.py` comment (nit).** Clarified that the `ParserConfig` built for the interchange-Parquet
+  footer read is a throwaway — the real parser identity comes from the footer (`source_parser`),
+  never persisted or hashed.
+- **Frontend nits.** `UploadDialog.tsx` file input now sets `accept=".csv,.jsonl,.parquet,.log"`;
+  `ConverterPanel.tsx` download anchor gets `rel="noopener noreferrer"`.
+
+Also regenerated `assets/converters/manifest.json` (pcap converter sha256/size changed with the
+DoS fix — `test_manifest_hashes_match_committed_assets` enforces this). New tests:
+`test_parquet_reader.py::TestNullHandling::test_null_provenance_rejected` (4-param) and
+`test_pcap_converter.py::TestOversizedLengthGuard` (classic + pcapng). Full suite green.
+
+## Session 37 — 2026-07-09: proportion_shift detector (G-test value-share shifts, BH-FDR)
+
+New statistical detector answering "is this value significantly more/less frequent in the
+suspect window than in the baseline?" — the gap between temporal value_novelty (only
+`baseline_cnt = 0` first-seen) and frequency (bucket-level absolute-count z-scores that miss
+evenly-spread rate shifts, fire on global volume changes, and in temporal mode mostly
+re-report zero-baseline series). Per (field, value, suspect window): 2×2 **G-test**
+(log-likelihood ratio, Dunning 1993) on raw counts, p-values via the exact df=1 chi² survival
+function (`erfc(√(G/2))` — deliberately no scipy dependency, airgapped), **Benjamini–Hochberg
+FDR** pooled across every test in the run, plus a **rate-ratio effect floor** so
+statistically-significant-but-tiny shifts on huge timelines don't flood the list.
+
+Decided semantics: temporal-only (`method="g-test"`; no windows → graceful
+`insufficient_data`, not 422, so the DetectorAccordion sweep stays calm); two-sided with
+`direction: up|down`; **vanished values included** as maximal "down" (representative event =
+last baseline occurrence, Haldane–Anscombe +0.5 smoothing for the displayed ratio only);
+**first-seen excluded** in SQL (`HAVING baseline_cnt >= 1` — value_novelty owns those, and the
+definitional prune keeps the BH test count honest); per-field candidate cap (2000, highest
+volume first) surfaces an FDR-coverage warning when hit; score = G. New `TS_STAT_SHIFT_FDR_Q`
+/ `TS_STAT_SHIFT_MIN_RATIO` / `TS_STAT_SHIFT_MAX_CANDIDATES_PER_FIELD` settings; effective
+thresholds snapshotted into the persisted `DetectorRun` params.
+
+Files: `db/anomaly_stats.py` (`ShiftFinding`, `find_proportion_shifts`, `_g_statistic` /
+`_chi2_sf_df1` / `_bh_qvalues`), `api/routers/events.py` (dispatch, `fdr_q`/`min_ratio`
+request params, serialization, tag content), `core/config.py`; frontend
+`ProportionShiftView.tsx` (temporal-only frame gating on top of `useBaselineRequest`),
+`DetectorAccordion` row, `MethodologyPanel` card, types; docs: `ANOMALY_DETECTION.md` new §7
+(similarity renumbered §8). 13 new service tests (hand-computed G/χ²/BH constants) + 5 router
+tests.
+
+## Session 36 — 2026-07-08: M25 — native Parquet converters for filterlog, suricata, cloudtrail, pcap
+
+Ported four of the six remaining vendored `*2timesketch` scripts to native, standalone
+`*2tracesignal.py` Parquet converters, following the `nginx2tracesignal.py` pilot's structure
+(embedded schema/metadata constants verified by a parity test, stdlib + pyarrow only, minimal
+CLI `-i/-o/-w/-v`). Each reuses its vendored counterpart's field-naming conventions
+(attribute keys, artifact/message formats) so existing Timesketch muscle memory carries over;
+new tests live in `tests/test_{filterlog,suricata,cloudtrail,pcap}_converter.py` with hand-built
+fixtures under `tests/data/` (including `tests/data/gen_pcap_fixtures.py`, a one-off byte-level
+pcap/pcapng generator — no scapy/dpkt dependency).
+
+- **filterlog2tracesignal.py / suricata2tracesignal.py** — line-oriented, so both get full
+  nginx-style intra-file chunked multiprocessing (newline-boundary chunking via
+  `find_chunk_boundaries` + `ProcessPoolExecutor`).
+- **cloudtrail2tracesignal.py** — a CloudTrail file holds one JSON `Records` array rather than
+  one record per line, so `byte_offset`/`content_hash` are computed by re-scanning the array
+  with `json.JSONDecoder.raw_decode` one object at a time
+  (`iter_json_records_with_offsets`), giving each row an exact byte span in the original file
+  without re-serializing. Parallelism is cross-file only (one worker process per input file).
+- **pcap2tracesignal.py** — ports the from-scratch pcap/pcapng dissector unchanged (Ethernet/
+  Linux-SLL/raw-IP, IPv4/IPv6, TCP/UDP/ICMP/ARP). Two deliberate simplifications vs. the
+  vendored version: (1) parallelism is cross-file only, not the record-boundary chunking a
+  line-oriented file would get — noted as a deferred follow-up in `ROADMAP.md`; (2) dropped the
+  `heapq.merge` k-way global chronological sort across input files (a CSV/JSONL-timeline
+  concern) — packets are written in file order since the server sorts on query.
+- **Mid-session decision (user request):** the vendored `*2timesketch` scripts stay vendored
+  **permanently** as a minimal-dependency (stdlib-only, no pyarrow) alternative. Re-added
+  `nginx2timesketch` to `scripts/vendor_converters.py`'s `CONVERTERS` dict (it had been dropped
+  when the nginx pilot shipped) and re-ran the vendor script against a local
+  `overcuriousity/2timesketch` checkout, so nginx now also has both a vendored and a native
+  entry, matching cloudtrail/filterlog/pcap/suricata. Native and vendored converters for the
+  same source appear side by side in `manifest.json`/`/api/converters`
+  (`test_converters_api.py` updated accordingly).
+
+## Session 35 — 2026-07-08: M20 — Arrow bulk insert, Parquet interchange format, nginx converter pilot
+
+Session 34's plan proposed *server-side* native raw-log parsing; discussion corrected the
+requirement: keep the downloadable-converter workflow, but converters emit **Parquet** instead
+of inflated Timesketch CSV, and the server bulk-ingests that via Arrow. Shipped:
+
+- **Bulk Arrow ClickHouse insert (M20).** `db/_arrow_schema.py::EVENT_ARROW_SCHEMA` mirrors the
+  events DDL; `insert_events()` now encodes through `_events_to_record_batch` (built strictly on
+  `Event.to_clickhouse_row()` — sentinel/attribute rules preserved) and `client.insert_arrow`;
+  new `insert_events_arrow()` pass-through for pre-built batches. Live round-trip verified
+  against a real ClickHouse (UUID/FixedString-from-string, Map, Array, DateTime64 sentinel) in
+  `tests/test_arrow_insert_clickhouse.py` (skip-if-unreachable). `pyarrow` is a core dependency.
+- **Upload retention hardlink fix (M20).** `cases.py::_retain_file` replaces the second full
+  `shutil.copy2` pass: exists short-circuit (content-addressed), `os.link`, copy fallback on
+  `EXDEV`. Fast path requires `TMPDIR` and `TS_SOURCE_RETENTION_PATH` on one filesystem.
+- **TraceSignal Parquet interchange format v1.** Spec + validation in
+  `ingestion/parquet_format.py`: per-row `source_file`/`file_hash`/`byte_offset`/`content_hash`
+  (all referring to the **original raw evidence file**) + event columns; footer metadata carries
+  format version, converter name/version, and per-file sha256 provenance. Converter identity
+  becomes `parser_name`/`parser_version`, so `event_id` is re-derivable from the raw log alone
+  (`models/event.py::derive_event_id`, extracted from `Event._derive_id`).
+- **Server Parquet ingest path.** `ingestion/parquet_reader.py::ParquetEventsParser` stamps
+  server-side columns onto each record batch (no `Event` objects) and feeds the pipeline's new
+  `parse_arrow_batches`/`_ingest_file_arrow` bulk branch; CSV/JSONL paths unchanged. Upload
+  validates the footer up front (400 on non-interchange parquet) and records
+  `converter@version` as the Source's parser. `.parquet` auto-detected; CLI works unchanged.
+- **nginx converter pilot.** `assets/converters/nginx2tracesignal.py` (in-repo, requires
+  pyarrow): access/error/redirect logs, plain/.gz, file or directory, multiprocessing chunk
+  parsing for large plain files, zstd Parquet output, embedded provenance. Replaces the vendored
+  `nginx2timesketch.py` (deleted; manifest entry marked `"native": true` and preserved across
+  `scripts/vendor_converters.py` re-runs). Remaining six converters: ROADMAP M25.
+- Frontend: copy-only tweaks (upload dialog formats, converter panel note, guidance). Docs:
+  ROADMAP M20→M25 rewrite, MODEL_REFINEMENT/CONCEPT provenance conventions, plan doc archived
+  as superseded.
 
 ## Session 34 — 2026-07-08: Fast end-to-end ingestion plan (nginx access logs)
 

@@ -1,0 +1,3 @@
+2026/06/25 09:46:41 [error] 1234#1234: *1 open() "/var/www/missing.html" failed (2: No such file or directory), client: 192.168.1.10, server: example.com
+2026/06/25 09:50:03 [warn] 1234#1235: *2 upstream response is buffered, client: 203.0.113.7, server: example.com
+garbage line

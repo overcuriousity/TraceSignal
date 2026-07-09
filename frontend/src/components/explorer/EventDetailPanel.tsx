@@ -326,6 +326,7 @@ export function EventDetailPanel({
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["annotations"] });
     },
+    meta: { successToast: "Finding pinned as annotation", errorTitle: "Pin failed" },
   });
 
   // "Mark normal" = value-level normality: the detector never flags this value

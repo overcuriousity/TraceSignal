@@ -1,0 +1,4 @@
+192.168.1.10 - alice [25/Jun/2026:09:46:41 +0200] "GET /index.html HTTP/1.1" 200 1234 "https://example.com/" "Mozilla/5.0 (X11; Linux x86_64)"
+203.0.113.7 - - [25/Jun/2026:09:47:02 +0200] "POST /api/login HTTP/2.0" 401 89 "-" "curl/8.5.0"
+not a parseable line at all
+2001:db8::42 - - [25/Jun/2026:09:48:15 +0200] "GET /assets/app.js HTTP/1.1" 304 0 "https://example.com/index.html" "Mozilla/5.0 (X11; Linux x86_64)" "extra"

@@ -1,0 +1,5 @@
+message,timestamp,datetime,timestamp_desc,extra_field_1,extra_field_2,tag
+A message,1331698658276340,2015-07-24T19:01:01+00:00,Write time,foo,bar,"a,b"
+"Multi
+line message",,2015-07-24T19:02:01+00:00,Write time,baz,qux,"[""x"", ""y""]"
+No tag message,,2015-07-24T19:03:01+00:00,Access time,onlyfield,,

@@ -129,6 +129,8 @@ export function BaselineSection({ caseId, timelineId }: Props) {
       setActiveBaselineId(res.baseline.id);
       invalidate();
     },
+    // Save errors render inline under the builder — skip the global toast.
+    meta: { silentError: true },
   });
 
   const deleteMut = useMutation({
@@ -334,7 +336,14 @@ export function NormalValuesList({ caseId, timelineId }: Props) {
   const allowlist = data?.entries ?? [];
   const removeMut = useMutation({
     mutationFn: (id: string) => baselinesApi.removeAllowlist(caseId, timelineId, id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["allowlist", caseId, timelineId] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["allowlist", caseId, timelineId] });
+      // Un-suppressing a value must let its findings come back — re-run the
+      // detector queries (adding an entry never needs this: useMarkNormal
+      // filters cached results optimistically instead).
+      qc.invalidateQueries({ queryKey: ["anomalies", caseId, timelineId] });
+    },
+    meta: { successToast: "Removed from normal values" },
   });
 
   return (

@@ -59,6 +59,29 @@ which `tsig-web` serves directly (auto-built on first run if missing).
 - An 80 GiB source compresses well and filters quickly on modest hardware.
 - **Deployment note**: ClickHouse is an external service. TraceSignal connects to it over HTTP/TCP; it is never inside the application package or container.
 
+### 3.4a Converter Interchange Format — Parquet + Arrow
+- Client-side converter scripts (`assets/converters/*2tracesignal.py`) parse raw evidence
+  logs locally and emit **Parquet** files rather than the CSV/JSONL the vendored
+  `*2timesketch` scripts produce. The server bulk-inserts those files into ClickHouse via
+  **Arrow** record batches (`db/_arrow_schema.py`, `insert_events_arrow`) instead of
+  row-by-row parsing — an order of magnitude faster on multi-GB logs, since ClickHouse's
+  native Arrow ingestion skips the CSV/JSON tokenize-and-cast step entirely.
+- Columnar + typed: Parquet's schema (`ingestion/parquet_format.py::PARQUET_EVENT_SCHEMA`)
+  carries real types (`timestamp`, `uint64`, `map<string,string>`) end to end, avoiding the
+  string-serialize-then-reparse round trip CSV/JSONL forces on every field. Zstd-compressed
+  Parquet is also considerably smaller on disk than the equivalent CSV.
+- Forensic provenance is a first-class part of the format, not bolted on: every row carries
+  the sha256 of its original raw evidence file (`file_hash`), the byte offset of the
+  record within it, and the sha256 of the record itself (`content_hash`) — enough for an
+  examiner to re-derive the same `event_id` from the raw log alone
+  (`models/event.py::derive_event_id`). Footer metadata pins converter name/version.
+- Converters are standalone downloads (no dependency on the `tracesignal` package) and use
+  `pyarrow` as their only non-stdlib dependency, so they still work disconnected from any
+  TraceSignal deployment — consistent with the airgapped-by-default goal.
+- Not a replacement for CSV/JSONL ingestion: those paths (and the vendored stdlib-only
+  `*2timesketch` scripts) remain fully supported as a minimal-dependency alternative for
+  environments that can't install pyarrow.
+
 ### 3.5 Vector Store — Qdrant
 - Already proven in ScalarForensic for forensic vector search.
 - Runs as an external service; also supports a local/embedded mode via the Python client for single-user deployments.

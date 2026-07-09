@@ -26,6 +26,20 @@
       "sha256": "98ed1120344c8a95d34e58f8d59164b5cca8974c43ebbaa6390e1079b51fcdb9"
     },
     {
+      "name": "cloudtrail2tracesignal",
+      "filename": "cloudtrail2tracesignal.py",
+      "description": "AWS CloudTrail JSON/JSON.gz exports (file or directory) to a TraceSignal Parquet file for direct upload. Requires pyarrow.",
+      "inputs": [
+        "CloudTrail .json / .json.gz"
+      ],
+      "native": true,
+      "requires": [
+        "pyarrow"
+      ],
+      "size_bytes": 20972,
+      "sha256": "834d26b8fb67dd2239543a222b7cc9c9c371a067cfc176a04934186c52ecc0e4"
+    },
+    {
       "name": "filterlog2timesketch",
       "filename": "filterlog2timesketch.py",
       "description": "pfSense/OPNsense filterlog firewall logs to Timesketch timeline.",
@@ -34,6 +48,20 @@
       ],
       "size_bytes": 51113,
       "sha256": "77e9be35c2706897f009f2e6c4bbde2a3dd5d0118e4aa51a51b64f1cb46a4bb8"
+    },
+    {
+      "name": "filterlog2tracesignal",
+      "filename": "filterlog2tracesignal.py",
+      "description": "pfSense/OPNsense filterlog firewall logs (plain or .gz, file or directory) to a TraceSignal Parquet file for direct upload. Requires pyarrow.",
+      "inputs": [
+        "filter.log (syslog filterlog lines)"
+      ],
+      "native": true,
+      "requires": [
+        "pyarrow"
+      ],
+      "size_bytes": 26536,
+      "sha256": "b2e9d764cfca77e8cd09eded3bcb3496e16942a0c2107744d470a52c4825c3fe"
     },
     {
       "name": "journal2timesketch",
@@ -48,13 +76,28 @@
     {
       "name": "nginx2timesketch",
       "filename": "nginx2timesketch.py",
-      "description": "nginx access/error/redirect logs (plain or .gz) to Timesketch timeline.",
+      "description": "nginx access/error/redirect logs to Timesketch timeline.",
       "inputs": [
         "access.log*",
         "error.log*"
       ],
-      "size_bytes": 46588,
-      "sha256": "ff7cbd2f23395d680973aec1d92fd04d8e85c984125104173aa2fe83b2560ff5"
+      "size_bytes": 46573,
+      "sha256": "4cb8391520d0d89c46e00580237f74ae36f062428a679a362ff6d0d92f784857"
+    },
+    {
+      "name": "nginx2tracesignal",
+      "filename": "nginx2tracesignal.py",
+      "description": "nginx access/error/redirect logs (plain or .gz, file or directory) to a TraceSignal Parquet file for direct upload. Requires pyarrow.",
+      "inputs": [
+        "access.log*",
+        "error.log*"
+      ],
+      "native": true,
+      "requires": [
+        "pyarrow"
+      ],
+      "size_bytes": 21707,
+      "sha256": "a9bcc7e6ffe093c0bd6fb51227d5d17efcce11168963b1c2898c56d47cb03b11"
     },
     {
       "name": "pcap2timesketch",
@@ -68,6 +111,21 @@
       "sha256": "9c0d7963ce8226464c032300a210189e7c86891fe3f1fe8b79e8628a3dd40388"
     },
     {
+      "name": "pcap2tracesignal",
+      "filename": "pcap2tracesignal.py",
+      "description": "Packet captures (pcap/pcapng, file or directory) to a TraceSignal Parquet file for direct upload, decoded to Ethernet/IPv4/IPv6/TCP/UDP/ICMP/ARP headers. Requires pyarrow.",
+      "inputs": [
+        "*.pcap",
+        "*.pcapng"
+      ],
+      "native": true,
+      "requires": [
+        "pyarrow"
+      ],
+      "size_bytes": 35836,
+      "sha256": "32e6223ea50fe7a3892a69cc3c43992a8d47dc1f33b3491ec25f1a418b18785f"
+    },
+    {
       "name": "suricata2timesketch",
       "filename": "suricata2timesketch.py",
       "description": "Suricata IDS/IPS logs (EVE JSON, fast.log, OPNsense syslog export) to Timesketch timeline.",
@@ -78,6 +136,37 @@
       ],
       "size_bytes": 53516,
       "sha256": "762f32313af78714ae35d3a1e9e8ac45ce310e9a6a3911436f99dedd8f37d0f2"
+    },
+    {
+      "name": "suricata2tracesignal",
+      "filename": "suricata2tracesignal.py",
+      "description": "Suricata IDS/IPS logs (EVE JSON, fast.log, OPNsense syslog export; plain or .gz, file or directory) to a TraceSignal Parquet file for direct upload. Requires pyarrow.",
+      "inputs": [
+        "eve.json",
+        "fast.log",
+        "OPNsense suricata syslog export"
+      ],
+      "native": true,
+      "requires": [
+        "pyarrow"
+      ],
+      "size_bytes": 27107,
+      "sha256": "fce9ffe4e2c572f15786c0dc4490c4548f68a52ab83e883f8077b71e0e4b8475"
+    },
+    {
+      "name": "timesketch2parquet",
+      "filename": "timesketch2parquet.py",
+      "description": "Generic Timesketch-compatible CSV/JSONL (any column set, plain or .gz, file or directory) to a TraceSignal Parquet file for direct upload. Column requirements follow upstream google/timesketch's own import spec. Requires pyarrow.",
+      "inputs": [
+        "*.csv",
+        "*.jsonl"
+      ],
+      "native": true,
+      "requires": [
+        "pyarrow"
+      ],
+      "size_bytes": 27794,
+      "sha256": "7049091a50dc6a54e63753a1f8025f584f149a5c407e2e941ab8ce043233d979"
     }
   ]
 }

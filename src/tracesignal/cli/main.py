@@ -114,7 +114,10 @@ def ingest(
         None,
         "--format",
         "-f",
-        help="Parser format (timesketch_csv, jsonl). Inferred from extension if omitted.",
+        help=(
+            "Parser format (timesketch_csv, jsonl, tracesignal_parquet). "
+            "Inferred from extension if omitted."
+        ),
     ),
     batch_size: int | None = typer.Option(
         None,

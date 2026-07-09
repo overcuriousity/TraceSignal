@@ -474,3 +474,123 @@ async def test_receive_upload_to_tmp_returns_hash_and_size(tmp_path, monkeypatch
         assert size == len(payload)
     finally:
         result_path.unlink(missing_ok=True)
+
+
+def test_retain_file_hardlinks_same_filesystem(tmp_path: Path) -> None:
+    src = tmp_path / "upload.tmp"
+    src.write_bytes(b"evidence")
+    dest = tmp_path / "ab" / "abcdef"
+
+    cases._retain_file(src, dest)
+
+    assert dest.read_bytes() == b"evidence"
+    assert dest.stat().st_ino == src.stat().st_ino  # hardlink, no data copy
+    # Unlinking the temp file (as the ingestion job does) keeps the retained copy.
+    src.unlink()
+    assert dest.read_bytes() == b"evidence"
+
+
+def test_retain_file_falls_back_to_copy_on_exdev(tmp_path: Path, monkeypatch) -> None:
+    import errno
+    import os
+
+    src = tmp_path / "upload.tmp"
+    src.write_bytes(b"evidence")
+    dest = tmp_path / "ab" / "abcdef"
+
+    def _exdev(*args, **kwargs):
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    monkeypatch.setattr(os, "link", _exdev)
+    cases._retain_file(src, dest)
+
+    assert dest.read_bytes() == b"evidence"
+    assert dest.stat().st_ino != src.stat().st_ino
+
+
+def test_retain_file_short_circuits_when_retained(tmp_path: Path, monkeypatch) -> None:
+    import os
+
+    src = tmp_path / "upload.tmp"
+    src.write_bytes(b"evidence")
+    dest = tmp_path / "ab" / "abcdef"
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"evidence")  # content-addressed: existing == identical
+
+    def _fail(*args, **kwargs):  # pragma: no cover - must not be reached
+        raise AssertionError("no link/copy for an already-retained file")
+
+    monkeypatch.setattr(os, "link", _fail)
+    cases._retain_file(src, dest)
+    assert dest.read_bytes() == b"evidence"
+
+
+def _interchange_parquet_bytes() -> bytes:
+    """Build a minimal valid TraceSignal interchange parquet in memory."""
+    import io
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from tracesignal.ingestion import parquet_format
+
+    row = {
+        "source_file": "access.log",
+        "file_hash": "a" * 64,
+        "byte_offset": 0,
+        "content_hash": "b" * 64,
+        "message": "GET / 200",
+        "timestamp": None,
+        "timestamp_desc": "HTTP Request Time",
+        "artifact": "nginx:access",
+        "artifact_long": "web:access:request",
+        "display_name": "",
+        "tags": [],
+        "attributes": {"status_code": "200"},
+    }
+    import json as _json
+
+    meta = {
+        parquet_format.META_FORMAT_VERSION: parquet_format.FORMAT_VERSION,
+        parquet_format.META_CONVERTER_NAME: "nginx2tracesignal",
+        parquet_format.META_CONVERTER_VERSION: "1.0.0",
+        parquet_format.META_ORIGINAL_FILES: _json.dumps(
+            [{"name": "access.log", "sha256": "a" * 64, "size_bytes": 10}]
+        ),
+    }
+    table = pa.Table.from_pylist(
+        [row], schema=parquet_format.PARQUET_EVENT_SCHEMA.with_metadata(meta)
+    )
+    sink = io.BytesIO()
+    pq.write_table(table, sink)
+    return sink.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_parquet_upload_records_converter_identity(store: PostgresStore, case: str) -> None:
+    case_obj = await store.get_case(case)
+    response = await _upload(case_obj, "events.parquet", _interchange_parquet_bytes())
+    # The Source's parser is the embedded converter identity, not the format string.
+    assert response.parser == "nginx2tracesignal@1.0.0"
+    source = await store.get_source(case, response.source_id)
+    assert source.parser == "nginx2tracesignal@1.0.0"
+
+
+@pytest.mark.asyncio
+async def test_non_interchange_parquet_rejected_400(store: PostgresStore, case: str) -> None:
+    import io
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    table = pa.Table.from_pydict({"message": ["not an interchange file"]})
+    sink = io.BytesIO()
+    pq.write_table(table, sink)
+
+    case_obj = await store.get_case(case)
+    with pytest.raises(HTTPException) as exc_info:
+        await _upload(case_obj, "events.parquet", sink.getvalue())
+    assert exc_info.value.status_code == 400
+    assert "TraceSignal" in exc_info.value.detail
+    # No orphaned source row.
+    assert await store.list_sources(case) == []

@@ -55,7 +55,7 @@ CONVERTERS = {
     "nginx2timesketch": (
         "nginx",
         "nginx2timesketch.py",
-        "nginx access/error/redirect logs (plain or .gz) to Timesketch timeline.",
+        "nginx access/error/redirect logs to Timesketch timeline.",
         ["access.log*", "error.log*"],
     ),
     "pcap2timesketch": (
@@ -192,6 +192,20 @@ def vendor(upstream: Path) -> None:
         print(f"vendored {out.relative_to(REPO_ROOT)} ({len(content.splitlines())} lines)")
 
     manifest_path = ASSETS_DIR / "manifest.json"
+
+    # Preserve native (in-repo, non-vendored) converter entries across
+    # re-vendor runs, refreshing their size/hash from the committed file.
+    if manifest_path.is_file():
+        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for entry in existing.get("converters", []):
+            if not entry.get("native"):
+                continue
+            content = (ASSETS_DIR / entry["filename"]).read_bytes()
+            entry["size_bytes"] = len(content)
+            entry["sha256"] = hashlib.sha256(content).hexdigest()
+            manifest["converters"].append(entry)
+    manifest["converters"].sort(key=lambda entry: entry["name"])
+
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"wrote {manifest_path.relative_to(REPO_ROOT)}")
 

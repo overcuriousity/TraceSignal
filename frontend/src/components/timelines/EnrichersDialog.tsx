@@ -13,6 +13,7 @@ import {
   SelectValue,
 } from "@/components/ui/Select";
 import { useJobsStore } from "@/stores/jobs";
+import { toast } from "@/stores/toasts";
 import type { Timeline } from "@/api/types";
 
 interface Props {
@@ -70,14 +71,22 @@ export function EnrichersDialog({ caseId, timeline }: Props) {
         qc.invalidateQueries({ queryKey });
       }
     },
+    meta: { errorTitle: "Enricher config change failed" },
   });
 
   const runMutation = useMutation({
     mutationFn: (key: string) => enrichersApi.run(caseId, timeline.id, key),
     onSuccess: (res, key) => {
       // Skipped run: every ready source already enriched at the current config
-      // (same enricher + data version), so no job started — nothing to track.
-      if (res.job_id === null) return;
+      // (same enricher + data version), so no job started — say so instead of
+      // letting the click look like it did nothing.
+      if (res.job_id === null) {
+        toast.info(
+          `${key}: already enriched`,
+          "Every ready source is up to date — no job started.",
+        );
+        return;
+      }
       addJob(res.job_id, `${key} enrichment`, [
         ["events", caseId, timeline.id],
         ["fields", caseId, timeline.id],

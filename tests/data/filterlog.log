@@ -1,0 +1,4 @@
+2026-07-08T09:46:41+02:00 firewall filterlog: 5,,,1000000103,igb0,match,block,in,4,0x0,,64,54244,0,DF,6,tcp,60,192.168.1.50,8.8.8.8,52345,443,0,S,1974194169,,64240,,mss;sackOK
+2026-07-08T09:47:12+02:00 firewall filterlog: 6,,,1000000104,igb0,match,pass,out,4,0x0,,64,11223,0,,17,udp,40,192.168.1.51,1.1.1.1,53021,53,12
+2026-07-08T09:48:03+02:00 firewall filterlog: 7,,,1000000105,igb0,match,block,in,4,0x0,,64,222,0,,1,icmp,84,192.168.1.52,4.4.4.4,request,1234,1
+2026-07-08T09:49:00+02:00 firewall filterlog: bad,line,too,short

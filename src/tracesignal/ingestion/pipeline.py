@@ -8,6 +8,7 @@ background job.
 from __future__ import annotations
 
 import traceback
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -175,6 +176,16 @@ class IngestionPipeline:
         last event's ``byte_offset`` within the current file on top of the
         bytes of already-completed files.
         """
+        batches = parser.parse_arrow_batches(
+            file_path,
+            on_progress=lambda done: self._report_progress(
+                total=total_bytes, processed=bytes_before_file + done
+            ),
+        )
+        if batches is not None:
+            self._ingest_file_arrow(batches, result)
+            return
+
         batch: list[Event] = []
 
         for event in parser.parse(file_path):
@@ -197,6 +208,17 @@ class IngestionPipeline:
                 total=total_bytes,
                 processed=bytes_before_file + batch[-1].byte_offset,
             )
+
+    def _ingest_file_arrow(self, batches: Iterator[Any], result: IngestionResult) -> None:
+        """Drain a parser's Arrow record batches into ClickHouse.
+
+        Batches are pre-encoded against ``EVENT_ARROW_SCHEMA`` — no ``Event``
+        objects are built. Progress is reported by the parser through the
+        ``on_progress`` callback it was handed, not per batch here.
+        """
+        for batch in batches:
+            result.events_parsed += batch.num_rows
+            result.events_inserted += self.clickhouse.insert_events_arrow(batch)
 
     def _report_progress(self, total: int, processed: int) -> None:
         if self.progress_callback is not None:

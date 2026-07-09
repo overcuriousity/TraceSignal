@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,7 @@ from tracesignal.db.qdrant import QdrantStore
 from tracesignal.ingestion.parser import detect_format
 from tracesignal.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
 from tracesignal.models.embeddings import embeddings_available
+from tracesignal.models.event import ParserConfig
 
 
 class CaseCreate(BaseModel):
@@ -130,6 +132,26 @@ def _retention_path(file_hash: str) -> Path:
     """Return the content-addressed path for a retained source file."""
     # Shard by the first two hash characters to avoid huge flat directories.
     return _retention_dir() / file_hash[:2] / file_hash
+
+
+def _retain_file(tmp_path: Path, retention_path: Path) -> None:
+    """Retain an uploaded file at its content-addressed path without a data copy.
+
+    The retention path is content-addressed by hash, so an existing file there
+    is guaranteed byte-identical — short-circuit. Otherwise hardlink
+    (metadata-only; the ingestion job keeps reading and finally unlinking
+    ``tmp_path``, which leaves the retained link untouched), falling back to a
+    full copy when the OS temp dir and TS_SOURCE_RETENTION_PATH live on
+    different filesystems.
+    """
+    if retention_path.exists():
+        return
+    retention_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(tmp_path, retention_path)
+    except OSError:
+        # EXDEV (cross-device) or a filesystem without hardlink support.
+        shutil.copy2(tmp_path, retention_path)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -652,16 +674,40 @@ async def upload_source(
                     status_code=400,
                     detail=(
                         f"Cannot detect parser format for {file.filename!r}; "
-                        "pass an explicit parser (e.g. jsonl, timesketch_csv)."
+                        "pass an explicit parser (e.g. jsonl, timesketch_csv, "
+                        "tracesignal_parquet)."
                     ),
                 ) from exc
         source_id = generate_id(f"{case_id}:{file_hash}")
         source_name = name or file.filename or tmp_path.name
 
-        # Retain the original file content-addressed by hash.
+        # For interchange Parquet uploads, validate the footer now (a broken
+        # file should 400 here, not fail the background job) and record the
+        # embedded converter identity as the source's parser — that is the
+        # real provenance, not the generic format string.
+        source_parser = fmt
+        if fmt in {"tracesignal_parquet", "parquet"}:
+            from tracesignal.ingestion.parquet_reader import ParquetEventsParser
+
+            # The ParserConfig here is a throwaway: read_source_meta only reads
+            # the file's footer, and the real parser identity is taken from that
+            # footer below (source_parser). This placeholder config is never
+            # persisted or hashed.
+            reader = ParquetEventsParser(
+                case_id, source_id, ParserConfig(name=fmt, version="0.1.0")
+            )
+            try:
+                parquet_meta = await run_in_threadpool(reader.read_source_meta, tmp_path)
+            except ValueError as exc:
+                tmp_path.unlink(missing_ok=True)
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            source_parser = f"{parquet_meta.converter_name}@{parquet_meta.converter_version}"
+
+        # Retain the original file content-addressed by hash (hardlink fast
+        # path; copy only across filesystems). Threadpool because the copy
+        # fallback is a full I/O pass over the upload.
         retention_path = _retention_path(file_hash)
-        retention_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(tmp_path, retention_path)
+        await run_in_threadpool(_retain_file, tmp_path, retention_path)
 
         # Create the source row up front (event_count=0) so a re-upload of
         # the same bytes is rejected as a duplicate while ingestion runs.
@@ -673,7 +719,7 @@ async def upload_source(
                 file_hash=file_hash,
                 size_bytes=size_bytes,
                 filename=file.filename,
-                parser=fmt,
+                parser=source_parser,
                 event_count=0,
                 created_by=user.id,
                 # Excluded from timeline queries/detectors/embedding until
@@ -733,7 +779,7 @@ async def upload_source(
         source_id=source_id,
         events_parsed=0,
         events_inserted=0,
-        parser=fmt,
+        parser=source_parser,
         duplicate=False,
         status="ingesting",
         job_id=job.id,

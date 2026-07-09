@@ -47,6 +47,8 @@ The current vocabulary is defined and implemented in
   - Plaso CSV / JSONL
   - Generic CSV with configurable column mapping
   - Generic JSONL (one event per line)
+  - TraceSignal Parquet interchange files produced by the downloadable converter scripts
+    (raw-log provenance embedded per row; see `docs/MODEL_REFINEMENT.md`)
 - Streaming parser: handle 80 GiB+ inputs without loading everything into RAM.
 - Per-event SHA-256 hash and provenance metadata (source file, byte offset, parser config).
 - Optional deduplication by hash or by (file path + offset).

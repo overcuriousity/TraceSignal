@@ -17,6 +17,7 @@ class FakeClickHouseStore:
     def __init__(self) -> None:
         self.events: list[Event] = []
         self.insert_batch_sizes: list[int] = []
+        self.arrow_batches: list[Any] = []
         self.schema_initialized = False
 
     def init_schema(self) -> None:
@@ -26,6 +27,10 @@ class FakeClickHouseStore:
         self.events.extend(events)
         self.insert_batch_sizes.append(len(events))
         return len(events)
+
+    def insert_events_arrow(self, batch: Any) -> int:
+        self.arrow_batches.append(batch)
+        return batch.num_rows
 
     def count_events(self, case_id: str | None = None, source_id: str | None = None) -> int:
         events = self.events
@@ -368,3 +373,104 @@ def test_large_csv_ingest_memory_stays_bounded(tmp_path: Path) -> None:
     assert peak < 8 * 1024 * 1024, (
         f"peak heap {peak / 2**20:.1f} MiB for a {file_size / 2**20:.1f} MiB file"
     )
+
+
+class _ArrowFakeParser:
+    """Parser stand-in exercising the Arrow bulk branch of _ingest_file."""
+
+    def __init__(self, events_per_batch: list[list[Event]]) -> None:
+        self._events_per_batch = events_per_batch
+        self.progress_calls: list[int] = []
+
+    def parse(self, path: Path):  # pragma: no cover - must not be reached
+        raise AssertionError("arrow-capable parser must not fall back to parse()")
+
+    def parse_arrow_batches(self, path: Path, on_progress=None):
+        from tracesignal.db.clickhouse import _events_to_record_batch
+
+        def _generate():
+            done = 0
+            for events in self._events_per_batch:
+                done += 100
+                if on_progress is not None:
+                    on_progress(done)
+                    self.progress_calls.append(done)
+                yield _events_to_record_batch(events)
+
+        return _generate()
+
+
+def _arrow_event(i: int) -> Event:
+    return Event(
+        case_id="case1",
+        source_id="source1",
+        source_file=Path("events.parquet"),
+        byte_offset=i * 10,
+        content_hash=f"{i:064d}",
+        file_hash="a" * 64,
+        parser_name="test",
+        parser_version="1.0.0",
+        raw_line=f"raw {i}",
+        message=f"msg {i}",
+    )
+
+
+def test_pipeline_arrow_branch_bulk_inserts(sample_jsonl: Path) -> None:
+    clickhouse = FakeClickHouseStore()
+    pipeline = IngestionPipeline(
+        case_id="case1",
+        source_id="source1",
+        clickhouse=clickhouse,
+        source_name="events.parquet",
+        file_hash="a" * 64,
+    )
+    parser = _ArrowFakeParser([[_arrow_event(1), _arrow_event(2)], [_arrow_event(3)]])
+    from tracesignal.ingestion.pipeline import IngestionResult
+
+    result = IngestionResult(case_id="case1", source_id="source1", files=[sample_jsonl])
+    pipeline._ingest_file(sample_jsonl, parser, result)
+
+    assert result.events_parsed == 3
+    assert result.events_inserted == 3
+    assert [b.num_rows for b in clickhouse.arrow_batches] == [2, 1]
+    # The Event-object path must not have been used.
+    assert clickhouse.events == []
+    assert clickhouse.insert_batch_sizes == []
+
+
+def test_pipeline_arrow_branch_reports_progress(sample_jsonl: Path) -> None:
+    calls: list[tuple[int, int]] = []
+    pipeline = IngestionPipeline(
+        case_id="case1",
+        source_id="source1",
+        clickhouse=FakeClickHouseStore(),
+        source_name="events.parquet",
+        file_hash="a" * 64,
+        progress_callback=lambda total, processed: calls.append((total, processed)),
+    )
+    parser = _ArrowFakeParser([[_arrow_event(1)], [_arrow_event(2)]])
+    from tracesignal.ingestion.pipeline import IngestionResult
+
+    result = IngestionResult(case_id="case1", source_id="source1", files=[sample_jsonl])
+    pipeline._ingest_file(sample_jsonl, parser, result, total_bytes=500, bytes_before_file=50)
+
+    assert calls == [(500, 150), (500, 250)]
+
+
+def test_pipeline_none_arrow_batches_falls_back(sample_jsonl: Path) -> None:
+    # Parsers without an Arrow path (base default returns None) keep using the
+    # Event-object loop unchanged.
+    clickhouse = FakeClickHouseStore()
+    pipeline = IngestionPipeline(
+        case_id="case1",
+        source_id="source1",
+        clickhouse=clickhouse,
+        batch_size=2,
+        source_name="events.jsonl",
+        file_hash="abc",
+    )
+    result = pipeline.run(sample_jsonl)
+
+    assert result.events_inserted == 3
+    assert clickhouse.arrow_batches == []
+    assert clickhouse.insert_batch_sizes == [2, 1]

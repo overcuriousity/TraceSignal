@@ -37,12 +37,29 @@ resolved — this file holds only the condensed, still-open action items.
   merged `distinct` likewise deferred (max-across-sources approximation documented in the
   module).
 
-- [ ] **M20 — Ingest-throughput follow-ups.** Full design in
-  [`docs/archive/PLAN_FAST_NGINX_INGESTION.md`](./archive/PLAN_FAST_NGINX_INGESTION.md): bulk
-  Arrow-based `ClickHouseStore.insert_events`/`insert_events_arrow` (replacing the row-by-row
-  `client.insert()` path) plus a fix for the upload-receive double file-copy
-  (`shutil.copy2` after the temp-file hash pass). Benefits every ingestion path (CSV/JSONL/CLI/
-  web) immediately and is the prerequisite for the native nginx parser below.
+- [ ] **M25 — Port remaining converters to the Parquet interchange format.** M20 shipped the
+  bulk Arrow insert, the upload hardlink-retention fix, the TraceSignal Parquet interchange
+  format v1 (`ingestion/parquet_format.py`, `ingestion/parquet_reader.py`), and the
+  `nginx2tracesignal.py` converter (pilot). This session added native `*2tracesignal.py`
+  Parquet converters for filterlog, suricata, cloudtrail, and pcap, each with its own
+  `tests/test_<name>_converter.py`. Decision (mid-session, user request): the vendored
+  `*2timesketch` scripts stay vendored **permanently** as a minimal-dependency (stdlib-only,
+  no pyarrow) alternative — `scripts/vendor_converters.py` is not retired, and native/vendored
+  converters are listed side by side in `manifest.json`/`/api/converters`. Remaining:
+  journal, browser (still vendored-only, not yet ported to native). Follow-ups from the nginx
+  pilot, still open: benchmark converter worker-count/parallel-threshold defaults on a
+  multi-GB log; parallel `.gz` parsing (seek-point indexing) deferred; pcap intra-file
+  parallelism (record-boundary chunking, analogous to nginx's newline chunking) deferred —
+  `pcap2tracesignal.py` currently parallelizes only across files, one worker process per file.
+  Also added `timesketch2parquet.py` — a generic Timesketch-compatible CSV/JSONL converter (any
+  column set, no per-source parsing) with no vendored counterpart; column requirements follow
+  upstream `google/timesketch`'s own import spec exactly (`message`/`timestamp_desc`/`datetime`
+  mandatory, `timestamp` substitutable for `datetime` in CSV, `tag` the only other recognized
+  column), not TraceSignal's own server-side generic-CSV parser's extra recognized columns. CSV
+  parsing is single-process only (a logical record can span multiple physical lines via quoted
+  embedded newlines, unsafe to newline-chunk); JSONL gets full nginx-style chunked
+  multiprocessing. CSV intra-file parallelism (record-boundary-aware chunking) deferred,
+  same treatment as pcap's.
 
 - [ ] **M23 — detector-scan residue (post 300M-row overhaul, session 27).** Two follow-ups
   deliberately deferred: (a) `canonical_inventory` stays a live query — it only runs when a
@@ -89,13 +106,19 @@ Prep landed: shared frontend detector scaffolding (`components/analysis/detector
 a Radix `Select` detector switcher replacing the flat sub-tab strip, standardized
 `["anomalies", caseId, timelineId, ...]` query keys, and an `_col_expr(prefix=...)` param for
 multi-field queries. **D1 (value-combo), D2 (timestamp-order), D3 (charset), D4
-(numeric-range), and D5 (entropy) shipped.**
+(numeric-range), and D5 (entropy) shipped.** Also shipped (beyond the AMiner set, no AMiner
+equivalent): **proportion_shift** — per-(field, value) 2×2 G-test of a value's *share* of
+events between the baseline and each suspect window, BH-FDR across the run, rate-ratio effect
+floor, temporal-only, first-seen excluded (`baseline_cnt ≥ 1`; value_novelty owns those).
 
 High value first:
 
 - [ ] **D6 — Per-value silence** (AMiner `MissingMatchPathValueDetector`): a value that
   appeared regularly in the baseline stops appearing in the detect window (agent killed,
   log source suppressed). Complements the existing `frequency` detector's global silences.
+  *Partially covered by the shipped `proportion_shift` detector's "down"/vanished findings
+  (whole-window share drop to zero); what remains distinct is the periodicity angle
+  ("appeared regularly"), which overlaps D7 — re-scope before building.*
 - [ ] **D7 — Interval-periodicity violations** (AMiner `PathValueTimeIntervalDetector`): learn
   the inter-arrival interval distribution per field value in the baseline; flag deviation
   (missed/shifted periodic events) and, inversely, newly *regular* intervals (beaconing).
@@ -150,11 +173,10 @@ Hard, high value:
   untouched. Natural extension of the field-mappings path (canonical field = regex extraction
   instead of only key rename) via ClickHouse `extractGroups()`; detectors consume it through
   the existing `_col_expr` field-expression mechanism. Prerequisite for making bespoke
-  unstructured logs first-class. The companion write half — a native, parallel raw-log
-  ingestion mode (starting with nginx access/error logs, bypassing the CSV/JSONL pre-conversion
-  step entirely) — now has a full design in
-  [`docs/archive/PLAN_FAST_NGINX_INGESTION.md`](./archive/PLAN_FAST_NGINX_INGESTION.md); not yet
-  scheduled for implementation.
+  unstructured logs first-class. (The old companion "write half" — server-side raw-log
+  parsing per [`docs/archive/PLAN_FAST_NGINX_INGESTION.md`](./archive/PLAN_FAST_NGINX_INGESTION.md)
+  — was superseded by the client-side Parquet converter architecture shipped with M20;
+  see M25 above.)
 - [ ] **W7 — Stories (investigative notebook).** Markdown document per case embedding live
   references to saved Views, charts, and tagged events — the report writes itself during the
   investigation. Building blocks (Views, annotations, saved charts, RBAC) all exist; this is

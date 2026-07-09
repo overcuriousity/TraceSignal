@@ -1,8 +1,16 @@
 # Plan: Fast end-to-end ingestion for massive line-oriented logs (nginx access logs)
 
-Status: **planned, not implemented.** Written 2026-07-08 in response to an evaluation of the
-50GiB-nginx-access-log ingestion path. Closes/advances `docs/ROADMAP.md` **M20** and **W8** once
-implemented — this file holds the full design; ROADMAP keeps only the condensed pointer.
+Status: **superseded (2026-07-08).** The server-side native raw-log parsing architecture
+below (§2, §3's nginx parts) was a misreading of the actual requirement and was replaced by
+the client-side Parquet converter architecture: converter scripts
+(`assets/converters/*2tracesignal.py`) parse raw logs locally and emit a TraceSignal
+interchange Parquet file (`ingestion/parquet_format.py`) that the server bulk-ingests via
+Arrow (`ingestion/parquet_reader.py`). §1 (bulk Arrow `insert_events`/`insert_events_arrow`)
+and §4 (upload double-copy hardlink fix) were implemented as designed; the optional
+`parse_arrow_batches` pipeline hook from §3 shipped too, consumed by the Parquet reader
+instead of a native nginx parser. See ROADMAP M25 for the remaining converter ports.
+
+Original text follows.
 
 ## Context
 
