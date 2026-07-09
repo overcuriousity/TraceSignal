@@ -93,6 +93,18 @@ class AnnotationCreate(BaseModel):
     content: str = Field(..., min_length=1, max_length=4096)
 
 
+class SourceUpdate(BaseModel):
+    """Payload to update a source's editable metadata.
+
+    Currently only the analyst-declared clock-skew correction
+    (``time_offset_seconds``, W2). Bounded to ±10 years — a wider offset is
+    always a data-entry error, never a real forensic clock drift, and an
+    unbounded value would overflow the ClickHouse ``addSeconds`` correction.
+    """
+
+    time_offset_seconds: int = Field(..., ge=-315_576_000, le=315_576_000)
+
+
 class SourceUploadResponse(BaseModel):
     """Response shape for a source upload.
 
@@ -358,6 +370,41 @@ async def get_source(source_id: str, case: Case = Depends(require_case_read)) ->
     if source is None:
         raise HTTPException(status_code=404, detail="Source not found")
     return {"source": source.to_dict()}
+
+
+@router.patch("/{case_id}/sources/{source_id}")
+async def update_source(
+    source_id: str,
+    payload: SourceUpdate,
+    case: Case = Depends(require_case_contribute),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Set a source's analyst-declared clock-skew correction (W2).
+
+    The offset is query-time-only metadata — it shifts how the source's events
+    are filtered, ordered, bucketed and presented everywhere (explorer,
+    histogram, export, detectors), and never mutates the ingested events. The
+    previous and new values are recorded in the audit trail so the correction
+    itself is forensically reproducible.
+    """
+    store = get_store()
+    existing = await store.get_source(case.id, source_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Source not found")
+    previous = existing.time_offset_seconds
+    updated = await store.set_source_time_offset(case.id, source_id, payload.time_offset_seconds)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Source not found")
+    if payload.time_offset_seconds != previous:
+        await store.record_audit(
+            action="source.update_offset",
+            actor=user,
+            case_id=case.id,
+            target_type="source",
+            target_id=source_id,
+            detail={"previous": previous, "new": payload.time_offset_seconds},
+        )
+    return {"source": updated.to_dict()}
 
 
 @router.get("/{case_id}/jobs")

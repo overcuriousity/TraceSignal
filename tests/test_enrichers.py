@@ -403,6 +403,7 @@ async def test_init_schema_drops_legacy_staging_table(tmp_path):
         # A real pre-Alembic database has only the revision-0001 tables.
         await conn.execute(text("DROP TABLE baseline_definitions"))
         await conn.execute(text("DROP TABLE detector_allowlist"))
+        await conn.execute(text("ALTER TABLE sources DROP COLUMN time_offset_seconds"))
         await conn.execute(text("DROP TABLE enrichment_results_staging"))
         await conn.execute(
             text(

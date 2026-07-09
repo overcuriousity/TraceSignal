@@ -1,6 +1,208 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-09 (session 40 — interval_periodicity detector, D6+D7 merged).
+Last updated: 2026-07-09 (session 42 — W2 clock-skew correction COMPLETE).
+
+## Session 42 — 2026-07-09: W2 per-source clock-skew correction (COMPLETE)
+
+Finished the query-layer-plus-threading work checkpointed in session 41. Every piece of the
+per-source clock-skew correction is now wired end to end; the branch is green (full backend suite
+passes except the pre-existing environmental failures that need a live ClickHouse / the optional
+embeddings extra, and the frontend passes `typecheck`/`lint`/`test`).
+
+**Router threading (`api/routers/events.py`, `viz.py`)** — `_resolve_timeline_scope`'s
+`source_offsets` map is now threaded into all five `EventQuery(...)` constructions (explorer,
+bulk-annotate refs, histogram, export, viz) and into every statistical-detector call via
+`_run_stat_detector` (new `source_offsets` kwarg, passed from both `list_anomalies` and
+`tag_anomalies`) and `_resolve_analysis_windows` (window midpoint now derived over effective time).
+
+**Detector layer (`db/anomaly_stats.py`)** — `_window_preds`/`_window_totals` build predicates
+over `effective_ts_sql` and bind the offset arrays; every detector (`find_value_novelty`,
+`find_value_combos`, `find_range_violations`, `find_charset_novelty`, `find_entropy_outliers`,
+`find_proportion_shifts`, `find_interval_periodicity`, `find_frequency_anomalies`) takes a
+`source_offsets` kwarg and routes its window predicates, representative-event aggregates
+(`minIf`/`argMinIf`/`maxIf`/`argMaxIf`), bucket SQL, and `get_timeline_range` through the
+effective timestamp. `find_range_violations` additionally projects `source_id` into its numeric
+subqueries (only when an offset is active — fast path stays byte-identical) because the
+effective-ts expression references `source_id`. `find_order_violations` keeps its `lagInFrame`
+skew math on the **raw** column (a uniform per-source shift cancels within a source) and shifts
+only the reported `timestamp`/`prev_timestamp` in Python. `get_timeline_range`/`_buckets.py`'s
+`query_timestamp_range` gained an effective-ts expression param.
+
+**PATCH endpoint (`api/routers/cases.py`)** — `PATCH /{case_id}/sources/{source_id}` with a
+`SourceUpdate` model (bounded ±10y), `require_case_contribute`, and a `source.update_offset`
+audit row recording previous vs new.
+
+**Export + run stamping (`api/routers/events.py`)** — `export_events` adds `applied_time_offsets`
+to the export audit detail and prepends an offset-metadata line to JSONL (`{"_meta": …}`) / CSV
+(`# applied_time_offsets=…`) only when an offset is active (untouched exports stay byte-stable).
+`_persist_detector_run` stamps `source_offsets` into `DetectorRun.params`.
+
+**Frontend** — `Source.time_offset_seconds` type, `sourcesApi.update` PATCH helper, a
+`ClockOffsetControl` popover + offset badge on each source row (invalidates every timeline-scoped
+query root on save), and the **L3 rider**: `analysisPanelWidth` → `investigatePanelWidth` in
+`stores/ui.ts` (persist bumped to v4 with a carry-forward migrate step), the four
+`InvestigatePanel.tsx` usages, and the stale `AnalysisPanel` comment mentions in
+`ExplorerPage.tsx` / `scrollPosition.ts`.
+
+**Tests** — 9 new detector SQL-scoping tests in `tests/test_anomaly_stats.py` (fast-path
+byte-identity, effective-ts predicates, the `source_id`-projection fix, order-violation shifting),
+store-setter tests in `tests/test_postgres_store.py`, `_persist_detector_run`/export-stream tests
+in `tests/test_events_router.py`. The two pre-Alembic-adoption tests
+(`test_postgres_store.py`, `test_enrichers.py`) now drop the 0003 column when simulating a
+revision-0001 DB, and the router/viz/uploads test fakes were updated for the 3-tuple
+`_resolve_timeline_scope`. Migration 0003 is exercised against SQLite by every store fixture; not
+yet run against a live Postgres.
+
+## Session 41 — 2026-07-09: W2 per-source clock-skew correction (IN PROGRESS — resume here)
+
+Branch `feat/source-clock-skew` (based on `feat/interval-periodicity-detector`, which is
+committed — commit `3e3ebd5`). **Working tree has uncommitted WIP, committed at the end of this
+session as a checkpoint** — see the commit on this branch titled "wip(w2): query-layer clock-skew
+correction, threading incomplete" for the exact diff. Tests for everything done so far pass;
+nothing done so far is user-visible yet (no API/UI wiring).
+
+### Design (decided, don't re-litigate)
+
+Gated **effective-timestamp SQL expression**, not bound-shifting — bound-shifting breaks under
+mixed per-source offsets and can't express cross-source `ORDER BY` or bucketing at all. New
+module `src/tracesignal/db/_offsets.py`:
+
+- `effective_ts_sql(offsets)` → bare `"timestamp"` when no in-scope source has a nonzero offset
+  (the mandatory fast path — byte-identical SQL to pre-W2, verified by
+  `test_zero_offset_map_keeps_sql_byte_identical`); otherwise
+  `if(<not sentinel>, addSeconds(timestamp, transform(source_id, {clk_off_src:Array(String)},
+  {clk_off_val:Array(Int64)}, 0)), timestamp)` — sentinel rows (year-2299 no-timestamp marker)
+  are never shifted.
+- `bind_offset_params(offsets, params)` binds the two parallel arrays only when active.
+- `offset_raw_bounds(offsets)` returns `(max_offset, min_offset)` (both clamped to include 0) —
+  used to widen a *raw*-column scalar bound alongside every corrected filter/cursor predicate, so
+  ClickHouse's primary-index granule pruning survives the effective-ts expression (never changes
+  the result set, purely a pruning aid — same trick as the existing redundant cursor bound).
+
+### What's DONE (commit checkpoint, all tests green)
+
+1. **Postgres model** — `src/tracesignal/db/postgres.py`: `Source.time_offset_seconds`
+   (BigInteger, default 0) added after the `status` column (~line 109), doc comment explains
+   query-time-only semantics; `to_dict()` includes it.
+2. **Migration** — `src/tracesignal/db/migrations/versions/0003_source_time_offset.py`
+   (`down_revision="0002"`, head). `add_column` with `server_default="0"`, SQLite-safe. **Not
+   yet run/tested against a live Postgres** — only exercised implicitly if the test suite
+   bootstraps SQLite through Alembic; verify with `uv run alembic upgrade head` before shipping.
+3. **Store setter** — `PostgresStore.set_source_time_offset(case_id, source_id, seconds)` next
+   to `set_source_status` (~line 1287 in the pre-migration numbering, search for the method
+   name), returns the updated detached `Source` or `None`.
+4. **Query path** — `src/tracesignal/db/queries.py`, fully wired and tested:
+   - `EventQuery.source_offsets: dict[str, int] | None` field added (with doc comment).
+   - `_build_where`: binds offset params once, computes `eff`/`max_off`/`min_off`, applies to
+     the `start`/`end` time-range filter (corrected predicate + widened raw bound) and to
+     `add_cursor` calls (both `after`/`before`).
+   - `_ParameterizedQueryBuilder.add_cursor` gained `ts_expr`/`raw_widen_seconds` kwargs — when
+     `ts_expr != "timestamp"` it emits the tuple compare on the corrected expression plus a
+     separately-widened raw scalar bound (previously the raw bound reused the same `ts` param).
+   - `query()`: `ORDER BY` uses `eff`; `_normalize_event_row` now takes `source_offsets` and
+     shifts the presented `timestamp` (not `ingest_time`) by the row's source offset, skipping
+     sentinel rows.
+   - `iter_events()` (export streaming): same `ORDER BY eff` + `_normalize_event_row` offset
+     threading — **exports already get corrected timestamps for free** once callers pass
+     `source_offsets` on the `EventQuery`.
+   - `histogram()`: both the explicit-range and derived-range (WITH-CTE) branches bucket over
+     `eff` instead of bare `timestamp`; range min/max also computed over `eff`.
+5. **Tests** — `tests/test_queries.py`, 9 new tests appended after
+   `test_normalize_event_row_presents_sentinel_timestamp_as_null` (search for
+   `# W2 — per-source clock-skew correction`): byte-identical-SQL fast path, corrected
+   `ORDER BY`, widened raw bound on time filters, `_normalize_event_row` offset application +
+   sentinel skip + wrong-source no-op, histogram bucketing over `eff`. All pass
+   (`uv run pytest tests/test_queries.py -q --no-cov` → 97 passed).
+6. **`_resolve_timeline_scope` signature change** — `src/tracesignal/api/routers/events.py`
+   (~line 274): now returns a 3-tuple `(source_ids, field_mappings, source_offsets)` — the third
+   element is `{source_id: offset}` for ready sources with a *nonzero* offset, or `None`. All 9
+   call sites in `events.py` and the 1 in `viz.py` were mechanically updated via `sed` to unpack
+   three values (`source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(...)`)
+   — **the resulting `source_offsets` local is currently UNUSED at every call site**. Confirmed
+   this compiles and lints clean (`uv run ruff check` passes — unused-local isn't in the
+   configured rule set) so the tree is safe to leave mid-refactor, but it means **no endpoint
+   actually applies offsets yet** — the query-layer plumbing is ready and tested, the router
+   layer doesn't call it.
+
+### What's NOT done — exact resume point
+
+**Step A — thread `source_offsets` into every `EventQuery(...)` construction.** Five
+constructions need `source_offsets=source_offsets` added:
+`src/tracesignal/api/routers/events.py` lines ~631, ~764, ~991, ~1186 (search
+`EventQuery(` in that file) and `src/tracesignal/api/routers/viz.py` line ~98. Each of these
+functions already has `source_offsets` in scope from the now-updated `_resolve_timeline_scope`
+unpack (or needs to receive it as a parameter if it's a helper called after the unpack — check
+each call site's function signature).
+
+**Step B — thread `source_offsets` into every statistical detector call.** This is the
+largest remaining chunk. `src/tracesignal/db/anomaly_stats.py` detector methods take a
+`source_ids` parameter but no `source_offsets` yet; the module-level `_window_preds(windows,
+params)` (~line 352) and `_window_totals` (~line 1357) build baseline/suspect predicates
+directly against the bare `timestamp` column and need to route through
+`effective_ts_sql`/`bind_offset_params` from `db/_offsets.py` (same import as `queries.py`
+uses). Concretely:
+  - `_window_preds` needs a `source_offsets` param, must call `bind_offset_params` into the
+    passed `params` dict and build predicates against `effective_ts_sql(source_offsets)`
+    instead of the literal `"timestamp"` string baked into its f-strings (search for
+    `f"(timestamp >=` in that function).
+  - Every detector method (`find_value_novelty`, `find_value_combos`, `find_range_violations`,
+    `find_charset_novelty`, `find_entropy_outliers`, `find_proportion_shifts`,
+    `find_interval_periodicity`, `find_frequency_anomalies`) needs a new `source_offsets:
+    dict[str, int] | None = None` kwarg threaded down to every `_window_preds`/`_window_totals`
+    call it makes, plus any other bare `timestamp` reference in its own SQL (representative-event
+    `minIf(timestamp, ...)`/`argMinIf(event_id, timestamp, ...)` aggregates, bucket SQL in
+    `find_frequency_anomalies`, `get_timeline_range`/`get_timeline_midpoint` via
+    `query_timestamp_range` in `db/_buckets.py`).
+  - `find_order_violations` (`method="sequential"`, `lagInFrame` over raw `timestamp`
+    partitioned by `source_id`) is the one exception per the original design: keep its
+    `lagInFrame` on the RAW column (a uniform per-source offset doesn't change intra-source
+    ordering or skew deltas), and only shift the *reported* `timestamp`/`prev_timestamp` values
+    in Python before returning findings.
+  - `src/tracesignal/api/routers/events.py::_run_stat_detector` (search for the function) must
+    pass `source_offsets=source_offsets` into every `svc.find_*` call — it already receives
+    `source_ids`; add the new parameter alongside it, threaded from the `_resolve_timeline_scope`
+    tuple at each of the two callers (`list_anomalies`, `tag_anomalies`).
+
+**Step C — PATCH endpoint + audit.** `src/tracesignal/api/routers/cases.py`: add
+`SourceUpdate` Pydantic model (`time_offset_seconds: int`, bounds ±315_576_000 ≈ ±10y) and
+`PATCH /{case_id}/sources/{source_id}` calling the already-written
+`store.set_source_time_offset`; record an audit row (`action="source.update_offset"`,
+`detail={"previous": ..., "new": ...}`) — pattern at `admin.py` PATCH handlers (search
+`record_audit` calls there). 404 when the store setter returns `None`.
+
+**Step D — export + DetectorRun stamping.** `export_events` (events.py, search
+`async def export_events`): pass `source_offsets` on its `EventQuery`; extend the existing
+export audit-detail dict with `"applied_time_offsets"`; when any offset is active, prepend an
+export-metadata line (JSONL: `{"_meta": {...}}` first record; CSV: `# applied_time_offsets=...`
+comment before the header) — only when nonzero, so untouched exports stay byte-stable.
+`_persist_detector_run` (events.py): add `"source_offsets"` to the persisted `params` dict
+(same pattern as the existing `allowlist_hash` stamping).
+
+**Step E — frontend.** `frontend/src/api/types.ts` `Source` interface: add
+`time_offset_seconds: number`. `frontend/src/api/sources.ts`: add an `update()` call using the
+existing `patch` helper (`client.ts` already exports one — confirmed in original planning,
+re-verify it's still there). `frontend/src/components/sources/SourceList.tsx`: small "Clock
+offset…" edit affordance + a compact badge on rows with nonzero offset; invalidate
+sources/events/histogram queries on save.
+
+**Step F — L3 rider (independent, do anytime, zero risk).** Rename
+`analysisPanelWidth`/`setAnalysisPanelWidth` → `investigatePanelWidth`/`setInvestigatePanelWidth`
+in `frontend/src/stores/ui.ts` (bump persist `version` and add a migrate step carrying the old
+value forward), update the 4 usages in `components/analysis/InvestigatePanel.tsx`, fix stale
+`AnalysisPanel`/`BaselineManager` comment mentions in `pages/ExplorerPage.tsx` and
+`stores/scrollPosition.ts`.
+
+**Step G — full verification once A–F land.** `uv run alembic upgrade head` against a real
+Postgres (migration 0003 untested live); full `uv run pytest`; `uv run ruff check . && uv run
+ruff format .`; frontend `npm run typecheck && npm run lint && npm run test`; manual: two
+sources, set an offset on one, confirm grid interleaving + histogram shift, run a detector and
+inspect `DetectorRun.params`, export JSONL/CSV and check the metadata line, reset offset to 0
+and confirm export goes back to byte-stable + both audit rows exist.
+
+Original detailed design/plan (statistic formulas for the already-shipped interval_periodicity
+detector, full W2 step list) is in the approved plan file from this work session if still
+present under `~/.claude/plans/`; this PROGRESS entry is the authoritative resume pointer since
+that plan file is not part of the repo.
 
 ## Session 40 — 2026-07-09: interval_periodicity detector (D6+D7 merged)
 

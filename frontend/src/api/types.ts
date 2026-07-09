@@ -99,6 +99,11 @@ export interface Source {
   vector_count: number;
   /** Ingest lifecycle: "ingesting" sources are excluded from timeline queries until "ready". */
   status: "ingesting" | "ready";
+  /**
+   * Analyst-declared clock-skew correction in seconds (W2), applied at query
+   * time only — never mutates events. 0 for the vast majority of sources.
+   */
+  time_offset_seconds: number;
   created_by: string | null;
   created_at: string;
   updated_at: string;

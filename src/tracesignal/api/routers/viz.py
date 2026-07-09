@@ -84,7 +84,7 @@ async def _resolve_event_query(
     parsed_exclusion_modes = _parse_modes_object(exclusion_modes)
     _validate_field_regexes(parsed_filters, parsed_filter_modes)
     _validate_field_regexes(parsed_exclusions, parsed_exclusion_modes)
-    source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
+    source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
         case_id,
         source_ids,
@@ -115,6 +115,7 @@ async def _resolve_event_query(
         tags_include=tags_include_filter,
         tags_exclude=tags_exclude_filter,
         field_mappings=field_mappings,
+        source_offsets=source_offsets,
     )
 
 

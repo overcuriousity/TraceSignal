@@ -4,7 +4,7 @@
  * Panels:
  *   Left:   FilterRail (collapsible via toolbar toggle)
  *   Center: EventGrid (always visible)
- *   Right:  EventDetailPanel + AnalysisPanel (independently closeable)
+ *   Right:  EventDetailPanel + InvestigatePanel (independently closeable)
  *
  * All filter state lives in the URL so investigation links are shareable.
  * Filter-in / Filter-out from the detail panel adds directly to the URL.
@@ -393,7 +393,7 @@ export function ExplorerPage() {
   } = useBaselineStore();
   // Scroll position feeds TimelineHistogram only, via a store subscribed
   // solely by that component (C15) — not page state, so scrolling doesn't
-  // re-render EventGrid/FilterRail/AnalysisPanel on every row crossed.
+  // re-render EventGrid/FilterRail/InvestigatePanel on every row crossed.
   const setCurrentPositionTs = useScrollPositionStore((s) => s.setCurrentPositionTs);
   // Active baseline definition → histogram bands + detector windows. Fetched
   // here (once) so the histogram and detector views share one source of truth.

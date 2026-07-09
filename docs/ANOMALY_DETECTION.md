@@ -51,6 +51,16 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   presented as `null` by the API. Every aggregate/bucket over `timestamp`
   must exclude them via `TS_NOT_SENTINEL_SQL` — exactly where the old
   Nullable schema used `timestamp IS NOT NULL`.
+- **Per-source clock-skew offsets (W2) are honored.** When a source carries a
+  nonzero `time_offset_seconds`, every window predicate, bucket, representative
+  first-seen/last aggregate, and timeline-range query runs over the *effective*
+  (offset-corrected) timestamp via `effective_ts_sql` (`db/_offsets.py`), so
+  windows and cadences are judged on the corrected timeline. The applied offset
+  map is stamped into `DetectorRun.params` for reproducibility. The fast path
+  (no in-scope source has an offset) is byte-identical to pre-W2 SQL. The one
+  exception is **timestamp order**: its `lagInFrame` skew math stays on the raw
+  column (a uniform per-source shift cancels within a source), and only the
+  reported timestamps are shifted for display.
 
 ### Baseline definitions, suspect windows, and the normality model
 

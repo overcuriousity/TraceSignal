@@ -299,7 +299,7 @@ async def test_ingesting_source_excluded_from_timeline_scope(
     await store.add_source_to_timeline(case, default_timeline.id, "s_ready")
     await store.add_source_to_timeline(case, default_timeline.id, "s_pending")
 
-    source_ids, _ = await _resolve_timeline_scope(case, default_timeline.id)
+    source_ids, _, _ = await _resolve_timeline_scope(case, default_timeline.id)
     assert source_ids == ["s_ready"]
 
 

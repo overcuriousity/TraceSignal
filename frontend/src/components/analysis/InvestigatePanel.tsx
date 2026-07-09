@@ -107,20 +107,20 @@ export function InvestigatePanel({
   const showBanner = !hasVectors || (timeline?.is_stale ?? false);
 
   // ── Resize drag (mirrors EventDetailPanel) ─────────────────────────────
-  const { analysisPanelWidth, setAnalysisPanelWidth } = useUiStore();
+  const { investigatePanelWidth, setInvestigatePanelWidth } = useUiStore();
   const dragState = useRef<{ startX: number; startWidth: number } | null>(null);
   const onDragStart = useCallback(
     (e: React.MouseEvent) => {
       e.preventDefault();
-      dragState.current = { startX: e.clientX, startWidth: analysisPanelWidth };
+      dragState.current = { startX: e.clientX, startWidth: investigatePanelWidth };
     },
-    [analysisPanelWidth],
+    [investigatePanelWidth],
   );
   useEffect(() => {
     function onMouseMove(e: MouseEvent) {
       if (!dragState.current) return;
       const delta = dragState.current.startX - e.clientX;
-      setAnalysisPanelWidth(Math.max(320, Math.min(720, dragState.current.startWidth + delta)));
+      setInvestigatePanelWidth(Math.max(320, Math.min(720, dragState.current.startWidth + delta)));
     }
     function onMouseUp() {
       dragState.current = null;
@@ -131,12 +131,12 @@ export function InvestigatePanel({
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
     };
-  }, [setAnalysisPanelWidth]);
+  }, [setInvestigatePanelWidth]);
 
   return (
     <div
       className="relative flex h-full shrink-0 flex-col border-l border-[var(--color-border)] bg-[var(--color-bg-surface)]"
-      style={{ width: analysisPanelWidth }}
+      style={{ width: investigatePanelWidth }}
     >
       <div
         onMouseDown={onDragStart}

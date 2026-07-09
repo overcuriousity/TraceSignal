@@ -27,7 +27,11 @@ class _ChClient(Protocol):
 
 
 def query_timestamp_range(
-    client: _ChClient, database: str, where: str, parameters: dict[str, Any]
+    client: _ChClient,
+    database: str,
+    where: str,
+    parameters: dict[str, Any],
+    ts_expr: str = "timestamp",
 ) -> tuple[datetime | None, datetime | None]:
     """Return the (min, max) UTC timestamp for rows matching *where*.
 
@@ -36,9 +40,16 @@ def query_timestamp_range(
     any undated row matches, stretching every derived bucket interval.
     Returns ``(None, None)`` when there are no matching dated rows — callers
     are expected to short-circuit on that.
+
+    *ts_expr* is the timestamp expression to aggregate — pass the offset-
+    corrected effective-timestamp SQL (see ``db/_offsets.py``) so a per-source
+    clock-skew correction widens the derived range; callers passing it must
+    also have bound the offset arrays into *parameters*. The sentinel guard
+    always stays on the raw ``timestamp`` column (sentinel-ness is a physical
+    property, never shifted).
     """
     result = client.query(
-        f"SELECT min(timestamp), max(timestamp) FROM {database}.events "
+        f"SELECT min({ts_expr}), max({ts_expr}) FROM {database}.events "
         f"WHERE {where} AND {TS_NOT_SENTINEL_SQL}",
         parameters=parameters,
     )

@@ -38,8 +38,8 @@ async def _fake_source_ids(case_id: str, timeline_id: str) -> list[str]:
 
 async def _fake_scope(
     case_id: str, timeline_id: str
-) -> tuple[list[str], dict[str, list[str]] | None]:
-    return ["s1", "s2"], None
+) -> tuple[list[str], dict[str, list[str]] | None, dict[str, int] | None]:
+    return ["s1", "s2"], None, None
 
 
 @pytest.mark.asyncio

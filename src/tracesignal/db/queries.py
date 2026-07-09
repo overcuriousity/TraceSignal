@@ -6,7 +6,7 @@ import logging
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Literal
 
 from tracesignal.db._buckets import (
@@ -27,6 +27,11 @@ from tracesignal.db._dt import (
     ensure_utc_iso,
     is_null_ts_sentinel,
     to_clickhouse_utc,
+)
+from tracesignal.db._offsets import (
+    bind_offset_params,
+    effective_ts_sql,
+    offset_raw_bounds,
 )
 from tracesignal.db._scan import HEAVY_SCAN_SETTINGS
 from tracesignal.db.clickhouse import ClickHouseStore
@@ -164,6 +169,12 @@ class EventQuery:
     # attribute keys, applied at query time wherever a field token resolves
     # to SQL. None/empty means no mapping. See db/field_mappings.py.
     field_mappings: dict[str, list[str]] | None = None
+    # Per-source clock-skew correction (W2): source_id → offset seconds,
+    # applied at query time to the timestamp column wherever it is filtered,
+    # ordered, bucketed or returned. None/empty (the common case) keeps the
+    # generated SQL byte-identical to the un-offset path. Only nonzero
+    # offsets appear here. See effective_ts_expr and _dt.py's sentinel guard.
+    source_offsets: dict[str, int] | None = None
 
 
 def _iter_attr_items(attrs: Any) -> Iterator[tuple[str, Any]]:
@@ -239,7 +250,9 @@ def _glob_to_like(value: str) -> str:
     return _escape_like(value).replace("*", "%").replace("?", "_")
 
 
-def _normalize_event_row(row: dict[str, Any]) -> dict[str, Any]:
+def _normalize_event_row(
+    row: dict[str, Any], source_offsets: dict[str, int] | None = None
+) -> dict[str, Any]:
     """Attach an explicit UTC offset to timestamps and stringify `event_id`.
 
     The `events` table's `timestamp`/`ingest_time` columns have no explicit
@@ -257,6 +270,9 @@ def _normalize_event_row(row: dict[str, Any]) -> dict[str, Any]:
     themselves — e.g. export's annotation lookup keys its dict by `str`
     annotation `event_id`s and would silently miss every match otherwise.
     """
+    offset = 0
+    if source_offsets:
+        offset = source_offsets.get(str(row.get("source_id", "")), 0)
     for key in ("timestamp", "ingest_time"):
         value = row.get(key)
         if isinstance(value, datetime):
@@ -266,6 +282,12 @@ def _normalize_event_row(row: dict[str, Any]) -> dict[str, Any]:
             if key == "timestamp" and is_null_ts_sentinel(value):
                 row[key] = None
                 continue
+            # W2: apply the source's declared clock-skew correction to the
+            # *event* time only (never ingest_time, which is real wall-clock
+            # metadata), so the grid/exports show corrected times. Events stay
+            # unmodified in storage — this is a presentation-time shift.
+            if key == "timestamp" and offset:
+                value = value + timedelta(seconds=offset)
             row[key] = ensure_utc_iso(value)
     if "event_id" in row:
         row["event_id"] = str(row["event_id"])
@@ -539,8 +561,16 @@ class _ParameterizedQueryBuilder:
         clauses.append(f"arrayExists(v -> match(v, {{{name}:String}}), mapValues(attributes))")
         self.conditions.append("(" + " OR ".join(clauses) + ")")
 
-    def add_cursor(self, op: str, ts: datetime, event_id: str) -> None:
-        """Add a keyset predicate ``(timestamp, event_id) {op} (ts, event_id)``.
+    def add_cursor(
+        self,
+        op: str,
+        ts: datetime,
+        event_id: str,
+        *,
+        ts_expr: str = "timestamp",
+        raw_widen_seconds: int = 0,
+    ) -> None:
+        """Add a keyset predicate ``(ts_expr, event_id) {op} (ts, event_id)``.
 
         ClickHouse supports native tuple comparison, so ties at equal
         timestamps are broken by ``event_id`` in a single comparison — exactly
@@ -567,14 +597,32 @@ class _ParameterizedQueryBuilder:
         time with no anchor event) and is mapped to :data:`_MIN_EVENT_ID`,
         the lowest possible UUID, so it keeps sorting before every real
         event at that timestamp.
+
+        When a per-source clock offset is in scope (W2), *ts_expr* is the
+        offset-corrected timestamp expression and *ts* is a corrected value
+        (cursors round-trip the value the previous page displayed). The tuple
+        compare then runs on the corrected key, and the redundant scalar bound
+        is applied to the *raw* column widened by *raw_widen_seconds* — the
+        raw timestamp can differ from the corrected one by at most that much,
+        so the widened bound stays a superset (correctness) while still letting
+        the primary index prune granules (the whole point of the scalar bound).
         """
         ts_name = self._param_name()
         id_name = self._param_name()
         scalar_op = "<=" if op == "<" else ">="
-        self.conditions.append(
-            f"(timestamp, event_id) {op} ({{{ts_name}:DateTime64(3)}}, {{{id_name}:UUID}})"
-            f" AND timestamp {scalar_op} {{{ts_name}:DateTime64(3)}}"
-        )
+        tuple_cond = f"({ts_expr}, event_id) {op} ({{{ts_name}:DateTime64(3)}}, {{{id_name}:UUID}})"
+        if ts_expr == "timestamp":
+            self.conditions.append(
+                f"{tuple_cond} AND timestamp {scalar_op} {{{ts_name}:DateTime64(3)}}"
+            )
+        else:
+            raw_name = self._param_name()
+            self.conditions.append(
+                f"{tuple_cond} AND timestamp {scalar_op} {{{raw_name}:DateTime64(3)}}"
+            )
+            self.parameters[raw_name] = to_clickhouse_utc(
+                ts - timedelta(seconds=raw_widen_seconds), precise=True
+            )
         self.parameters[ts_name] = to_clickhouse_utc(ts, precise=True)
         self.parameters[id_name] = event_id or _MIN_EVENT_ID
 
@@ -618,6 +666,14 @@ class EventQueryService:
         builder = _ParameterizedQueryBuilder(field_mappings=query.field_mappings)
         builder.add_param("case_id = :name", query.case_id)
 
+        # Per-source clock-skew correction (W2). Bind the source→offset arrays
+        # once so both this WHERE clause and the caller's ORDER BY / bucketing
+        # can reference the same effective-ts expression; `eff` is the bare
+        # column (byte-identical fast path) when no in-scope source is offset.
+        bind_offset_params(query.source_offsets, builder.parameters)
+        eff = effective_ts_sql(query.source_offsets)
+        max_off, min_off = offset_raw_bounds(query.source_offsets)
+
         if query.source_ids is not None:
             builder.add_in_list("source_id", query.source_ids)
 
@@ -658,15 +714,28 @@ class EventQueryService:
 
         if query.start is not None:
             builder.add_param(
-                "timestamp >= :name",
+                f"{eff} >= :name",
                 to_clickhouse_utc(query.start),
             )
+            if eff != "timestamp":
+                # Widened raw-column bound so the primary index still prunes
+                # under the effective-ts filter — a superset, never changing
+                # results (see offset_raw_bounds).
+                builder.add_param(
+                    "timestamp >= :name",
+                    to_clickhouse_utc(query.start - timedelta(seconds=max_off)),
+                )
 
         if query.end is not None:
             builder.add_param(
-                "timestamp <= :name",
+                f"{eff} <= :name",
                 to_clickhouse_utc(query.end),
             )
+            if eff != "timestamp":
+                builder.add_param(
+                    "timestamp <= :name",
+                    to_clickhouse_utc(query.end - timedelta(seconds=min_off)),
+                )
 
         if query.start is not None or query.end is not None:
             # A time-range filter must never match sentinel (no-timestamp)
@@ -689,12 +758,16 @@ class EventQueryService:
         if query.after is not None:
             ts, event_id = query.after
             op = "<" if query.order == "desc" else ">"
-            builder.add_cursor(op, ts, event_id)
+            builder.add_cursor(
+                op, ts, event_id, ts_expr=eff, raw_widen_seconds=(min_off if op == "<" else max_off)
+            )
 
         if query.before is not None:
             ts, event_id = query.before
             op = ">" if query.order == "desc" else "<"
-            builder.add_cursor(op, ts, event_id)
+            builder.add_cursor(
+                op, ts, event_id, ts_expr=eff, raw_widen_seconds=(min_off if op == "<" else max_off)
+            )
 
         for key, values in (query.field_filters or {}).items():
             builder.add_field_filter(key, values, mode=(query.filter_modes or {}).get(key, "exact"))
@@ -746,12 +819,18 @@ class EventQueryService:
         # bounded by the page's timestamp range so the primary index prunes
         # the hydration scan too. One-phase SELECT * was measured at
         # 187 GiB read per page on a 300M-row case.
+        # W2: order by the offset-corrected timestamp when any in-scope source
+        # is skewed (bare `timestamp` otherwise, keeping the read-in-order fast
+        # path). Phase-1 still selects the *raw* timestamp for hydration
+        # bounding; the corrected value only drives ordering and the cursor
+        # (built from the presented, corrected rows below).
+        eff = effective_ts_sql(query.source_offsets)
         fetch_limit = query.limit + 1 if cursor_mode else query.limit
         sql = f"""
             SELECT event_id, timestamp
             FROM {database}.events
             WHERE {where}
-            ORDER BY timestamp {fetch_dir}, event_id {fetch_dir}
+            ORDER BY {eff} {fetch_dir}, event_id {fetch_dir}
             LIMIT {fetch_limit}
         """
         if not cursor_mode:
@@ -796,7 +875,10 @@ class EventQueryService:
             # there's no cursor-side limit+1 trick to lean on here.
             has_more_after = (query.offset + len(rows)) < total
 
-        events = [_normalize_event_row(dict(zip(columns, row, strict=False))) for row in rows]
+        events = [
+            _normalize_event_row(dict(zip(columns, row, strict=False)), query.source_offsets)
+            for row in rows
+        ]
         if query.before is not None:
             events.reverse()
 
@@ -884,6 +966,7 @@ class EventQueryService:
         where, parameters = self._build_where(query)
         database = self.store.database
         sort_dir = query.order.upper()
+        eff = effective_ts_sql(query.source_offsets)
         offset = 0
 
         while True:
@@ -892,7 +975,7 @@ class EventQueryService:
                 SELECT {_EVENT_SELECT_COLUMNS}
                 FROM {database}.events
                 WHERE {where}
-                ORDER BY timestamp {sort_dir}, event_id
+                ORDER BY {eff} {sort_dir}, event_id
                 LIMIT {batch_size}
                 OFFSET {offset}
                 """,
@@ -901,7 +984,9 @@ class EventQueryService:
             columns = result.column_names
             rows = result.result_rows
             for row in rows:
-                yield _normalize_event_row(dict(zip(columns, row, strict=False)))
+                yield _normalize_event_row(
+                    dict(zip(columns, row, strict=False)), query.source_offsets
+                )
             if len(rows) < batch_size:
                 break
             offset += batch_size
@@ -1307,6 +1392,10 @@ class EventQueryService:
         self.store.init_schema()
         where, parameters = self._build_where(query)
         database = self.store.database
+        # W2: bucket and range over the offset-corrected timestamp (bare
+        # `timestamp` when no in-scope source is skewed). The sentinel guard
+        # stays on the raw column — sentinel rows are never shifted.
+        eff = effective_ts_sql(query.source_offsets)
 
         if query.start is not None and query.end is not None:
             # Explicit range: no range scan needed, single bucket query.
@@ -1315,7 +1404,7 @@ class EventQueryService:
             interval = bucket_interval_seconds(min_ts, max_ts, buckets)
             bucket_result = self.store.client.query(
                 f"""
-                SELECT toStartOfInterval(timestamp, INTERVAL {interval} second) AS bucket,
+                SELECT toStartOfInterval({eff}, INTERVAL {interval} second) AS bucket,
                        count() AS c
                 FROM {database}.events
                 WHERE {where} AND {TS_NOT_SENTINEL_SQL}
@@ -1347,14 +1436,14 @@ class EventQueryService:
         result = self.store.client.query(
             f"""
             WITH (
-                SELECT (min(timestamp), max(timestamp))
+                SELECT (min({eff}), max({eff}))
                 FROM {database}.events
                 WHERE {where} AND {TS_NOT_SENTINEL_SQL}
             ) AS rng,
             greatest(
                 1, intDiv(toUnixTimestamp(rng.2) - toUnixTimestamp(rng.1), {int(buckets)})
             ) AS iv
-            SELECT toDateTime(intDiv(toUnixTimestamp(timestamp), iv) * iv) AS bucket,
+            SELECT toDateTime(intDiv(toUnixTimestamp({eff}), iv) * iv) AS bucket,
                    count() AS c,
                    any(iv) AS interval_seconds,
                    any(rng.1) AS min_ts,

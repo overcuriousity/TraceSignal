@@ -1,4 +1,4 @@
-import { del, get, postForm } from "./client";
+import { del, get, patch, postForm } from "./client";
 import type {
   EmbeddingFieldsResponse,
   Source,
@@ -23,6 +23,12 @@ export const sourcesApi = {
 
   delete: (caseId: string, sourceId: string) =>
     del<{ deleted: boolean }>(`/cases/${caseId}/sources/${sourceId}`),
+
+  /** Set a source's query-time clock-skew correction (W2), in seconds. */
+  update: (caseId: string, sourceId: string, timeOffsetSeconds: number) =>
+    patch<{ source: Source }>(`/cases/${caseId}/sources/${sourceId}`, {
+      time_offset_seconds: timeOffsetSeconds,
+    }).then((r) => r.source),
 
   upload: (
     caseId: string,

@@ -6,11 +6,12 @@ All tests use fakes/mocks for ClickHouse so they run without external services.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import numpy as np
 
+from tracesignal.db._offsets import OFFSET_SRC_PARAM, OFFSET_VAL_PARAM
 from tracesignal.db.anomaly_stats import (
     AnalysisWindows,
     FreqFinding,
@@ -26,6 +27,8 @@ from tracesignal.db.anomaly_stats import (
     _g_statistic,
     _greenwood_p,
     _poisson_rate_g,
+    _window_preds,
+    effective_ts_sql,
     windows_from_split,
 )
 
@@ -3034,3 +3037,199 @@ def test_interval_sql_partitions_deltas_within_windows():
     # Baseline-only (silent) values must survive; first-seen must not.
     assert "HAVING w0_n >= 1" in candidate_sql
     assert "{b0:String}" in candidate_sql and "{b1:String}" in candidate_sql
+
+
+# ---------------------------------------------------------------------------
+# W2 — per-source clock-skew correction (offset-corrected effective timestamp)
+# ---------------------------------------------------------------------------
+
+
+def _w2_windows() -> AnalysisWindows:
+    return _one_suspect(
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2024, 1, 2, tzinfo=UTC),
+        datetime(2024, 1, 2, tzinfo=UTC),
+        datetime(2024, 1, 3, tzinfo=UTC),
+    )
+
+
+def test_window_preds_fast_path_is_bare_timestamp():
+    """No active offset → predicates are byte-identical to the pre-W2 form and
+    no offset params are bound (keeps ClickHouse's primary-index path intact)."""
+    params: dict[str, Any] = {}
+    bp, sps = _window_preds(_w2_windows(), params, None)
+    assert bp == "(timestamp >= {b0:String} AND timestamp < {b1:String})"
+    assert sps == ["(timestamp >= {w0s:String} AND timestamp < {w0e:String})"]
+    assert OFFSET_SRC_PARAM not in params and OFFSET_VAL_PARAM not in params
+
+
+def test_window_preds_offset_path_uses_effective_ts_and_binds_arrays():
+    """An active offset rewrites the predicates over the effective-ts expression
+    and binds the parallel source/offset arrays consumed by transform()."""
+    params: dict[str, Any] = {}
+    offsets = {"s1": 3600}
+    bp, sps = _window_preds(_w2_windows(), params, offsets)
+    eff = effective_ts_sql(offsets)
+    assert eff != "timestamp"
+    assert bp == f"({eff} >= {{b0:String}} AND {eff} < {{b1:String}})"
+    assert sps == [f"({eff} >= {{w0s:String}} AND {eff} < {{w0e:String}})"]
+    assert params[OFFSET_SRC_PARAM] == ["s1"]
+    assert params[OFFSET_VAL_PARAM] == [3600]
+
+
+def test_value_novelty_temporal_fast_path_binds_no_offset_params():
+    """A zero/absent offset map leaves every query's params free of the offset
+    arrays — the byte-identical fast path detectors share with the query layer."""
+    responses = [
+        FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(1000, 10)], column_names=["bl", "w0"]),
+        FakeQueryResult(result_rows=[], column_names=[]),
+    ]
+    svc = _svc(responses)
+    svc.find_value_novelty("c1", ["s1"], fields=["artifact"], windows=_w2_windows())
+    assert all(OFFSET_SRC_PARAM not in p for p in svc.ch.client._all_parameters)
+
+
+def test_value_novelty_temporal_offset_uses_effective_ts():
+    """With an offset, the temporal scan's representative aggregates and window
+    predicates are built over the effective timestamp and the arrays are bound."""
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(1000, 10)], column_names=["bl", "w0"]),
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_value_novelty(
+        "c1", ["s1"], fields=["artifact"], windows=_w2_windows(), source_offsets={"s1": 3600}
+    )
+    scan_sql = client.full_queries[2]
+    assert "addSeconds(timestamp, transform(source_id" in scan_sql
+    assert "minIf(if(" in scan_sql  # minIf over the effective-ts expression
+    assert any(p.get(OFFSET_VAL_PARAM) == [3600] for p in client._all_parameters)
+
+
+def test_range_violations_offset_projects_source_id_in_subquery():
+    """The effective-ts expression references source_id, so the numeric
+    subqueries must project it — otherwise the outer window predicate / min()
+    would reference an out-of-scope column."""
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            # baseline stat (min/max/n)
+            FakeQueryResult(result_rows=[(0.0, 100.0, 500)], column_names=["lo", "hi", "n"]),
+            # violations
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_range_violations(
+        "c1", ["s1"], fields=["attr:bytes"], windows=_w2_windows(), source_offsets={"s1": -120}
+    )
+    stat_sql = client.full_queries[1]
+    viol_sql = client.full_queries[2]
+    # source_id projected into the inner num subqueries (fast path omits it).
+    assert "AS num, timestamp, source_id" in stat_sql
+    assert "source_id" in viol_sql
+    assert "addSeconds(timestamp, transform(source_id" in stat_sql
+    assert any(p.get(OFFSET_VAL_PARAM) == [-120] for p in client._all_parameters)
+
+
+def test_frequency_self_baseline_offset_buckets_effective_ts():
+    """Self-baseline bucketing runs over the effective timestamp so a skewed
+    source's events land in their corrected bucket."""
+    client = RecordingClient(
+        [
+            # timeline range (min, max)
+            FakeQueryResult(
+                result_rows=[(datetime(2024, 1, 1), datetime(2024, 1, 3))],
+                column_names=["min", "max"],
+            ),
+            # bucket scan
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_frequency_anomalies("c1", ["s1"], series_field="artifact", source_offsets={"s1": 3600})
+    range_sql = client.full_queries[0]
+    bucket_sql = client.full_queries[1]
+    assert "min(if(" in range_sql  # range over effective-ts
+    assert "toStartOfInterval(if(" in bucket_sql
+    assert any(p.get(OFFSET_SRC_PARAM) == ["s1"] for p in client._all_parameters)
+
+
+def test_get_timeline_range_offset_uses_effective_ts():
+    client = RecordingClient(
+        [
+            FakeQueryResult(
+                result_rows=[(datetime(2024, 1, 1), datetime(2024, 1, 3))], column_names=[]
+            )
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.get_timeline_range("c1", ["s1"], source_offsets={"s1": 3600})
+    sql = client.full_queries[0]
+    assert "min(if(" in sql and "max(if(" in sql
+    assert client._all_parameters[0].get(OFFSET_VAL_PARAM) == [3600]
+
+
+def test_order_violations_offset_shifts_reported_timestamps_only():
+    """The skew math stays on the raw column (offset cancels within a source);
+    only the reported timestamp/prev_timestamp are shifted for presentation."""
+    ts = datetime(2024, 1, 1, 12, 0, 5, tzinfo=UTC)
+    prev = datetime(2024, 1, 1, 12, 1, 5, tzinfo=UTC)
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[("s1", 1, 60.0)],
+                column_names=["source_id", "n_viol", "max_skew"],
+            ),
+            FakeQueryResult(
+                result_rows=[("s1", "evt-a", ts, prev, 60.0, 100, 3, "record a")],
+                column_names=[
+                    "source_id",
+                    "event_id",
+                    "timestamp",
+                    "prev_ts",
+                    "skew",
+                    "byte_offset",
+                    "line_number",
+                    "message",
+                ],
+            ),
+        ]
+    )
+    result = svc.find_order_violations(
+        "c1", ["s1"], min_skew_seconds=1.0, source_offsets={"s1": 3600}
+    )
+    f = result.results[0]
+    assert f.timestamp == (ts + timedelta(hours=1)).isoformat()
+    assert f.prev_timestamp == (prev + timedelta(hours=1)).isoformat()
+    # Skew delta is invariant to a uniform per-source shift.
+    assert f.skew_seconds == 60.0
+
+
+def test_interval_periodicity_offset_uses_effective_ts_for_gaps():
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(1500,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(1000, 500)], column_names=["bl", "w0"]),
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_interval_periodicity(
+        "c1", ["s1"], fields=["attr:service"], windows=_w2_windows(), source_offsets={"s1": 3600}
+    )
+    candidate_sql = client.full_queries[2]
+    # ts (the lag/gap column) is the effective timestamp, so gaps are computed
+    # on the corrected timeline.
+    assert "addSeconds(timestamp, transform(source_id" in candidate_sql
+    assert "AS ts" in candidate_sql

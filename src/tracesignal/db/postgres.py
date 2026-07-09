@@ -109,6 +109,17 @@ class Source(Base):
     status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="ready", server_default="ready"
     )
+    # Analyst-declared clock-skew correction (W2), in seconds. Applied at
+    # QUERY TIME to this source's event timestamps across explorer, histogram,
+    # detectors and exports — the ingested events are never mutated (evidence
+    # stays raw; the offset is declared metadata that appears in the audit
+    # trail and export output). A compromised/misconfigured host whose clock
+    # drifts would otherwise lie in the merged master timeline. Positive shifts
+    # this source's events later. See db/queries.py::effective_ts_expr and
+    # docs/ROADMAP.md W2.
+    time_offset_seconds: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
 
     @property
     def is_ready(self) -> bool:
@@ -151,6 +162,7 @@ class Source(Base):
             "event_count": self.event_count,
             "vector_count": self.vector_count,
             "status": self.status,
+            "time_offset_seconds": self.time_offset_seconds,
             "created_by": self.created_by,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
@@ -1281,6 +1293,26 @@ class PostgresStore:
                 .values(status=status, updated_at=datetime.now(UTC))
             )
             await session.commit()
+
+    async def set_source_time_offset(
+        self, case_id: str, source_id: str, seconds: int
+    ) -> Source | None:
+        """Set a source's analyst-declared clock-skew correction (W2).
+
+        Applied at query time only — never mutates events. Returns the updated
+        Source (detached) so the caller can audit the previous vs new value and
+        serialize the row, or ``None`` when no such source exists.
+        """
+        async with self.session_factory() as session:
+            source = await session.get(Source, source_id)
+            if source is None or source.case_id != case_id:
+                return None
+            source.time_offset_seconds = seconds
+            source.updated_at = datetime.now(UTC)
+            await session.commit()
+            await session.refresh(source)
+            session.expunge(source)
+            return source
 
     async def source_hash_in_use(self, file_hash: str, *, exclude_source_id: str) -> bool:
         """Whether any *other* source row (in any case) still has this file hash.
