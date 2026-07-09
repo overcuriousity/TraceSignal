@@ -14,23 +14,23 @@ import { Input } from "@/components/ui/Input";
 import { SegmentedControl } from "@/components/ui/SegmentedControl";
 import { fmtBytes } from "@/lib/format";
 
-function CopyPromptButton() {
+function CopyPromptButton({ prompt, label }: { prompt: string; label: string }) {
   const [copied, setCopied] = useState(false);
 
   const copy = async () => {
     try {
-      await navigator.clipboard.writeText(guidance.converters.llmPrompt);
+      await navigator.clipboard.writeText(prompt);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {
-      window.prompt("Copy the prompt below:", guidance.converters.llmPrompt);
+      window.prompt("Copy the prompt below:", prompt);
     }
   };
 
   return (
     <Button variant="outline" size="sm" onClick={copy}>
       {copied ? <Check size={13} /> : <Clipboard size={13} />}
-      {copied ? "Copied" : "Copy LLM prompt"}
+      {copied ? "Copied" : label}
     </Button>
   );
 }
@@ -145,7 +145,17 @@ export function ParserDownloadsPanel() {
             <p className="text-[11px] leading-relaxed text-[var(--color-fg-muted)]">
               {guidance.converters.hint}
             </p>
-            <CopyPromptButton />
+            {mode === "optimized" ? (
+              <CopyPromptButton
+                prompt={guidance.converters.llmPromptParquet}
+                label="Copy LLM prompt (Parquet)"
+              />
+            ) : (
+              <CopyPromptButton
+                prompt={guidance.converters.llmPromptCsv}
+                label="Copy LLM prompt (CSV/JSONL)"
+              />
+            )}
           </div>
         </div>
       </div>
