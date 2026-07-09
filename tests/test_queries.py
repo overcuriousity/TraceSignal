@@ -262,6 +262,104 @@ def test_normalize_event_row_presents_sentinel_timestamp_as_null() -> None:
     assert normalized["ingest_time"] == "2024-01-01T12:00:00+00:00"
 
 
+# ---------------------------------------------------------------------------
+# W2 — per-source clock-skew correction (query time)
+# ---------------------------------------------------------------------------
+
+
+def test_zero_offset_map_keeps_sql_byte_identical(service: EventQueryService) -> None:
+    """An all-zero/empty offset map must not change the generated SQL at all."""
+    service.query(EventQuery(case_id="case-1", source_ids=["s1"], source_offsets={"s1": 0}))
+    query, params = _last_query(service)
+    # Fast path: bare column in ORDER BY, no offset expression or params.
+    assert "ORDER BY timestamp DESC" in query
+    assert "addSeconds" not in query
+    assert "transform(source_id" not in query
+    assert not any(k.startswith("clk_off") for k in (params or {}))
+
+
+def test_active_offset_orders_by_corrected_timestamp(service: EventQueryService) -> None:
+    service.query(EventQuery(case_id="case-1", source_ids=["s1", "s2"], source_offsets={"s2": 3600}))
+    query, params = _last_query(service)
+    # Ordering (and the cursor, when present) run on the corrected timestamp.
+    assert "addSeconds(timestamp, transform(source_id" in query
+    assert "ORDER BY if(" in query
+    assert params["clk_off_src"] == ["s2"]
+    assert params["clk_off_val"] == [3600]
+    # The sentinel is never shifted — the correction is gated on it.
+    assert TS_NOT_SENTINEL_SQL in query
+
+
+def test_active_offset_time_filter_widens_raw_bound(service: EventQueryService) -> None:
+    """The corrected time filter carries a widened raw-column bound for pruning."""
+    start = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+    end = datetime(2024, 1, 2, 12, 0, 0, tzinfo=UTC)
+    service.query(
+        EventQuery(
+            case_id="case-1",
+            source_ids=["s1"],
+            source_offsets={"s1": 3600},
+            start=start,
+            end=end,
+        )
+    )
+    query, params = _last_query(service)
+    # Corrected-ts predicate on the effective expression.
+    assert "if(" in query and ">= {p" in query
+    # Widened raw bounds: lower = start - max_off (1h earlier), upper =
+    # end - min_off (min_off = 0 here, so unchanged).
+    assert "2024-01-01 11:00:00" in params.values()
+    assert "2024-01-02 12:00:00" in params.values()
+
+
+def test_normalize_event_row_applies_source_offset() -> None:
+    row = {
+        "event_id": "e1",
+        "source_id": "s2",
+        "timestamp": datetime(2024, 1, 1, 12, 0, 0),
+        "ingest_time": datetime(2024, 1, 1, 12, 0, 0),
+    }
+    normalized = _normalize_event_row(row, {"s2": 3600})
+    # Event time shifts +1h; ingest_time (real wall-clock metadata) does not.
+    assert normalized["timestamp"] == "2024-01-01T13:00:00+00:00"
+    assert normalized["ingest_time"] == "2024-01-01T12:00:00+00:00"
+
+
+def test_normalize_event_row_offset_skips_sentinel() -> None:
+    sentinel_naive = NULL_TS_SENTINEL.replace(tzinfo=None)
+    row = {"event_id": "e1", "source_id": "s2", "timestamp": sentinel_naive}
+    normalized = _normalize_event_row(row, {"s2": 3600})
+    # A shifted sentinel would leak a fake date — must stay null.
+    assert normalized["timestamp"] is None
+
+
+def test_normalize_event_row_offset_only_its_source() -> None:
+    row = {
+        "event_id": "e1",
+        "source_id": "s1",
+        "timestamp": datetime(2024, 1, 1, 12, 0, 0),
+    }
+    # s1 has no offset in the map — untouched.
+    normalized = _normalize_event_row(row, {"s2": 3600})
+    assert normalized["timestamp"] == "2024-01-01T12:00:00+00:00"
+
+
+def test_histogram_buckets_over_corrected_timestamp() -> None:
+    svc = EventQueryService(store=FakeClickHouseStore())
+    svc.histogram(
+        EventQuery(
+            case_id="case-1",
+            source_ids=["s1"],
+            source_offsets={"s1": 3600},
+            start=datetime(2024, 1, 1, tzinfo=UTC),
+            end=datetime(2024, 1, 2, tzinfo=UTC),
+        )
+    )
+    query, _ = svc.store.client.queries[-1]
+    assert "toStartOfInterval(if(" in query
+    assert "addSeconds(timestamp, transform(source_id" in query
+
+
 def test_top_level_field_filter_uses_column(service: EventQueryService) -> None:
     service.query(
         EventQuery(

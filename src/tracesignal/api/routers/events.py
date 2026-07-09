@@ -273,13 +273,20 @@ def _uses_regex(q_regex: bool, *mode_maps: dict[str, str]) -> bool:
 
 async def _resolve_timeline_scope(
     case_id: str, timeline_id: str
-) -> tuple[list[str], dict[str, list[str]] | None]:
-    """Return a timeline's *ready* source IDs plus its field mappings (issue #10).
+) -> tuple[list[str], dict[str, list[str]] | None, dict[str, int] | None]:
+    """Return a timeline's *ready* source IDs, field mappings, and clock offsets.
 
     Every endpoint whose parameters carry field tokens (filters, group-bys,
     detector fields, exports) must resolve through this so canonical mapped
-    fields work uniformly; endpoints that never see a field token can keep
-    using :func:`_resolve_timeline_source_ids`.
+    fields (issue #10) and per-source clock-skew corrections (W2) both apply
+    uniformly; endpoints that never see a field token can keep using
+    :func:`_resolve_timeline_source_ids`.
+
+    The third element is the ``{source_id: time_offset_seconds}`` map of every
+    ready source with a *nonzero* declared offset (``None`` when none is set —
+    the common case, which keeps the query path on its byte-identical fast
+    path). Applied at query time to explorer, histogram, export and detectors;
+    the ingested events are never mutated.
 
     Sources still being ingested (``status != "ready"``) are excluded here —
     this is the single choke point that keeps half-ingested files out of the
@@ -293,12 +300,14 @@ async def _resolve_timeline_scope(
     if timeline is None:
         raise HTTPException(status_code=404, detail="Timeline not found")
     sources = await store.list_timeline_sources(case_id, timeline_id)
-    return [s.id for s in sources if s.is_ready], timeline.field_mappings or None
+    ready = [s for s in sources if s.is_ready]
+    offsets = {s.id: s.time_offset_seconds for s in ready if s.time_offset_seconds} or None
+    return [s.id for s in ready], timeline.field_mappings or None, offsets
 
 
 async def _resolve_timeline_source_ids(case_id: str, timeline_id: str) -> list[str]:
     """Return the source IDs attached to a timeline."""
-    source_ids, _ = await _resolve_timeline_scope(case_id, timeline_id)
+    source_ids, _, _ = await _resolve_timeline_scope(case_id, timeline_id)
     return source_ids
 
 
@@ -588,7 +597,7 @@ async def list_events(
     if after_cursor is not None and before_cursor is not None:
         raise HTTPException(status_code=400, detail="Cannot set both 'after' and 'before' cursors")
 
-    source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
+    source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     if event_id:
         # A specific event_id short-circuits the annotated/tags_include/ids
         # resolution entirely — those filters are irrelevant once the caller
@@ -735,7 +744,7 @@ async def bulk_annotate_by_filter(
     _validate_field_regexes(parsed_filters, parsed_filter_modes)
     _validate_field_regexes(parsed_exclusions, parsed_exclusion_modes)
 
-    source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
+    source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
         case_id,
         source_ids,
@@ -831,7 +840,7 @@ async def list_fields(
     """
     from tracesignal.enrichers.registry import all_enrichers
 
-    source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
+    source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     stats = await ensure_source_field_stats(
         get_store(), _get_query_service().store, case_id, source_ids
     )
@@ -963,7 +972,7 @@ async def get_histogram(
     parsed_exclusion_modes = _parse_modes_object(exclusion_modes)
     _validate_field_regexes(parsed_filters, parsed_filter_modes)
     _validate_field_regexes(parsed_exclusions, parsed_exclusion_modes)
-    source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
+    source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
         case_id,
         source_ids,
@@ -1157,7 +1166,7 @@ async def export_events(
                 )
     _validate_field_regexes(body.filter.fields, body.filter.field_modes)
     _validate_field_regexes(body.filter.exclude, body.filter.exclude_modes)
-    source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
+    source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
         case_id,
         source_ids,
@@ -1774,7 +1783,7 @@ async def list_anomaly_fields(
     - ``kind``        — ``"categorical"`` | ``"constant"`` | ``"identifier"`` | ``"sparse"``.
     - ``recommended`` — ``true`` when the field is suitable for novelty detection.
     """
-    source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
+    source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     svc = _get_stat_anomaly_service()
     inventory, total = await _resolve_field_inventory(
         svc, get_store(), case_id, source_ids, field_mappings
@@ -1808,7 +1817,7 @@ async def list_numeric_anomaly_fields(
     field's non-empty values that parse as a number). Candidate inventory comes
     from the per-source stats cache; the numeric probe is a single live query.
     """
-    source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
+    source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     svc = _get_stat_anomaly_service()
     stats = await ensure_source_field_stats(get_store(), svc.ch, case_id, source_ids)
     inventory, total = merged_inventory(stats, field_mappings)
@@ -2067,7 +2076,7 @@ async def list_anomalies(
     suspiciously regular (Greenwood spacing test, beaconing). Temporal-only;
     BH-FDR across the run.
     """
-    source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
+    source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     result, resolution = await _run_stat_detector(
         case_id,
         timeline_id,
@@ -2208,7 +2217,7 @@ async def tag_anomalies(
     Returns the same shape as ``GET /anomalies`` plus a ``tagged`` count.
     """
     store = get_store()
-    source_ids, field_mappings = await _resolve_timeline_scope(case_id, timeline_id)
+    source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     result, resolution = await _run_stat_detector(
         case_id,
         timeline_id,
