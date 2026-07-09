@@ -17,7 +17,14 @@ function EmbeddingStatusBadge({ caseId }: { caseId: string }) {
   const { data: sources } = useQuery({
     queryKey: ["sources", caseId],
     queryFn: () => sourcesApi.list(caseId),
-    refetchInterval: 15_000,
+    // Only poll while an embedding could still be in flight; once every
+    // source is embedded there is nothing to watch — a new upload
+    // invalidates ["sources", caseId] and restarts the interval.
+    refetchInterval: (query) => {
+      const data = query.state.data;
+      if (!data || data.length === 0) return false;
+      return data.every((s) => s.vector_count > 0) ? false : 15_000;
+    },
   });
 
   if (!sources || sources.length === 0) return null;

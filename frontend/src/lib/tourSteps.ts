@@ -86,7 +86,7 @@ export const TOUR_STEPS: TourStep[] = [
     routePattern: CASE,
     selector: '[data-tour="upload-log"]',
     side: "bottom",
-    title: "Ingest a log file",
+    title: "Upload your data",
     body: "Click Upload Data to add your first source. TraceSignal ingests Timesketch-compatible CSV, JSONL, and Parquet files.",
     advance: { type: "event", name: "upload-dialog-opened" },
     hideWhileTriggerOpen: true,

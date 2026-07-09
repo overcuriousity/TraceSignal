@@ -23,7 +23,14 @@ export function CaseJobsPanel({ caseId }: Props) {
   const { data: jobs, isLoading } = useQuery({
     queryKey: ["case-jobs", caseId],
     queryFn: () => jobsApi.listByCase(caseId),
-    refetchInterval: 5000,
+    // Poll briskly while anything is in flight; back off (rather than stop)
+    // once everything is terminal — another analyst may start a job on this
+    // case at any time and shared visibility is the point of this panel.
+    refetchInterval: (query) => {
+      const data = query.state.data;
+      const active = data?.some((j) => j.status === "queued" || j.status === "running");
+      return active ? 5000 : 30_000;
+    },
     refetchIntervalInBackground: false,
   });
 
