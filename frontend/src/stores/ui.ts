@@ -36,9 +36,9 @@ interface UiState {
   detailPanelWidth: number;
   setDetailPanelWidth: (w: number) => void;
 
-  /** Width of the analysis panel in pixels. */
-  analysisPanelWidth: number;
-  setAnalysisPanelWidth: (w: number) => void;
+  /** Width of the investigate panel in pixels. */
+  investigatePanelWidth: number;
+  setInvestigatePanelWidth: (w: number) => void;
 
   /** Persisted event grid column widths (px), keyed by column id. */
   columnWidths: Record<string, number>;
@@ -102,8 +102,8 @@ export const useUiStore = create<UiState>()(
       detailPanelWidth: 420,
       setDetailPanelWidth: (w) => set({ detailPanelWidth: w }),
 
-      analysisPanelWidth: 400,
-      setAnalysisPanelWidth: (w) => set({ analysisPanelWidth: w }),
+      investigatePanelWidth: 400,
+      setInvestigatePanelWidth: (w) => set({ investigatePanelWidth: w }),
 
       columnWidths: {},
       setColumnWidth: (id, width) =>
@@ -111,7 +111,7 @@ export const useUiStore = create<UiState>()(
     }),
     {
       name: "tsig-ui",
-      version: 3,
+      version: 4,
       migrate: (persistedState, version) => {
         const state = persistedState as UiState;
         if (version < 1) {
@@ -126,6 +126,14 @@ export const useUiStore = create<UiState>()(
         }
         if (version < 3) {
           state.density = state.density ?? "comfortable";
+        }
+        if (version < 4) {
+          // Renamed analysisPanelWidth → investigatePanelWidth; carry the
+          // persisted width forward so a saved drag survives the rename.
+          const legacy = (state as unknown as { analysisPanelWidth?: number })
+            .analysisPanelWidth;
+          state.investigatePanelWidth = legacy ?? state.investigatePanelWidth ?? 400;
+          delete (state as unknown as { analysisPanelWidth?: number }).analysisPanelWidth;
         }
         return state;
       },

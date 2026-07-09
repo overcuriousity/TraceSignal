@@ -653,6 +653,7 @@ async def list_events(
             after=after_cursor,
             before=before_cursor,
             field_mappings=field_mappings,
+            source_offsets=source_offsets,
         ),
     )
     return {
@@ -781,6 +782,7 @@ async def bulk_annotate_by_filter(
             tags_include=tags_include_filter,
             tags_exclude=tags_exclude_filter,
             field_mappings=field_mappings,
+            source_offsets=source_offsets,
         ),
     )
 
@@ -1008,6 +1010,7 @@ async def get_histogram(
             tags_include=tags_include_filter,
             tags_exclude=tags_exclude_filter,
             field_mappings=field_mappings,
+            source_offsets=source_offsets,
         ),
         buckets=buckets,
     )
@@ -1090,8 +1093,19 @@ def _index_annotations_by_event(
     return by_event
 
 
-def _stream_jsonl(query: EventQuery, annotations_by_event: dict[str, list[Any]]) -> Generator[str]:
-    """Yield one JSONL line per matching event, with its annotations attached."""
+def _stream_jsonl(
+    query: EventQuery,
+    annotations_by_event: dict[str, list[Any]],
+    applied_offsets: dict[str, int] | None = None,
+) -> Generator[str]:
+    """Yield one JSONL line per matching event, with its annotations attached.
+
+    When any per-source clock-skew offset is active, a leading ``_meta`` record
+    documents it so the corrected timestamps in the export are self-describing;
+    an untouched (offset-free) export stays byte-identical to pre-W2.
+    """
+    if applied_offsets:
+        yield json.dumps({"_meta": {"applied_time_offsets": applied_offsets}}) + "\n"
     service = EventQueryService()
     for event in service.iter_events(query):
         row = dict(event)
@@ -1099,9 +1113,20 @@ def _stream_jsonl(query: EventQuery, annotations_by_event: dict[str, list[Any]])
         yield json.dumps(row, default=str) + "\n"
 
 
-def _stream_csv(query: EventQuery, annotations_by_event: dict[str, list[Any]]) -> Generator[str]:
-    """Yield CSV rows for all matching events (header first), annotations flattened."""
+def _stream_csv(
+    query: EventQuery,
+    annotations_by_event: dict[str, list[Any]],
+    applied_offsets: dict[str, int] | None = None,
+) -> Generator[str]:
+    """Yield CSV rows for all matching events (header first), annotations flattened.
+
+    A leading ``# applied_time_offsets=…`` comment documents any active
+    per-source clock-skew offset; without one the output is byte-identical to
+    the pre-W2 export.
+    """
     buf = io.StringIO()
+    if applied_offsets:
+        yield f"# applied_time_offsets={json.dumps(applied_offsets)}\n"
     writer = csv.DictWriter(
         buf,
         fieldnames=_CSV_COLUMNS,
@@ -1203,6 +1228,7 @@ async def export_events(
         tags_include=tags_include_filter,
         tags_exclude=tags_exclude_filter,
         field_mappings=field_mappings,
+        source_offsets=source_offsets,
     )
 
     if _uses_regex(bool(eq.q_regex and eq.q), eq.filter_modes, eq.exclusion_modes):
@@ -1215,11 +1241,11 @@ async def export_events(
     if body.format == "jsonl":
         media_type = "application/x-ndjson"
         ext = "jsonl"
-        content = _stream_jsonl(eq, annotations_by_event)
+        content = _stream_jsonl(eq, annotations_by_event, source_offsets)
     else:
         media_type = "text/csv"
         ext = "csv"
-        content = _stream_csv(eq, annotations_by_event)
+        content = _stream_csv(eq, annotations_by_event, source_offsets)
 
     # Audited before streaming starts: an export that fails mid-stream still
     # extracted data up to the failure point, so the attempt itself is the
@@ -1233,6 +1259,7 @@ async def export_events(
         detail={
             "format": body.format,
             "filter": body.filter.model_dump(exclude_none=True, exclude_defaults=True),
+            **({"applied_time_offsets": source_offsets} if source_offsets else {}),
         },
     )
 
@@ -1318,6 +1345,7 @@ async def _resolve_analysis_windows(
     baseline_id: str | None,
     baseline_end: datetime | None,
     temporal: bool,
+    source_offsets: dict[str, int] | None = None,
 ) -> AnalysisWindows | None:
     """Resolve the temporal windows for a detector run.
 
@@ -1338,7 +1366,9 @@ async def _resolve_analysis_windows(
     if baseline_end is None and not temporal:
         return None
 
-    min_ts, max_ts = await run_in_threadpool(svc.get_timeline_range, case_id, source_ids)
+    min_ts, max_ts = await run_in_threadpool(
+        svc.get_timeline_range, case_id, source_ids, source_offsets
+    )
     if min_ts is None or max_ts is None:
         return None
     split = ensure_utc(baseline_end) if baseline_end is not None else min_ts + (max_ts - min_ts) / 2
@@ -1362,6 +1392,7 @@ async def _run_stat_detector(
     fdr_q: float | None = None,
     min_ratio: float | None = None,
     field_mappings: dict[str, list[str]] | None = None,
+    source_offsets: dict[str, int] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Resolve analysis windows + value allowlist, then dispatch to the detector.
 
@@ -1385,7 +1416,15 @@ async def _run_stat_detector(
     allow_task = store.list_allowlist_entries(case_id, timeline_id)
     normal_task = store.list_event_ids_by_annotation_type(case_id, source_ids, "normal")
     windows_task = _resolve_analysis_windows(
-        store, svc, case_id, timeline_id, source_ids, baseline_id, baseline_end, temporal
+        store,
+        svc,
+        case_id,
+        timeline_id,
+        source_ids,
+        baseline_id,
+        baseline_end,
+        temporal,
+        source_offsets,
     )
     all_entries, normal_ids, windows = await asyncio.gather(allow_task, normal_task, windows_task)
     allow_entries = [e for e in all_entries if e.detector in (detector, "*")]
@@ -1407,6 +1446,7 @@ async def _run_stat_detector(
             svc.find_order_violations,
             case_id=case_id,
             source_ids=source_ids,
+            source_offsets=source_offsets,
             min_skew_seconds=(
                 min_skew_seconds if min_skew_seconds is not None else cfg.stat_order_min_skew
             ),
@@ -1420,6 +1460,7 @@ async def _run_stat_detector(
             svc.find_frequency_anomalies,
             case_id=case_id,
             source_ids=source_ids,
+            source_offsets=source_offsets,
             series_field=series_field,
             limit=limit,
             bucket_count=cfg.stat_frequency_buckets,
@@ -1438,6 +1479,7 @@ async def _run_stat_detector(
             svc.find_range_violations,
             case_id=case_id,
             source_ids=source_ids,
+            source_offsets=source_offsets,
             fields=parsed_fields,
             limit=limit,
             per_field_limit=cfg.stat_per_field_limit,
@@ -1464,6 +1506,7 @@ async def _run_stat_detector(
                 svc.find_value_combos,
                 case_id=case_id,
                 source_ids=source_ids,
+                source_offsets=source_offsets,
                 fields=parsed_fields,
                 limit=limit,
                 rarity_floor=cfg.stat_rarity_floor,
@@ -1493,6 +1536,7 @@ async def _run_stat_detector(
             svc.find_charset_novelty,
             case_id=case_id,
             source_ids=source_ids,
+            source_offsets=source_offsets,
             fields=parsed_fields,
             limit=limit,
             per_field_limit=cfg.stat_per_field_limit,
@@ -1511,6 +1555,7 @@ async def _run_stat_detector(
             svc.find_entropy_outliers,
             case_id=case_id,
             source_ids=source_ids,
+            source_offsets=source_offsets,
             fields=parsed_fields,
             limit=limit,
             per_field_limit=cfg.stat_per_field_limit,
@@ -1534,6 +1579,7 @@ async def _run_stat_detector(
             svc.find_proportion_shifts,
             case_id=case_id,
             source_ids=source_ids,
+            source_offsets=source_offsets,
             fields=parsed_fields,
             limit=limit,
             windows=windows,
@@ -1560,6 +1606,7 @@ async def _run_stat_detector(
             svc.find_interval_periodicity,
             case_id=case_id,
             source_ids=source_ids,
+            source_offsets=source_offsets,
             fields=parsed_fields,
             limit=limit,
             windows=windows,
@@ -1584,6 +1631,7 @@ async def _run_stat_detector(
         svc.find_value_novelty,
         case_id=case_id,
         source_ids=source_ids,
+        source_offsets=source_offsets,
         fields=parsed_fields,
         limit=limit,
         rarity_floor=cfg.stat_rarity_floor,
@@ -1894,6 +1942,7 @@ async def _persist_detector_run(
     payload: dict[str, Any],
     resolution: dict[str, Any],
     min_skew_seconds: float | None = None,
+    source_offsets: dict[str, int] | None = None,
 ) -> str:
     """Persist a detector scan's request params + serialized result, return the run_id.
 
@@ -1927,6 +1976,10 @@ async def _persist_detector_run(
             "windows_hash": resolution.get("windows_hash"),
             "allowlist_hash": resolution.get("allowlist_hash"),
             "allowlist_count": resolution.get("allowlist_count"),
+            # W2: the per-source clock-skew offsets applied to this run's
+            # windows/timestamps (None when none was active), so the run stays
+            # reproducible even if a source's offset is later changed.
+            "source_offsets": source_offsets or None,
         },
         result=payload,
     )
@@ -2093,6 +2146,7 @@ async def list_anomalies(
         fdr_q=fdr_q,
         min_ratio=min_ratio,
         field_mappings=field_mappings,
+        source_offsets=source_offsets,
     )
 
     payload = _serialize_stat_result(result)
@@ -2111,6 +2165,7 @@ async def list_anomalies(
             min_skew_seconds=min_skew_seconds,
             payload=payload,
             resolution=resolution,
+            source_offsets=source_offsets,
         )
     # GETs are skipped by the generic audit middleware, so detector-run
     # launches would otherwise leave no trace at all. Audited regardless of
@@ -2234,6 +2289,7 @@ async def tag_anomalies(
         fdr_q=body.fdr_q,
         min_ratio=body.min_ratio,
         field_mappings=field_mappings,
+        source_offsets=source_offsets,
     )
 
     if result.status != "ok":
@@ -2471,6 +2527,7 @@ async def tag_anomalies(
         min_skew_seconds=body.min_skew_seconds,
         payload=payload,
         resolution=resolution,
+        source_offsets=source_offsets,
     )
 
     await store.record_audit(

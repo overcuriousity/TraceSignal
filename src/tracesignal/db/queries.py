@@ -612,10 +612,14 @@ class _ParameterizedQueryBuilder:
         scalar_op = "<=" if op == "<" else ">="
         tuple_cond = f"({ts_expr}, event_id) {op} ({{{ts_name}:DateTime64(3)}}, {{{id_name}:UUID}})"
         if ts_expr == "timestamp":
-            self.conditions.append(f"{tuple_cond} AND timestamp {scalar_op} {{{ts_name}:DateTime64(3)}}")
+            self.conditions.append(
+                f"{tuple_cond} AND timestamp {scalar_op} {{{ts_name}:DateTime64(3)}}"
+            )
         else:
             raw_name = self._param_name()
-            self.conditions.append(f"{tuple_cond} AND timestamp {scalar_op} {{{raw_name}:DateTime64(3)}}")
+            self.conditions.append(
+                f"{tuple_cond} AND timestamp {scalar_op} {{{raw_name}:DateTime64(3)}}"
+            )
             self.parameters[raw_name] = to_clickhouse_utc(
                 ts - timedelta(seconds=raw_widen_seconds), precise=True
             )
@@ -980,7 +984,9 @@ class EventQueryService:
             columns = result.column_names
             rows = result.result_rows
             for row in rows:
-                yield _normalize_event_row(dict(zip(columns, row, strict=False)), query.source_offsets)
+                yield _normalize_event_row(
+                    dict(zip(columns, row, strict=False)), query.source_offsets
+                )
             if len(rows) < batch_size:
                 break
             offset += batch_size

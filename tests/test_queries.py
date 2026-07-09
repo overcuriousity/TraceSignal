@@ -279,7 +279,9 @@ def test_zero_offset_map_keeps_sql_byte_identical(service: EventQueryService) ->
 
 
 def test_active_offset_orders_by_corrected_timestamp(service: EventQueryService) -> None:
-    service.query(EventQuery(case_id="case-1", source_ids=["s1", "s2"], source_offsets={"s2": 3600}))
+    service.query(
+        EventQuery(case_id="case-1", source_ids=["s1", "s2"], source_offsets={"s2": 3600})
+    )
     query, params = _last_query(service)
     # Ordering (and the cursor, when present) run on the corrected timestamp.
     assert "addSeconds(timestamp, transform(source_id" in query

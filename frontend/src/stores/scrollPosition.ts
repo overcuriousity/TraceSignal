@@ -5,7 +5,7 @@
  * Deliberately a separate, non-persisted store rather than `useState` on
  * ExplorerPage: scroll fires on nearly every row crossed, and ExplorerPage
  * has no other reason to re-render on scroll — a page-level `useState` here
- * would re-render the whole page tree (FilterRail, EventGrid, AnalysisPanel)
+ * would re-render the whole page tree (FilterRail, EventGrid, InvestigatePanel)
  * on every update. TimelineHistogram alone subscribes to this value via a
  * selector, so only it re-renders.
  */

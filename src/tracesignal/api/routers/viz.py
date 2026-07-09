@@ -115,6 +115,7 @@ async def _resolve_event_query(
         tags_include=tags_include_filter,
         tags_exclude=tags_exclude_filter,
         field_mappings=field_mappings,
+        source_offsets=source_offsets,
     )
 
 

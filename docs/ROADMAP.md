@@ -140,31 +140,6 @@ covers most of it and stays explainable).
 Gap analysis vs. Timesketch's researcher-loved features and generic forensic-platform
 expectations. Ordered: easy+high value first, then easy+low value, then hard+high value.
 
-Easy, high value:
-
-- [ ] **W2 — Per-source clock-skew correction. IN PROGRESS on `feat/source-clock-skew`,
-  see `docs/PROGRESS.md` session 41 for exact resume point.** Compromised/misconfigured hosts
-  drift; master timeline lies without correction. Add `time_offset_seconds` to Source (Postgres),
-  applied at **query time** (never mutate ingested events — evidence stays raw; offset is
-  analyst-declared metadata and must appear in the audit trail and any export manifest). Applies
-  to explorer, histogram, detectors, exports uniformly — route through the shared filter/query
-  path. Design (decided, implemented in `db/_offsets.py` + `db/queries.py`): a gated
-  effective-timestamp SQL expression (`effective_ts_sql`) that returns the bare `timestamp`
-  column — byte-identical SQL — whenever no in-scope source has a nonzero offset, and otherwise
-  an `if(<not sentinel>, addSeconds(timestamp, transform(source_id, ...)), timestamp)` expression;
-  every corrected filter/cursor also carries a widened *raw*-column scalar bound so ClickHouse's
-  primary-index pruning survives. **Done:** Postgres model + migration 0003, store setter, the
-  full `EventQueryService` path (`_build_where`, cursor, ORDER BY, histogram bucket/range,
-  `_normalize_event_row` presentation-time shift), `db/_offsets.py` unit-tested via
-  `tests/test_queries.py` (9 new tests, all passing). **Not started:** the PATCH endpoint +
-  audit row, `_resolve_timeline_scope`'s offset threading into every `EventQuery(...)`
-  construction and every statistical-detector call (`_window_preds` etc. in
-  `db/anomaly_stats.py` still read the raw `timestamp` column unconditionally), export
-  audit-detail/output-metadata stamping, `DetectorRun.params` stamping, frontend (Source type,
-  `api/sources.ts` PATCH call, SourceList edit UI + offset badge), and the L3 rename rider
-  (`analysisPanelWidth` → `investigatePanelWidth`). See PROGRESS.md for the precise file:line
-  resume point.
-
 Easy, low value (deferred, revisit on demand):
 
 - [ ] **W4 — Python client library.** REST API + `tsig` CLI exist; a thin typed client for
@@ -217,13 +192,6 @@ one commit that also updates `docs/ANOMALY_DETECTION.md`.
   findings (positional, no value key); honored read-only everywhere else. Cut once
   timestamp-order gets a positional-allowlist equivalent — then the `normal`
   annotation origin can be dropped from the mark-normal path entirely.
-- [ ] **L3 — `AnalysisPanel` / `BaselineManager` naming remnants (cosmetic).** The
-  components are gone (replaced by `InvestigatePanel` + `WindowsNormality` this PR);
-  no dangling imports remain. Leftover: stale comment mentions in `ExplorerPage.tsx`
-  / `stores/scrollPosition.ts` and the `analysisPanelWidth` ui-store key still named
-  after the old panel. Rename to `investigatePanelWidth` and fix comments when next
-  touching that store.
-
 ## Explicitly out of scope (decided during the audit)
 
 - Persistent job store — in-memory is a documented deliberate choice for the single-process

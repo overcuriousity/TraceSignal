@@ -177,6 +177,7 @@ from tracesignal.db._dt import (
     is_null_ts_sentinel,
     to_clickhouse_utc,
 )
+from tracesignal.db._offsets import active_offsets, bind_offset_params, effective_ts_sql
 from tracesignal.db._scan import HEAVY_SCAN_SETTINGS
 from tracesignal.db.clickhouse import ClickHouseStore
 from tracesignal.db.field_mappings import mapping_coalesce_expr, resolve_mapping
@@ -349,22 +350,33 @@ def windows_from_split(
     )
 
 
-def _window_preds(windows: AnalysisWindows, params: dict[str, Any]) -> tuple[str, list[str]]:
+def _window_preds(
+    windows: AnalysisWindows,
+    params: dict[str, Any],
+    source_offsets: dict[str, int] | None = None,
+) -> tuple[str, list[str]]:
     """Bind window bounds into *params* and return SQL predicates.
 
     Returns ``(baseline_pred, [suspect_pred, ...])`` — each a self-contained
-    parenthesized ``timestamp`` range test. Parameter names are fixed
-    (``b0``/``b1``, ``w{i}s``/``w{i}e``), so one params dict must not be
-    reused for two different window sets.
+    parenthesized range test over the *effective* (offset-corrected) timestamp.
+    Parameter names are fixed (``b0``/``b1``, ``w{i}s``/``w{i}e``), so one
+    params dict must not be reused for two different window sets.
+
+    When any in-scope source carries a nonzero clock-skew offset (W2), the
+    range tests are built against ``effective_ts_sql`` and the offset arrays
+    are bound into *params*; otherwise the predicates are byte-identical to
+    the pre-W2 bare-``timestamp`` form.
     """
+    bind_offset_params(source_offsets, params)
+    eff = effective_ts_sql(source_offsets)
     params["b0"] = to_clickhouse_utc(windows.baseline.start)
     params["b1"] = to_clickhouse_utc(windows.baseline.end)
-    baseline_pred = "(timestamp >= {b0:String} AND timestamp < {b1:String})"
+    baseline_pred = f"({eff} >= {{b0:String}} AND {eff} < {{b1:String}})"
     suspect_preds = []
     for i, w in enumerate(windows.suspects):
         params[f"w{i}s"] = to_clickhouse_utc(w.start)
         params[f"w{i}e"] = to_clickhouse_utc(w.end)
-        suspect_preds.append(f"(timestamp >= {{w{i}s:String}} AND timestamp < {{w{i}e:String}})")
+        suspect_preds.append(f"({eff} >= {{w{i}s:String}} AND {eff} < {{w{i}e:String}})")
     return baseline_pred, suspect_preds
 
 
@@ -1327,25 +1339,34 @@ class StatisticalAnomalyService:
         self,
         case_id: str,
         source_ids: list[str],
+        source_offsets: dict[str, int] | None = None,
     ) -> tuple[datetime | None, datetime | None]:
-        """Return the (min, max) UTC timestamp of the timeline, or (None, None)."""
+        """Return the (min, max) UTC timestamp of the timeline, or (None, None).
+
+        With per-source clock-skew offsets (W2), the range spans the *effective*
+        (corrected) timestamps, so windows derived from it line up with the
+        offset-corrected predicates every detector uses.
+        """
         self.ch.init_schema()
         db = self.ch.database
         params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        bind_offset_params(source_offsets, params)
         return query_timestamp_range(
             self.ch.client,
             db,
             "case_id = {cid:String} AND has({src:Array(String)}, source_id)",
             params,
+            ts_expr=effective_ts_sql(source_offsets),
         )
 
     def get_timeline_midpoint(
         self,
         case_id: str,
         source_ids: list[str],
+        source_offsets: dict[str, int] | None = None,
     ) -> datetime | None:
         """Return the midpoint timestamp of the timeline, or None if no events."""
-        min_dt, max_dt = self.get_timeline_range(case_id, source_ids)
+        min_dt, max_dt = self.get_timeline_range(case_id, source_ids, source_offsets)
         if min_dt is None or max_dt is None:
             return None
         return min_dt + (max_dt - min_dt) / 2
@@ -1355,7 +1376,11 @@ class StatisticalAnomalyService:
     # ------------------------------------------------------------------
 
     def _window_totals(
-        self, case_id: str, source_ids: list[str], windows: AnalysisWindows
+        self,
+        case_id: str,
+        source_ids: list[str],
+        windows: AnalysisWindows,
+        source_offsets: dict[str, int] | None = None,
     ) -> tuple[int, list[int]]:
         """Return ``(baseline_total, [suspect_total, ...])`` event counts.
 
@@ -1364,7 +1389,7 @@ class StatisticalAnomalyService:
         covered only part of the timeline).
         """
         params: dict[str, Any] = {"cid": case_id, "src": source_ids}
-        bp, sps = _window_preds(windows, params)
+        bp, sps = _window_preds(windows, params, source_offsets)
         parts = [f"countIf({bp}) AS bl_total"] + [
             f"countIf({sp}) AS w{i}_total" for i, sp in enumerate(sps)
         ]
@@ -1395,6 +1420,7 @@ class StatisticalAnomalyService:
         field_mappings: dict[str, list[str]] | None = None,
         inventory: list[tuple[str, int, int]] | None = None,
         inventory_total: int | None = None,
+        source_offsets: dict[str, int] | None = None,
     ) -> StatAnomalyResult:
         """Return rare or first-seen values per field, ranked by surprise score.
 
@@ -1425,6 +1451,7 @@ class StatisticalAnomalyService:
         db = self.ch.database
         base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
         method = "self-baseline" if windows is None else "temporal"
+        eff = effective_ts_sql(source_offsets)
 
         # Total event count for surprise score denominator.
         total_events = self._count_events(case_id, source_ids)
@@ -1465,13 +1492,16 @@ class StatisticalAnomalyService:
         suspect_totals: list[int] = []
         run_warnings: list[str] = []
         if windows is not None:
-            baseline_size, suspect_totals = self._window_totals(case_id, source_ids, windows)
+            baseline_size, suspect_totals = self._window_totals(
+                case_id, source_ids, windows, source_offsets
+            )
             run_warnings = _window_size_warnings(windows, suspect_totals)
 
         all_findings: list[ValueFinding] = []
 
         for field_token in scan_fields:
             params: dict[str, Any] = {**base_params}
+            bind_offset_params(source_offsets, params)
             col = _col_expr(field_token, params, field_mappings)
 
             if windows is None:
@@ -1482,8 +1512,8 @@ class StatisticalAnomalyService:
                     SELECT
                         {col} AS val,
                         count() AS cnt,
-                        min(timestamp) AS first_seen,
-                        toString(argMin(event_id, timestamp)) AS evt_id
+                        min({eff}) AS first_seen,
+                        toString(argMin(event_id, {eff})) AS evt_id
                     FROM {db}.events
                     WHERE case_id = {{cid:String}}
                       AND has({{src:Array(String)}}, source_id)
@@ -1501,12 +1531,12 @@ class StatisticalAnomalyService:
                 # counts and representatives. The WHERE union restricts the
                 # scan to the windows (events between/outside windows are
                 # ignored by construction).
-                bp, sps = _window_preds(windows, params)
+                bp, sps = _window_preds(windows, params, source_offsets)
                 params["lim"] = per_field_limit
                 w_blocks = ",\n                        ".join(
                     f"countIf({sp}) AS w{i}_cnt,"
-                    f" minIf(timestamp, {sp}) AS w{i}_first,"
-                    f" toString(argMinIf(event_id, timestamp, {sp})) AS w{i}_evt"
+                    f" minIf({eff}, {sp}) AS w{i}_first,"
+                    f" toString(argMinIf(event_id, {eff}, {sp})) AS w{i}_evt"
                     for i, sp in enumerate(sps)
                 )
                 w_sum = " + ".join(f"w{i}_cnt" for i in range(len(sps)))
@@ -1662,6 +1692,7 @@ class StatisticalAnomalyService:
         exclude_event_ids: set[str] | None = None,
         allowlist: set[tuple[str, str]] | None = None,
         field_mappings: dict[str, list[str]] | None = None,
+        source_offsets: dict[str, int] | None = None,
     ) -> StatAnomalyResult:
         """Return rare or first-seen *combinations* of field values.
 
@@ -1691,6 +1722,7 @@ class StatisticalAnomalyService:
         db = self.ch.database
         base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
         method = "self-baseline" if windows is None else "temporal"
+        eff = effective_ts_sql(source_offsets)
 
         total_events = self._count_events(case_id, source_ids)
         if total_events == 0:
@@ -1726,6 +1758,7 @@ class StatisticalAnomalyService:
         # distinct prefixes (fk0, fk1, …) keep the attribute-key bind params
         # from colliding (see _col_expr's `prefix`).
         params: dict[str, Any] = {**base_params}
+        bind_offset_params(source_offsets, params)
         exprs = [
             _col_expr(tok, params, field_mappings, prefix=f"fk{i}")
             for i, tok in enumerate(combo_fields)
@@ -1739,7 +1772,9 @@ class StatisticalAnomalyService:
         suspect_totals: list[int] = []
         run_warnings: list[str] = []
         if windows is not None:
-            baseline_size, suspect_totals = self._window_totals(case_id, source_ids, windows)
+            baseline_size, suspect_totals = self._window_totals(
+                case_id, source_ids, windows, source_offsets
+            )
             run_warnings = _window_size_warnings(windows, suspect_totals)
 
         if windows is None:
@@ -1749,8 +1784,8 @@ class StatisticalAnomalyService:
                 SELECT
                     {val_cols},
                     count() AS cnt,
-                    min(timestamp) AS first_seen,
-                    toString(argMin(event_id, timestamp)) AS evt_id
+                    min({eff}) AS first_seen,
+                    toString(argMin(event_id, {eff})) AS evt_id
                 FROM {db}.events
                 WHERE case_id = {{cid:String}}
                   AND has({{src:Array(String)}}, source_id)
@@ -1762,12 +1797,12 @@ class StatisticalAnomalyService:
                 {HEAVY_SCAN_SETTINGS}
             """
         else:
-            bp, sps = _window_preds(windows, params)
+            bp, sps = _window_preds(windows, params, source_offsets)
             params["lim"] = limit
             w_blocks = ",\n                    ".join(
                 f"countIf({sp}) AS w{i}_cnt,"
-                f" minIf(timestamp, {sp}) AS w{i}_first,"
-                f" toString(argMinIf(event_id, timestamp, {sp})) AS w{i}_evt"
+                f" minIf({eff}, {sp}) AS w{i}_first,"
+                f" toString(argMinIf(event_id, {eff}, {sp})) AS w{i}_evt"
                 for i, sp in enumerate(sps)
             )
             w_sum = " + ".join(f"w{i}_cnt" for i in range(len(sps)))
@@ -1956,6 +1991,7 @@ class StatisticalAnomalyService:
         exclude_event_ids: set[str] | None = None,
         allowlist: set[tuple[str, str]] | None = None,
         field_mappings: dict[str, list[str]] | None = None,
+        source_offsets: dict[str, int] | None = None,
     ) -> StatAnomalyResult:
         """Return numeric values falling outside a field's learned range.
 
@@ -1976,6 +2012,11 @@ class StatisticalAnomalyService:
         db = self.ch.database
         base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
         method = "iqr" if windows is None else "temporal-range"
+        eff = effective_ts_sql(source_offsets)
+        # The effective-ts expression references source_id; the num subqueries
+        # below must project it too when any offset is active. Empty (byte-
+        # identical) when none is, keeping the fast path unchanged.
+        off_src = ", source_id" if active_offsets(source_offsets) else ""
 
         total_events = self._count_events(case_id, source_ids)
         if total_events == 0:
@@ -2000,9 +2041,10 @@ class StatisticalAnomalyService:
         for field_token in scan_fields:
             # --- Learn the band from the baseline. ---
             stat_params: dict[str, Any] = {**base_params}
+            bind_offset_params(source_offsets, stat_params)
             col = _col_expr(field_token, stat_params, field_mappings)
             num_src = (
-                f"SELECT toFloat64OrNull({col}) AS num, timestamp"
+                f"SELECT toFloat64OrNull({col}) AS num, timestamp{off_src}"
                 f" FROM {db}.events"
                 f" WHERE case_id = {{cid:String}}"
                 f" AND has({{src:Array(String)}}, source_id)"
@@ -2014,7 +2056,7 @@ class StatisticalAnomalyService:
                     f" FROM ({num_src}) WHERE num IS NOT NULL {HEAVY_SCAN_SETTINGS}"
                 )
             else:
-                stat_bp, _ = _window_preds(windows, stat_params)
+                stat_bp, _ = _window_preds(windows, stat_params, source_offsets)
                 stat_sql = (
                     f"SELECT min(num) AS lo, max(num) AS hi, count() AS n"
                     f" FROM ({num_src}) WHERE num IS NOT NULL AND {stat_bp}"
@@ -2048,6 +2090,7 @@ class StatisticalAnomalyService:
 
             # --- Flag values outside the band. ---
             viol_params: dict[str, Any] = {**base_params}
+            bind_offset_params(source_offsets, viol_params)
             vcol = _col_expr(field_token, viol_params, field_mappings)
             viol_params["lo"] = lower
             viol_params["hi"] = upper
@@ -2056,7 +2099,7 @@ class StatisticalAnomalyService:
             win_idx_group = ""
             detect_clause = ""
             if windows is not None:
-                _, viol_sps = _window_preds(windows, viol_params)
+                _, viol_sps = _window_preds(windows, viol_params, source_offsets)
                 # Restrict the scan to the suspect-window union (events outside
                 # every window are ignored), tag each row with its window index
                 # for attribution, and exclude sentinel/undated rows — the
@@ -2069,10 +2112,10 @@ class StatisticalAnomalyService:
                 SELECT
                     num AS val,
                     count() AS cnt,
-                    min(timestamp) AS first_seen,
-                    toString(argMin(event_id, timestamp)) AS evt_id{win_idx_group}
+                    min({eff}) AS first_seen,
+                    toString(argMin(event_id, {eff})) AS evt_id{win_idx_group}
                 FROM (
-                    SELECT toFloat64OrNull({vcol}) AS num, timestamp, event_id{win_idx_col}
+                    SELECT toFloat64OrNull({vcol}) AS num, timestamp, event_id{off_src}{win_idx_col}
                     FROM {db}.events
                     WHERE case_id = {{cid:String}}
                       AND has({{src:Array(String)}}, source_id)
@@ -2227,6 +2270,7 @@ class StatisticalAnomalyService:
         field_mappings: dict[str, list[str]] | None = None,
         inventory: list[tuple[str, int, int]] | None = None,
         inventory_total: int | None = None,
+        source_offsets: dict[str, int] | None = None,
     ) -> StatAnomalyResult:
         """Return values containing characters outside a field's reference charset.
 
@@ -2264,6 +2308,7 @@ class StatisticalAnomalyService:
         db = self.ch.database
         base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
         method = "rare-chars" if windows is None else "temporal-charset"
+        eff = effective_ts_sql(source_offsets)
 
         total_events = self._count_events(case_id, source_ids)
         if total_events == 0:
@@ -2330,7 +2375,7 @@ class StatisticalAnomalyService:
                 # year-2299 sentinel can never fall inside it).
                 bs_params: dict[str, Any] = {**base_params}
                 col = _col_expr(field_token, bs_params, field_mappings)
-                bs_bp, _ = _window_preds(windows, bs_params)
+                bs_bp, _ = _window_preds(windows, bs_params, source_offsets)
                 bs_sql = f"""
                     SELECT
                         groupUniqArrayArray(arrayDistinct(extractAll(val, '(?s).'))) AS charset,
@@ -2359,6 +2404,7 @@ class StatisticalAnomalyService:
 
             # --- Flag values containing characters outside the reference set. ---
             viol_params: dict[str, Any] = {**base_params}
+            bind_offset_params(source_offsets, viol_params)
             vcol = _col_expr(field_token, viol_params, field_mappings)
             viol_params["base"] = reference
             viol_params["plim"] = per_field_limit
@@ -2366,7 +2412,7 @@ class StatisticalAnomalyService:
             win_idx_group = ""
             detect_clause = ""
             if windows is not None:
-                _, viol_sps = _window_preds(windows, viol_params)
+                _, viol_sps = _window_preds(windows, viol_params, source_offsets)
                 # Restrict the scan to the suspect-window union, tag rows with
                 # their window index for attribution, and exclude sentinel/
                 # undated rows (the year-2299 sentinel would land in any
@@ -2388,8 +2434,8 @@ class StatisticalAnomalyService:
                         SELECT
                             {vcol} AS val,
                             count() AS cnt,
-                            min(timestamp) AS first_seen,
-                            toString(argMin(event_id, timestamp)) AS evt_id{win_idx_sel}
+                            min({eff}) AS first_seen,
+                            toString(argMin(event_id, {eff})) AS evt_id{win_idx_sel}
                         FROM {db}.events
                         WHERE case_id = {{cid:String}}
                           AND has({{src:Array(String)}}, source_id)
@@ -2495,6 +2541,7 @@ class StatisticalAnomalyService:
         field_mappings: dict[str, list[str]] | None = None,
         inventory: list[tuple[str, int, int]] | None = None,
         inventory_total: int | None = None,
+        source_offsets: dict[str, int] | None = None,
     ) -> StatAnomalyResult:
         """Return values whose Shannon character entropy falls outside a learned band.
 
@@ -2525,6 +2572,7 @@ class StatisticalAnomalyService:
         db = self.ch.database
         base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
         method = "iqr" if windows is None else "temporal-iqr"
+        eff = effective_ts_sql(source_offsets)
 
         total_events = self._count_events(case_id, source_ids)
         if total_events == 0:
@@ -2556,7 +2604,7 @@ class StatisticalAnomalyService:
             col = _col_expr(field_token, stat_params, field_mappings)
             baseline_clause = ""
             if windows is not None:
-                stat_bp, _ = _window_preds(windows, stat_params)
+                stat_bp, _ = _window_preds(windows, stat_params, source_offsets)
                 # The baseline window is a bounded range, so the year-2299
                 # sentinel can never fall inside it.
                 baseline_clause = f" AND {stat_bp}"
@@ -2596,6 +2644,7 @@ class StatisticalAnomalyService:
 
             # --- Flag values whose entropy falls outside the band. ---
             viol_params: dict[str, Any] = {**base_params, "minlen": _MIN_ENTROPY_VALUE_LEN}
+            bind_offset_params(source_offsets, viol_params)
             vcol = _col_expr(field_token, viol_params, field_mappings)
             viol_params["lo"] = lower
             viol_params["hi"] = upper
@@ -2604,7 +2653,7 @@ class StatisticalAnomalyService:
             win_idx_group = ""
             detect_clause = ""
             if windows is not None:
-                _, viol_sps = _window_preds(windows, viol_params)
+                _, viol_sps = _window_preds(windows, viol_params, source_offsets)
                 # Restrict the scan to the suspect-window union, tag each row
                 # with its window index for attribution, and exclude sentinel/
                 # undated rows (year-2299 sentinel would land in any open range).
@@ -2627,8 +2676,8 @@ class StatisticalAnomalyService:
                             SELECT
                                 {vcol} AS val,
                                 count() AS cnt,
-                                min(timestamp) AS first_seen,
-                                toString(argMin(event_id, timestamp)) AS evt_id{win_idx_sel}
+                                min({eff}) AS first_seen,
+                                toString(argMin(event_id, {eff})) AS evt_id{win_idx_sel}
                             FROM {db}.events
                             WHERE case_id = {{cid:String}}
                               AND has({{src:Array(String)}}, source_id)
@@ -2740,6 +2789,7 @@ class StatisticalAnomalyService:
         field_mappings: dict[str, list[str]] | None = None,
         inventory: list[tuple[str, int, int]] | None = None,
         inventory_total: int | None = None,
+        source_offsets: dict[str, int] | None = None,
     ) -> StatAnomalyResult:
         """Return values whose share of events shifted between baseline and suspect windows.
 
@@ -2778,6 +2828,7 @@ class StatisticalAnomalyService:
         self.ch.init_schema()
         db = self.ch.database
         base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        eff = effective_ts_sql(source_offsets)
 
         total_events = self._count_events(case_id, source_ids)
         if total_events == 0:
@@ -2789,7 +2840,9 @@ class StatisticalAnomalyService:
                 windows=windows.payload(),
             )
 
-        baseline_size, suspect_totals = self._window_totals(case_id, source_ids, windows)
+        baseline_size, suspect_totals = self._window_totals(
+            case_id, source_ids, windows, source_offsets
+        )
         run_warnings = _window_size_warnings(windows, suspect_totals)
         if baseline_size == 0:
             return StatAnomalyResult(
@@ -2825,12 +2878,12 @@ class StatisticalAnomalyService:
         for field_token in scan_fields:
             params: dict[str, Any] = {**base_params}
             col = _col_expr(field_token, params, field_mappings)
-            bp, sps = _window_preds(windows, params)
+            bp, sps = _window_preds(windows, params, source_offsets)
             params["cap"] = max_candidates_per_field
             w_blocks = ",\n                    ".join(
                 f"countIf({sp}) AS w{i}_cnt,"
-                f" minIf(timestamp, {sp}) AS w{i}_first,"
-                f" toString(argMinIf(event_id, timestamp, {sp})) AS w{i}_evt"
+                f" minIf({eff}, {sp}) AS w{i}_first,"
+                f" toString(argMinIf(event_id, {eff}, {sp})) AS w{i}_evt"
                 for i, sp in enumerate(sps)
             )
             w_sum = " + ".join(f"w{i}_cnt" for i in range(len(sps)))
@@ -2843,8 +2896,8 @@ class StatisticalAnomalyService:
                 SELECT
                     {col} AS val,
                     countIf({bp}) AS baseline_cnt,
-                    maxIf(timestamp, {bp}) AS bl_last,
-                    toString(argMaxIf(event_id, timestamp, {bp})) AS bl_evt,
+                    maxIf({eff}, {bp}) AS bl_last,
+                    toString(argMaxIf(event_id, {eff}, {bp})) AS bl_evt,
                     {w_blocks}
                 FROM {db}.events
                 WHERE case_id = {{cid:String}}
@@ -3000,6 +3053,7 @@ class StatisticalAnomalyService:
         field_mappings: dict[str, list[str]] | None = None,
         inventory: list[tuple[str, int, int]] | None = None,
         inventory_total: int | None = None,
+        source_offsets: dict[str, int] | None = None,
     ) -> StatAnomalyResult:
         """Return values whose arrival cadence changed between baseline and suspect windows.
 
@@ -3046,6 +3100,7 @@ class StatisticalAnomalyService:
         self.ch.init_schema()
         db = self.ch.database
         base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        eff = effective_ts_sql(source_offsets)
 
         total_events = self._count_events(case_id, source_ids)
         if total_events == 0:
@@ -3057,7 +3112,9 @@ class StatisticalAnomalyService:
                 windows=windows.payload(),
             )
 
-        baseline_size, suspect_totals = self._window_totals(case_id, source_ids, windows)
+        baseline_size, suspect_totals = self._window_totals(
+            case_id, source_ids, windows, source_offsets
+        )
         run_warnings = _window_size_warnings(windows, suspect_totals)
         if baseline_size == 0:
             return StatAnomalyResult(
@@ -3102,7 +3159,7 @@ class StatisticalAnomalyService:
         for field_token in scan_fields:
             params: dict[str, Any] = {**base_params}
             col = _col_expr(field_token, params, field_mappings)
-            bp, sps = _window_preds(windows, params)
+            bp, sps = _window_preds(windows, params, source_offsets)
             params["cap"] = max_candidates_per_field
             win_exprs = ", ".join(
                 [f"if({bp}, 0, -1)"] + [f"if({sp}, {i + 1}, -1)" for i, sp in enumerate(sps)]
@@ -3141,7 +3198,7 @@ class StatisticalAnomalyService:
                     FROM (
                         SELECT
                             {col} AS val,
-                            timestamp AS ts,
+                            {eff} AS ts,
                             event_id,
                             arrayJoin(arrayFilter(x -> x >= 0, [{win_exprs}])) AS win
                         FROM {db}.events
@@ -3344,6 +3401,7 @@ class StatisticalAnomalyService:
         exclude_event_ids: set[str] | None = None,
         allowlist: set[tuple[str, str]] | None = None,
         field_mappings: dict[str, list[str]] | None = None,
+        source_offsets: dict[str, int] | None = None,
     ) -> StatAnomalyResult:
         """Return time windows with anomalous event-count frequency.
 
@@ -3374,6 +3432,7 @@ class StatisticalAnomalyService:
         col = _col_expr(series_field, field_params, field_mappings)
         src_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
         method = "z-score" if windows is None else "temporal-z-score"
+        eff = effective_ts_sql(source_offsets)
 
         if windows is not None:
             return self._frequency_windowed(
@@ -3388,14 +3447,17 @@ class StatisticalAnomalyService:
                 z_threshold,
                 exclude_event_ids,
                 allowlist,
+                source_offsets,
             )
 
         # --- Self-baseline: whole-timeline buckets, leave-one-out z-score. ---
+        bind_offset_params(source_offsets, src_params)
         min_ts, max_ts = query_timestamp_range(
             self.ch.client,
             db,
             "case_id = {cid:String} AND has({src:Array(String)}, source_id)",
             src_params,
+            ts_expr=eff,
         )
         if min_ts is None or max_ts is None:
             return StatAnomalyResult(
@@ -3411,7 +3473,7 @@ class StatisticalAnomalyService:
         params: dict[str, Any] = {**src_params, **field_params, "iv": interval}
         bucket_sql = f"""
             SELECT
-                toStartOfInterval(timestamp, INTERVAL {{iv:UInt32}} second) AS bucket,
+                toStartOfInterval({eff}, INTERVAL {{iv:UInt32}} second) AS bucket,
                 {col} AS series_val,
                 count() AS cnt
             FROM {db}.events
@@ -3487,6 +3549,7 @@ class StatisticalAnomalyService:
             limit=limit,
             warnings=[],
             windows=None,
+            source_offsets=source_offsets,
         )
 
     def _frequency_windowed(
@@ -3502,6 +3565,7 @@ class StatisticalAnomalyService:
         z_threshold: float,
         exclude_event_ids: set[str] | None,
         allowlist: set[tuple[str, str]] | None,
+        source_offsets: dict[str, int] | None = None,
     ) -> StatAnomalyResult:
         """Temporal frequency detection over an explicit baseline + suspect windows.
 
@@ -3513,6 +3577,7 @@ class StatisticalAnomalyService:
         db = self.ch.database
         method = "temporal-z-score"
         warnings: list[str] = []
+        eff = effective_ts_sql(source_offsets)
 
         # Interval from the baseline window: it is the reference distribution,
         # so it gets the full bucket_count resolution; the same epoch-aligned
@@ -3551,12 +3616,12 @@ class StatisticalAnomalyService:
 
         # One bucket scan over the union of all windows.
         params: dict[str, Any] = {**{"cid": case_id, "src": source_ids}, **field_params}
-        _, sps = _window_preds(windows, params)
+        bp, sps = _window_preds(windows, params, source_offsets)
         params["iv"] = interval
-        union_pred = " OR ".join(["(timestamp >= {b0:String} AND timestamp < {b1:String})", *sps])
+        union_pred = " OR ".join([bp, *sps])
         bucket_sql = f"""
             SELECT
-                toStartOfInterval(timestamp, INTERVAL {{iv:UInt32}} second) AS bucket,
+                toStartOfInterval({eff}, INTERVAL {{iv:UInt32}} second) AS bucket,
                 {col} AS series_val,
                 count() AS cnt
             FROM {db}.events
@@ -3650,6 +3715,7 @@ class StatisticalAnomalyService:
             limit=limit,
             warnings=warnings,
             windows=windows,
+            source_offsets=source_offsets,
         )
 
     def _finalize_freq(
@@ -3670,6 +3736,7 @@ class StatisticalAnomalyService:
         limit: int,
         warnings: list[str],
         windows: AnalysisWindows | None,
+        source_offsets: dict[str, int] | None = None,
     ) -> StatAnomalyResult:
         """Hydrate, suppress, rank and cap frequency findings; build the result."""
         windows_payload = windows.payload() if windows is not None else None
@@ -3699,7 +3766,7 @@ class StatisticalAnomalyService:
         findings.sort(key=lambda f: f.score, reverse=True)
         candidates = findings[: max(limit * 3, 100)]
         candidates = self._hydrate_freq_findings(
-            candidates, case_id, source_ids, col, db, field_params, interval
+            candidates, case_id, source_ids, col, db, field_params, interval, source_offsets
         )
         if exclude_event_ids:
             candidates = [
@@ -3726,6 +3793,7 @@ class StatisticalAnomalyService:
         db: str,
         field_params: dict[str, Any],
         interval: int,
+        source_offsets: dict[str, int] | None = None,
     ) -> list[FreqFinding]:
         """Fetch one representative event per (series_value, window) pair.
 
@@ -3752,6 +3820,8 @@ class StatisticalAnomalyService:
             "buckets": buckets,
             "iv": interval,
         }
+        bind_offset_params(source_offsets, params)
+        eff = effective_ts_sql(source_offsets)
         # Phase 1 aggregates only argMin(event_id, ...) per (bucket, series)
         # pair — the former all-column argMin dragged message/attributes for
         # every matching row through the aggregation. The winners' full rows
@@ -3765,12 +3835,12 @@ class StatisticalAnomalyService:
         # which is why only frequency broke). Bucket boundaries are always
         # whole seconds (interval >= 1s), so wrapping in toDateTime() is
         # lossless and pins both sides to DateTime regardless of CH version.
-        bucket_expr = "toDateTime(toStartOfInterval(timestamp, INTERVAL {iv:UInt32} second))"
+        bucket_expr = f"toDateTime(toStartOfInterval({eff}, INTERVAL {{iv:UInt32}} second))"
         sql = f"""
             SELECT
                 {bucket_expr} AS bucket,
                 {col} AS series_val,
-                toString(argMin(event_id, timestamp)) AS evt_id
+                toString(argMin(event_id, {eff})) AS evt_id
             FROM {db}.events
             WHERE case_id = {{cid:String}}
               AND has({{src:Array(String)}}, source_id)
@@ -3815,6 +3885,7 @@ class StatisticalAnomalyService:
         min_skew_seconds: float = 1.0,
         limit: int = 50,
         exclude_event_ids: set[str] | None = None,
+        source_offsets: dict[str, int] | None = None,
     ) -> StatAnomalyResult:
         """Return events whose timestamp jumps backwards in record order.
 
@@ -3828,6 +3899,13 @@ class StatisticalAnomalyService:
         This detector is mode-less (``method="sequential"``) — there is no
         baseline/detect split. NULL timestamps are excluded (they carry no
         order signal).
+
+        Per-source clock-skew offsets (W2) do **not** touch the ``lagInFrame``
+        skew math: a uniform per-source shift moves an event and its
+        predecessor equally, so intra-source ordering and the skew delta are
+        invariant. Only the *reported* ``timestamp``/``prev_timestamp`` are
+        shifted (in Python, below) so the finding's displayed times match the
+        offset-corrected explorer.
         """
         self.ch.init_schema()
         db = self.ch.database
@@ -3916,6 +3994,15 @@ class StatisticalAnomalyService:
             source_id, event_id, ts, prev_ts, skew, byte_offset, line_number, msg = row
             if not event_id:
                 continue
+            # Shift the reported pair by this source's offset (skew is left
+            # untouched — the shift cancels within a source). Both rows are
+            # dated (sentinels were filtered in the inner scan).
+            off = (source_offsets or {}).get(str(source_id), 0)
+            if off:
+                if ts is not None:
+                    ts = ensure_utc(ts) + timedelta(seconds=off)
+                if prev_ts is not None:
+                    prev_ts = ensure_utc(prev_ts) + timedelta(seconds=off)
             ts_str = _present_ts(ts)
             prev_str = ensure_utc(prev_ts).isoformat() if prev_ts else None
             n_viol, max_skew = source_summary.get(str(source_id), (0, 0.0))

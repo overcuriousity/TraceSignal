@@ -211,6 +211,7 @@ async def test_init_schema_adopts_pre_alembic_db(tmp_path):
         # drop everything later revisions add, or the upgrade would collide.
         await conn.execute(text("DROP TABLE baseline_definitions"))
         await conn.execute(text("DROP TABLE detector_allowlist"))
+        await conn.execute(text("ALTER TABLE sources DROP COLUMN time_offset_seconds"))
         # Simulate a database from before two of the hand-rolled ALTERs.
         await conn.execute(text("ALTER TABLE annotations DROP COLUMN pinned"))
         await conn.execute(text("ALTER TABLE users DROP COLUMN onboarding_completed"))
@@ -306,3 +307,47 @@ async def test_timeline_and_case_delete_cascade_baseline_rows(store):
     await store.create_allowlist_entry("c1", default_tl.id, "value_novelty", "artifact", "y")
     assert await store.delete_case("c1") is True
     assert await store.list_allowlist_entries("c1", default_tl.id) == []
+
+
+# ---------------------------------------------------------------------------
+# Source clock-skew offset (W2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_source_time_offset_defaults_to_zero(store):
+    await store.create_case("c1", "Case One")
+    await store.create_source("c1", "s1", "source one", file_hash="h1", size_bytes=10)
+    source = await store.get_source("c1", "s1")
+    assert source is not None
+    assert source.time_offset_seconds == 0
+    assert source.to_dict()["time_offset_seconds"] == 0
+
+
+@pytest.mark.asyncio
+async def test_set_source_time_offset_persists_and_returns_updated(store):
+    await store.create_case("c1", "Case One")
+    await store.create_source("c1", "s1", "source one", file_hash="h1", size_bytes=10)
+    updated = await store.set_source_time_offset("c1", "s1", -3600)
+    assert updated is not None
+    assert updated.time_offset_seconds == -3600
+    # Re-read confirms it was committed, not just returned from the session.
+    reread = await store.get_source("c1", "s1")
+    assert reread.time_offset_seconds == -3600
+
+
+@pytest.mark.asyncio
+async def test_set_source_time_offset_unknown_source_returns_none(store):
+    await store.create_case("c1", "Case One")
+    assert await store.set_source_time_offset("c1", "no-such-source", 60) is None
+
+
+@pytest.mark.asyncio
+async def test_set_source_time_offset_is_case_scoped(store):
+    """A source_id from another case must not be writable through the wrong case."""
+    await store.create_case("c1", "Case One")
+    await store.create_case("c2", "Case Two")
+    await store.create_source("c1", "s1", "source one", file_hash="h1", size_bytes=10)
+    assert await store.set_source_time_offset("c2", "s1", 60) is None
+    unchanged = await store.get_source("c1", "s1")
+    assert unchanged.time_offset_seconds == 0

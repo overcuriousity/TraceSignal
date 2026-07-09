@@ -8,6 +8,7 @@ spinning up a FastAPI TestClient.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -563,10 +564,10 @@ class _FakeStatAnomalyService:
         self.shift_calls: list[dict] = []
         self.interval_calls: list[dict] = []
 
-    def get_timeline_midpoint(self, case_id, source_ids):
+    def get_timeline_midpoint(self, case_id, source_ids, source_offsets=None):
         return self._midpoint
 
-    def get_timeline_range(self, case_id, source_ids):
+    def get_timeline_range(self, case_id, source_ids, source_offsets=None):
         return self._ts_range
 
     def find_frequency_anomalies(self, **kwargs):
@@ -1234,7 +1235,7 @@ class _FakeStatAnomalyServiceWithResult:
     def __init__(self, result):
         self._result = result
 
-    def get_timeline_midpoint(self, case_id, source_ids):
+    def get_timeline_midpoint(self, case_id, source_ids, source_offsets=None):
         return None
 
     def find_value_novelty(self, **kwargs):
@@ -1561,3 +1562,93 @@ def test_field_encoder_caches_load_failure(monkeypatch):
     assert events._get_field_encoder() is None
     assert events._get_field_encoder() is None
     assert len(attempts) == 1
+
+
+# ---------------------------------------------------------------------------
+# _persist_detector_run — W2 source_offsets stamping
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_persist_detector_run_stamps_source_offsets(patched_store):
+    """An active clock-skew offset is recorded in the persisted run params so
+    the run stays reproducible after the source's offset is later changed."""
+    run_id = await events._persist_detector_run(
+        "c1",
+        "t1",
+        detector="value_novelty",
+        fields="artifact",
+        series_field="artifact",
+        z_threshold=None,
+        baseline_end=None,
+        temporal=False,
+        limit=50,
+        payload={"results": []},
+        resolution={},
+        source_offsets={"s1": 3600},
+    )
+    run = await patched_store.get_detector_run("c1", run_id)
+    assert run.params["source_offsets"] == {"s1": 3600}
+
+
+@pytest.mark.asyncio
+async def test_persist_detector_run_offsets_none_when_inactive(patched_store):
+    """No offset → the params key is None (not an empty dict), keeping untouched
+    runs' stamps stable."""
+    run_id = await events._persist_detector_run(
+        "c1",
+        "t1",
+        detector="value_novelty",
+        fields="artifact",
+        series_field="artifact",
+        z_threshold=None,
+        baseline_end=None,
+        temporal=False,
+        limit=50,
+        payload={"results": []},
+        resolution={},
+    )
+    run = await patched_store.get_detector_run("c1", run_id)
+    assert run.params["source_offsets"] is None
+
+
+# ---------------------------------------------------------------------------
+# Export streams — W2 offset metadata line
+# ---------------------------------------------------------------------------
+
+
+class _StubQueryService:
+    """EventQueryService stand-in whose iter_events yields two fixed rows."""
+
+    def __init__(self, *_a, **_k):
+        pass
+
+    def iter_events(self, query, batch_size=1000):
+        yield {"event_id": "e1", "message": "one", "timestamp": "2024-01-01T00:00:00+00:00"}
+        yield {"event_id": "e2", "message": "two", "timestamp": "2024-01-01T00:00:01+00:00"}
+
+
+def test_stream_jsonl_prepends_meta_line_only_when_offsets_active(monkeypatch):
+    monkeypatch.setattr(events, "EventQueryService", _StubQueryService)
+    from tracesignal.db.queries import EventQuery
+
+    eq = EventQuery(case_id="c1", source_ids=["s1"])
+    with_off = list(events._stream_jsonl(eq, {}, {"s1": 3600}))
+    assert json.loads(with_off[0]) == {"_meta": {"applied_time_offsets": {"s1": 3600}}}
+    assert len(with_off) == 3  # meta + 2 rows
+
+    without = list(events._stream_jsonl(eq, {}, None))
+    assert "_meta" not in without[0]
+    assert len(without) == 2
+
+
+def test_stream_csv_prepends_offset_comment_only_when_active(monkeypatch):
+    monkeypatch.setattr(events, "EventQueryService", _StubQueryService)
+    from tracesignal.db.queries import EventQuery
+
+    eq = EventQuery(case_id="c1", source_ids=["s1"])
+    with_off = list(events._stream_csv(eq, {}, {"s1": -120}))
+    assert with_off[0] == '# applied_time_offsets={"s1": -120}\n'
+
+    without = list(events._stream_csv(eq, {}, None))
+    assert not without[0].startswith("#")
