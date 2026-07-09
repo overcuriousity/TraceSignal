@@ -24,6 +24,8 @@ export function usePasswordChangeForm() {
       setNewPassword("");
       setConfirmPassword("");
     },
+    // Both host forms render mutation.error inline — skip the global toast.
+    meta: { successToast: "Password changed", silentError: true },
   });
 
   const mismatch = confirmPassword.length > 0 && newPassword !== confirmPassword;

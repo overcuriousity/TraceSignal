@@ -2,7 +2,7 @@ import { Outlet, useLocation } from "react-router-dom";
 import { TopBar } from "./TopBar";
 import { Footer } from "./Footer";
 import { TourProvider } from "@/components/tour/TourProvider";
-import { ToastProvider, ToastViewport } from "@/components/ui/Toaster";
+import { ToastProvider, Toasts, ToastViewport } from "@/components/ui/Toaster";
 import { TooltipProvider } from "@/components/ui/Tooltip";
 
 /**
@@ -28,6 +28,7 @@ export function AppShell() {
           </main>
           {showFooter && <Footer />}
         </div>
+        <Toasts />
         <ToastViewport />
         <TourProvider />
       </TooltipProvider>

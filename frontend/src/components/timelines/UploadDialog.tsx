@@ -64,6 +64,8 @@ export function UploadDialog({ caseId }: Props) {
       // and is still ingesting (status !== "ready") — the source list panel
       // shows its live "Ingesting" badge/progress, so don't claim it's done.
     },
+    // Upload failures render inline in the dialog — skip the global toast.
+    meta: { silentError: true },
   });
 
   const handleFile = (f: File) => setFile(f);

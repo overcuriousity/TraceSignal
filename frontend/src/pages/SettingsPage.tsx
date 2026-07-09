@@ -38,6 +38,8 @@ export function SettingsPage() {
       setUser(u);
       invalidate();
     },
+    // Error is rendered inline next to the form — skip the global toast.
+    meta: { successToast: "Profile saved", silentError: true },
   });
 
   const restartTour = useMutation({
@@ -48,6 +50,7 @@ export function SettingsPage() {
       useTourStore.getState().start();
       navigate("/");
     },
+    meta: { silentError: true },
   });
 
   if (!user) return null;

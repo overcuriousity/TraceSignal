@@ -460,6 +460,7 @@ export function useOpenEvent(
     onSuccess: (event) => {
       if (event) onSelectEvent(event);
     },
+    meta: { errorTitle: "Couldn't open event" },
   });
 }
 

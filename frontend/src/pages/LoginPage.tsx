@@ -34,6 +34,9 @@ export function LoginPage() {
       queryClient.setQueryData(["auth", "me"], user);
       navigate(from, { replace: true });
     },
+    // Rejected logins render inline under the form (and 401 here is the
+    // expected failure mode) — skip the global toast.
+    meta: { silentError: true },
   });
 
   return (

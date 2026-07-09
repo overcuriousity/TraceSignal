@@ -1,21 +1,12 @@
 import { useEffect } from "react";
 import { RouterProvider } from "react-router-dom";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClientProvider } from "@tanstack/react-query";
 import { router } from "./router";
 import { setUnauthorizedHandler } from "./api/client";
+import { queryClient } from "./lib/queryClient";
 import { useAuthStore } from "./stores/auth";
 import { useThemeStore } from "./stores/theme";
 import { useUiStore } from "./stores/ui";
-
-const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: {
-      staleTime: 10_000,
-      retry: 1,
-      refetchOnWindowFocus: false,
-    },
-  },
-});
 
 export default function App() {
   const theme = useThemeStore((s) => s.theme);
