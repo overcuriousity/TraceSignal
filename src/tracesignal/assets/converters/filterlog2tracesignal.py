@@ -31,6 +31,7 @@ Usage:
 
 from __future__ import annotations
 
+import collections
 import concurrent.futures
 import datetime
 import gzip
@@ -56,7 +57,7 @@ except ImportError:  # pragma: no cover - environment guard
     sys.exit(2)
 
 CONVERTER_NAME = "filterlog2tracesignal"
-CONVERTER_VERSION = "1.0.0"
+CONVERTER_VERSION = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # TraceSignal Parquet interchange format v1 — embedded copy of the spec in
@@ -481,6 +482,11 @@ def hash_file(path: Path) -> tuple[str, int]:
 
 BATCH_ROWS = 50_000
 PARALLEL_MIN_BYTES = int(os.environ.get("FILTERLOG2TS_PARALLEL_MIN_BYTES", 256 * 1024 * 1024))
+# No single parallel chunk may exceed this many bytes, so per-worker memory
+# stays bounded on huge files.
+MAX_CHUNK_BYTES = int(os.environ.get("FILTERLOG2TS_MAX_CHUNK_BYTES", 128 * 1024 * 1024))
+# Default cap on parallel workers; high core counts otherwise multiply peak RAM.
+DEFAULT_MAX_WORKERS = int(os.environ.get("FILTERLOG2TS_DEFAULT_WORKERS", 4))
 
 
 class _BatchBuffer:
@@ -566,23 +572,30 @@ def _convert_stream(
 # ---------------------------------------------------------------------------
 
 
-def find_chunk_boundaries(path: Path, target_chunks: int) -> list[tuple[int, int]]:
-    """Split a plain file into newline-aligned ``(start, end)`` byte ranges."""
+def find_chunk_boundaries(
+    path: Path, target_chunks: int, max_chunk_bytes: int = MAX_CHUNK_BYTES
+) -> list[tuple[int, int]]:
+    """Split a plain file into newline-aligned ``(start, end)`` byte ranges.
+
+    Chunks never exceed ``max_chunk_bytes`` so per-worker memory stays bounded.
+    """
     size = path.stat().st_size
     if size == 0 or target_chunks <= 1:
         return [(0, size)]
-    approx = size // target_chunks
+    approx = min(size // target_chunks, max_chunk_bytes)
+    if approx <= 0:
+        approx = max_chunk_bytes
     boundaries = [0]
     with open(path, "rb") as fh:
-        for i in range(1, target_chunks):
-            candidate = i * approx
+        candidate = approx
+        while candidate < size:
             if candidate <= boundaries[-1]:
+                candidate += approx
                 continue
             fh.seek(candidate)
-            window = 4096
             found = None
             while found is None:
-                chunk = fh.read(window)
+                chunk = fh.read(4096)
                 if not chunk:
                     found = size
                     break
@@ -593,6 +606,7 @@ def find_chunk_boundaries(path: Path, target_chunks: int) -> list[tuple[int, int
                     candidate += len(chunk)
             if boundaries[-1] < found < size:
                 boundaries.append(found)
+            candidate = found + approx
     boundaries.append(size)
     return list(zip(boundaries, boundaries[1:]))
 
@@ -625,6 +639,34 @@ def _parse_chunk(
     return sink.getvalue(), parsed, skipped
 
 
+def _available_ram_bytes() -> int | None:
+    """Best-effort available RAM in bytes (Linux MemAvailable, else total)."""
+    try:
+        with open("/proc/meminfo", "rb") as fh:
+            for raw in fh:
+                line = raw.decode("ascii", errors="replace")
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, AttributeError, OSError):
+        return None
+
+
+def _warn_if_ram_tight(workers: int) -> None:
+    ram = _available_ram_bytes()
+    # Rough per-worker estimate: raw chunk + parsed columns + Arrow IPC copy.
+    estimated = workers * MAX_CHUNK_BYTES * 6
+    if ram and estimated > ram * 0.75:
+        sys.stderr.write(
+            f"warning: {workers} workers x {MAX_CHUNK_BYTES // (1024 * 1024)} MiB chunks may "
+            f"need ~{estimated // (1024 * 1024)} MiB RAM; ~{ram // (1024 * 1024)} MiB available. "
+            "Reduce -w if memory runs out.\n"
+        )
+
+
 def _convert_file_parallel(
     path: Path, file_hash: str, buffer: _BatchBuffer, workers: int, year: int | None, verbose: bool
 ) -> tuple[int, int]:
@@ -632,16 +674,31 @@ def _convert_file_parallel(
     chunks = find_chunk_boundaries(path, target_chunks=workers * 4)
     if verbose:
         sys.stderr.write(f"  parallel: {len(chunks)} chunks, {workers} workers\n")
+    _warn_if_ram_tight(workers)
     parsed_total = 0
     skipped_total = 0
     ctx = multiprocessing.get_context("spawn")
     with concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
-        futures = [
-            pool.submit(_parse_chunk, str(path), start, end, path.name, file_hash, year)
-            for start, end in chunks
-        ]
-        for future in concurrent.futures.as_completed(futures):
-            ipc_bytes, parsed, skipped = future.result()
+        # Submit a bounded window and consume strictly in submit order: rows
+        # land in the output in original file order (forensic requirement),
+        # and at most ~2*workers chunk results exist in the parent at once,
+        # so finished-but-unwritten Arrow IPC results cannot pile up and OOM
+        # the parent when the Parquet writer is the bottleneck.
+        chunk_iter = iter(chunks)
+        pending: collections.deque = collections.deque()
+
+        def _submit_next() -> None:
+            for start, end in chunk_iter:
+                pending.append(
+                    pool.submit(_parse_chunk, str(path), start, end, path.name, file_hash, year)
+                )
+                return
+
+        for _ in range(workers * 2):
+            _submit_next()
+        while pending:
+            ipc_bytes, parsed, skipped = pending.popleft().result()
+            _submit_next()
             parsed_total += parsed
             skipped_total += skipped
             reader = pa.ipc.open_stream(ipc_bytes)
@@ -731,8 +788,8 @@ def main() -> int:
         "-w",
         "--workers",
         type=int,
-        default=getattr(os, "process_cpu_count", os.cpu_count)() or 4,
-        help="parallel parser processes for large plain files (default: CPU count)",
+        default=min(getattr(os, "process_cpu_count", os.cpu_count)() or 4, DEFAULT_MAX_WORKERS),
+        help="parallel parser processes for large plain files (default: min(CPU count, %(default)s))",
     )
     parser.add_argument(
         "--year",

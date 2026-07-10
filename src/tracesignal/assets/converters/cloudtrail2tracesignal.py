@@ -40,6 +40,7 @@ Usage:
 
 from __future__ import annotations
 
+import collections
 import concurrent.futures
 import datetime
 import gzip
@@ -64,7 +65,7 @@ except ImportError:  # pragma: no cover - environment guard
     sys.exit(2)
 
 CONVERTER_NAME = "cloudtrail2tracesignal"
-CONVERTER_VERSION = "1.0.0"
+CONVERTER_VERSION = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # TraceSignal Parquet interchange format v1 — embedded copy of the spec in
@@ -381,6 +382,9 @@ def _iter_records(text: str) -> Any:
 # ---------------------------------------------------------------------------
 
 BATCH_ROWS = 50_000
+# Default cap on parallel workers; each worker holds one whole decoded file
+# plus its parsed records in memory, so high core counts multiply peak RAM.
+DEFAULT_MAX_WORKERS = int(os.environ.get("CLOUDTRAIL2TS_DEFAULT_WORKERS", 4))
 
 
 class _BatchBuffer:
@@ -486,6 +490,22 @@ def _parse_file(path_str: str, file_hash: str) -> tuple[bytes, int, int]:
 # ---------------------------------------------------------------------------
 
 
+def _available_ram_bytes() -> int | None:
+    """Best-effort available RAM in bytes (Linux MemAvailable, else total)."""
+    try:
+        with open("/proc/meminfo", "rb") as fh:
+            for raw in fh:
+                line = raw.decode("ascii", errors="replace")
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, AttributeError, OSError):
+        return None
+
+
 def convert(input_path: str, output: str, workers: int, verbose: bool) -> int:
     """Convert CloudTrail logs at ``input_path`` into ``output`` (.parquet)."""
     import json
@@ -523,11 +543,37 @@ def convert(input_path: str, output: str, workers: int, verbose: bool) -> int:
         if workers > 1 and len(files) > 1:
             if verbose:
                 sys.stderr.write(f"parsing {len(files)} file(s) across {workers} workers...\n")
+            ram = _available_ram_bytes()
+            largest = max(path.stat().st_size for path in files)
+            # Rough per-worker estimate: decoded text + parsed records + Arrow IPC copy.
+            estimated = min(workers, len(files)) * largest * 6
+            if ram and estimated > ram * 0.75:
+                sys.stderr.write(
+                    f"warning: {workers} workers on files up to "
+                    f"{largest // (1024 * 1024)} MiB may need "
+                    f"~{estimated // (1024 * 1024)} MiB RAM; "
+                    f"~{ram // (1024 * 1024)} MiB available. Reduce -w if memory runs out.\n"
+                )
             ctx = multiprocessing.get_context("spawn")
             with concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
-                futures = [pool.submit(_parse_file, str(path), hashes[path]) for path in files]
-                for future in concurrent.futures.as_completed(futures):
-                    ipc_bytes, parsed, skipped = future.result()
+                # Submit a bounded window and consume strictly in submit order:
+                # rows land in the output in input-file order (forensic
+                # requirement), and at most ~2*workers file results exist in
+                # the parent at once, so finished-but-unwritten Arrow IPC
+                # results cannot pile up and OOM the parent.
+                file_iter = iter(files)
+                pending: collections.deque = collections.deque()
+
+                def _submit_next() -> None:
+                    for path in file_iter:
+                        pending.append(pool.submit(_parse_file, str(path), hashes[path]))
+                        return
+
+                for _ in range(workers * 2):
+                    _submit_next()
+                while pending:
+                    ipc_bytes, parsed, skipped = pending.popleft().result()
+                    _submit_next()
                     parsed_total += parsed
                     skipped_total += skipped
                     reader = pa.ipc.open_stream(ipc_bytes)
@@ -567,8 +613,8 @@ def main() -> int:
         "-w",
         "--workers",
         type=int,
-        default=getattr(os, "process_cpu_count", os.cpu_count)() or 4,
-        help="parallel parser processes across input files (default: CPU count)",
+        default=min(getattr(os, "process_cpu_count", os.cpu_count)() or 4, DEFAULT_MAX_WORKERS),
+        help="parallel parser processes across input files (default: min(CPU count, %(default)s))",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="progress on stderr")
     args = parser.parse_args()
