@@ -1,6 +1,18 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-11 (session 48 — keyset pagination for source batch reads, fixes ClickHouse OOM).
+Last updated: 2026-07-11 (session 48 — keyset pagination + entropy detector memory fix).
+
+## Session 48b — 2026-07-11: entropy detector no longer explodes chars into rows
+
+Entropy detector hit the per-query memory cap in production (`MEMORY_LIMIT_EXCEEDED`, 4 GiB —
+the HEAVY_SCAN_SETTINGS guard worked; server survived, endpoint 500'd). Cause: both entropy
+queries computed `entropy(c)` by `arrayJoin`-ing each distinct value's characters out one row
+each — every exploded row carried the full value string (+ cnt/first_seen/evt_id in the
+violations scan), i.e. O(len²) bytes per value; long-value fields blew past the cap despite
+external-GROUP-BY spill. Replaced with `arrayReduce('entropy', extractAll(val, '(?s).'))` —
+same aggregate applied to the char array in place, one row per distinct value, linear memory,
+and one whole GROUP BY layer dropped from the violations query. Verified identical entropies
+against live ClickHouse. Suite 811 passed.
 
 ## Session 48 — 2026-07-11: keyset pagination in `list_events` (enricher OOM'd ClickHouse)
 

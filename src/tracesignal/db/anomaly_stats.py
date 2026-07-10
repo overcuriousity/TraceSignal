@@ -2649,10 +2649,15 @@ class StatisticalAnomalyService:
             )
 
         # Shannon character entropy in bits (log2) per distinct value, via
-        # ClickHouse's built-in `entropy` aggregate over the value's characters
-        # ARRAY JOIN-ed out one row each. This is linear in the value length;
-        # the earlier `arrayMap(c -> countEqual(chars, c), ...)` form rescanned
-        # the whole char array once per distinct character (quadratic).
+        # `arrayReduce('entropy', extractAll(val, ...))` — the `entropy`
+        # aggregate applied to the value's char array in place, one row per
+        # distinct value. Two earlier forms both blew up: `arrayMap(c ->
+        # countEqual(chars, c), ...)` rescanned the char array per distinct
+        # character (quadratic CPU), and `arrayJoin`-ing the chars out one row
+        # each duplicated the full value string (plus cnt/first_seen/evt_id)
+        # once per character — O(len²) bytes per value, which pushed the
+        # violations scan past the per-query memory cap on long-value fields
+        # (MEMORY_LIMIT_EXCEEDED in production). arrayReduce is linear in both.
         all_findings: list[EntropyFinding] = []
         evaluated_fields = 0
 
@@ -2669,19 +2674,15 @@ class StatisticalAnomalyService:
             stat_sql = f"""
                 SELECT quantile(0.25)(ent) AS q1, quantile(0.75)(ent) AS q3, count() AS n
                 FROM (
-                    SELECT entropy(c) AS ent
+                    SELECT arrayReduce('entropy', extractAll(val, '(?s).')) AS ent
                     FROM (
-                        SELECT val, arrayJoin(extractAll(val, '(?s).')) AS c
-                        FROM (
-                            SELECT DISTINCT {col} AS val
-                            FROM {db}.events
-                            WHERE case_id = {{cid:String}}
-                              AND has({{src:Array(String)}}, source_id)
-                              AND {col} != ''
-                              AND lengthUTF8({col}) >= {{minlen:UInt32}}{baseline_clause}
-                        )
+                        SELECT DISTINCT {col} AS val
+                        FROM {db}.events
+                        WHERE case_id = {{cid:String}}
+                          AND has({{src:Array(String)}}, source_id)
+                          AND {col} != ''
+                          AND lengthUTF8({col}) >= {{minlen:UInt32}}{baseline_clause}
                     )
-                    GROUP BY val
                 )
                 {HEAVY_SCAN_SETTINGS}
             """
@@ -2723,28 +2724,21 @@ class StatisticalAnomalyService:
                 FROM (
                     SELECT
                         val,
-                        entropy(c) AS ent,
-                        any(cnt) AS cnt,
-                        any(first_seen) AS first_seen,
-                        any(evt_id) AS evt_id{win_idx_group}
+                        arrayReduce('entropy', extractAll(val, '(?s).')) AS ent,
+                        cnt, first_seen, evt_id{win_idx_group}
                     FROM (
-                        SELECT val, cnt, first_seen, evt_id{win_idx_group},
-                               arrayJoin(extractAll(val, '(?s).')) AS c
-                        FROM (
-                            SELECT
-                                {vcol} AS val,
-                                count() AS cnt,
-                                min({eff}) AS first_seen,
-                                toString(argMin(event_id, {eff})) AS evt_id{win_idx_sel}
-                            FROM {db}.events
-                            WHERE case_id = {{cid:String}}
-                              AND has({{src:Array(String)}}, source_id)
-                              AND {vcol} != ''
-                              AND lengthUTF8({vcol}) >= {{minlen:UInt32}}{detect_clause}
-                            GROUP BY val{win_idx_group}
-                        )
+                        SELECT
+                            {vcol} AS val,
+                            count() AS cnt,
+                            min({eff}) AS first_seen,
+                            toString(argMin(event_id, {eff})) AS evt_id{win_idx_sel}
+                        FROM {db}.events
+                        WHERE case_id = {{cid:String}}
+                          AND has({{src:Array(String)}}, source_id)
+                          AND {vcol} != ''
+                          AND lengthUTF8({vcol}) >= {{minlen:UInt32}}{detect_clause}
+                        GROUP BY val{win_idx_group}
                     )
-                    GROUP BY val{win_idx_group}
                 )
                 WHERE ent < {{lo:Float64}} OR ent > {{hi:Float64}}
                 ORDER BY greatest({{lo:Float64}} - ent, ent - {{hi:Float64}}) DESC, first_seen ASC
