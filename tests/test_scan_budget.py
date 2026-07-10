@@ -31,14 +31,25 @@ def test_detection_failure_falls_back_to_conservative_default():
 def test_cgroup_limit_bounds_detection(monkeypatch):
     """Inside a memory-limited container the cgroup limit wins over host RAM."""
     monkeypatch.setattr(_scan, "_cgroup_memory_limit", lambda: 8 << 30)
+    monkeypatch.setattr(_scan, "_meminfo_total", lambda: 128 << 30)
     monkeypatch.setattr(_scan, "_physical_memory_total", lambda: 128 << 30)
     assert _scan.detect_scan_memory_budget() == int((8 << 30) * 0.8)
 
 
 def test_unlimited_cgroup_uses_physical_memory(monkeypatch):
     monkeypatch.setattr(_scan, "_cgroup_memory_limit", lambda: None)
+    monkeypatch.setattr(_scan, "_meminfo_total", lambda: None)
     monkeypatch.setattr(_scan, "_physical_memory_total", lambda: 64 << 30)
     assert _scan.detect_scan_memory_budget() == int((64 << 30) * 0.8)
+
+
+def test_meminfo_beats_ballooned_sysinfo(monkeypatch):
+    """On VMs with memory ballooning sysinfo() overreports (503 GiB on a
+    128 GiB box); MemTotal is the usable truth and must win via min()."""
+    monkeypatch.setattr(_scan, "_cgroup_memory_limit", lambda: None)
+    monkeypatch.setattr(_scan, "_meminfo_total", lambda: 128 << 30)
+    monkeypatch.setattr(_scan, "_physical_memory_total", lambda: 503 << 30)
+    assert _scan.detect_scan_memory_budget() == int((128 << 30) * 0.8)
 
 
 def test_heavy_scan_settings_carries_a_positive_budget():

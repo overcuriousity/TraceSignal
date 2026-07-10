@@ -56,8 +56,27 @@ def _cgroup_memory_limit() -> int | None:
     return None
 
 
+def _meminfo_total() -> int | None:
+    """MemTotal from /proc/meminfo — the kernel-managed usable RAM.
+
+    Preferred over ``sysconf``: on VMs with memory ballooning/hotplug the
+    ``sysinfo()`` syscall behind ``SC_PHYS_PAGES`` can report the *possible*
+    memory ceiling (observed 503 GiB on a 128 GiB VM — the same misdetection
+    that makes ClickHouse's own server limit unreliable there), while
+    MemTotal matches what ``free`` reports.
+    """
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
 def _physical_memory_total() -> int | None:
-    """Total physical RAM of the (virtual) machine."""
+    """Total physical RAM of the (virtual) machine (sysinfo-backed fallback)."""
     try:
         pages = os.sysconf("SC_PHYS_PAGES")
         page_size = os.sysconf("SC_PAGE_SIZE")
@@ -81,7 +100,11 @@ def detect_scan_memory_budget() -> int:
     """Resolve the ``max_memory_usage`` budget for heavy scans (see module docstring)."""
     s = get_settings()
     detected = min(
-        (v for v in (_cgroup_memory_limit(), _physical_memory_total()) if v),
+        (
+            v
+            for v in (_cgroup_memory_limit(), _meminfo_total(), _physical_memory_total())
+            if v
+        ),
         default=None,
     )
     return _resolve_scan_memory_budget(
