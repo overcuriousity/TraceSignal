@@ -1,6 +1,18 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-10 (session 47 — converter OOM + row-order fixes, all natives → 1.1.0).
+Last updated: 2026-07-11 (session 48 — keyset pagination for source batch reads, fixes ClickHouse OOM).
+
+## Session 48 — 2026-07-11: keyset pagination in `list_events` (enricher OOM'd ClickHouse)
+
+A production enrichment job took down ClickHouse (kernel OOM, `Connection refused` on :8123).
+Root cause: `ClickHouseStore.list_events` paginated with `ORDER BY event_id LIMIT n OFFSET m`,
+but the events table sort key is `(case_id, source_id, timestamp, event_id)` — no read-in-order,
+so every batch re-sorted the whole source and materialized `offset + limit` full-width rows;
+memory grew with the offset (O(N²) total work per source). Replaced OFFSET with a keyset cursor
+(`after_event_id`, `WHERE event_id > cursor`): constant memory per batch, O(N) total.
+`iter_source_events` now threads the last event_id of each batch as the next cursor; all its
+consumers (embedding pipeline, enrichers) benefit unchanged. Test fakes updated to the new
+signature. Full suite 811 passed.
 
 ## Session 47 — 2026-07-10: native converters memory-bounded, row order guaranteed (v1.1.0)
 

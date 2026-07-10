@@ -517,13 +517,24 @@ class ClickHouseStore:
         case_id: str,
         source_id: str,
         limit: int,
-        offset: int = 0,
+        after_event_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return a batch of raw event rows for a source ordered by event_id.
 
         This is used by the embedding pipeline to read events that were
         previously ingested without vectors.
+
+        Pagination is keyset-based (``after_event_id`` cursor) rather than
+        OFFSET: the table sort key is (case_id, source_id, timestamp, event_id),
+        so an ORDER BY event_id OFFSET query would re-sort the whole source and
+        materialize offset+limit full-width rows per batch — memory grows with
+        the offset and can OOM the server on large sources.
         """
+        after_clause = ""
+        parameters = {"case_id": case_id, "source_id": source_id}
+        if after_event_id is not None:
+            after_clause = "AND event_id > {after_event_id:String}"
+            parameters["after_event_id"] = after_event_id
         result = self.client.query(
             f"""
             SELECT
@@ -550,11 +561,11 @@ class ClickHouseStore:
                 embedding_config_hash
             FROM {self.database}.events
             WHERE case_id = {{case_id:String}} AND source_id = {{source_id:String}}
+            {after_clause}
             ORDER BY event_id
             LIMIT {limit}
-            OFFSET {offset}
             """,
-            parameters={"case_id": case_id, "source_id": source_id},
+            parameters=parameters,
         )
         columns = result.column_names
         return [
@@ -576,17 +587,20 @@ class ClickHouseStore:
         Each ``next()`` issues one blocking query, so async callers should
         drive the iterator from a worker thread.
         """
-        offset = 0
+        after_event_id: str | None = None
         while True:
             batch = self.list_events(
-                case_id=case_id, source_id=source_id, limit=batch_size, offset=offset
+                case_id=case_id,
+                source_id=source_id,
+                limit=batch_size,
+                after_event_id=after_event_id,
             )
             if not batch:
                 return
             yield batch
             if len(batch) < batch_size:
                 return
-            offset += len(batch)
+            after_event_id = batch[-1]["event_id"]
 
     def get_events_by_ids(
         self,

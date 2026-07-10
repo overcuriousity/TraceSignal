@@ -767,29 +767,31 @@ def test_enricher_run_guard_claim_release():
 def test_iter_source_events_batches_and_stops():
     from tracesignal.db.clickhouse import ClickHouseStore
 
-    calls: list[int] = []
+    calls: list[str | None] = []
 
     class _FakeCH:
         iter_source_events = ClickHouseStore.iter_source_events
 
-        def list_events(self, case_id, source_id, limit, offset):
-            calls.append(offset)
+        def list_events(self, case_id, source_id, limit, after_event_id=None):
+            calls.append(after_event_id)
             data = [{"event_id": str(i)} for i in range(5)]  # 5 rows total
-            return data[offset : offset + limit]
+            if after_event_id is not None:
+                data = [e for e in data if e["event_id"] > after_event_id]
+            return data[:limit]
 
     batches = list(_FakeCH().iter_source_events("c1", "s1", batch_size=2))
     assert [len(b) for b in batches] == [2, 2, 1]
-    assert calls == [0, 2, 4]  # short final batch ends iteration, no extra query
+    assert calls == [None, "1", "3"]  # short final batch ends iteration, no extra query
 
     calls.clear()
 
     class _EmptyCH(_FakeCH):
-        def list_events(self, case_id, source_id, limit, offset):
-            calls.append(offset)
+        def list_events(self, case_id, source_id, limit, after_event_id=None):
+            calls.append(after_event_id)
             return []
 
     assert list(_EmptyCH().iter_source_events("c1", "s1", batch_size=2)) == []
-    assert calls == [0]
+    assert calls == [None]
 
 
 def test_effective_enricher_state_resolution():
@@ -1214,8 +1216,8 @@ async def test_run_enrichment_job_stamps_config_hash_and_fails_loudly(store, mon
         def count_events(self, case_id, source_ids):
             return len(source_ids)
 
-        def list_events(self, case_id, source_id, limit, offset):
-            if offset > 0:
+        def list_events(self, case_id, source_id, limit, after_event_id=None):
+            if after_event_id is not None:
                 return []
             return [{"event_id": "e1", "attributes": {"field": "match-me"}}]
 

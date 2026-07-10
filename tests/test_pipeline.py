@@ -45,12 +45,15 @@ class FakeClickHouseStore:
         case_id: str,
         source_id: str,
         limit: int,
-        offset: int = 0,
+        after_event_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        events = [
-            e.as_dict() for e in self.events if e.case_id == case_id and e.source_id == source_id
-        ]
-        return events[offset : offset + limit]
+        events = sorted(
+            (e.as_dict() for e in self.events if e.case_id == case_id and e.source_id == source_id),
+            key=lambda e: e["event_id"],
+        )
+        if after_event_id is not None:
+            events = [e for e in events if e["event_id"] > after_event_id]
+        return events[:limit]
 
     # Reuse the real batching iterator on top of the fake list_events.
     iter_source_events = ClickHouseStore.iter_source_events
