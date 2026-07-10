@@ -4140,9 +4140,7 @@ class StatisticalAnomalyService:
         n_susp = len(windows.suspects)
         merged: dict[tuple[str, ...], list[list[Any]]] = {}
         for sid in source_ids:
-            rows = self.ch.client.query(
-                novel_sql, parameters={**params, "src": [sid]}
-            ).result_rows
+            rows = self.ch.client.query(novel_sql, parameters={**params, "src": [sid]}).result_rows
             if len(rows) >= max_candidates:
                 run_warnings.append(
                     f"Source {sid}: hit the {max_candidates}-sequence candidate cap — "

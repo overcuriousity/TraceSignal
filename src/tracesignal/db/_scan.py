@@ -118,11 +118,7 @@ def detect_scan_memory_budget() -> int:
     """Resolve the per-query ``max_memory_usage`` for heavy scans (see module docstring)."""
     s = get_settings()
     detected = min(
-        (
-            v
-            for v in (_cgroup_memory_limit(), _meminfo_total(), _physical_memory_total())
-            if v
-        ),
+        (v for v in (_cgroup_memory_limit(), _meminfo_total(), _physical_memory_total()) if v),
         default=None,
     )
     return _resolve_scan_memory_budget(

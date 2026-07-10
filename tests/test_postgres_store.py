@@ -282,10 +282,20 @@ async def test_baseline_definition_crud_and_timeline_scoping(store):
 async def test_disposition_dedupe_and_detector_filter(store):
     await store.create_case("c1", "Case One")
     e1 = await store.create_disposition(
-        "c1", kind="normal", detector="value_novelty", timeline_id="t1", field="attr:user", value="svc"
+        "c1",
+        kind="normal",
+        detector="value_novelty",
+        timeline_id="t1",
+        field="attr:user",
+        value="svc",
     )
     e2 = await store.create_disposition(
-        "c1", kind="normal", detector="value_novelty", timeline_id="t1", field="attr:user", value="svc"
+        "c1",
+        kind="normal",
+        detector="value_novelty",
+        timeline_id="t1",
+        field="attr:user",
+        value="svc",
     )
     assert e1.id == e2.id
     await store.create_disposition(
@@ -312,7 +322,12 @@ async def test_timeline_and_case_delete_cascade_baseline_rows(store):
         suspect_windows=[],
     )
     await store.create_disposition(
-        "c1", kind="normal", detector="value_novelty", timeline_id=tl.id, field="artifact", value="x"
+        "c1",
+        kind="normal",
+        detector="value_novelty",
+        timeline_id=tl.id,
+        field="artifact",
+        value="x",
     )
     assert await store.delete_timeline("c1", tl.id) is True
     assert await store.list_baseline_definitions("c1", tl.id) == []

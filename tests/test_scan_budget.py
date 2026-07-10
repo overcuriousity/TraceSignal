@@ -110,11 +110,7 @@ def test_gate_admits_at_most_the_configured_concurrency():
 def test_every_detector_entry_point_is_gated():
     from tracesignal.db.anomaly_stats import StatisticalAnomalyService
 
-    detectors = [
-        name
-        for name in dir(StatisticalAnomalyService)
-        if name.startswith("find_")
-    ]
+    detectors = [name for name in dir(StatisticalAnomalyService) if name.startswith("find_")]
     assert detectors, "no find_* detectors discovered"
     for name in detectors:
         fn = getattr(StatisticalAnomalyService, name)

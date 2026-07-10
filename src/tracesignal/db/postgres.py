@@ -2593,9 +2593,7 @@ class PostgresStore:
             conditions.append(FindingDisposition.detector == detector)
         async with self.session_factory() as session:
             result = await session.execute(
-                select(FindingDisposition.event_id, FindingDisposition.detector).where(
-                    *conditions
-                )
+                select(FindingDisposition.event_id, FindingDisposition.detector).where(*conditions)
             )
             return {(row[0], row[1]) for row in result.all() if row[0]}
 
@@ -2774,9 +2772,7 @@ class PostgresStore:
                 # portable across the SQLite test dialect, and the preserved
                 # set is tiny (manually-confirmed findings only).
                 rows = (
-                    (await session.execute(select(Annotation).where(*conditions)))
-                    .scalars()
-                    .all()
+                    (await session.execute(select(Annotation).where(*conditions))).scalars().all()
                 )
                 doomed = [a for a in rows if (a.event_id, a.detector or "") not in preserve_keys]
                 for a in doomed:

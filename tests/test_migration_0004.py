@@ -19,9 +19,7 @@ def _alembic(sync_conn: Any, verb: str, target: str) -> None:
     from alembic.config import Config
 
     cfg = Config()
-    cfg.set_main_option(
-        "script_location", str(Path(pg.__file__).parent / "migrations")
-    )
+    cfg.set_main_option("script_location", str(Path(pg.__file__).parent / "migrations"))
     cfg.attributes["connection"] = sync_conn
     getattr(command, verb)(cfg, target)
 
@@ -84,25 +82,20 @@ async def test_upgrade_moves_legacy_rows(engine):
         assert ("confirmed", "charset", None, None, "s1", "e-pin", None) in as_set
 
         anns = (
-            await conn.execute(
-                text("SELECT id, annotation_type FROM annotations ORDER BY id")
-            )
+            await conn.execute(text("SELECT id, annotation_type FROM annotations ORDER BY id"))
         ).fetchall()
         # normal annotation deleted; pinned anomaly + tag kept.
         assert [tuple(a) for a in anns] == [("an_pin", "anomaly"), ("an_tag", "tag")]
 
         # pinned column gone, detector_allowlist gone.
         cols = [
-            r[1]
-            for r in (await conn.execute(text("PRAGMA table_info(annotations)"))).fetchall()
+            r[1] for r in (await conn.execute(text("PRAGMA table_info(annotations)"))).fetchall()
         ]
         assert "pinned" not in cols
         tables = [
             r[0]
             for r in (
-                await conn.execute(
-                    text("SELECT name FROM sqlite_master WHERE type='table'")
-                )
+                await conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))
             ).fetchall()
         ]
         assert "detector_allowlist" not in tables

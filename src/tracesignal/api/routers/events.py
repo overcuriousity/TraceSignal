@@ -2448,9 +2448,7 @@ async def tag_anomalies(
     # disposition — created via the per-event "Confirm" action — so a
     # manually-confirmed finding survives even if this re-scan no longer
     # surfaces it.
-    confirmed_keys = await store.list_confirmed_keys(
-        case_id, source_ids, detector=body.detector
-    )
+    confirmed_keys = await store.list_confirmed_keys(case_id, source_ids, detector=body.detector)
     await store.delete_system_annotations(
         case_id, source_ids, "anomaly", detector=body.detector, preserve_keys=confirmed_keys
     )

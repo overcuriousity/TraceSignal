@@ -89,8 +89,7 @@ def test_disposition_scope_invariants(client, admin_bootstrap, store):
     )
     # Unknown kind rejected by the model.
     assert (
-        client.post(base, json={"kind": "meh", "field": "attr:x", "value": "v"}).status_code
-        == 422
+        client.post(base, json={"kind": "meh", "field": "attr:x", "value": "v"}).status_code == 422
     )
 
 
@@ -103,7 +102,12 @@ def test_event_scoped_rows_have_no_timeline_and_list_by_source(client, admin_boo
 
     row = client.post(
         base,
-        json={"kind": "dismissed", "detector": "timestamp_order", "source_id": "s-none", "event_id": "e1"},
+        json={
+            "kind": "dismissed",
+            "detector": "timestamp_order",
+            "source_id": "s-none",
+            "event_id": "e1",
+        },
     ).json()["disposition"]
     assert row["timeline_id"] is None
     # Not listed: source "s-none" isn't attached to the timeline.
@@ -116,7 +120,9 @@ def test_list_filters_by_kind_and_detector(client, admin_bootstrap, store):
     base = _base(case_id, tl_id)
 
     client.post(base, json={"kind": "normal", "detector": "charset", "field": "f", "value": "v1"})
-    client.post(base, json={"kind": "dismissed", "detector": "entropy", "field": "f", "value": "v2"})
+    client.post(
+        base, json={"kind": "dismissed", "detector": "entropy", "field": "f", "value": "v2"}
+    )
     client.post(base, json={"kind": "normal", "detector": "*", "field": "f", "value": "v3"})
 
     assert len(client.get(base).json()["dispositions"]) == 3
@@ -177,15 +183,9 @@ def test_bulk_validates_everything_before_writing(client, admin_bootstrap, store
 def test_dispositions_hash_covers_normal_only_and_event_scope():
     """dismissed/confirmed never change the hash; event-scoped normals do —
     the reproducibility gap the old allowlist_hash left open."""
-    value_normal = FindingDisposition(
-        kind="normal", detector="charset", field="f", value="v"
-    )
-    event_normal = FindingDisposition(
-        kind="normal", detector="*", source_id="s1", event_id="e1"
-    )
-    dismissed = FindingDisposition(
-        kind="dismissed", detector="charset", field="f", value="x"
-    )
+    value_normal = FindingDisposition(kind="normal", detector="charset", field="f", value="v")
+    event_normal = FindingDisposition(kind="normal", detector="*", source_id="s1", event_id="e1")
+    dismissed = FindingDisposition(kind="dismissed", detector="charset", field="f", value="x")
     confirmed = FindingDisposition(
         kind="confirmed", detector="charset", source_id="s1", event_id="e2"
     )
