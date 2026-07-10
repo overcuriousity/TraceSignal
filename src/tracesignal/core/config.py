@@ -126,6 +126,10 @@ class Settings(BaseSettings):
     # 300M-row incident; tune per ClickHouse host RAM/cores. See db/_scan.py.
     stat_scan_max_threads: int = 8
     stat_scan_external_group_by_bytes: int = 4_000_000_000
+    # Same spill threshold for sorts: window functions (timestamp-order,
+    # sequence-novelty lagInFrame chains) sort whole partitions, which on
+    # 100M+-row cases exceeds max_memory_usage without an external sort.
+    stat_scan_external_sort_bytes: int = 4_000_000_000
     stat_scan_max_memory_bytes: int = 12_000_000_000
 
     # Ingestion

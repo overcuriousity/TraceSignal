@@ -22,6 +22,10 @@ def _build_heavy_scan_settings() -> str:
     return (
         f"SETTINGS max_threads = {s.stat_scan_max_threads}, "
         f"max_bytes_before_external_group_by = {s.stat_scan_external_group_by_bytes}, "
+        # Window functions (lagInFrame in timestamp-order / sequence-novelty)
+        # sort whole partitions; without an external-sort spill a 100M+-row
+        # case hits max_memory_usage (MEMORY_LIMIT_EXCEEDED, code 241).
+        f"max_bytes_before_external_sort = {s.stat_scan_external_sort_bytes}, "
         f"max_memory_usage = {s.stat_scan_max_memory_bytes}"
     )
 

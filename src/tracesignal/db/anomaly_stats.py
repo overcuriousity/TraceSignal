@@ -4238,14 +4238,34 @@ class StatisticalAnomalyService:
         """
 
         # Per-source summary: violation count + worst skew, for the UI's
-        # per-source grouping header and the overall status.
+        # per-source grouping header and the overall status. Deliberately NOT
+        # built over `inner`: the window sort buffers whole partitions, and
+        # hauling `message`/`toString(event_id)` through a 100M+-row sort is
+        # what blew the memory cap on the 300M-row case — the summary needs
+        # only (source_id, skew), so scan only those.
+        summary_inner = f"""
+            SELECT
+                source_id,
+                lagInFrame(toNullable(timestamp)) OVER w AS prev_ts,
+                if(prev_ts IS NOT NULL AND timestamp < prev_ts,
+                   dateDiff('millisecond', timestamp, prev_ts) / 1000.0, 0.) AS skew
+            FROM {db}.events
+            WHERE case_id = {{cid:String}}
+              AND has({{src:Array(String)}}, source_id)
+              AND {TS_NOT_SENTINEL_SQL}
+            WINDOW w AS (
+                PARTITION BY source_id
+                ORDER BY byte_offset, line_number, event_id
+                ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING
+            )
+        """
         summary_params = {**base_params, "skew": float(min_skew_seconds)}
         summary_sql = f"""
             SELECT
                 source_id,
                 countIf(skew >= {{skew:Float64}}) AS n_viol,
                 maxIf(skew, skew >= {{skew:Float64}}) AS max_skew
-            FROM ({inner})
+            FROM ({summary_inner})
             GROUP BY source_id
             {HEAVY_SCAN_SETTINGS}
         """

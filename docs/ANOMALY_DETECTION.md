@@ -42,10 +42,16 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   (`_hydrate_finding_events` / `_hydrate_freq_findings`); a finding whose
   event vanished mid-flight keeps a minimal `_stub_event` shape.
 - **`_HEAVY_SCAN_SETTINGS` on every whole-corpus scan** (`max_threads = 8`,
-  `max_bytes_before_external_group_by = 4 GB`, `max_memory_usage = 12 GB`):
-  large GROUP BY states spill to disk, a runaway query fails alone instead of
-  taking the server with it, and concurrent panel scans can't oversubscribe
-  the box. Any new detector query that touches the whole corpus must carry it.
+  `max_bytes_before_external_group_by = 4 GB`,
+  `max_bytes_before_external_sort = 4 GB`, `max_memory_usage = 12 GB`):
+  large GROUP BY states *and* large sorts spill to disk (window functions —
+  the timestamp-order / sequence-novelty `lagInFrame` scans — sort whole
+  partitions, which OOMed the 300M-row case before the sort spill), a runaway
+  query fails alone instead of taking the server with it, and concurrent
+  panel scans can't oversubscribe the box. Any new detector query that
+  touches the whole corpus must carry it — and a window-function scan should
+  also select only the columns it needs (see the timestamp-order summary
+  scan: dragging `message` through the partition sort is what hurts).
 - **No-timestamp events are stored as a sentinel, not NULL.** `timestamp` is
   a non-Nullable sort-key column; events without a parseable timestamp carry
   `2299-12-31 23:59:59.999 UTC` (`db/_dt.py NULL_TS_SENTINEL`) and are

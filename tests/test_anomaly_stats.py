@@ -1498,7 +1498,7 @@ def test_order_flags_backwards_jump_ranked_by_skew():
 
 def test_order_min_skew_bound_as_param():
     """min_skew_seconds is bound into both summary and detail queries."""
-    svc = _svc(
+    client = RecordingClient(
         [
             FakeQueryResult(result_rows=[(10,)], column_names=["count()"]),
             FakeQueryResult(
@@ -1531,11 +1531,25 @@ def test_order_min_skew_bound_as_param():
             ),
         ]
     )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
     svc.find_order_violations("c1", ["s1"], min_skew_seconds=2.5)
     params = svc.ch.client._all_parameters
     # params[0] = count(); [1] = summary; [2] = detail
     assert params[1]["skew"] == 2.5
     assert params[2]["skew"] == 2.5
+    # The summary scan needs only (source_id, skew) — hauling `message` /
+    # `toString(event_id)` through the whole-partition window sort blew the
+    # ClickHouse memory cap on a 300M-row case. The wide columns belong to
+    # the detail query only.
+    summary_sql, detail_sql = svc.ch.client.full_queries[1], svc.ch.client.full_queries[2]
+    assert "message" not in summary_sql
+    assert "toString(event_id)" not in summary_sql
+    assert "message" in detail_sql
+    # The shared guardrails must spill sorts, not just GROUP BYs — window
+    # functions sort whole partitions.
+    assert "max_bytes_before_external_sort" in summary_sql
+    assert "max_bytes_before_external_sort" in detail_sql
 
 
 def test_order_excludes_normal_marked_events():
