@@ -24,29 +24,20 @@ embeddings surface the needles in the haystack, without needing a cluster to run
 - Every ingested file (**Source**) is SHA-256 hashed and retained content-addressed for
   re-download — forensic provenance and immutability by construction.
 - CLI-available (`tsig ingest`), so ingestion is scriptable and reproducible outside the web UI.
-  For very large files (tens of GiB and up), prefer `tsig ingest` over the web upload: it
-  streams straight from disk with no HTTP upload, no temp copy, and no `TS_MAX_UPLOAD_BYTES`
-  cap. Insert batching is tuned via `TS_INGEST_BATCH_SIZE`
-  (default 20 000 events per ClickHouse round-trip). Run `tsig cases list` first to find the
-  target case's ID (with its owner and team) — `tsig ingest` requires a real case ID, not a
-  name, and validates it before touching the file. Ingestion shows a live progress box
-  (Kalman-filtered throughput/ETA) so multi-hour large-file runs aren't silent, and attributes
-  the resulting Source to a user (`--user`, or the sole admin if unambiguous) for forensic
-  chain-of-custody.
+  For very large files (tens of GiB and up), prefer it over the web upload: it streams straight
+  from disk — no HTTP upload, no temp copy, no `TS_MAX_UPLOAD_BYTES` cap — with live
+  progress/ETA and per-user Source attribution for chain-of-custody. See `tsig ingest --help`.
 - A separate, user-triggered embedding job (`tsig embed` / the embed wizard) computes vectors
   after ingestion — ingestion itself stays fast and embedding-free until you ask for it.
 - Downloadable converter scripts (nginx, filterlog, suricata, cloudtrail, pcap, and more) parse
-  vendor-specific log formats client-side and emit typed, columnar **Parquet** files instead of
-  CSV/JSONL; the server bulk-inserts these via **Arrow** record batches, an order of magnitude
-  faster than row-by-row CSV parsing on multi-GB logs, while keeping the same per-row forensic
-  provenance (file hash, byte offset, content hash). See
-  [`docs/TECH_STACK.md`](docs/TECH_STACK.md) §3.4a for the full rationale. Stdlib-only vendored
-  converters remain available as a minimal-dependency (no pyarrow) alternative.
+  vendor-specific log formats client-side into typed, columnar **Parquet**, which the server
+  bulk-inserts via Arrow record batches — an order of magnitude faster than row-by-row CSV on
+  multi-GB logs, with the same per-row forensic provenance. See
+  [`docs/TECH_STACK.md`](docs/TECH_STACK.md) §3.4a.
 
 ### Explorer
 - A virtualized, ELK-like event grid: resizable/pickable columns, comfortable/compact density,
-  light/dark theme.
-- Color Scheme and Fonts optimized for best-in-class eye-friendly working envoronment.
+  eye-friendly light/dark themes.
 - Full-text and structured filtering (artifact type, source, tags, arbitrary field
   equality/exclusion), pushed down into ClickHouse rather than resolved client-side.
 - Time histogram with anomaly overlay markers, bidirectional keyset pagination with jump-to-time.
@@ -55,11 +46,19 @@ embeddings surface the needles in the haystack, without needing a cluster to run
   (`source_id`, `artifact`, `content_hash`, `file_hash`) included.
 
 ### Anomaly detection
-- **Statistical engine**, inspired by
-  [`ait-aecid/logdata-anomaly-miner`](https://github.com/ait-aecid/logdata-anomaly-miner)'s
-  value/frequency detector approach, run directly against ClickHouse — no embeddings required.
-  See [Anomaly Detection](docs/ANOMALY_DETECTION.md) for a plain-language explanation of every
-  detector.
+- **Nine statistical detectors**, inspired by
+  [`ait-aecid/logdata-anomaly-miner`](https://github.com/ait-aecid/logdata-anomaly-miner) and
+  run directly against ClickHouse — no embeddings required: value novelty, frequency
+  spikes/silences, timestamp order, numeric range, charset novelty, entropy outliers,
+  proportion shift, interval cadence, and never-seen event sequences.
+- **Semantic similarity search** over locally-computed embeddings (Qdrant): find events that
+  *mean* the same thing as a known-bad line, across differing literal content.
+- Explicit **baseline vs. suspect windows**: every detector can compare a known-good period
+  against the window under investigation, instead of only self-baselining.
+- Findings carry a unified disposition workflow (confirm/dismiss), and manually-confirmed
+  findings survive re-scans.
+- See [Anomaly Detection](docs/ANOMALY_DETECTION.md) for a plain-language explanation of every
+  detector — what it catches, how it scores, and its knobs.
 
 ### Authentication, access control, and audit
 - Session-cookie authentication for local accounts, with a seeded one-time bootstrap admin and
@@ -125,9 +124,10 @@ For active frontend development, run `npm install && npm run dev` in `frontend/`
 
 ### Docker/Podman Compose (optional containerized app)
 
-`docker-compose.yml` includes an `app` service that builds the image from the local checkout
-and reaches the backing services over the compose-internal network — `docker compose up -d`
-(or `podman compose up -d`) brings up the full stack in one command.
+`docker-compose.yml` ships with a **commented-out** `app` service that builds the image from
+the local checkout (`Dockerfile`) and reaches the backing services over the compose-internal
+network. Uncomment it, then `docker compose up -d` (or `podman compose up -d`) brings up the
+full stack in one command.
 
 **This compose file is a reference/evaluation deployment, not a production hardening guide.**
 It ships with fixed, well-known defaults so it works out of the box: `postgres`/`tracesignal`
