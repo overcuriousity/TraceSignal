@@ -177,11 +177,33 @@ async def bulk_create_dispositions(
 ) -> dict[str, Any]:
     """Declare several dispositions in one action (single audit entry)."""
     await _require_timeline(case_id, timeline_id)
-    # Validate everything before writing anything — a bulk action is one
-    # analyst intent and shouldn't half-apply.
-    for item in payload.items:
-        _validate_scope(item)
-    rows = [await _create_one(case_id, timeline_id, item, user) for item in payload.items]
+    # Validate everything first, then write in ONE transaction — a bulk
+    # action is one analyst intent and must not half-apply, neither on a
+    # validation error nor on a mid-batch database error.
+    scopes = [_validate_scope(item) for item in payload.items]
+    rows = [
+        r.to_dict()
+        for r in await get_store().create_dispositions_bulk(
+            case_id,
+            [
+                {
+                    "kind": item.kind,
+                    "detector": item.detector,
+                    # Event-scoped rows carry no timeline (events live once
+                    # per Source and appear in multiple timelines).
+                    "timeline_id": timeline_id if scope == "value" else None,
+                    "field": item.field,
+                    "value": item.value,
+                    "source_id": item.source_id,
+                    "event_id": item.event_id,
+                    "note": item.note,
+                    "details": item.details,
+                    "created_by": user.id,
+                }
+                for item, scope in zip(payload.items, scopes, strict=True)
+            ],
+        )
+    ]
     await get_store().record_audit(
         action="disposition.bulk_create",
         actor=user,

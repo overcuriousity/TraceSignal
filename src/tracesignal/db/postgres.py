@@ -2502,6 +2502,60 @@ class PostgresStore:
             await session.refresh(row)
             return row
 
+    async def create_dispositions_bulk(
+        self, case_id: str, items: list[dict[str, Any]]
+    ) -> list[FindingDisposition]:
+        """Create several disposition rows in one transaction, with per-item dedupe.
+
+        All-or-nothing: a bulk declaration is one analyst intent, so a failure
+        on any item rolls back the whole batch instead of half-applying it.
+        Each *items* dict takes the same keyword arguments as
+        :meth:`create_disposition`; duplicates (against existing rows or
+        earlier items in the same batch, via flush) return the existing row.
+        """
+        async with self.session_factory() as session:
+            rows: list[FindingDisposition] = []
+            for it in items:
+                existing = (
+                    await session.execute(
+                        select(FindingDisposition).where(
+                            FindingDisposition.case_id == case_id,
+                            FindingDisposition.timeline_id == it.get("timeline_id"),
+                            FindingDisposition.kind == it["kind"],
+                            FindingDisposition.detector == it.get("detector", "*"),
+                            FindingDisposition.field == it.get("field"),
+                            FindingDisposition.value == it.get("value"),
+                            FindingDisposition.source_id == it.get("source_id"),
+                            FindingDisposition.event_id == it.get("event_id"),
+                        )
+                    )
+                ).scalar_one_or_none()
+                if existing is not None:
+                    rows.append(existing)
+                    continue
+                row = FindingDisposition(
+                    id=generate_id(f"disp_{it['kind']}"),
+                    case_id=case_id,
+                    timeline_id=it.get("timeline_id"),
+                    kind=it["kind"],
+                    detector=it.get("detector", "*"),
+                    field=it.get("field"),
+                    value=it.get("value"),
+                    source_id=it.get("source_id"),
+                    event_id=it.get("event_id"),
+                    note=it.get("note"),
+                    details=it.get("details"),
+                    created_by=it.get("created_by"),
+                )
+                session.add(row)
+                # Make the row visible to the dedupe SELECT of later items.
+                await session.flush()
+                rows.append(row)
+            await session.commit()
+            for row in rows:
+                await session.refresh(row)
+            return rows
+
     async def delete_disposition(self, case_id: str, disposition_id: str) -> bool:
         """Delete a disposition row. Returns True if it existed."""
         async with self.session_factory() as session:

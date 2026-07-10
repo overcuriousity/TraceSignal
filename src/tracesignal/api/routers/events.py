@@ -2231,14 +2231,18 @@ async def list_anomalies(
             resolution=resolution,
             source_offsets=source_offsets,
         )
-    dismissed_rows = await get_store().list_dispositions(
-        case_id,
-        timeline_id=timeline_id,
-        source_ids=source_ids,
-        kinds=["dismissed"],
-        detector=detector,
-    )
-    payload = _apply_dismissals(dict(payload), dismissed_rows, include_dismissed)
+    # Nothing to filter on an empty result — skip the dispositions read.
+    if payload.get("results"):
+        dismissed_rows = await get_store().list_dispositions(
+            case_id,
+            timeline_id=timeline_id,
+            source_ids=source_ids,
+            kinds=["dismissed"],
+            detector=detector,
+        )
+        payload = _apply_dismissals(dict(payload), dismissed_rows, include_dismissed)
+    else:
+        payload["dismissed_count"] = 0
     # GETs are skipped by the generic audit middleware, so detector-run
     # launches would otherwise leave no trace at all. Audited regardless of
     # `persist` — unpersisted preview scans still read case data and should
@@ -2628,14 +2632,18 @@ async def tag_anomalies(
         },
     )
 
-    dismissed_rows = await store.list_dispositions(
-        case_id,
-        timeline_id=timeline_id,
-        source_ids=source_ids,
-        kinds=["dismissed"],
-        detector=body.detector,
-    )
-    payload = _apply_dismissals(dict(payload), dismissed_rows, body.include_dismissed)
+    # Nothing to filter on an empty result — skip the dispositions read.
+    if payload.get("results"):
+        dismissed_rows = await store.list_dispositions(
+            case_id,
+            timeline_id=timeline_id,
+            source_ids=source_ids,
+            kinds=["dismissed"],
+            detector=body.detector,
+        )
+        payload = _apply_dismissals(dict(payload), dismissed_rows, body.include_dismissed)
+    else:
+        payload["dismissed_count"] = 0
 
     return {
         "status": "ok",

@@ -102,21 +102,23 @@ def upgrade() -> None:
         sa.column("created_by", sa.String),
         sa.column("created_at", sa.DateTime),
     )
-    for row in bind.execute(sa.select(allowlist)).mappings():
-        bind.execute(
-            _dispositions.insert().values(
-                id=_derived_id(row["id"], "normal"),
-                case_id=row["case_id"],
-                timeline_id=row["timeline_id"],
-                kind="normal",
-                detector=row["detector"],
-                field=row["field"],
-                value=row["value"],
-                note=row["note"],
-                created_by=row["created_by"],
-                created_at=row["created_at"],
-            )
-        )
+    allowlist_values = [
+        {
+            "id": _derived_id(row["id"], "normal"),
+            "case_id": row["case_id"],
+            "timeline_id": row["timeline_id"],
+            "kind": "normal",
+            "detector": row["detector"],
+            "field": row["field"],
+            "value": row["value"],
+            "note": row["note"],
+            "created_by": row["created_by"],
+            "created_at": row["created_at"],
+        }
+        for row in bind.execute(sa.select(allowlist)).mappings()
+    ]
+    if allowlist_values:
+        bind.execute(_dispositions.insert(), allowlist_values)
 
     annotations = sa.table(
         "annotations",
@@ -136,41 +138,45 @@ def upgrade() -> None:
 
     # 2. Per-event "normal" annotations -> event-scoped kind="normal",
     #    detector="*" (the legacy exclusion applied to every detector).
-    for row in bind.execute(
-        sa.select(annotations).where(annotations.c.annotation_type == "normal")
-    ).mappings():
-        bind.execute(
-            _dispositions.insert().values(
-                id=_derived_id(row["id"], "normal"),
-                case_id=row["case_id"],
-                kind="normal",
-                detector="*",
-                source_id=row["source_id"],
-                event_id=row["event_id"],
-                note=row["content"],
-                created_by=row["created_by"],
-                created_at=row["created_at"],
-            )
-        )
+    normal_values = [
+        {
+            "id": _derived_id(row["id"], "normal"),
+            "case_id": row["case_id"],
+            "kind": "normal",
+            "detector": "*",
+            "source_id": row["source_id"],
+            "event_id": row["event_id"],
+            "note": row["content"],
+            "created_by": row["created_by"],
+            "created_at": row["created_at"],
+        }
+        for row in bind.execute(
+            sa.select(annotations).where(annotations.c.annotation_type == "normal")
+        ).mappings()
+    ]
+    if normal_values:
+        bind.execute(_dispositions.insert(), normal_values)
     bind.execute(sa.delete(annotations).where(annotations.c.annotation_type == "normal"))
 
     # 3. Pinned system annotations -> kind="confirmed"; annotation row kept.
-    for row in bind.execute(
-        sa.select(annotations).where(annotations.c.pinned.is_(True))
-    ).mappings():
-        bind.execute(
-            _dispositions.insert().values(
-                id=_derived_id(row["id"], "confirmed"),
-                case_id=row["case_id"],
-                kind="confirmed",
-                detector=row["detector"] or "*",
-                source_id=row["source_id"],
-                event_id=row["event_id"],
-                details=row["details"],
-                created_by=row["created_by"],
-                created_at=row["created_at"],
-            )
-        )
+    confirmed_values = [
+        {
+            "id": _derived_id(row["id"], "confirmed"),
+            "case_id": row["case_id"],
+            "kind": "confirmed",
+            "detector": row["detector"] or "*",
+            "source_id": row["source_id"],
+            "event_id": row["event_id"],
+            "details": row["details"],
+            "created_by": row["created_by"],
+            "created_at": row["created_at"],
+        }
+        for row in bind.execute(
+            sa.select(annotations).where(annotations.c.pinned.is_(True))
+        ).mappings()
+    ]
+    if confirmed_values:
+        bind.execute(_dispositions.insert(), confirmed_values)
 
     with op.batch_alter_table("annotations") as batch_op:
         batch_op.drop_column("pinned")

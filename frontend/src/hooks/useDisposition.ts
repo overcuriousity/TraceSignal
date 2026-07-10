@@ -43,6 +43,11 @@ function filterFindings(data: AnomaliesResponse, t: DispositionTarget): Anomalie
   return {
     ...data,
     results,
+    // Keep the "N of M findings" bar consistent with the removal.
+    total_findings:
+      data.total_findings !== undefined
+        ? Math.max(0, data.total_findings - dropped)
+        : undefined,
     // Dismissed findings stay counted — the backend reports them the same way.
     dismissed_count:
       t.kind === "dismissed" ? (data.dismissed_count ?? 0) + dropped : data.dismissed_count,

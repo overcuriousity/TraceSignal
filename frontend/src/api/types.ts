@@ -203,10 +203,11 @@ export interface View {
 }
 
 /**
- * "normal" is legacy read-only: normality/dismissal/confirmation are
- * dispositions now (see `Disposition`); old rows may still be returned.
+ * The legacy "normal" type is gone: normality/dismissal/confirmation are
+ * dispositions now (see `Disposition`); migration 0004 converted and
+ * deleted the old rows.
  */
-export type AnnotationType = "comment" | "tag" | "anomaly" | "normal";
+export type AnnotationType = "comment" | "tag" | "anomaly";
 export type AnnotationOrigin = "user" | "system";
 
 export interface Annotation {
