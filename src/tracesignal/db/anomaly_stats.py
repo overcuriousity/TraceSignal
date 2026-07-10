@@ -723,16 +723,39 @@ class OrderFinding:
 
 
 @dataclass
+class SequenceFinding:
+    """One event-order n-gram absent from the baseline window (sequence novelty)."""
+
+    # Field token the sequence was built over (e.g. "artifact").
+    field: str
+    # The n-gram's values, oldest → newest.
+    values: list[str]
+    # " → ".join(values) — display form and the allowlist key.
+    value: str
+    # Occurrences of the n-gram in the suspect window.
+    count: int
+    # -log(count / window_ngram_total); higher = rarer.
+    score: float
+    # Timestamp of the first event of the earliest occurrence in the window.
+    first_seen: str | None
+    # First event of that earliest occurrence.
+    event_id: str | None
+    event: dict[str, Any] | None
+    details: dict[str, Any]
+
+
+@dataclass
 class StatAnomalyResult:
     """Return value of statistical anomaly detection."""
 
     status: str  # "ok" | "no_data" | "insufficient_data"
     # "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range"
     #  | "charset" | "entropy" | "proportion_shift" | "interval_periodicity"
+    #  | "sequence_novelty"
     detector: str
     # "self-baseline" | "temporal" | "z-score" | "temporal-z-score" | "sequential"
     #  | "iqr" | "temporal-range" | "rare-chars" | "temporal-charset" | "temporal-iqr"
-    #  | "g-test" | "cadence"
+    #  | "g-test" | "cadence" | "ngram"
     method: str
     baseline_size: int  # total events (value_novelty) or event-count used for z-score
     results: list[
@@ -745,6 +768,7 @@ class StatAnomalyResult:
         | EntropyFinding
         | ShiftFinding
         | IntervalFinding
+        | SequenceFinding
     ] = field(default_factory=list)
     # Effective |z| cutoff used by the frequency detector; None for value_novelty.
     z_threshold: float | None = None
@@ -3888,6 +3912,258 @@ class StatisticalAnomalyService:
     # ------------------------------------------------------------------
     # Timestamp-order violations
     # ------------------------------------------------------------------
+
+    def find_sequence_novelty(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        series_field: str = "artifact",
+        ngram: int = 3,
+        limit: int = 50,
+        windows: AnalysisWindows | None = None,
+        max_candidates: int = 2000,
+        exclude_event_ids: set[str] | None = None,
+        allowlist: set[tuple[str, str]] | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
+        source_offsets: dict[str, int] | None = None,
+    ) -> StatAnomalyResult:
+        """Return event-order n-grams present in a suspect window but absent from the baseline.
+
+        AMiner ``EventSequenceDetector`` analog: per source, events are ordered
+        by effective timestamp (record-order tie-breaks) and every run of
+        *ngram* consecutive values of *series_field* forms one n-gram. An
+        n-gram that never occurs in the baseline window but occurs in a
+        suspect window is flagged, once per suspect window it appears in,
+        scored ``-log(count / window_ngram_total)`` against that window's own
+        n-gram total.
+
+        Sequences are assembled entirely in SQL (``lagInFrame`` over a
+        ``PARTITION BY source_id, w_idx`` window), so an n-gram never mixes
+        events from different sources, never spans a window boundary, and the
+        whole run is reproducible from the recorded query. Counting is
+        case-wide: n-grams are built per source but their counts are summed
+        across sources within each window. Multi-writer sources whose records
+        interleave several independent streams will produce interleaving
+        n-grams — a per-stream secondary partition field is a possible
+        follow-up, deliberately not implemented yet.
+
+        Temporal-only: without *windows* the result is ``insufficient_data``
+        — "never seen before" needs a before. *allowlist* suppresses findings
+        whose (series_field, " → "-joined n-gram) an analyst declared
+        never-anomalous.
+        """
+        detector = "sequence_novelty"
+        method = "ngram"
+        if not 2 <= ngram <= 5:
+            raise ValueError("ngram must be between 2 and 5")
+        if windows is None:
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector=detector,
+                method=method,
+                baseline_size=0,
+                warnings=[
+                    "sequence_novelty is temporal-only — select or create a baseline "
+                    "definition (baseline + suspect windows)."
+                ],
+            )
+
+        self.ch.init_schema()
+        db = self.ch.database
+
+        total_events = self._count_events(case_id, source_ids)
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data",
+                detector=detector,
+                method=method,
+                baseline_size=0,
+                windows=windows.payload(),
+            )
+
+        baseline_size, _suspect_event_totals = self._window_totals(
+            case_id, source_ids, windows, source_offsets
+        )
+
+        params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        col = _col_expr(series_field, params, field_mappings)
+        bp, sps = _window_preds(windows, params, source_offsets)
+        eff = effective_ts_sql(source_offsets)
+        union_pred = " OR ".join([bp, *sps])
+        # multiIf: baseline → -1, suspect i → i. The -2 default is unreachable
+        # (the WHERE union admits only in-window rows) but multiIf requires one.
+        w_branches = ", ".join(f"{sp}, {i}" for i, sp in enumerate(sps))
+        w_idx_expr = f"multiIf({bp}, -1, {w_branches}, -2)"
+
+        # Level 1: scope events to the windows and stamp each with its window
+        # index. Level 2: assemble each row's preceding n-gram via lagInFrame
+        # over per-(source, window) record order — partitioning by w_idx too
+        # keeps an n-gram from spanning a window boundary or the gap between
+        # windows. The toNullable guard is NULL exactly on each partition's
+        # first ngram-1 rows (incomplete n-grams), same trick as
+        # find_order_violations.
+        gram_lags = ", ".join(
+            [f"lagInFrame(val, {ngram - 1 - j}) OVER w" for j in range(ngram - 1)] + ["val"]
+        )
+        inner = f"""
+            SELECT
+                val,
+                ets,
+                w_idx,
+                [{gram_lags}] AS gram,
+                lagInFrame(toNullable(val), {ngram - 1}) OVER w AS guard,
+                lagInFrame(eid, {ngram - 1}) OVER w AS first_eid,
+                lagInFrame(toNullable(ets), {ngram - 1}) OVER w AS first_ts
+            FROM (
+                SELECT
+                    source_id,
+                    {col} AS val,
+                    toString(event_id) AS eid,
+                    {eff} AS ets,
+                    byte_offset,
+                    line_number,
+                    event_id,
+                    {w_idx_expr} AS w_idx
+                FROM {db}.events
+                WHERE case_id = {{cid:String}}
+                  AND has({{src:Array(String)}}, source_id)
+                  AND {col} != ''
+                  AND {TS_NOT_SENTINEL_SQL}
+                  AND ({union_pred})
+            )
+            WINDOW w AS (
+                PARTITION BY source_id, w_idx
+                ORDER BY ets, byte_offset, line_number, event_id
+                ROWS BETWEEN {ngram - 1} PRECEDING AND CURRENT ROW
+            )
+        """
+
+        # Query A: complete-n-gram totals per window — the surprise
+        # denominators and the basis for small-window warnings.
+        totals_sql = f"""
+            SELECT w_idx, count() AS n
+            FROM ({inner})
+            WHERE guard IS NOT NULL
+            GROUP BY w_idx
+            {HEAVY_SCAN_SETTINGS}
+        """
+        totals_rows = self.ch.client.query(totals_sql, parameters=params).result_rows
+        ngram_totals = {int(r[0]): int(r[1]) for r in totals_rows}
+        baseline_ngram_total = ngram_totals.get(-1, 0)
+        suspect_ngram_totals = [ngram_totals.get(i, 0) for i in range(len(windows.suspects))]
+
+        run_warnings = [
+            f"Suspect window {w.label!r} has only {total} complete sequences of "
+            f"length {ngram} — surprise scores over samples below "
+            f"{_MIN_WINDOW_EVENTS} are unstable"
+            for w, total in zip(windows.suspects, suspect_ngram_totals, strict=False)
+            if total < _MIN_WINDOW_EVENTS
+        ]
+        if baseline_ngram_total == 0:
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector=detector,
+                method=method,
+                baseline_size=baseline_size,
+                warnings=[
+                    *run_warnings,
+                    f"The baseline window contains no complete sequences of length {ngram}.",
+                ],
+                windows=windows.payload(),
+            )
+
+        # Query B: n-grams absent from the baseline but present in a suspect
+        # window — one countIf/minIf/argMinIf block per suspect window, same
+        # shape as value_novelty's temporal scan, keyed by the gram array.
+        params["cap"] = max_candidates
+        w_blocks = ",\n                ".join(
+            f"countIf(w_idx = {i}) AS w{i}_cnt,"
+            f" minIf(first_ts, w_idx = {i}) AS w{i}_first,"
+            f" argMinIf(first_eid, first_ts, w_idx = {i}) AS w{i}_evt"
+            for i in range(len(windows.suspects))
+        )
+        w_sum = " + ".join(f"w{i}_cnt" for i in range(len(windows.suspects)))
+        novel_sql = f"""
+            SELECT
+                gram,
+                countIf(w_idx = -1) AS baseline_cnt,
+                {w_blocks}
+            FROM ({inner})
+            WHERE guard IS NOT NULL
+            GROUP BY gram
+            HAVING baseline_cnt = 0 AND ({w_sum}) > 0
+            ORDER BY ({w_sum}) ASC, gram ASC
+            LIMIT {{cap:UInt32}}
+            {HEAVY_SCAN_SETTINGS}
+        """
+        rows = self.ch.client.query(novel_sql, parameters=params).result_rows
+        if len(rows) >= max_candidates:
+            run_warnings.append(
+                f"Hit the {max_candidates}-sequence candidate cap — only the "
+                f"{max_candidates} lowest-volume novel sequences were fetched; "
+                f"higher-volume novel sequences may be missing."
+            )
+
+        findings: list[SequenceFinding] = []
+        for row in rows:
+            values = [str(v) for v in row[0]]
+            joined = " → ".join(values)
+            for i, w in enumerate(windows.suspects):
+                w_cnt = int(row[2 + i * 3])
+                if w_cnt <= 0:
+                    continue
+                first_seen = _present_ts(row[3 + i * 3])
+                evt_id = row[4 + i * 3]
+                evt_id_str = str(evt_id) if evt_id else None
+                window_total = suspect_ngram_totals[i]
+                score = (
+                    -math.log(w_cnt / window_total) if w_cnt > 0 and window_total > 0 else 0.0
+                ) + 0.0
+                findings.append(
+                    SequenceFinding(
+                        field=series_field,
+                        values=values,
+                        value=joined,
+                        count=w_cnt,
+                        score=round(score, 4),
+                        first_seen=first_seen,
+                        event_id=evt_id_str,
+                        event=_stub_event(evt_id_str, case_id, first_seen),
+                        details={
+                            "detector": detector,
+                            "method": method,
+                            "field": series_field,
+                            "values": values,
+                            "value": joined,
+                            "n": ngram,
+                            "count": w_cnt,
+                            "window_ngram_total": window_total,
+                            "baseline_ngram_total": baseline_ngram_total,
+                            "baseline_size": baseline_size,
+                            "window_label": w.label,
+                            "window_start": ensure_utc(w.start).isoformat(),
+                            "window_end": ensure_utc(w.end).isoformat(),
+                            "surprise": round(score, 4),
+                            "allowlist_field": series_field,
+                            "allowlist_value": joined,
+                        },
+                    )
+                )
+
+        return self._finalize_findings(
+            findings,
+            detector=detector,
+            method=method,
+            total_events=baseline_size,
+            evaluated_fields=1,
+            exclude_event_ids=exclude_event_ids,
+            limit=limit,
+            case_id=case_id,
+            source_ids=source_ids,
+            allowlist=allowlist,
+            warnings=run_warnings,
+            windows=windows,
+        )
 
     def find_order_violations(
         self,

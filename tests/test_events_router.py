@@ -563,6 +563,7 @@ class _FakeStatAnomalyService:
         self.entropy_calls: list[dict] = []
         self.shift_calls: list[dict] = []
         self.interval_calls: list[dict] = []
+        self.sequence_calls: list[dict] = []
 
     def get_timeline_midpoint(self, case_id, source_ids, source_offsets=None):
         return self._midpoint
@@ -605,6 +606,10 @@ class _FakeStatAnomalyService:
     def find_interval_periodicity(self, **kwargs):
         self.interval_calls.append(kwargs)
         return "interval-result"
+
+    def find_sequence_novelty(self, **kwargs):
+        self.sequence_calls.append(kwargs)
+        return "sequence-result"
 
 
 @pytest.fixture()
@@ -1085,6 +1090,82 @@ def test_serialize_finding_interval_periodicity_shape():
     assert out["baseline_median_interval"] == 60.0
     assert out["score"] == 300.0
     assert out["details"]["last_seen_baseline"] == "2024-01-14"
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_dispatches_to_sequence_novelty(patched_store, monkeypatch):
+    """sequence_novelty dispatches with the config-default n and candidate cap."""
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    result, resolution = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="sequence_novelty",
+        fields=None,
+        series_field="attr:proc",
+        z_threshold=None,
+        baseline_end=None,
+        temporal=False,
+        limit=50,
+    )
+    assert result == "sequence-result"
+    call = fake_svc.sequence_calls[0]
+    assert call["series_field"] == "attr:proc"
+    assert call["windows"] is None
+    cfg = events.get_settings()
+    assert call["ngram"] == cfg.stat_sequence_ngram
+    assert call["max_candidates"] == cfg.stat_sequence_max_candidates
+    assert resolution["sequence_ngram"] == cfg.stat_sequence_ngram
+    assert not fake_svc.value_novelty_calls
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_sequence_ngram_override(patched_store, monkeypatch):
+    """The ngram_size request param overrides the server default and is snapshotted."""
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    _result, resolution = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="sequence_novelty",
+        fields=None,
+        series_field="artifact",
+        z_threshold=None,
+        baseline_end=None,
+        temporal=False,
+        limit=50,
+        ngram_size=4,
+    )
+    call = fake_svc.sequence_calls[0]
+    assert call["ngram"] == 4
+    assert resolution["sequence_ngram"] == 4
+
+
+def test_serialize_finding_sequence_novelty_shape():
+    from tracesignal.db.anomaly_stats import SequenceFinding
+
+    f = SequenceFinding(
+        field="artifact",
+        values=["login", "priv_esc", "wipe"],
+        value="login → priv_esc → wipe",
+        count=2,
+        score=6.9068,
+        first_seen="2024-01-17T12:00:00+00:00",
+        event_id="evt-1",
+        event=None,
+        details={"detector": "sequence_novelty", "n": 3, "window_ngram_total": 1998},
+    )
+    out = events._serialize_finding(f)
+    assert out["type"] == "sequence_novelty"
+    assert out["values"] == ["login", "priv_esc", "wipe"]
+    assert out["value"] == "login → priv_esc → wipe"
+    assert out["count"] == 2
+    assert out["score"] == 6.9068
+    assert out["details"]["n"] == 3
 
 
 @pytest.mark.asyncio

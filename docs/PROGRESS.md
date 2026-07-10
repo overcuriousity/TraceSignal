@@ -1,6 +1,45 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-10 (session 44 — unified disposition taxonomy + anomaly panel fixes).
+Last updated: 2026-07-10 (session 45 — D8 event-sequence novelty detector).
+
+## Session 45 — 2026-07-10: D8 — event-sequence novelty detector (`sequence_novelty`)
+
+Shipped roadmap D8 (AMiner `EventSequenceDetector` analog) end to end. Per source, events are
+ordered by effective timestamp (record-order tie-breaks) and every run of n consecutive values
+of one grouping field forms an n-gram; n-grams present in a suspect window but absent from the
+baseline window are flagged, scored `-log(count / window_ngram_total)`. Temporal-only
+(no self-baseline mode); counting is case-wide (n-grams built per source, counts summed).
+
+**Backend (`db/anomaly_stats.py`)** — new `SequenceFinding` dataclass +
+`find_sequence_novelty(series_field="artifact", ngram=3, …)`. Sequences are assembled entirely
+in SQL: a `lagInFrame` chain over `PARTITION BY source_id, w_idx` (window index via a
+`multiIf` over `_window_preds`), so an n-gram never mixes sources or spans a window boundary;
+a `toNullable` lag guard drops incomplete leading n-grams (same trick as timestamp-order).
+Two queries: per-window complete-n-gram totals (denominators + small-window warnings), then
+the novel-gram GROUP BY with per-window `countIf`/`minIf`/`argMinIf` blocks (value_novelty
+temporal shape), capped at `TS_STAT_SEQUENCE_MAX_CANDIDATES` (2000, warning on hit).
+Representative event = first event of the earliest window occurrence, via lagged
+event-id/timestamp columns. Config: `stat_sequence_ngram` (3), `stat_sequence_max_candidates`.
+
+**Router (`api/routers/events.py`)** — `sequence_novelty` dispatch branch (n validated 2–5 →
+422), new `ngram_size` param on `list_anomalies` + `TagAnomaliesRequest`, effective n
+snapshotted into `resolution`/`DetectorRun.params`, `SequenceFinding` serialization
+(`type: "sequence_novelty"`), tag-annotation content branch ("New sequence — …"). Allowlist
+key = `(series_field, " → "-joined n-gram)`. No migration needed.
+
+**Frontend** — `EventSequenceView.tsx` (temporal-only gate like proportion shift, grouping
+field select + n selector, chip-arrow sequence rows), `DetectorAccordion` entry ("Event
+sequences"), `MethodologyPanel` card, detector unions + `SequenceNoveltyFinding` type +
+`ngram_size` param in `api/anomalies.ts`/`types.ts`.
+
+**Tests** — 12 service tests (temporal-only/no-data/validation, baseline-without-n-grams,
+scoring + details, multi-window attribution, allowlist/exclude, warnings, limit, SQL-shape and
+W2-offset assertions via `RecordingClient`) + 3 router tests (dispatch defaults, `ngram_size`
+override, serialization). Backend 211 pass in the two touched files; frontend
+typecheck/lint/183 tests green.
+
+**Docs** — `ANOMALY_DETECTION.md` new §9 (semantic search renumbered §10, intro list now ten
+tools); `ROADMAP.md` D8 item replaced with a shipped summary.
 
 ## Session 44 — 2026-07-10: unified disposition taxonomy; stale-panel + 50-cap fixes
 

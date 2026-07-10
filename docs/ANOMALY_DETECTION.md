@@ -9,7 +9,7 @@ file and the "Method" tab copy in the same commit — see
 [Reality check](#reality-check-2026-07) at the bottom for the audit that
 produced this file and what was fixed as part of it.
 
-There are nine independent analysis tools in TraceSignal:
+There are ten independent analysis tools in TraceSignal:
 
 1. [Value novelty](#1-value-novelty-rare--first-seen-values) — rare/new field values, single field or [combinations](#value-combinations-the-value_combo-variant) (ClickHouse, no ML)
 2. [Frequency anomalies](#2-frequency-anomalies-volume-spikes--silences) — volume spikes/silences (ClickHouse, no ML)
@@ -19,14 +19,15 @@ There are nine independent analysis tools in TraceSignal:
 6. [Entropy outliers](#6-entropy-outliers-random-looking-values) — values whose character entropy falls outside the field's learned band (ClickHouse, no ML)
 7. [Proportion shift](#7-proportion-shift-value-share-changes-between-windows) — values whose *share* of events changed significantly between the baseline and a suspect window (ClickHouse + a real significance test, no ML)
 8. [Interval cadence](#8-interval-cadence-arrival-rhythm-changes-between-windows) — values whose inter-arrival rhythm broke (missed/silent heartbeat) or newly regularized (beaconing) between the baseline and a suspect window (ClickHouse + significance tests, no ML)
-9. [Semantic similarity search](#9-semantic-similarity-search) — "find events like this one" (embeddings + Qdrant)
+9. [Event sequences](#9-event-sequences-never-seen-orderings) — time-ordered n-grams of a field's values that occur in a suspect window but never in the baseline (ClickHouse, no ML)
+10. [Semantic similarity search](#10-semantic-similarity-search) — "find events like this one" (embeddings + Qdrant)
 
-The first eight are **statistical detectors**: pure counting and arithmetic over
+The first nine are **statistical detectors**: pure counting and arithmetic over
 already-ingested events, no machine learning, no network calls, work the
-instant ingestion finishes. The ninth needs an explicit embedding step first.
+instant ingestion finishes. The tenth needs an explicit embedding step first.
 
-Code: `src/tracesignal/db/anomaly_stats.py` (detectors 1–8),
-`src/tracesignal/db/similarity.py` (detector 9). UI: `frontend/src/components/analysis/`.
+Code: `src/tracesignal/db/anomaly_stats.py` (detectors 1–9),
+`src/tracesignal/db/similarity.py` (detector 10). UI: `frontend/src/components/analysis/`.
 
 ### Query-cost discipline (all statistical detectors)
 
@@ -65,10 +66,10 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
 ### Baseline definitions, suspect windows, and the normality model
 
 Every temporal detector (value novelty, value combos, frequency, numeric
-range, charset, entropy, proportion shift — everything except the mode-less
-timestamp-order detector; proportion shift is the one detector that is
-temporal-*only*, having no self-baseline mode) answers the same shape of
-question: *given a period I know was
+range, charset, entropy, proportion shift, interval cadence, event sequences —
+everything except the mode-less timestamp-order detector; proportion shift,
+interval cadence and event sequences are temporal-*only*, having no
+self-baseline mode) answers the same shape of question: *given a period I know was
 normal, what stands out in the periods I'm suspicious of?* Two persistent,
 analyst-declared primitives express "normal", and it is worth being precise
 about which is which:
@@ -986,7 +987,87 @@ field as exploratory.
 
 ---
 
-## 9. Semantic similarity search
+## 9. Event sequences (never-seen orderings)
+
+**What it answers:** "Did events start happening in an *order* never seen
+before?" The AMiner `EventSequenceDetector` analog (roadmap D8). A login, a
+privilege change and a log clear may each be individually common — value
+novelty sees nothing — but the three in that order, back to back, may never
+have happened in the baseline. This detector owns the *ordering* axis the way
+proportion shift owns magnitude and interval cadence owns spacing.
+
+**How it works.** Per source, events are ordered by (effective) timestamp —
+with record-order tie-breaks (`byte_offset`, `line_number`, `event_id`) so the
+ordering is deterministic — and every run of **n consecutive values** of one
+grouping field (default `artifact`, n = 3) forms one **n-gram**. An n-gram
+that occurs in a suspect window but **never in the baseline window** is
+flagged, once per suspect window it appears in.
+
+Sequences are assembled entirely in SQL: a `lagInFrame` chain over a window
+`PARTITION BY source_id, window-index`, so
+
+- an n-gram never mixes events from different sources,
+- an n-gram never spans a window boundary or the gap between windows (all n
+  events sit inside one window), and
+- the whole run is reproducible from the recorded query — no Python-side
+  sequence assembly.
+
+Counting is case-wide: n-grams are built per source, but their counts are
+summed across sources within each window.
+
+**Temporal-only.** "Never seen before" needs a before — there is no
+self-baseline mode. Without a
+[baseline definition](#baseline-definitions-suspect-windows-and-the-normality-model)
+it reports `insufficient_data`; likewise when the baseline window holds no
+complete sequence of length n.
+
+**Score = −log(count / window_ngram_total)** — the same surprise scale as
+value novelty, but the denominator is the suspect window's own count of
+*complete n-grams* (not its event count; the first n−1 events of each
+(source, window) run contribute no complete n-gram). The representative event
+is the **first** event of the n-gram's earliest occurrence in the window. A
+suspect window with fewer than 50 complete n-grams gets a `warnings` entry.
+
+**Parameters.**
+
+- `ngram_size` (request) / `TS_STAT_SEQUENCE_NGRAM` (server default 3, the
+  AMiner default sequence length) — validated 2–5; the effective n is
+  snapshotted into the persisted `DetectorRun`.
+- `series_field` (request, default `artifact`) — the single grouping field the
+  sequence is built over (shared with the frequency detector's group-by; not
+  the multi-field `fields` picker). Any field token works, including
+  `attr:<key>` and mapped canonical fields.
+- `TS_STAT_SEQUENCE_MAX_CANDIDATES` (default 2000) — cap on novel n-grams
+  fetched per run, lowest suspect volume (rarest) first; hitting it attaches a
+  warning.
+
+**Allowlist key:** `(series_field, "a → b → c")` — the finding's `value` is
+the " → "-joined n-gram, so **Mark normal** suppresses that exact ordering on
+every event.
+
+### Caveats
+
+- **Interleaved multi-writer sources.** A source whose records interleave many
+  independent streams (one syslog file carrying fifty hosts) produces
+  n-grams that cross stream boundaries — a "new sequence" may be two unrelated
+  streams shuffling differently. Choose a grouping field that is meaningful
+  across the whole source, or scope the timeline to per-stream sources. A
+  per-stream secondary partition field is a possible follow-up, deliberately
+  not implemented yet.
+- **Tiny baselines make everything novel.** A baseline with few complete
+  n-grams vouches for almost nothing; the <50-n-gram warning fires, and n = 4
+  or 5 on a short baseline mostly measures the baseline's poverty. Prefer
+  longer baselines for larger n.
+- **Order is judged per source on the corrected timeline** — per-source clock
+  skew offsets (W2) shift a source's events uniformly, so intra-source order
+  is invariant, but which *window* an event falls in follows the corrected
+  timestamp.
+- A new ordering is **not malicious by itself** — a software update legitimately
+  changes startup sequences. Rank for triage.
+
+---
+
+## 10. Semantic similarity search
 
 Not a statistical anomaly detector — no baseline, no score threshold, no
 z-score — but it lives in the same Analysis tab and Method panel, so it's

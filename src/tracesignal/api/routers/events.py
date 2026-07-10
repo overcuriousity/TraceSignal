@@ -38,6 +38,7 @@ from tracesignal.db.anomaly_stats import (
     NoveltyFieldInfo,
     OrderFinding,
     RangeFinding,
+    SequenceFinding,
     ShiftFinding,
     StatisticalAnomalyService,
     TimeWindow,
@@ -1392,6 +1393,7 @@ async def _run_stat_detector(
     min_skew_seconds: float | None = None,
     fdr_q: float | None = None,
     min_ratio: float | None = None,
+    ngram_size: int | None = None,
     field_mappings: dict[str, list[str]] | None = None,
     source_offsets: dict[str, int] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
@@ -1482,6 +1484,32 @@ async def _run_stat_detector(
             field_mappings=field_mappings,
         )
         return result, resolution
+
+    if detector == "sequence_novelty":
+        # Sequences are built over the single series_field (like frequency's
+        # GROUP BY field), not the multi-field `fields` param. Snapshot the
+        # effective n so the persisted run stays self-describing.
+        resolution["sequence_ngram"] = (
+            ngram_size if ngram_size is not None else cfg.stat_sequence_ngram
+        )
+        try:
+            result = await run_in_threadpool(
+                svc.find_sequence_novelty,
+                case_id=case_id,
+                source_ids=source_ids,
+                source_offsets=source_offsets,
+                series_field=series_field,
+                ngram=resolution["sequence_ngram"],
+                limit=limit,
+                windows=windows,
+                max_candidates=cfg.stat_sequence_max_candidates,
+                exclude_event_ids=exclude_ids,
+                allowlist=allowlist,
+                field_mappings=field_mappings,
+            )
+            return result, resolution
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     parsed_fields = _parse_novelty_fields(fields)
 
@@ -1743,12 +1771,16 @@ def _serialize_finding(
     | CharsetFinding
     | EntropyFinding
     | ShiftFinding
-    | IntervalFinding,
+    | IntervalFinding
+    | SequenceFinding,
 ) -> dict[str, Any]:
-    """Serialise a Value/Freq/Order/Combo/Range/Charset/Entropy/Shift/Interval finding to a JSON-safe dict."""
-    # Charset/Entropy/Shift/Interval finding dataclass fields are exactly the
-    # wire keys, so asdict() avoids a hand-maintained field-by-field
-    # transcription that would silently drop any newly added field.
+    """Serialise a Value/Freq/Order/Combo/Range/Charset/Entropy/Shift/Interval/Sequence finding to a JSON-safe dict."""
+    # Charset/Entropy/Shift/Interval/Sequence finding dataclass fields are
+    # exactly the wire keys, so asdict() avoids a hand-maintained
+    # field-by-field transcription that would silently drop any newly added
+    # field.
+    if isinstance(r, SequenceFinding):
+        return {"type": "sequence_novelty", **asdict(r)}
     if isinstance(r, IntervalFinding):
         return {"type": "interval_periodicity", **asdict(r)}
     if isinstance(r, ShiftFinding):
@@ -2025,6 +2057,8 @@ async def _persist_detector_run(
             "fdr_q": resolution.get("shift_fdr_q") or resolution.get("interval_fdr_q"),
             "min_ratio": resolution.get("shift_min_ratio")
             or resolution.get("interval_min_rate_ratio"),
+            # sequence_novelty: effective (request-or-default) n-gram length.
+            "ngram_size": resolution.get("sequence_ngram"),
             "baseline_id": resolution.get("baseline_id"),
             "windows": resolution.get("windows"),
             "windows_hash": resolution.get("windows_hash"),
@@ -2064,7 +2098,7 @@ async def list_anomalies(
     timeline_id: str,
     detector: str = Query(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', or 'interval_periodicity'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', or 'sequence_novelty'.",
     ),
     fields: str | None = Query(
         default=None,
@@ -2076,7 +2110,7 @@ async def list_anomalies(
     ),
     series_field: str = Query(
         default="artifact",
-        description="Field to group frequency series by.",
+        description="Field to group frequency series / build event sequences by.",
     ),
     z_threshold: float | None = Query(
         default=None,
@@ -2108,6 +2142,14 @@ async def list_anomalies(
             "Effect-size floor (rate ratio, either direction) for the "
             "proportion_shift and interval_periodicity detectors. Omit to "
             "use the server default."
+        ),
+    ),
+    ngram_size: int | None = Query(
+        default=None,
+        ge=2,
+        le=5,
+        description=(
+            "Sequence length (n) for the sequence_novelty detector. Omit to use the server default."
         ),
     ),
     baseline_end: datetime | None = Query(  # noqa: B008
@@ -2190,6 +2232,11 @@ async def list_anomalies(
     covers per-value silence) or a baseline-bursty value that becomes
     suspiciously regular (Greenwood spacing test, beaconing). Temporal-only;
     BH-FDR across the run.
+
+    **sequence_novelty**: per source, builds time-ordered n-grams of
+    `series_field` values and flags n-grams that occur in a suspect window
+    but never in the baseline window (AMiner EventSequenceDetector analog).
+    Temporal-only; surprise-scored against the window's own n-gram total.
     """
     source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     result, resolution = await _run_stat_detector(
@@ -2207,6 +2254,7 @@ async def list_anomalies(
         min_skew_seconds=min_skew_seconds,
         fdr_q=fdr_q,
         min_ratio=min_ratio,
+        ngram_size=ngram_size,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )
@@ -2274,7 +2322,7 @@ class TagAnomaliesRequest(BaseModel):
 
     detector: str = Field(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', or 'interval_periodicity'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', or 'sequence_novelty'.",
     )
     fields: str | None = Field(
         default=None,
@@ -2282,7 +2330,7 @@ class TagAnomaliesRequest(BaseModel):
     )
     series_field: str = Field(
         default="artifact",
-        description="Field to group frequency series by.",
+        description="Field to group frequency series / build event sequences by.",
     )
     z_threshold: float | None = Field(
         default=None,
@@ -2304,6 +2352,12 @@ class TagAnomaliesRequest(BaseModel):
         default=None,
         gt=1,
         description="Effect-size floor (rate ratio) for the proportion_shift and interval_periodicity detectors.",
+    )
+    ngram_size: int | None = Field(
+        default=None,
+        ge=2,
+        le=5,
+        description="Sequence length (n) for the sequence_novelty detector.",
     )
     baseline_end: datetime | None = Field(
         default=None,
@@ -2371,6 +2425,7 @@ async def tag_anomalies(
         min_skew_seconds=body.min_skew_seconds,
         fdr_q=body.fdr_q,
         min_ratio=body.min_ratio,
+        ngram_size=body.ngram_size,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )
@@ -2493,6 +2548,18 @@ async def tag_anomalies(
                     f"of {result.baseline_size:,} events in the corpus "
                     f"(surprise {r.score:.2f})"
                 )
+        elif isinstance(r, SequenceFinding):
+            event_id = r.event_id or ""
+            src_id = r.event.get("source_id", "") if r.event else ""
+            where = _window_phrase(r.details) or "the detect window"
+            content = (
+                f"New sequence — {r.field}: {r.value}: this "
+                f"{r.details.get('n')}-event order never occurs among the baseline "
+                f"window's {r.details.get('baseline_ngram_total', 0):,} sequences; "
+                f"first appears in {where} at {r.first_seen} ({r.count} of "
+                f"{r.details.get('window_ngram_total', 0):,} window sequences; "
+                f"surprise {r.score:.2f})"
+            )
         elif isinstance(r, IntervalFinding):
             event_id = r.event_id or ""
             src_id = r.event.get("source_id", "") if r.event else ""

@@ -120,11 +120,15 @@ value that breaks rhythm (Poisson-rate LRT; missed/accelerated) and a baseline-b
 becomes suspiciously regular (Greenwood spacing statistic; beaconing). Temporal-only, `-log10(p)`
 score. See `docs/ANOMALY_DETECTION.md` §8.
 
+D8 shipped as the `sequence_novelty` detector (`method="ngram"`): per source, time-ordered
+n-grams (n = 2–5, default 3) of one grouping field (`series_field`, default `artifact`),
+assembled entirely in SQL via a `lagInFrame` chain partitioned by (source, window); n-grams
+absent from the baseline window are flagged per suspect window, surprise-scored against the
+window's own complete-n-gram total. Temporal-only. See `docs/ANOMALY_DETECTION.md` §9
+(semantic search renumbered §10).
+
 High value first:
 
-- [ ] **D8 — Event-sequence novelty** (AMiner `EventSequenceDetector`): n-grams of artifact
-  types (or values of one user-chosen grouping field) ordered by time; flag n-grams absent
-  from the baseline. `groupArray` + window functions.
 - [ ] **D9 — Value-distribution drift** (AMiner `VariableTypeDetector`, simplified): per
   field, compare baseline vs. detect-window value distributions with ClickHouse's built-in
   `kolmogorovSmirnovTest()` (numeric) or frequency-vector comparison (categorical).
