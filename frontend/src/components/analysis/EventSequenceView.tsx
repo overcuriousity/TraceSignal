@@ -23,6 +23,7 @@ import {
 } from "./detector-shared";
 import {
   useCappedFindings,
+  useFindingsLimit,
   useBaselineRequest,
   useAnomalyMarkers,
   useDetectorRunId,
@@ -140,6 +141,7 @@ export function EventSequenceView({
   const [ngramSize, setNgramSize] = useState(3);
   const qc = useQueryClient();
 
+  const fl = useFindingsLimit();
   const enabled = frame === "baseline" && !needsBaseline;
 
   // Dynamic attribute fields extend the grouping-field dropdown (same source
@@ -162,13 +164,13 @@ export function EventSequenceView({
   }, [fieldsData]);
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "sequence_novelty", seriesField, ngramSize, blKey],
+    queryKey: ["anomalies", caseId, timelineId, "sequence_novelty", seriesField, ngramSize, blKey, fl.limit],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "sequence_novelty",
         series_field: seriesField,
         ngram_size: ngramSize,
-        limit: 50,
+        limit: fl.limit,
         ...blParams,
       }),
     staleTime: 60_000,
@@ -181,7 +183,7 @@ export function EventSequenceView({
         detector: "sequence_novelty",
         series_field: seriesField,
         ngram_size: ngramSize,
-        limit: 50,
+        limit: fl.limit,
         ...blParams,
       }),
     onSuccess: () => {
@@ -314,7 +316,7 @@ export function EventSequenceView({
       {/* Findings list */}
       {findings.length > 0 && (
         <div className="space-y-1.5">
-          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} />
+          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} serverTotal={data?.total_findings} onLoadMore={fl.canRaise ? fl.raise : undefined} loadingMore={isFetching} dismissedCount={data?.dismissed_count} />
           {cap.shown.map((f, i) => (
             <SequenceRow
               key={`${f.field}:${f.value}:${i}`}

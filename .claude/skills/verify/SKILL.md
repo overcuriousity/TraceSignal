@@ -52,7 +52,8 @@ Timesketch CSV ingests with zero config; columns `datetime,timestamp_desc,source
 5. Run a detector: `GET /api/cases/{case}/timelines/{tl}/anomalies?detector=<id>&baseline_id=<bl>`
    (add `&persist=false` for probes); tag: `POST .../anomalies/tag`;
    inspect a persisted run: `GET /api/cases/{case}/detector-runs/{run_id}`;
-   allowlist: `POST .../allowlist` `{"detector","field","value"}`
+   disposition (mark normal / dismiss / confirm):
+   `POST .../dispositions` `{"kind":"normal","detector","field","value"}`
 
 ## Cleanup
 

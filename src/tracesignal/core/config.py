@@ -115,7 +115,9 @@ class Settings(BaseSettings):
     stat_interval_max_candidates_per_field: int = 2000
     # Sequence-novelty detector: default n-gram length (AMiner
     # EventSequenceDetector's default sequence length).
-    stat_sequence_ngram: int = 3
+    # Constrained here so a bad TS_STAT_SEQUENCE_NGRAM fails at startup as a
+    # config error instead of surfacing as a 422 that blames the client.
+    stat_sequence_ngram: int = Field(default=3, ge=2, le=5)
     # Cap on novel n-grams fetched per run (lowest suspect volume first —
     # rarest sequences are the detector's point); hitting it carries a warning.
     stat_sequence_max_candidates: int = 2000
