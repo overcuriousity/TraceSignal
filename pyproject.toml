@@ -45,7 +45,7 @@ dependencies = [
 # without it, embed jobs and semantic search return a clear 503 and
 # /api/health reports embeddings_available=false.
 embeddings = [
-    "torch>=2.2.0",
+    "torch>=2.13.0",
     "sentence-transformers>=3.3.0",
 ]
 
