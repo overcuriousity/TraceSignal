@@ -1,6 +1,27 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-10 (session 46 — PR merges, prod hotfixes, scan-memory overhaul).
+Last updated: 2026-07-10 (session 47 — converter OOM + row-order fixes, all natives → 1.1.0).
+
+## Session 47 — 2026-07-10: native converters memory-bounded, row order guaranteed (v1.1.0)
+
+A 60 GB nginx log OOM-killed `nginx2tracesignal.py` in the field. Root causes fixed across
+**all six native converters** (nginx/filterlog/suricata/timesketch2parquet chunked-parallel;
+cloudtrail/pcap per-file-parallel), each bumped to `CONVERTER_VERSION = "1.1.0"`:
+
+- **Parent-side result pile-up (the actual OOM, survived the first field patch).** The
+  parallel loops submitted every chunk/file up front and consumed via `as_completed`; the
+  `futures` list retained every finished chunk's Arrow IPC bytes for the whole run, so the
+  parent accumulated ~the entire parsed file. Replaced with a bounded submission window
+  (`workers * 2` in flight) consumed strictly in submit order — ≤ ~2×workers results ever
+  resident, and rows land in **original file order** (forensic requirement; previously
+  completion-ordered, i.e. nondeterministic).
+- **Worker-side bounds:** chunk stride hard-capped at 128 MiB (`<PREFIX>_MAX_CHUNK_BYTES`),
+  default workers capped at 4 (`<PREFIX>_DEFAULT_WORKERS`, still `-w`-overridable), and a
+  MemAvailable-based warning before parallel runs.
+
+Verified: parallel output byte-identical to sequential for both architectures (nginx 20k rows
+across 29 forced chunks; cloudtrail 6 files × 4 workers), full suite 807 passed, manifest
+sha256/size refreshed for the six native entries.
 
 ## Session 46 — 2026-07-10: PRs #86/#87/#85 merged; prod deploy hotfixes; scan-memory overhaul
 
