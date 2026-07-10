@@ -102,7 +102,7 @@ function IntervalRow({
           eventId={finding.event_id}
           onDrillField={onDrillField}
           onJumpToTime={onJumpToTime}
-          markNormal={{
+          disposition={{
             caseId,
             timelineId,
             detector: "interval_periodicity",
@@ -346,6 +346,7 @@ export function IntervalPeriodicityView({
             serverTotal={data?.total_findings}
             onLoadMore={fl.canRaise ? fl.raise : undefined}
             loadingMore={isFetching}
+            dismissedCount={data?.dismissed_count}
           />
           {cap.shown.map((f, i) => (
             <IntervalRow
