@@ -3940,12 +3940,16 @@ class StatisticalAnomalyService:
         Sequences are assembled entirely in SQL (``lagInFrame`` over a
         ``PARTITION BY source_id, w_idx`` window), so an n-gram never mixes
         events from different sources, never spans a window boundary, and the
-        whole run is reproducible from the recorded query. Counting is
-        case-wide: n-grams are built per source but their counts are summed
-        across sources within each window. Multi-writer sources whose records
-        interleave several independent streams will produce interleaving
-        n-grams — a per-stream secondary partition field is a possible
-        follow-up, deliberately not implemented yet.
+        whole run is reproducible from the recorded queries. Every scan runs
+        **once per source** — ClickHouse cannot spill window-function sorts
+        to disk (see docs/ANOMALY_DETECTION.md), so the sort must be bounded
+        by one source; a case-wide query OOMs on 100M+-row cases. Counting
+        stays case-wide: per-source counts are summed per window in Python,
+        and a candidate n-gram survives only if **no** source's baseline
+        contains it (cross-source verification pass). Multi-writer sources
+        whose records interleave several independent streams will produce
+        interleaving n-grams — a per-stream secondary partition field is a
+        possible follow-up, deliberately not implemented yet.
 
         Temporal-only: without *windows* the result is ``insufficient_data``
         — "never seen before" needs a before. *allowlist* suppresses findings
@@ -4038,8 +4042,8 @@ class StatisticalAnomalyService:
             )
         """
 
-        # Query A: complete-n-gram totals per window — the surprise
-        # denominators and the basis for small-window warnings.
+        # Query A (once per source): complete-n-gram totals per window —
+        # summed into the surprise denominators and small-window warnings.
         totals_sql = f"""
             SELECT w_idx, count() AS n
             FROM ({inner})
@@ -4047,8 +4051,13 @@ class StatisticalAnomalyService:
             GROUP BY w_idx
             {HEAVY_SCAN_SETTINGS}
         """
-        totals_rows = self.ch.client.query(totals_sql, parameters=params).result_rows
-        ngram_totals = {int(r[0]): int(r[1]) for r in totals_rows}
+        ngram_totals: dict[int, int] = {}
+        for sid in source_ids:
+            totals_rows = self.ch.client.query(
+                totals_sql, parameters={**params, "src": [sid]}
+            ).result_rows
+            for r in totals_rows:
+                ngram_totals[int(r[0])] = ngram_totals.get(int(r[0]), 0) + int(r[1])
         baseline_ngram_total = ngram_totals.get(-1, 0)
         suspect_ngram_totals = [ngram_totals.get(i, 0) for i in range(len(windows.suspects))]
 
@@ -4072,9 +4081,11 @@ class StatisticalAnomalyService:
                 windows=windows.payload(),
             )
 
-        # Query B: n-grams absent from the baseline but present in a suspect
-        # window — one countIf/minIf/argMinIf block per suspect window, same
-        # shape as value_novelty's temporal scan, keyed by the gram array.
+        # Query B (once per source): n-grams absent from THIS source's
+        # baseline but present in a suspect window — one countIf/minIf/
+        # argMinIf block per suspect window, same shape as value_novelty's
+        # temporal scan, keyed by the gram array. Candidates that another
+        # source's baseline vouches for are dropped by Query C below.
         params["cap"] = max_candidates
         w_blocks = ",\n                ".join(
             f"countIf(w_idx = {i}) AS w{i}_cnt,"
@@ -4096,24 +4107,62 @@ class StatisticalAnomalyService:
             LIMIT {{cap:UInt32}}
             {HEAVY_SCAN_SETTINGS}
         """
-        rows = self.ch.client.query(novel_sql, parameters=params).result_rows
-        if len(rows) >= max_candidates:
-            run_warnings.append(
-                f"Hit the {max_candidates}-sequence candidate cap — only the "
-                f"{max_candidates} lowest-volume novel sequences were fetched; "
-                f"higher-volume novel sequences may be missing."
-            )
+        # gram -> one [count, first_ts, first_eid] slot per suspect window,
+        # merged across sources (counts summed, earliest occurrence wins).
+        n_susp = len(windows.suspects)
+        merged: dict[tuple[str, ...], list[list[Any]]] = {}
+        for sid in source_ids:
+            rows = self.ch.client.query(
+                novel_sql, parameters={**params, "src": [sid]}
+            ).result_rows
+            if len(rows) >= max_candidates:
+                run_warnings.append(
+                    f"Source {sid}: hit the {max_candidates}-sequence candidate cap — "
+                    f"only its {max_candidates} lowest-volume novel sequences were "
+                    f"fetched; higher-volume novel sequences may be missing."
+                )
+            for row in rows:
+                gram = tuple(str(v) for v in row[0])
+                slots = merged.setdefault(gram, [[0, None, None] for _ in range(n_susp)])
+                for i in range(n_susp):
+                    cnt = int(row[2 + i * 3])
+                    if cnt <= 0:
+                        continue
+                    slot = slots[i]
+                    slot[0] += cnt
+                    first_ts = row[3 + i * 3]
+                    if first_ts is not None and (slot[1] is None or first_ts < slot[1]):
+                        slot[1] = first_ts
+                        slot[2] = row[4 + i * 3]
+
+        # Query C (multi-source cases only): "never in the baseline" is
+        # case-wide — drop any candidate that occurs in ANY source's baseline
+        # window (Query B could only rule out the reporting source's own).
+        if merged and len(source_ids) > 1:
+            baseline_check_sql = f"""
+                SELECT DISTINCT gram
+                FROM ({inner})
+                WHERE guard IS NOT NULL AND w_idx = -1
+                  AND has({{cands:Array(Array(String))}}, gram)
+                {HEAVY_SCAN_SETTINGS}
+            """
+            cands = [list(g) for g in merged]
+            for sid in source_ids:
+                brows = self.ch.client.query(
+                    baseline_check_sql, parameters={**params, "src": [sid], "cands": cands}
+                ).result_rows
+                for r in brows:
+                    merged.pop(tuple(str(v) for v in r[0]), None)
 
         findings: list[SequenceFinding] = []
-        for row in rows:
-            values = [str(v) for v in row[0]]
+        for gram, slots in merged.items():
+            values = list(gram)
             joined = " → ".join(values)
             for i, w in enumerate(windows.suspects):
-                w_cnt = int(row[2 + i * 3])
+                w_cnt, first_ts_val, evt_id = slots[i]
                 if w_cnt <= 0:
                     continue
-                first_seen = _present_ts(row[3 + i * 3])
-                evt_id = row[4 + i * 3]
+                first_seen = _present_ts(first_ts_val)
                 evt_id_str = str(evt_id) if evt_id else None
                 window_total = suspect_ngram_totals[i]
                 score = (

@@ -3489,3 +3489,70 @@ def test_sequence_offset_uses_effective_ts():
     novel_sql = client.full_queries[3]
     assert "addSeconds(timestamp, transform(source_id" in novel_sql
     assert "AS ets" in novel_sql
+
+
+def test_sequence_single_source_skips_cross_source_baseline_check():
+    """With one source, Query C is unnecessary: exactly 4 queries run
+    (count, window totals, per-source totals, per-source novel grams)."""
+    first_ts = datetime(2024, 1, 17, tzinfo=UTC)
+    svc = _svc(
+        _seq_responses(
+            total=10_000,
+            window_totals=(8000, 2000),
+            ngram_totals=[(-1, 7998), (0, 1998)],
+            novel_rows=[(["a", "b", "c"], 0, 2, first_ts, "evt-1")],
+        )
+    )
+    result = svc.find_sequence_novelty("c1", ["s1"], windows=_seq_windows())
+    assert result.status == "ok"
+    assert len(svc.ch.client._calls) == 4
+
+
+def test_sequence_multi_source_merges_counts_and_verifies_baselines():
+    """Per-source scans (X4): counts are summed across sources, the earliest
+    occurrence supplies the representative event, and a candidate present in
+    ANOTHER source's baseline is killed by the cross-source check."""
+    ts_early = datetime(2024, 1, 16, 8, 0, tzinfo=UTC)
+    ts_late = datetime(2024, 1, 17, 12, 0, tzinfo=UTC)
+    responses = [
+        FakeQueryResult(result_rows=[(10_000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(8000, 2000)], column_names=["bl_total", "w0_total"]),
+        # totals per source — summed: baseline 5000+3000, suspect 1000+998.
+        FakeQueryResult(result_rows=[(-1, 5000), (0, 1000)], column_names=_SEQ_TOTALS_COLS),
+        FakeQueryResult(result_rows=[(-1, 3000), (0, 998)], column_names=_SEQ_TOTALS_COLS),
+        # novel grams per source: gram A in both (s2 earlier), gram B only s1.
+        FakeQueryResult(
+            result_rows=[
+                (["a", "b", "c"], 0, 2, ts_late, "evt-s1"),
+                (["x", "y", "z"], 0, 4, ts_late, "evt-s1x"),
+            ],
+            column_names=_SEQ_NOVEL_COLS,
+        ),
+        FakeQueryResult(
+            result_rows=[(["a", "b", "c"], 0, 3, ts_early, "evt-s2")],
+            column_names=_SEQ_NOVEL_COLS,
+        ),
+        # cross-source baseline check: s1's baseline vouches for nothing,
+        # s2's baseline contains gram B — killed.
+        FakeQueryResult(result_rows=[], column_names=["gram"]),
+        FakeQueryResult(result_rows=[(["x", "y", "z"],)], column_names=["gram"]),
+    ]
+    svc = _svc(responses)
+    result = svc.find_sequence_novelty("c1", ["s1", "s2"], windows=_seq_windows())
+    assert result.status == "ok"
+    assert len(result.results) == 1
+    r = result.results[0]
+    assert r.value == "a → b → c"
+    # 2 (s1) + 3 (s2), scored against the summed window total.
+    assert r.count == 5
+    assert abs(r.score - (-np.log(5 / 1998))) < 1e-3
+    assert r.details["window_ngram_total"] == 1998
+    assert r.details["baseline_ngram_total"] == 8000
+    # Earliest occurrence (s2) supplies the representative event.
+    assert r.event_id == "evt-s2"
+    assert r.first_seen is not None and r.first_seen.startswith("2024-01-16T08:00")
+    # 8 queries: count, window totals, 2x totals, 2x novel, 2x baseline check.
+    assert len(svc.ch.client._calls) == 8
+    # Every per-source query is bound to exactly one source.
+    for p in svc.ch.client._all_parameters[2:]:
+        assert p["src"] in (["s1"], ["s2"])

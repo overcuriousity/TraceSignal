@@ -1023,11 +1023,16 @@ Sequences are assembled entirely in SQL: a `lagInFrame` chain over a window
 - an n-gram never mixes events from different sources,
 - an n-gram never spans a window boundary or the gap between windows (all n
   events sit inside one window), and
-- the whole run is reproducible from the recorded query — no Python-side
+- the whole run is reproducible from the recorded queries — no Python-side
   sequence assembly.
 
-Counting is case-wide: n-grams are built per source, but their counts are
-summed across sources within each window.
+Every scan runs **once per source** — window-function sorts cannot spill to
+disk (see [query-cost discipline](#query-cost-discipline-all-statistical-detectors)),
+so the sort must be bounded by one source. Counting stays case-wide:
+per-source counts are summed per window in Python, and — because each
+source's scan can only rule out its *own* baseline — a cross-source
+verification pass drops any candidate n-gram that occurs in **any** source's
+baseline window.
 
 **Temporal-only.** "Never seen before" needs a before — there is no
 self-baseline mode. Without a

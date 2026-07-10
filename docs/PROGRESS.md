@@ -1,6 +1,46 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-10 (session 45 — D8 event-sequence novelty detector).
+Last updated: 2026-07-10 (session 46 — PR merges, prod hotfixes, scan-memory overhaul).
+
+## Session 46 — 2026-07-10: PRs #86/#87/#85 merged; prod deploy hotfixes; scan-memory overhaul
+
+Reviewed and merged the three open PRs to main in order (#86 panel fixes → #87 dispositions →
+#85 sequence detector; signed merges), with review fixes applied first on each branch:
+optimistic-removal now decrements `total_findings` (useMarkNormal/useDisposition), disposition
+bulk-create runs in one all-or-nothing transaction, dismissed-rows read skipped on empty scans,
+migration 0004 batches its inserts, `EventSequenceView` gained the Load-more wiring, and
+`TS_STAT_SEQUENCE_NGRAM` is validated at settings load. Decided: bulk "Tag as anomaly" still
+tags dismissed findings (dismissed stays presentation-only).
+
+Prod deploy then surfaced two real-data bugs, fixed forward:
+
+- **Migration 0004 tz-bind crash (Postgres only).** The lightweight `sa.table()` helpers
+  declared `created_at` as plain `sa.DateTime` → asyncpg bound `TIMESTAMP WITHOUT TIME ZONE`
+  and rejected the tz-aware legacy rows. SQLite (the test dialect) can't catch this. Fixed
+  with `sa.DateTime(timezone=True)`; migration verified on prod (allowlist/normal/pinned rows
+  all moved, timezones intact).
+- **timestamp_order OOM on the 300M-row ViKo case (ClickHouse code 241).** Established
+  empirically on prod: **ClickHouse (26.6) cannot spill window-function sorts** — the
+  `MergeSortingTransform` feeding `lagInFrame` ignores `max_bytes_before_external_sort` (a
+  plain ORDER BY over the same rows spills fine). Fix: `find_order_violations` scans **per
+  source** (slim fixed-width columns; `message` hydrated afterwards for the reported rows
+  only; 30M-row source ≈ 5 s on prod), and `total_findings` now reports the true case-wide
+  violation count. Same restructure applied to `find_sequence_novelty` (ROADMAP X4, resolved):
+  per-source totals/novel-gram scans merged in Python plus a cross-source baseline
+  verification pass so "never in the baseline" stays case-wide.
+
+Scan-memory guardrails overhauled (`db/_scan.py`): `max_bytes_before_external_sort` added to
+`_HEAVY_SCAN_SETTINGS`, and `max_memory_usage` now auto-sizes to `TS_STAT_SCAN_MEMORY_RATIO`
+(0.8) of detected RAM — min of cgroup limit, `/proc/meminfo MemTotal` (preferred; `sysinfo()`
+overreports on ballooned VMs) and sysconf — with `TS_STAT_SCAN_MAX_MEMORY_BYTES` as the pin
+(0 = auto, old 12 GB is the detection-failure fallback). Prod quirk: the box is an LXC guest
+(128 GiB) on a ~503 GiB Proxmox host and docker containers bypass lxcfs, so in-container
+detection sees 503 GiB — prod pins 64 GiB via compose env (part of the stash/pop-preserved
+local diffs). Documented in the query-cost discipline section.
+
+Verification: full backend suite 807 pass (services up), frontend typecheck/lint/197 green,
+prod app healthy with the 0004 migration applied and detector scans verified directly against
+the live 300M-row ClickHouse.
 
 ## Session 45 — 2026-07-10: D8 — event-sequence novelty detector (`sequence_novelty`)
 
