@@ -43,11 +43,15 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   event vanished mid-flight keeps a minimal `_stub_event` shape.
 - **`_HEAVY_SCAN_SETTINGS` on every whole-corpus scan** (`max_threads = 8`,
   `max_bytes_before_external_group_by = 4 GB`,
-  `max_bytes_before_external_sort = 4 GB`, `max_memory_usage = 12 GB`):
+  `max_bytes_before_external_sort = 4 GB`, `max_memory_usage` auto-sized to
+  `TS_STAT_SCAN_MEMORY_RATIO` (0.8) of detected RAM — cgroup-aware, pin with
+  `TS_STAT_SCAN_MAX_MEMORY_BYTES` when ClickHouse is on a different host):
   large GROUP BY states and plain ORDER BY sorts spill to disk, a runaway
   query fails alone instead of taking the server with it, and concurrent
   panel scans can't oversubscribe the box. Any new detector query that
-  touches the whole corpus must carry it.
+  touches the whole corpus must carry it. ClickHouse's own 90%-of-RAM server
+  limit is no substitute — containerized servers misdetect total memory
+  (observed 503 GiB on a 128 GiB VM), so this per-query cap is the real bound.
 - **Window-function sorts cannot spill** (verified empirically on ClickHouse
   26.6: the `MergeSortingTransform` feeding a window function runs into
   `max_memory_usage` regardless of `max_bytes_before_external_sort`, code

@@ -126,11 +126,17 @@ class Settings(BaseSettings):
     # 300M-row incident; tune per ClickHouse host RAM/cores. See db/_scan.py.
     stat_scan_max_threads: int = 8
     stat_scan_external_group_by_bytes: int = 4_000_000_000
-    # Same spill threshold for sorts: window functions (timestamp-order,
-    # sequence-novelty lagInFrame chains) sort whole partitions, which on
-    # 100M+-row cases exceeds max_memory_usage without an external sort.
+    # Spill threshold for plain ORDER BY sorts. Window-function sorts cannot
+    # spill (ClickHouse limitation, docs/ANOMALY_DETECTION.md) — those scans
+    # are bounded structurally instead.
     stat_scan_external_sort_bytes: int = 4_000_000_000
-    stat_scan_max_memory_bytes: int = 12_000_000_000
+    # Per-query memory cap for heavy scans. 0 (default) = auto: memory-ratio ×
+    # detected RAM (cgroup limit when containerized, physical RAM otherwise;
+    # see db/_scan.py). Set a nonzero value to pin it — required when
+    # ClickHouse runs on a different host than the app.
+    stat_scan_max_memory_bytes: int = 0
+    # Fraction of detected memory the auto cap uses.
+    stat_scan_memory_ratio: float = Field(default=0.8, gt=0, le=1)
 
     # Ingestion
     # Events per ClickHouse insert during ingestion. Each batch is one HTTP
