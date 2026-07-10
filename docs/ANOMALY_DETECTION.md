@@ -41,17 +41,25 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   ranking are hydrated afterwards in one batched `get_events_by_ids` call
   (`_hydrate_finding_events` / `_hydrate_freq_findings`); a finding whose
   event vanished mid-flight keeps a minimal `_stub_event` shape.
-- **`_HEAVY_SCAN_SETTINGS` on every whole-corpus scan** (`max_threads = 8`,
-  `max_bytes_before_external_group_by = 4 GB`,
-  `max_bytes_before_external_sort = 4 GB`, `max_memory_usage` auto-sized to
-  `TS_STAT_SCAN_MEMORY_RATIO` (0.8) of detected RAM — cgroup-aware, pin with
-  `TS_STAT_SCAN_MAX_MEMORY_BYTES` when ClickHouse is on a different host):
-  large GROUP BY states and plain ORDER BY sorts spill to disk, a runaway
-  query fails alone instead of taking the server with it, and concurrent
-  panel scans can't oversubscribe the box. Any new detector query that
-  touches the whole corpus must carry it. ClickHouse's own 90%-of-RAM server
-  limit is no substitute — containerized servers misdetect total memory
-  (observed 503 GiB on a 128 GiB VM), so this per-query cap is the real bound.
+- **`HEAVY_SCAN_SETTINGS` on every whole-corpus scan** (`max_threads = 8`,
+  spill thresholds for GROUP BY and plain ORDER BY at min(4 GB, half the
+  per-query cap), `max_memory_usage` = total budget / concurrency — the
+  budget auto-sizes to `TS_STAT_SCAN_MEMORY_RATIO` (0.8) of detected RAM,
+  cgroup-aware; pin it with `TS_STAT_SCAN_MAX_MEMORY_BYTES` when ClickHouse
+  is on a different host, ~70% of *that* host's RAM): large GROUP BY states
+  and plain ORDER BY sorts spill to disk, and a runaway query fails alone
+  instead of taking the server with it. Any new detector query that touches
+  the whole corpus must carry it. ClickHouse's own 90%-of-RAM server limit
+  is no substitute — containerized servers misdetect total memory (observed
+  503 GiB on a 128 GiB VM), so this per-query cap is the real bound.
+- **`HEAVY_SCAN_GATE` admission control on every `find_*` detector**: at most
+  `TS_STAT_SCAN_CONCURRENCY` (2) heavy scans run against ClickHouse at once;
+  surplus scans queue in the app. `max_memory_usage` is per *query* — without
+  the gate, N parallel detector requests (one anomaly-panel load fires
+  several) each carry a full cap and stack past the ClickHouse host's RAM;
+  a correctly-pinned 8 GiB cap OOM-killed a 12 GiB host exactly this way.
+  Nested helpers (`recommend_*`, `*_inventory`) are not gated — gated scans
+  call them while holding the slot.
 - **Window-function sorts cannot spill** (verified empirically on ClickHouse
   26.6: the `MergeSortingTransform` feeding a window function runs into
   `max_memory_usage` regardless of `max_bytes_before_external_sort`, code

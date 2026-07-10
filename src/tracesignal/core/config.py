@@ -130,13 +130,22 @@ class Settings(BaseSettings):
     # spill (ClickHouse limitation, docs/ANOMALY_DETECTION.md) — those scans
     # are bounded structurally instead.
     stat_scan_external_sort_bytes: int = 4_000_000_000
-    # Per-query memory cap for heavy scans. 0 (default) = auto: memory-ratio ×
-    # detected RAM (cgroup limit when containerized, physical RAM otherwise;
-    # see db/_scan.py). Set a nonzero value to pin it — required when
-    # ClickHouse runs on a different host than the app.
+    # Total memory budget for heavy scans, shared across concurrent scans:
+    # each query's max_memory_usage is budget / concurrency. 0 (default) =
+    # auto: memory-ratio × detected RAM (cgroup limit when containerized,
+    # physical RAM otherwise; see db/_scan.py). Set a nonzero value to pin
+    # it — required when ClickHouse runs on a different host than the app
+    # (size it to *that* host's RAM, leaving headroom for the server's own
+    # caches/merges — ~70% of its RAM is a good start).
     stat_scan_max_memory_bytes: int = 0
-    # Fraction of detected memory the auto cap uses.
+    # Fraction of detected memory the auto budget uses.
     stat_scan_memory_ratio: float = Field(default=0.8, gt=0, le=1)
+    # Max detector scans running against ClickHouse at once. Surplus scans
+    # queue on a semaphore (db/_scan.py::HEAVY_SCAN_GATE). Without this, N
+    # parallel detector requests each carry the full per-query cap and can
+    # stack past the ClickHouse host's RAM — observed as a kernel OOM-kill
+    # of clickhouse-server, not a clean query error.
+    stat_scan_concurrency: int = Field(default=2, ge=1)
 
     # Ingestion
     # Events per ClickHouse insert during ingestion. Each batch is one HTTP

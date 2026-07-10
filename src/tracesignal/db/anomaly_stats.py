@@ -161,6 +161,7 @@ already-ingested data.
 
 from __future__ import annotations
 
+import functools
 import math
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
@@ -178,7 +179,7 @@ from tracesignal.db._dt import (
     to_clickhouse_utc,
 )
 from tracesignal.db._offsets import active_offsets, bind_offset_params, effective_ts_sql
-from tracesignal.db._scan import HEAVY_SCAN_SETTINGS
+from tracesignal.db._scan import HEAVY_SCAN_GATE, HEAVY_SCAN_SETTINGS
 from tracesignal.db.clickhouse import ClickHouseStore
 from tracesignal.db.field_mappings import mapping_coalesce_expr, resolve_mapping
 
@@ -1074,6 +1075,24 @@ def _select_auto_scan_tokens(cats: list[str], ids: list[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _gated_scan(fn):
+    """Admit at most TS_STAT_SCAN_CONCURRENCY heavy scans to ClickHouse at once.
+
+    Applied to every public ``find_*`` detector — each per-query
+    ``max_memory_usage`` cap is budget/concurrency, so admission control is
+    what makes the total budget actually hold (see ``db/_scan.py``). Nested
+    helpers (``recommend_*``, ``*_inventory``) are *not* gated: gated scans
+    call them while holding the slot, and gating them too would deadlock.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        with HEAVY_SCAN_GATE:
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
 class StatisticalAnomalyService:
     """Statistical anomaly detection over ClickHouse event fields.
 
@@ -1437,6 +1456,7 @@ class StatisticalAnomalyService:
         row = rows[0]
         return int(row[0]), [int(v) for v in row[1:]]
 
+    @_gated_scan
     def find_value_novelty(
         self,
         case_id: str,
@@ -1713,6 +1733,7 @@ class StatisticalAnomalyService:
             },
         )
 
+    @_gated_scan
     def find_value_combos(
         self,
         case_id: str,
@@ -2013,6 +2034,7 @@ class StatisticalAnomalyService:
         out.sort(key=lambda f: (not f.recommended, -f.numeric_ratio, -f.coverage))
         return out
 
+    @_gated_scan
     def find_range_violations(
         self,
         case_id: str,
@@ -2290,6 +2312,7 @@ class StatisticalAnomalyService:
         ids = [f.token for f in rec if f.kind == "identifier" and f.token not in _SYNTHETIC_FIELDS]
         return _select_auto_scan_tokens(cats, ids)
 
+    @_gated_scan
     def find_charset_novelty(
         self,
         case_id: str,
@@ -2562,6 +2585,7 @@ class StatisticalAnomalyService:
     # Value entropy outliers
     # ------------------------------------------------------------------
 
+    @_gated_scan
     def find_entropy_outliers(
         self,
         case_id: str,
@@ -2808,6 +2832,7 @@ class StatisticalAnomalyService:
     # Proportion shift (G-test)
     # ------------------------------------------------------------------
 
+    @_gated_scan
     def find_proportion_shifts(
         self,
         case_id: str,
@@ -3066,6 +3091,7 @@ class StatisticalAnomalyService:
     # Interval periodicity (cadence)
     # ------------------------------------------------------------------
 
+    @_gated_scan
     def find_interval_periodicity(
         self,
         case_id: str,
@@ -3423,6 +3449,7 @@ class StatisticalAnomalyService:
     # Frequency / volume anomalies
     # ------------------------------------------------------------------
 
+    @_gated_scan
     def find_frequency_anomalies(
         self,
         case_id: str,
@@ -3913,6 +3940,7 @@ class StatisticalAnomalyService:
     # Timestamp-order violations
     # ------------------------------------------------------------------
 
+    @_gated_scan
     def find_sequence_novelty(
         self,
         case_id: str,
@@ -4214,6 +4242,7 @@ class StatisticalAnomalyService:
             windows=windows,
         )
 
+    @_gated_scan
     def find_order_violations(
         self,
         case_id: str,

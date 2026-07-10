@@ -1,7 +1,10 @@
-"""Heavy-scan memory budget resolution (db/_scan.py).
+"""Heavy-scan memory budget resolution and admission gate (db/_scan.py).
 
-The per-query ``max_memory_usage`` cap auto-sizes to a ratio of detected RAM
-(cgroup-aware) unless pinned via ``TS_STAT_SCAN_MAX_MEMORY_BYTES``.
+The heavy-scan memory budget is a *total* across concurrent scans — pinned
+via ``TS_STAT_SCAN_MAX_MEMORY_BYTES`` or auto-sized to a ratio of detected
+RAM (cgroup-aware) — and each query's ``max_memory_usage`` is budget /
+``TS_STAT_SCAN_CONCURRENCY``. ``HEAVY_SCAN_GATE`` enforces that no more than
+that many detector scans run at once.
 """
 
 from __future__ import annotations
@@ -16,6 +19,18 @@ from tracesignal.db._scan import (
 def test_explicit_value_pins_the_budget():
     """A nonzero TS_STAT_SCAN_MAX_MEMORY_BYTES wins over any detection."""
     assert _resolve_scan_memory_budget(12_000_000_000, 0.8, 128 << 30) == 12_000_000_000
+
+
+def test_budget_is_divided_across_concurrency_slots():
+    """Explicit or auto, the budget is a total: per-query cap = budget / N.
+
+    Regression for the session-52 OOM: a pinned 8 GiB cap was per *query*,
+    so two concurrent detector scans stacked 16 GiB onto a 12 GiB host.
+    """
+    assert _resolve_scan_memory_budget(8 << 30, 0.8, None, concurrency=2) == 4 << 30
+    assert _resolve_scan_memory_budget(0, 0.5, 16 << 30, concurrency=2) == 4 << 30
+    # Degenerate concurrency never divides by zero or inflates the budget.
+    assert _resolve_scan_memory_budget(8 << 30, 0.8, None, concurrency=0) == 8 << 30
 
 
 def test_auto_uses_ratio_of_detected_memory():
@@ -33,14 +48,18 @@ def test_cgroup_limit_bounds_detection(monkeypatch):
     monkeypatch.setattr(_scan, "_cgroup_memory_limit", lambda: 8 << 30)
     monkeypatch.setattr(_scan, "_meminfo_total", lambda: 128 << 30)
     monkeypatch.setattr(_scan, "_physical_memory_total", lambda: 128 << 30)
-    assert _scan.detect_scan_memory_budget() == int((8 << 30) * 0.8)
+    settings = _scan.get_settings()
+    expected = int((8 << 30) * 0.8) // settings.stat_scan_concurrency
+    assert _scan.detect_scan_memory_budget() == expected
 
 
 def test_unlimited_cgroup_uses_physical_memory(monkeypatch):
     monkeypatch.setattr(_scan, "_cgroup_memory_limit", lambda: None)
     monkeypatch.setattr(_scan, "_meminfo_total", lambda: None)
     monkeypatch.setattr(_scan, "_physical_memory_total", lambda: 64 << 30)
-    assert _scan.detect_scan_memory_budget() == int((64 << 30) * 0.8)
+    settings = _scan.get_settings()
+    expected = int((64 << 30) * 0.8) // settings.stat_scan_concurrency
+    assert _scan.detect_scan_memory_budget() == expected
 
 
 def test_meminfo_beats_ballooned_sysinfo(monkeypatch):
@@ -49,7 +68,9 @@ def test_meminfo_beats_ballooned_sysinfo(monkeypatch):
     monkeypatch.setattr(_scan, "_cgroup_memory_limit", lambda: None)
     monkeypatch.setattr(_scan, "_meminfo_total", lambda: 128 << 30)
     monkeypatch.setattr(_scan, "_physical_memory_total", lambda: 503 << 30)
-    assert _scan.detect_scan_memory_budget() == int((128 << 30) * 0.8)
+    settings = _scan.get_settings()
+    expected = int((128 << 30) * 0.8) // settings.stat_scan_concurrency
+    assert _scan.detect_scan_memory_budget() == expected
 
 
 def test_heavy_scan_settings_carries_a_positive_budget():
@@ -58,3 +79,43 @@ def test_heavy_scan_settings_carries_a_positive_budget():
     value = int(clause.rsplit("max_memory_usage = ", 1)[1])
     assert value > 0
     assert "max_bytes_before_external_sort" in clause
+
+
+def test_spill_thresholds_stay_below_the_per_query_cap():
+    """Spill must engage before the cap kills the query — a threshold at or
+    above max_memory_usage would never fire."""
+    clause = _scan.HEAVY_SCAN_SETTINGS
+    cap = int(clause.rsplit("max_memory_usage = ", 1)[1])
+    group_by = int(clause.split("max_bytes_before_external_group_by = ")[1].split(",")[0])
+    sort = int(clause.split("max_bytes_before_external_sort = ")[1].split(",")[0])
+    assert group_by <= cap // 2
+    assert sort <= cap // 2
+
+
+def test_gate_admits_at_most_the_configured_concurrency():
+    """HEAVY_SCAN_GATE holds surplus scans; find_* entry points acquire it."""
+    settings = _scan.get_settings()
+    n = settings.stat_scan_concurrency
+    acquired = []
+    for _ in range(n):
+        assert _scan.HEAVY_SCAN_GATE.acquire(blocking=False)
+        acquired.append(True)
+    try:
+        assert not _scan.HEAVY_SCAN_GATE.acquire(blocking=False)
+    finally:
+        for _ in acquired:
+            _scan.HEAVY_SCAN_GATE.release()
+
+
+def test_every_detector_entry_point_is_gated():
+    from tracesignal.db.anomaly_stats import StatisticalAnomalyService
+
+    detectors = [
+        name
+        for name in dir(StatisticalAnomalyService)
+        if name.startswith("find_")
+    ]
+    assert detectors, "no find_* detectors discovered"
+    for name in detectors:
+        fn = getattr(StatisticalAnomalyService, name)
+        assert getattr(fn, "__wrapped__", None) is not None, f"{name} is not gated"

@@ -7,16 +7,28 @@ not the server), and bound thread fan-out so several concurrent scans don't
 oversubscribe the box. The limits are ``TS_*`` tunables (see
 ``core/config.py``).
 
-``max_memory_usage`` is auto-sized by default: ``TS_STAT_SCAN_MEMORY_RATIO``
-(0.8) of the detected memory — the cgroup limit when the process runs in a
-memory-limited container, the machine's physical RAM otherwise. Detection is
-**local to the app process**; that matches the supported deployments (compose
-stack or native app with local backing services, where app and ClickHouse
-share the box). When ClickHouse runs on a different host, pin the cap to that
-host's budget with ``TS_STAT_SCAN_MAX_MEMORY_BYTES`` — a nonzero value always
-wins over auto-detection. ClickHouse's own 90%-of-RAM server limit cannot be
-relied on here: inside containers it may misdetect total memory (observed
-503 GiB on a 128 GiB VM), so this per-query cap is the only real bound.
+The memory budget is a **total across concurrent scans**, resolved from
+``TS_STAT_SCAN_MAX_MEMORY_BYTES`` when nonzero, else auto-sized to
+``TS_STAT_SCAN_MEMORY_RATIO`` (0.8) of the detected memory — the cgroup limit
+when the process runs in a memory-limited container, the machine's physical
+RAM otherwise. Each query's ``max_memory_usage`` is budget /
+``TS_STAT_SCAN_CONCURRENCY``, and :data:`HEAVY_SCAN_GATE` (acquired by every
+detector entry point in ``db/anomaly_stats.py``) holds surplus scans so no
+more than that many run at once — ``max_memory_usage`` alone is per *query*,
+and N parallel detector requests stacking N full-budget queries is exactly
+how a correctly-pinned budget still OOM-killed a 12 GiB ClickHouse host
+(session-52 incident). The spill thresholds are clamped to half the per-query
+cap so external aggregation/sort actually engages before the cap kills the
+query.
+
+Auto-detection is **local to the app process**; that matches the supported
+deployments (compose stack or native app with local backing services, where
+app and ClickHouse share the box). When ClickHouse runs on a different host,
+pin the budget to that host's RAM (minus server-cache/merge headroom — ~70%
+is a good start) with ``TS_STAT_SCAN_MAX_MEMORY_BYTES`` — a nonzero value
+always wins over auto-detection. ClickHouse's own 90%-of-RAM server limit
+cannot be relied on here: inside containers/VMs it may misdetect total memory
+(observed 503 GiB on a 128 GiB VM), so these caps are the only real bound.
 
 The clause is a string constant, built once at import from the process
 settings, because it is interpolated into f-string SQL literals throughout the
@@ -25,6 +37,7 @@ clause.
 """
 
 import os
+import threading
 from pathlib import Path
 
 from tracesignal.core.config import get_settings
@@ -87,17 +100,22 @@ def _physical_memory_total() -> int | None:
     return pages * page_size
 
 
-def _resolve_scan_memory_budget(explicit: int, ratio: float, detected: int | None) -> int:
-    """Pure resolution: explicit nonzero pins, else ratio of detected, else fallback."""
+def _resolve_scan_memory_budget(
+    explicit: int, ratio: float, detected: int | None, concurrency: int = 1
+) -> int:
+    """Pure resolution: explicit nonzero pins the *total* budget, else ratio of
+    detected, else fallback — then divided across the concurrency slots."""
     if explicit > 0:
-        return explicit
-    if detected is None or detected <= 0:
-        return _FALLBACK_MAX_MEMORY_BYTES
-    return int(detected * ratio)
+        total = explicit
+    elif detected is None or detected <= 0:
+        total = _FALLBACK_MAX_MEMORY_BYTES
+    else:
+        total = int(detected * ratio)
+    return total // max(concurrency, 1)
 
 
 def detect_scan_memory_budget() -> int:
-    """Resolve the ``max_memory_usage`` budget for heavy scans (see module docstring)."""
+    """Resolve the per-query ``max_memory_usage`` for heavy scans (see module docstring)."""
     s = get_settings()
     detected = min(
         (
@@ -108,21 +126,36 @@ def detect_scan_memory_budget() -> int:
         default=None,
     )
     return _resolve_scan_memory_budget(
-        s.stat_scan_max_memory_bytes, s.stat_scan_memory_ratio, detected
+        s.stat_scan_max_memory_bytes,
+        s.stat_scan_memory_ratio,
+        detected,
+        s.stat_scan_concurrency,
     )
 
 
 def _build_heavy_scan_settings() -> str:
     s = get_settings()
+    budget = detect_scan_memory_budget()
+    # Spill must engage well before the cap kills the query — a configured
+    # threshold at or above the per-query cap would never fire.
+    group_by_spill = min(s.stat_scan_external_group_by_bytes, budget // 2)
+    sort_spill = min(s.stat_scan_external_sort_bytes, budget // 2)
     return (
         f"SETTINGS max_threads = {s.stat_scan_max_threads}, "
-        f"max_bytes_before_external_group_by = {s.stat_scan_external_group_by_bytes}, "
+        f"max_bytes_before_external_group_by = {group_by_spill}, "
         # Plain ORDER BY sorts spill at this threshold. Window-function sorts
         # cannot spill at all (see docs/ANOMALY_DETECTION.md) — bound those
         # scans structurally (per source / slim columns) instead.
-        f"max_bytes_before_external_sort = {s.stat_scan_external_sort_bytes}, "
-        f"max_memory_usage = {detect_scan_memory_budget()}"
+        f"max_bytes_before_external_sort = {sort_spill}, "
+        f"max_memory_usage = {budget}"
     )
 
 
 HEAVY_SCAN_SETTINGS = _build_heavy_scan_settings()
+
+# Admission gate for heavy detector scans: at most TS_STAT_SCAN_CONCURRENCY
+# run against ClickHouse at once; surplus callers block (threadpool threads,
+# so blocking is fine). Every public find_* detector entry point in
+# db/anomaly_stats.py acquires this — nested helpers (recommend_*/inventory)
+# deliberately do not, so a gated scan can call them without deadlocking.
+HEAVY_SCAN_GATE = threading.BoundedSemaphore(get_settings().stat_scan_concurrency)
