@@ -13,6 +13,7 @@ import { anomaliesApi } from "@/api/anomalies";
 import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
 import {
   DetectorStatusLine,
+  FindingRowActions,
   FindingShell,
   NeedsBaselinePrompt,
   ResultsBar,
@@ -81,6 +82,17 @@ function ComboRow({
       }}
       actions={
         <>
+          <FindingRowActions
+            ts={finding.event?.timestamp ?? finding.first_seen}
+            eventId={finding.event_id}
+            disposition={{
+              caseId,
+              timelineId,
+              detector: "value_combo",
+              details: finding.details,
+              sourceId: finding.event?.source_id,
+            }}
+          />
           {onComboDrill && (
             <button
               title="Filter to this combination"
@@ -284,7 +296,7 @@ export function ComboNoveltyView({
       {/* Findings list */}
       {findings.length > 0 && (
         <div className="space-y-1.5">
-          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} serverTotal={data?.total_findings} onLoadMore={fl.canRaise ? fl.raise : undefined} loadingMore={isFetching} />
+          <ResultsBar total={cap.total} shownCount={cap.shown.length} hasMore={cap.hasMore} expanded={cap.expanded} onToggle={cap.toggle} serverTotal={data?.total_findings} onLoadMore={fl.canRaise ? fl.raise : undefined} loadingMore={isFetching} dismissedCount={data?.dismissed_count} />
           {cap.shown.map((f, i) => (
             <ComboRow
               key={`${f.values.join("|")}:${i}`}

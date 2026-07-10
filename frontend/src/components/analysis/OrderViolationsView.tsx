@@ -78,6 +78,13 @@ function ViolationRow({
           ts={finding.timestamp}
           eventId={finding.event_id}
           onJumpToTime={onJumpToTime}
+          disposition={{
+            caseId,
+            timelineId,
+            detector: "timestamp_order",
+            details: finding.details,
+            sourceId: finding.source_id,
+          }}
         />
       }
     >
@@ -234,6 +241,7 @@ export function OrderViolationsView({
         <div className="flex items-center justify-between text-[11px] text-[var(--color-fg-muted)]">
           <span>
             {findings.length} of {data?.total_findings} violations
+            {(data?.dismissed_count ?? 0) > 0 ? ` · ${data?.dismissed_count} dismissed` : ""}
           </span>
           {fl.canRaise && (
             <button
