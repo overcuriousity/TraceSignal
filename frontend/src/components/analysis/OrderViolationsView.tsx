@@ -13,6 +13,7 @@ import { anomaliesApi } from "@/api/anomalies";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import {
   DetectorStatusLine,
+  DismissedToggle,
   FindingRowActions,
   FindingShell,
   RefreshButton,
@@ -135,7 +136,7 @@ export function OrderViolationsView({
   const sd = useShowDismissed();
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "timestamp_order", minSkewParam, fl.limit, sd.enabled],
+    queryKey: ["anomalies", caseId, timelineId, "timestamp_order", minSkewParam, fl.limit, sd.keyPart],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "timestamp_order",
@@ -252,17 +253,7 @@ export function OrderViolationsView({
             {((data?.dismissed_count ?? 0) > 0 || sd.enabled) && (
               <>
                 {` · ${data?.dismissed_count ?? 0} dismissed`}{" "}
-                <button
-                  className="text-[var(--color-accent)] hover:underline"
-                  onClick={sd.toggle}
-                  title={
-                    sd.enabled
-                      ? "Hide dismissed findings again"
-                      : "Reveal dismissed findings, dimmed, in place"
-                  }
-                >
-                  {sd.enabled ? "hide" : "show"}
-                </button>
+                <DismissedToggle shown={sd.enabled} onToggle={sd.toggle} />
               </>
             )}
           </span>

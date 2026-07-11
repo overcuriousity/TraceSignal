@@ -218,7 +218,7 @@ export function IntervalPeriodicityView({
       blKey,
       fieldsParam ?? "__auto__",
       fl.limit,
-      sd.enabled,
+      sd.keyPart,
     ],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {

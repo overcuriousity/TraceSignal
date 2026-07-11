@@ -182,7 +182,7 @@ export function ProportionShiftView({
   const enabled = frame === "baseline" && !needsBaseline;
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "proportion_shift", blKey, fieldsParam ?? "__auto__", fl.limit, sd.enabled],
+    queryKey: ["anomalies", caseId, timelineId, "proportion_shift", blKey, fieldsParam ?? "__auto__", fl.limit, sd.keyPart],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "proportion_shift",

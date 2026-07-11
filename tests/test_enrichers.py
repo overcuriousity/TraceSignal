@@ -404,6 +404,8 @@ async def test_init_schema_drops_legacy_staging_table(tmp_path):
         await conn.execute(text("DROP TABLE baseline_definitions"))
         await conn.execute(text("DROP TABLE finding_dispositions"))
         await conn.execute(text("ALTER TABLE sources DROP COLUMN time_offset_seconds"))
+        # 0005 adds completed_source_ids to the job-run marker.
+        await conn.execute(text("ALTER TABLE enrichment_job_runs DROP COLUMN completed_source_ids"))
         # 0001-era annotations still carried `pinned` (retired by 0004).
         await conn.execute(
             text("ALTER TABLE annotations ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT false")
@@ -540,11 +542,38 @@ async def test_reconcile_orphaned_enrichment_jobs_applies_and_returns_reruns(sto
     assert chunks == [[("e1", "ip:geo_country", "DE")]]
     assert await store.list_staged_rows_for_job("job1", limit=10) == []
     assert await store.list_orphaned_enrichment_job_runs() == []
-    # No provenance: the marker can't say which sources the crashed run
-    # finished staging, and a provenance row off partial staging would make
-    # the run route skip the source forever. The scheduled re-run records it.
+    # No provenance: the crashed run never marked s1's staging complete on
+    # the marker (crash mid-source), and a provenance row off partial staging
+    # would make the run route skip the source forever. The re-run records it.
     assert await store.list_source_enrichments("s1") == []
     # The run is returned so the caller can schedule a re-run.
+    assert [r.job_id for r in recovered] == ["job1"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_grants_provenance_to_marker_completed_sources(store):
+    """Sources the marker records as fully staged get provenance on recovery.
+
+    A crashed 200-source job that completed 199 must not re-enrich all 200:
+    ``mark_enrichment_source_staged`` appends each finished source to the
+    durable marker, and reconciliation grants exactly those provenance.
+    """
+    from tracesignal.enrichers.jobs import reconcile_orphaned_enrichment_jobs
+
+    await store.create_case("c1", "Case One")
+    await store.create_source("c1", "s1", "src", file_hash="a" * 64, size_bytes=1)
+    await store.start_enrichment_job_run(
+        "job1", timeline_id="t1", case_id="c1", enricher_key="geoip"
+    )
+    await _stage_one_row(store)
+    # The crashed run had finished staging s1 before dying.
+    await store.mark_enrichment_source_staged("job1", "s1")
+
+    recovered = await reconcile_orphaned_enrichment_jobs(store, _RecordingClickHouse())
+
+    provenance = await store.list_source_enrichments("s1")
+    assert len(provenance) == 1
+    assert provenance[0].enricher_config_hash == "hash1"
     assert [r.job_id for r in recovered] == ["job1"]
 
 

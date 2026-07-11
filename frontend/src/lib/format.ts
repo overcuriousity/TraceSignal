@@ -28,6 +28,12 @@ export function fmtPct(ratio: number | null | undefined): string {
 }
 
 /** Truncate a long string with an ellipsis. */
+/** Percent with adaptive precision: whole percents from 10% up, one decimal below. */
+export function fmtPctAdaptive(ratio: number): string {
+  const v = ratio * 100;
+  return `${v.toFixed(v >= 10 ? 0 : 1)}%`;
+}
+
 export function truncate(value: string, max = 120): string {
   if (value.length <= max) return value;
   return value.slice(0, max) + "…";

@@ -161,7 +161,7 @@ export function ValueNoveltyView({
   const sd = useShowDismissed();
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "value_novelty", blKey, fieldsParam ?? "__auto__", fl.limit, sd.enabled],
+    queryKey: ["anomalies", caseId, timelineId, "value_novelty", blKey, fieldsParam ?? "__auto__", fl.limit, sd.keyPart],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "value_novelty",

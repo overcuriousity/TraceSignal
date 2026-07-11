@@ -388,6 +388,14 @@ class EnrichmentJobRun(Base):
     case_id: Mapped[str] = mapped_column(String(64), nullable=False)
     enricher_key: Mapped[str] = mapped_column(String(128), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    # Source ids whose staging fully completed, appended as the run progresses
+    # (``mark_enrichment_source_staged``). This is what lets crash recovery
+    # record provenance for finished sources instead of re-enriching the whole
+    # job: only sources listed here may get a ``SourceEnrichment`` row when the
+    # staged results are applied after a crash.
+    completed_source_ids: Mapped[list] = mapped_column(
+        JSON, nullable=False, default=list, server_default="[]"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
@@ -1647,6 +1655,25 @@ class PostgresStore:
                     enricher_key=enricher_key,
                 )
             )
+            await session.commit()
+
+    async def mark_enrichment_source_staged(self, job_id: str, source_id: str) -> None:
+        """Record on the job marker that *source_id*'s staging fully completed.
+
+        Called by the enrichment job after each source's last batch is staged,
+        so a crash between sources leaves a marker that says exactly which
+        sources finished — reconciliation can then grant those (and only
+        those) provenance instead of re-enriching the whole job. Single-writer
+        per job (one task owns a job id), so read-modify-write is safe.
+        """
+        async with self.session_factory() as session:
+            run = await session.get(EnrichmentJobRun, job_id)
+            if run is None:
+                return
+            if source_id not in run.completed_source_ids:
+                # Assign a fresh list — in-place append is invisible to the
+                # JSON column's change tracking.
+                run.completed_source_ids = [*run.completed_source_ids, source_id]
             await session.commit()
 
     async def finish_enrichment_job_run(self, job_id: str) -> None:

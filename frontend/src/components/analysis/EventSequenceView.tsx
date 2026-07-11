@@ -167,7 +167,7 @@ export function EventSequenceView({
   }, [fieldsData]);
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "sequence_novelty", seriesField, ngramSize, blKey, fl.limit, sd.enabled],
+    queryKey: ["anomalies", caseId, timelineId, "sequence_novelty", seriesField, ngramSize, blKey, fl.limit, sd.keyPart],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "sequence_novelty",

@@ -1,6 +1,41 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-11 (session 49 — show-dismissed toggle, TriageMeter dispositions, D9 drift detector).
+Last updated: 2026-07-11 (session 49 — show-dismissed toggle, TriageMeter dispositions, D9 drift detector, self-review fixes).
+
+## Session 49c — 2026-07-11: self-review of the day's three commits, all findings fixed
+
+The 8-angle review of `7ef57bb..0b2ad6b` surfaced 10 findings; every one fixed:
+
+- **Tag crash (the real bug):** `tag_anomalies` had no `DistributionDriftFinding` branch —
+  drift findings fell into the frequency `else` and 500'd on `r.series_field`. Branch added
+  (KS and G-test content strings).
+- **Drift correctness:** equal-median KS drifts (pure spread/shape change — exactly what KS
+  catches that a median comparison can't) were mislabeled `down`; now `direction="spread"`,
+  representative event = the tail that moved outward more. Categorical `top_contributors`
+  now includes the `__other__` bucket (a tail-driven drift is headlined honestly), with the
+  representative event still taken from the best *named* category.
+- **Scan cost:** field classification for drift is now windowed — new shared
+  `_numeric_ratio_probe` (also used by `recommend_numeric_fields`, killing the duplicated
+  probe SQL) takes the baseline+suspect predicate, so auto-mode drift no longer pays an
+  unwindowed whole-case scan `proportion_shift` never paid.
+- **API shape:** `DistributionDriftFinding.value` (which held the *window label*, unlike
+  every other finding type where `value` is a field value) renamed to `window_label`
+  end to end; redundant `bl_tot`/`w_tot` test-dict keys dropped.
+- **Frontend robustness:** the show-dismissed cache detection no longer relies on the
+  positional `key[-1] === true` contract — `useShowDismissed` now contributes a named
+  `"dismissed-shown"`/`"dismissed-hidden"` key segment that `useDisposition` finds by
+  content; the KS effect is now worded honestly ("≥D of probability mass moved");
+  the show/hide link extracted into one shared `DismissedToggle` (ResultsBar +
+  OrderViolationsView); `pct` moved to `lib/format.ts` as `fmtPctAdaptive`.
+- **Enricher crash recovery:** the job-run marker now durably records
+  `completed_source_ids` (migration `0005`, `mark_enrichment_source_staged` after each
+  source finishes staging), so reconciliation grants provenance to exactly the finished
+  sources — a crashed 200-source job re-runs 1 source, not 200.
+
+Not changed (reviewed, accepted): categorical GROUP BY still ships up to 10k rows/field on
+a misclassified field (needed for the exact `__other__` mass, warned); ROADMAP's D9
+"shipped" prose follows the existing D8 precedent; the `dismissed?` field on each finding
+interface is enforced by the compiler at the generic access site.
 
 ## Session 49b — 2026-07-11: D9 value_distribution_drift detector
 

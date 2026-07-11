@@ -11,7 +11,7 @@
  */
 import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, ArrowDownRight, ArrowUpRight, Info, Sigma } from "lucide-react";
+import { AlertTriangle, ArrowDownRight, ArrowUpRight, Info, Sigma, UnfoldVertical } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
 import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
 import {
@@ -36,7 +36,7 @@ import {
 import { Spinner } from "@/components/ui/Spinner";
 import { useBaselineStore } from "@/stores/baseline";
 import type { AnomalyMarker, DistributionDriftFinding, Event } from "@/api/types";
-import { anomalyFieldLabel as fieldLabel, truncate } from "@/lib/format";
+import { anomalyFieldLabel as fieldLabel, fmtPctAdaptive as pct, truncate } from "@/lib/format";
 import { fmtTimestampCompactUtc as fmtTs } from "@/lib/time";
 
 interface Props {
@@ -66,10 +66,10 @@ function directionIcon(direction: DistributionDriftFinding["direction"]) {
     return <ArrowUpRight size={12} className="shrink-0 text-[var(--color-error)]" />;
   if (direction === "down")
     return <ArrowDownRight size={12} className="shrink-0 text-[var(--color-warning)]" />;
+  if (direction === "spread")
+    return <UnfoldVertical size={12} className="shrink-0 text-[var(--color-error)]" />;
   return <Sigma size={12} className="shrink-0 text-[var(--color-error)]" />;
 }
-
-const pct = (v: number) => `${(v * 100).toFixed(v * 100 >= 10 ? 0 : 1)}%`;
 
 function DriftRow({
   caseId,
@@ -127,7 +127,7 @@ function DriftRow({
           {numeric ? "KS" : "G"}
         </span>
         <span className="min-w-0 break-all font-mono text-xs font-medium text-[var(--color-fg-primary)]">
-          {truncate(finding.value)}
+          {truncate(finding.window_label)}
         </span>
       </div>
 
@@ -135,16 +135,29 @@ function DriftRow({
       <div className="text-xs text-[var(--color-fg-muted)]">
         {numeric ? (
           <>
-            median{" "}
-            <span className="font-mono text-[var(--color-fg-secondary)]">
-              {String(finding.details["baseline_median"])} →{" "}
-              {String(finding.details["window_median"])}
-            </span>{" "}
+            {finding.direction === "spread" ? (
+              <>
+                spread changed, median unchanged (p05–p95{" "}
+                <span className="font-mono text-[var(--color-fg-secondary)]">
+                  {String(finding.details["baseline_p05"])}–{String(finding.details["baseline_p95"])} →{" "}
+                  {String(finding.details["window_p05"])}–{String(finding.details["window_p95"])}
+                </span>
+                )
+              </>
+            ) : (
+              <>
+                median{" "}
+                <span className="font-mono text-[var(--color-fg-secondary)]">
+                  {String(finding.details["baseline_median"])} →{" "}
+                  {String(finding.details["window_median"])}
+                </span>
+              </>
+            )}{" "}
             (D ={" "}
             <span className="font-mono text-[var(--color-fg-secondary)]">
               {finding.effect.toFixed(2)}
             </span>
-            {" — "}
+            {" — ≥"}
             {pct(finding.effect)} of probability mass moved)
           </>
         ) : top ? (
@@ -218,7 +231,7 @@ export function DistributionDriftView({
       blKey,
       fieldsParam ?? "__auto__",
       fl.limit,
-      sd.enabled,
+      sd.keyPart,
     ],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
@@ -259,15 +272,15 @@ export function DistributionDriftView({
       const ts =
         f.event?.timestamp ?? f.first_seen ?? (f.details["window_start"] as string | undefined);
       if (!ts) return null;
-      const label = `${fieldLabel(f.field)} drift (${f.value})`;
+      const label = `${fieldLabel(f.field)} drift (${f.window_label})`;
       const top = topContributor(f);
       const detail =
         f.test === "ks"
           ? `Distribution drift: ${fieldLabel(f.field)} — numeric distribution shifted ` +
-            `${f.direction} in ${f.value} (median ${String(f.details["baseline_median"])} → ` +
+            `${f.direction} in ${f.window_label} (median ${String(f.details["baseline_median"])} → ` +
             `${String(f.details["window_median"])}, KS D=${f.effect.toFixed(2)}, ` +
             `q=${f.q_value.toPrecision(2)})`
-          : `Distribution drift: ${fieldLabel(f.field)} — category mix shifted in ${f.value}` +
+          : `Distribution drift: ${fieldLabel(f.field)} — category mix shifted in ${f.window_label}` +
             (top
               ? ` (${top.value}: ${pct(top.baseline_share)} → ${pct(top.window_share)}`
               : " (") +
@@ -358,7 +371,7 @@ export function DistributionDriftView({
           />
           {cap.shown.map((f, i) => (
             <DriftRow
-              key={`${f.field}:${f.value}:${f.test}:${i}`}
+              key={`${f.field}:${f.window_label}:${f.test}:${i}`}
               caseId={caseId}
               timelineId={timelineId}
               finding={f}

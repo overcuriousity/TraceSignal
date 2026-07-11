@@ -826,14 +826,17 @@ class DistributionDriftFinding:
     """One field whose value distribution drifted between baseline and a suspect window."""
 
     field: str
-    # Suspect-window label — the finding is per *field*, so the window names it.
-    value: str
+    # Suspect-window label. The finding is per *field* — deliberately NOT
+    # named `value`: every other finding type's `value` is a field value, and
+    # generic consumers (copy-value, drill) must not paste a window name.
+    window_label: str
     test: str  # "ks" | "g-test-k"
     # KS D statistic or the 2×k G statistic.
     statistic: float
     # The floor-gated effect size: KS D again, or the total-variation distance.
     effect: float
-    # "up" | "down" (numeric, by median shift) | "mixed" (categorical).
+    # "up" | "down" (numeric, by median shift) | "spread" (numeric, equal
+    # medians — pure shape change) | "mixed" (categorical).
     direction: str
     # Field-bearing events on each side of the test.
     baseline_n: int
@@ -2136,6 +2139,56 @@ class StatisticalAnomalyService:
     # Numeric range violations
     # ------------------------------------------------------------------
 
+    def _numeric_ratio_probe(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        tokens: list[str],
+        field_mappings: dict[str, list[str]] | None = None,
+        windows: AnalysisWindows | None = None,
+        source_offsets: dict[str, int] | None = None,
+    ) -> list[float]:
+        """Return each token's numeric-parseability ratio, in one batched query.
+
+        Per field: ``countIf(toFloat64OrNull(col) IS NOT NULL) / countIf(col
+        != '')`` — the single syntactic numeric test shared by the range and
+        drift detectors, so the two can never classify the same field
+        differently. When *windows* is given the probe is restricted to the
+        baseline + suspect-window union, so callers whose tests only ever
+        read windowed rows (the drift detector) don't pay a whole-case scan
+        just to classify fields.
+        """
+        db = self.ch.database
+        params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        window_pred = ""
+        if windows is not None:
+            bp, sps = _window_preds(windows, params, source_offsets)
+            window_pred = f" AND ({' OR '.join([bp, *sps])})"
+        parts = []
+        for i, tok in enumerate(tokens):
+            expr = _col_expr(tok, params, field_mappings, prefix=f"nf{i}")
+            parts.append(
+                f"countIf(toFloat64OrNull({expr}) IS NOT NULL) AS num{i}, "
+                f"countIf({expr} != '') AS ne{i}"
+            )
+        probe_sql = (
+            f"SELECT {', '.join(parts)}"
+            f" FROM {db}.events"
+            f" WHERE case_id = {{cid:String}}"
+            f" AND has({{src:Array(String)}}, source_id)"
+            f"{window_pred}"
+            f" {HEAVY_SCAN_SETTINGS}"
+        )
+        rows = self.ch.client.query(probe_sql, parameters=params).result_rows
+        if not rows:
+            return [0.0] * len(tokens)
+        r = rows[0]
+        ratios: list[float] = []
+        for i in range(len(tokens)):
+            num, ne = int(r[i * 2]), int(r[i * 2 + 1])
+            ratios.append(num / ne if ne else 0.0)
+        return ratios
+
     def recommend_numeric_fields(
         self,
         case_id: str,
@@ -2144,6 +2197,8 @@ class StatisticalAnomalyService:
         field_mappings: dict[str, list[str]] | None = None,
         inventory: list[tuple[str, int, int]] | None = None,
         min_ratio: float = _MIN_NUMERIC_RATIO,
+        windows: AnalysisWindows | None = None,
+        source_offsets: dict[str, int] | None = None,
     ) -> list[NumericFieldInfo]:
         """Return fields whose values parse as numbers, for the range detector.
 
@@ -2151,10 +2206,11 @@ class StatisticalAnomalyService:
         keys, or a supplied *inventory* — the per-source stats cache); the ones
         with non-trivial coverage and cardinality are probed with a single
         batched query computing, per field, the fraction of non-empty values
-        that ``toFloat64OrNull`` parses. Fields at or above *min_ratio* are
-        marked recommended. Type detection is purely syntactic — a field of
-        HTTP status codes qualifies, but so would any numeric-looking id, which
-        is why the UI leans on temporal mode for those.
+        that ``toFloat64OrNull`` parses (:meth:`_numeric_ratio_probe`;
+        restricted to *windows* when given). Fields at or above *min_ratio*
+        are marked recommended. Type detection is purely syntactic — a field
+        of HTTP status codes qualifies, but so would any numeric-looking id,
+        which is why the UI leans on temporal mode for those.
         """
         if inventory is None:
             inventory, total = self.field_inventory(case_id, source_ids, total, field_mappings)
@@ -2170,41 +2226,24 @@ class StatisticalAnomalyService:
         if not candidates:
             return []
 
-        db = self.ch.database
-        params: dict[str, Any] = {"cid": case_id, "src": source_ids}
-        parts = []
-        exprs = []
-        for i, (tok, _, _) in enumerate(candidates):
-            expr = _col_expr(tok, params, field_mappings, prefix=f"nf{i}")
-            exprs.append(expr)
-            parts.append(
-                f"countIf(toFloat64OrNull({expr}) IS NOT NULL) AS num{i}, "
-                f"countIf({expr} != '') AS ne{i}"
-            )
-        probe_sql = (
-            f"SELECT {', '.join(parts)}"
-            f" FROM {db}.events"
-            f" WHERE case_id = {{cid:String}}"
-            f" AND has({{src:Array(String)}}, source_id)"
-            f" {HEAVY_SCAN_SETTINGS}"
+        ratios = self._numeric_ratio_probe(
+            case_id,
+            source_ids,
+            [tok for tok, _, _ in candidates],
+            field_mappings,
+            windows=windows,
+            source_offsets=source_offsets,
         )
-        row = self.ch.client.query(probe_sql, parameters=params).result_rows
-        out: list[NumericFieldInfo] = []
-        if row:
-            r = row[0]
-            for i, (tok, dist, cov) in enumerate(candidates):
-                num = int(r[i * 2])
-                ne = int(r[i * 2 + 1])
-                ratio = num / ne if ne else 0.0
-                out.append(
-                    NumericFieldInfo(
-                        token=tok,
-                        distinct=dist,
-                        coverage=round(cov / total, 4),
-                        numeric_ratio=round(ratio, 4),
-                        recommended=ratio >= min_ratio,
-                    )
-                )
+        out = [
+            NumericFieldInfo(
+                token=tok,
+                distinct=dist,
+                coverage=round(cov / total, 4),
+                numeric_ratio=round(ratio, 4),
+                recommended=ratio >= min_ratio,
+            )
+            for (tok, dist, cov), ratio in zip(candidates, ratios, strict=True)
+        ]
         out.sort(key=lambda f: (not f.recommended, -f.numeric_ratio, -f.coverage))
         return out
 
@@ -3626,43 +3665,35 @@ class StatisticalAnomalyService:
         field_mappings: dict[str, list[str]] | None,
         inventory: list[tuple[str, int, int]] | None,
         inventory_total: int | None,
+        windows: AnalysisWindows | None = None,
+        source_offsets: dict[str, int] | None = None,
     ) -> tuple[list[str], list[str]]:
         """Return ``(numeric_fields, categorical_fields)`` for the drift scan.
 
         Explicit *fields* are honored verbatim and branch-classified by one
-        batched numeric-ratio probe (same syntactic test as
-        :meth:`recommend_numeric_fields` — no content assumptions). Auto mode
-        blends the numeric recommender's fields (KS branch) with the novelty
-        recommender's categorical fields (G-test branch), numeric first,
-        capped at ``_MAX_AUTO_SCAN_FIELDS`` total.
+        :meth:`_numeric_ratio_probe` call (the exact syntactic test the range
+        detector uses — no content assumptions). Auto mode blends the numeric
+        recommender's fields (KS branch) with the novelty recommender's
+        categorical fields (G-test branch), numeric first, capped at
+        ``_MAX_AUTO_SCAN_FIELDS`` total. Both probes are windowed to the
+        baseline + suspect union — the drift tests only ever read windowed
+        rows, so classification must not pay a whole-case scan.
         """
-        db = self.ch.database
         if fields is not None:
             scan = [t for t in fields if t]
             if not scan:
                 return [], []
-            params: dict[str, Any] = {"cid": case_id, "src": source_ids}
-            parts = []
-            for i, tok in enumerate(scan):
-                expr = _col_expr(tok, params, field_mappings, prefix=f"df{i}")
-                parts.append(
-                    f"countIf(toFloat64OrNull({expr}) IS NOT NULL) AS num{i}, "
-                    f"countIf({expr} != '') AS ne{i}"
-                )
-            probe_sql = (
-                f"SELECT {', '.join(parts)}"
-                f" FROM {db}.events"
-                f" WHERE case_id = {{cid:String}}"
-                f" AND has({{src:Array(String)}}, source_id)"
-                f" {HEAVY_SCAN_SETTINGS}"
+            ratios = self._numeric_ratio_probe(
+                case_id,
+                source_ids,
+                scan,
+                field_mappings,
+                windows=windows,
+                source_offsets=source_offsets,
             )
-            rows = self.ch.client.query(probe_sql, parameters=params).result_rows
             numeric: list[str] = []
             categorical: list[str] = []
-            r = rows[0] if rows else [0] * (2 * len(scan))
-            for i, tok in enumerate(scan):
-                num, ne = int(r[i * 2]), int(r[i * 2 + 1])
-                ratio = num / ne if ne else 0.0
+            for tok, ratio in zip(scan, ratios, strict=True):
                 (numeric if ratio >= _MIN_NUMERIC_RATIO else categorical).append(tok)
             return numeric, categorical
 
@@ -3678,6 +3709,8 @@ class StatisticalAnomalyService:
                 total=inventory_total,
                 field_mappings=field_mappings,
                 inventory=inventory,
+                windows=windows,
+                source_offsets=source_offsets,
             )
             if f.recommended
         ]
@@ -3784,6 +3817,8 @@ class StatisticalAnomalyService:
             field_mappings,
             inventory,
             inventory_total,
+            windows=windows,
+            source_offsets=source_offsets,
         )
 
         # One pooled test list across both branches; each entry carries what
@@ -3942,8 +3977,6 @@ class StatisticalAnomalyService:
                         "k_truncated": k_truncated,
                         "other_bl": other_bl,
                         "other_w": w_vec[-1] if k_truncated else 0,
-                        "bl_tot": bl_tot,
-                        "w_tot": w_tot,
                     }
                 )
 
@@ -3991,8 +4024,20 @@ class StatisticalAnomalyService:
             }
             if t["test"] == "ks":
                 bl_med, w_med = float(t["bl_q"][1]), float(t["w_q"][1])
-                direction = "up" if w_med > bl_med else "down"
-                rep = t["hi"] if direction == "up" else t["lo"]
+                if w_med > bl_med:
+                    direction = "up"
+                    rep = t["hi"]
+                elif w_med < bl_med:
+                    direction = "down"
+                    rep = t["lo"]
+                else:
+                    # Equal medians with a significant D = a pure spread/shape
+                    # change (the case KS catches that a median comparison
+                    # can't). Represent it by the tail that moved outward more.
+                    direction = "spread"
+                    up_shift = float(t["w_q"][2]) - float(t["bl_q"][2])
+                    down_shift = float(t["bl_q"][0]) - float(t["w_q"][0])
+                    rep = t["hi"] if up_shift >= down_shift else t["lo"]
                 evt_id, rep_ts = (rep[0], rep[1]) if rep and rep[0] else (None, None)
                 first_seen = _present_ts(rep_ts)
                 details.update(
@@ -4011,24 +4056,36 @@ class StatisticalAnomalyService:
             else:
                 direction = "mixed"
                 named, co = t["named"], t["co"]
-                bl_tot, w_tot = t["bl_tot"], t["w_tot"]
-                contributors = sorted(
-                    (
+                bl_tot, w_tot = t["bl_n"], t["w_n"]
+                contributor_rows = [
+                    {
+                        "value": str(r[0]),
+                        "baseline_share": round(int(r[1]) / bl_tot, 6),
+                        "window_share": round(int(r[co]) / w_tot, 6),
+                        "delta": round(int(r[co]) / w_tot - int(r[1]) / bl_tot, 6),
+                    }
+                    for r in named
+                ]
+                if t["k_truncated"]:
+                    # The folded tail is a real column of the test — when the
+                    # drift is a swarm of low-frequency values, __other__ is
+                    # the honest headline, not whichever named category moved
+                    # most.
+                    contributor_rows.append(
                         {
-                            "value": str(r[0]),
-                            "baseline_share": round(int(r[1]) / bl_tot, 6),
-                            "window_share": round(int(r[co]) / w_tot, 6),
-                            "delta": round(int(r[co]) / w_tot - int(r[1]) / bl_tot, 6),
+                            "value": "__other__",
+                            "baseline_share": round(t["other_bl"] / bl_tot, 6),
+                            "window_share": round(t["other_w"] / w_tot, 6),
+                            "delta": round(t["other_w"] / w_tot - t["other_bl"] / bl_tot, 6),
                         }
-                        for r in named
-                    ),
-                    key=lambda c: abs(c["delta"]),
-                    reverse=True,
-                )
-                top = contributors[0] if contributors else None
+                    )
+                contributors = sorted(contributor_rows, key=lambda c: abs(c["delta"]), reverse=True)
+                # Representative event: the most-shifted *named* category —
+                # __other__ is a bucket with no single row/event to point at.
+                top_named = next((c for c in contributors if c["value"] != "__other__"), None)
                 evt_id, first_seen = None, None
-                if top is not None:
-                    top_row = next(r for r in named if str(r[0]) == top["value"])
+                if top_named is not None:
+                    top_row = next(r for r in named if str(r[0]) == top_named["value"])
                     if int(top_row[co]) > 0:
                         evt_id = top_row[co + 2] or None
                         first_seen = _present_ts(top_row[co + 1])
@@ -4054,7 +4111,7 @@ class StatisticalAnomalyService:
             findings.append(
                 DistributionDriftFinding(
                     field=t["field"],
-                    value=window.label,
+                    window_label=window.label,
                     test=t["test"],
                     statistic=round(t["statistic"], 6),
                     effect=round(t["effect"], 6),

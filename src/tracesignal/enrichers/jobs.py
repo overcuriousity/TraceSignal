@@ -461,6 +461,9 @@ async def run_enrichment_job(
                 processed += len(batch)
                 job_store.update(job_id, progress={"processed": processed, "total": total})
             completed_sources += 1
+            # Durably record the completed source on the marker so a crash
+            # from here on can still grant it provenance during recovery.
+            await store.mark_enrichment_source_staged(job_id, source_id)
 
         applied = await _apply_staged_rows(store, ch_store, job_id)
         await store.finish_enrichment_job_run(job_id)
@@ -553,14 +556,15 @@ async def reconcile_orphaned_enrichment_jobs(
     on a fresh boot, so any ``EnrichmentJobRun`` marker still present means
     the process died mid-run. Staged rows are valid results — they are
     applied to ``events.attributes`` here rather than discarded, then the
-    marker is cleared. No provenance is recorded for any of them: the marker
-    doesn't say which sources the crashed run finished staging, and a
-    provenance row written off partial staging would make the run route skip
-    the source forever. Returns the recovered runs so the caller can schedule
-    fresh re-runs (``schedule_enrichment_reruns``) to cover whatever the
-    crashed run never processed — the re-run records provenance on success;
-    the run/re-run overlap is safe because ``mapUpdate`` overwrites the same
-    derived keys with recomputed values.
+    marker is cleared. Provenance is granted exactly to the sources the
+    marker's ``completed_source_ids`` lists (appended durably after each
+    source finished staging), so a crashed 200-source job that completed 199
+    re-runs one source, not 200; a source whose staging was cut short stays
+    provenance-free and eligible. Returns the recovered runs so the caller
+    can schedule fresh re-runs (``schedule_enrichment_reruns``) to cover
+    whatever the crashed run never processed — the re-run skips
+    provenance-matched sources; the run/re-run overlap is safe because
+    ``mapUpdate`` overwrites the same derived keys with recomputed values.
 
     If applying fails (e.g. ClickHouse unreachable), the marker and staged
     rows are left intact for the next restart.
@@ -570,7 +574,10 @@ async def reconcile_orphaned_enrichment_jobs(
     for run in orphaned:
         try:
             applied = await _apply_staged_rows(
-                store, ch_store, run.job_id, complete_source_ids=frozenset()
+                store,
+                ch_store,
+                run.job_id,
+                complete_source_ids=frozenset(run.completed_source_ids or []),
             )
             await store.finish_enrichment_job_run(run.job_id)
         except Exception:  # noqa: BLE001

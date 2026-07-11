@@ -3695,7 +3695,7 @@ def test_distribution_drift_numeric_ks_detected():
     r = result.results[0]
     assert r.test == "ks"
     assert r.field == "attr:duration"
-    assert r.value == "incident"
+    assert r.window_label == "incident"
     assert r.statistic == 0.35
     assert r.effect == 0.35
     # Window median 8.0 > baseline median 5.0 → up; representative = max event.
@@ -3970,3 +3970,66 @@ def test_distribution_drift_sql_shapes():
     assert "ORDER BY baseline_cnt DESC, val ASC" in cat_sql
     # Both branches' tests share one BH pool.
     assert all(r.details["m_tests"] == 2 for r in result.results)
+
+
+def test_distribution_drift_equal_medians_reads_spread():
+    """Significant D with unchanged median = pure shape change, not 'down'."""
+    responses = [
+        FakeQueryResult(result_rows=[(1500,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(1000, 500)], column_names=["bl", "w0"]),
+        _drift_probe(numeric=True),
+        # Same median (5.0); window widened symmetrically but the high tail
+        # moved out further → representative = max event.
+        _drift_ks_row(bl_q=(2.0, 5.0, 8.0), w_q=(1.0, 5.0, 12.0)),
+    ]
+    svc = _svc(responses)
+    result = svc.find_distribution_drift(
+        "c1", ["s1"], fields=["attr:duration"], windows=_shift_windows()
+    )
+    r = result.results[0]
+    assert r.direction == "spread"
+    assert r.event_id == "evt-hi"
+    assert r.details["baseline_median"] == r.details["window_median"]
+
+
+def test_distribution_drift_other_bucket_can_headline_contributors():
+    """A drift driven by the folded tail names __other__ as top contributor,
+    while the representative event still comes from the best named category."""
+    # 50 stable named categories, tail explodes in the window.
+    rows = [_cat_row(f"v{i:02d}", 100, 100) for i in range(50)]
+    rows += [_cat_row("tail1", 5, 4000), _cat_row("tail2", 5, 4000)]
+    responses = [
+        FakeQueryResult(result_rows=[(30000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(10000, 20000)], column_names=["bl", "w0"]),
+        _drift_probe(numeric=False),
+        _drift_cat_rows(rows),
+    ]
+    svc = _svc(responses)
+    result = svc.find_distribution_drift(
+        "c1", ["s1"], fields=["attr:url"], windows=_shift_windows()
+    )
+    r = result.results[0]
+    tops = r.details["top_contributors"]
+    assert tops[0]["value"] == "__other__"
+    assert tops[0]["delta"] > 0
+    # Representative event never points at the bucket — best named category.
+    assert r.event_id.startswith("evt-w-v")
+
+
+def test_distribution_drift_probe_is_windowed():
+    """Field-classification probes carry the baseline+suspect predicate —
+    classification must not pay a whole-case scan the tests never read."""
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(1500,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(1000, 500)], column_names=["bl", "w0"]),
+            FakeQueryResult(result_rows=[(95, 100)], column_names=["num0", "ne0"]),
+            _drift_ks_row(),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_distribution_drift("c1", ["s1"], fields=["attr:duration"], windows=_shift_windows())
+    probe_sql = client.full_queries[2]
+    assert "toFloat64OrNull" in probe_sql
+    assert "{b0:String}" in probe_sql and "{w0s:String}" in probe_sql

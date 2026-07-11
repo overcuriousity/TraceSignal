@@ -2651,6 +2651,24 @@ async def tag_anomalies(
                     f"({r.rate_ratio:.1f}×, {r.direction}) in {where} "
                     f"(G={r.g_statistic:.1f}, q={r.q_value:.3g})"
                 )
+        elif isinstance(r, DistributionDriftFinding):
+            event_id = r.event_id or ""
+            src_id = r.event.get("source_id", "") if r.event else ""
+            where = _window_phrase(r.details) or f"window {r.window_label!r}"
+            if r.test == "ks":
+                content = (
+                    f"Distribution drift — {r.field}: numeric distribution "
+                    f"shifted ({r.direction}) in {where}; median "
+                    f"{r.details.get('baseline_median')} → "
+                    f"{r.details.get('window_median')} "
+                    f"(KS D={r.effect:.2f}, q={r.q_value:.3g})"
+                )
+            else:
+                content = (
+                    f"Distribution drift — {r.field}: category mix shifted in "
+                    f"{where} across {r.details.get('k_categories')} categories "
+                    f"(G={r.statistic:.1f}, TVD={r.effect:.2f}, q={r.q_value:.3g})"
+                )
         elif isinstance(r, OrderFinding):
             event_id = r.event_id or ""
             src_id = r.event.get("source_id", "") if r.event else ""

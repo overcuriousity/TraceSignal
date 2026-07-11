@@ -41,6 +41,23 @@ export function NeedsBaselinePrompt() {
   );
 }
 
+/**
+ * The show/hide-dismissed reveal link. One source of truth for its wording
+ * and styling — rendered by `ResultsBar` and by OrderViolationsView's bespoke
+ * per-source notice bar.
+ */
+export function DismissedToggle({ shown, onToggle }: { shown: boolean; onToggle: () => void }) {
+  return (
+    <button
+      className="text-[var(--color-accent)] hover:underline"
+      onClick={onToggle}
+      title={shown ? "Hide dismissed findings again" : "Reveal dismissed findings, dimmed, in place"}
+    >
+      {shown ? "hide" : "show"}
+    </button>
+  );
+}
+
 /** "N findings · showing M" header + show-all/less toggle for a capped list.
  *
  * With the optional server props it also surfaces server-side truncation:
@@ -89,17 +106,7 @@ export function ResultsBar({
         {hasDismissed && onToggleDismissed && (
           <>
             {" "}
-            <button
-              className="text-[var(--color-accent)] hover:underline"
-              onClick={onToggleDismissed}
-              title={
-                showDismissed
-                  ? "Hide dismissed findings again"
-                  : "Reveal dismissed findings, dimmed, in place"
-              }
-            >
-              {showDismissed ? "hide" : "show"}
-            </button>
+            <DismissedToggle shown={showDismissed ?? false} onToggle={onToggleDismissed} />
           </>
         )}
       </span>

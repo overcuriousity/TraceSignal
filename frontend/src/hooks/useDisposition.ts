@@ -1,5 +1,6 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { anomaliesApi } from "@/api/anomalies";
+import { SHOW_DISMISSED_KEY } from "@/components/analysis/detector-hooks";
 import { dispositionsApi } from "@/api/dispositions";
 import { shouldInvalidate } from "@/hooks/useCaseStream";
 import { toast } from "@/stores/toasts";
@@ -159,11 +160,12 @@ export function useDisposition(caseId: string, timelineId: string) {
         // findings (backend matches `detector in (detector, "*")`); the
         // query key carries the detector id at index 3.
         if (t.detector !== "*" && key[3] !== t.detector) continue;
-        // Caches fetched with the show-dismissed toggle carry `true` as the
-        // key's last element (see useShowDismissed): there, a dismissal keeps
-        // the row visible, flagged + dimmed, matching what a refetch returns.
-        // Normal still removes — the backend suppresses it either way.
-        const showsDismissed = key[key.length - 1] === true;
+        // Caches fetched with the show-dismissed toggle carry the named
+        // "dismissed-shown" key segment (see useShowDismissed): there, a
+        // dismissal keeps the row visible, flagged + dimmed, matching what a
+        // refetch returns. Normal still removes — the backend suppresses it
+        // either way.
+        const showsDismissed = key.includes(SHOW_DISMISSED_KEY);
         qc.setQueryData(
           key,
           t.kind === "dismissed" && showsDismissed

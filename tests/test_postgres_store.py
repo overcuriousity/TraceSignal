@@ -212,6 +212,8 @@ async def test_init_schema_adopts_pre_alembic_db(tmp_path):
         await conn.execute(text("DROP TABLE baseline_definitions"))
         await conn.execute(text("DROP TABLE finding_dispositions"))
         await conn.execute(text("ALTER TABLE sources DROP COLUMN time_offset_seconds"))
+        # 0005 adds completed_source_ids to the enrichment job-run marker.
+        await conn.execute(text("ALTER TABLE enrichment_job_runs DROP COLUMN completed_source_ids"))
         # 0001-era annotations still carried `pinned` (retired by 0004).
         await conn.execute(
             text("ALTER TABLE annotations ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT false")

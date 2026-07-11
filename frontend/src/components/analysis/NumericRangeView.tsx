@@ -151,7 +151,7 @@ export function NumericRangeView({
   const sd = useShowDismissed();
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "numeric_range", blKey, fieldsParam ?? "__auto__", fl.limit, sd.enabled],
+    queryKey: ["anomalies", caseId, timelineId, "numeric_range", blKey, fieldsParam ?? "__auto__", fl.limit, sd.keyPart],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "numeric_range",

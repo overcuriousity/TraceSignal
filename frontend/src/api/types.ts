@@ -485,15 +485,15 @@ export interface DistributionDriftFinding {
   type: "value_distribution_drift";
   field: string;
   /** Suspect-window label — the finding is per field, so the window names it. */
-  value: string;
+  window_label: string;
   /** "ks" (numeric Kolmogorov–Smirnov) | "g-test-k" (categorical G-test). */
   test: "ks" | "g-test-k";
   /** KS D statistic or the 2×k G statistic. */
   statistic: number;
   /** The floor-gated effect size: KS D again, or the total-variation distance. */
   effect: number;
-  /** "up" | "down" (numeric, by median shift) | "mixed" (categorical). */
-  direction: "up" | "down" | "mixed";
+  /** "up"/"down" (median shift) | "spread" (equal medians, shape change) | "mixed" (categorical). */
+  direction: "up" | "down" | "spread" | "mixed";
   /** Field-bearing events on each side of the test. */
   baseline_n: number;
   window_n: number;

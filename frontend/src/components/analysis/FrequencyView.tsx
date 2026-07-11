@@ -247,7 +247,7 @@ export function FrequencyView({
   const sd = useShowDismissed();
 
   const { data, isLoading, isFetching, refetch } = useQuery({
-    queryKey: ["anomalies", caseId, timelineId, "frequency", seriesField, zThresholdParam, blKey, fl.limit, sd.enabled],
+    queryKey: ["anomalies", caseId, timelineId, "frequency", seriesField, zThresholdParam, blKey, fl.limit, sd.keyPart],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
         detector: "frequency",

@@ -29,18 +29,19 @@ const TL = "t1";
 
 /**
  * The exact query keys the analysis views use (key[3] = backend detector id;
- * the last element is the show-dismissed toggle from useShowDismissed).
+ * the "dismissed-hidden"/"dismissed-shown" segment is useShowDismissed's
+ * keyPart — useDisposition recognizes revealed caches by that named segment).
  */
 const VIEW_KEYS: Record<string, unknown[]> = {
-  value_novelty: ["anomalies", CASE, TL, "value_novelty", "bl", "__auto__", 50, false],
-  numeric_range: ["anomalies", CASE, TL, "numeric_range", "bl", "__auto__", 50, false],
-  value_combo: ["anomalies", CASE, TL, "value_combo", "bl", "__auto__", 50, false],
-  timestamp_order: ["anomalies", CASE, TL, "timestamp_order", 0, 100, false],
-  charset: ["anomalies", CASE, TL, "charset", "bl", "__auto__", 50, false],
-  entropy: ["anomalies", CASE, TL, "entropy", "bl", "__auto__", 50, false],
-  frequency: ["anomalies", CASE, TL, "frequency", "host", 3, "bl", 30, false],
-  proportion_shift: ["anomalies", CASE, TL, "proportion_shift", "bl", "__auto__", 50, false],
-  interval_periodicity: ["anomalies", CASE, TL, "interval_periodicity", "bl", "__auto__", 50, false],
+  value_novelty: ["anomalies", CASE, TL, "value_novelty", "bl", "__auto__", 50, "dismissed-hidden"],
+  numeric_range: ["anomalies", CASE, TL, "numeric_range", "bl", "__auto__", 50, "dismissed-hidden"],
+  value_combo: ["anomalies", CASE, TL, "value_combo", "bl", "__auto__", 50, "dismissed-hidden"],
+  timestamp_order: ["anomalies", CASE, TL, "timestamp_order", 0, 100, "dismissed-hidden"],
+  charset: ["anomalies", CASE, TL, "charset", "bl", "__auto__", 50, "dismissed-hidden"],
+  entropy: ["anomalies", CASE, TL, "entropy", "bl", "__auto__", 50, "dismissed-hidden"],
+  frequency: ["anomalies", CASE, TL, "frequency", "host", 3, "bl", 30, "dismissed-hidden"],
+  proportion_shift: ["anomalies", CASE, TL, "proportion_shift", "bl", "__auto__", 50, "dismissed-hidden"],
+  interval_periodicity: ["anomalies", CASE, TL, "interval_periodicity", "bl", "__auto__", 50, "dismissed-hidden"],
 };
 
 function response(field: string, value: string): AnomaliesResponse {
@@ -110,7 +111,7 @@ describe("useDisposition optimistic filtering", () => {
 
   it("dismissed flags (not removes) in a cache fetched with the show-dismissed toggle", async () => {
     const { qc, result } = setup();
-    const key = [...VIEW_KEYS.value_novelty.slice(0, -1), true];
+    const key = [...VIEW_KEYS.value_novelty.slice(0, -1), "dismissed-shown"];
     qc.setQueryData(key, response("host", "evil"));
 
     result.current.mutate({
@@ -134,7 +135,7 @@ describe("useDisposition optimistic filtering", () => {
 
   it("normal still removes even in a show-dismissed cache", async () => {
     const { qc, result } = setup();
-    const key = [...VIEW_KEYS.value_novelty.slice(0, -1), true];
+    const key = [...VIEW_KEYS.value_novelty.slice(0, -1), "dismissed-shown"];
     qc.setQueryData(key, response("host", "evil"));
 
     result.current.mutate({ kind: "normal", detector: "value_novelty", field: "host", value: "evil" });

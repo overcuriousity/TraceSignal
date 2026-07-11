@@ -1158,7 +1158,9 @@ field-agnostic rule):
 Auto field selection blends both recommenders — numeric-recommended fields to
 the KS branch, remaining categorical fields to the G branch — under the usual
 15-field cap; the Fields picker overrides, and explicitly picked fields are
-branch-classified by the same numeric-ratio probe.
+branch-classified by the same numeric-ratio probe. The classification probe
+is restricted to the baseline + suspect-window union: the drift tests only
+ever read windowed rows, so classifying fields never pays a whole-case scan.
 
 ### Multiple testing and the effect floors
 
