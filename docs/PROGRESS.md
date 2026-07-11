@@ -5,6 +5,27 @@ text-search fast path (M22)).
 
 ## Session 50 — 2026-07-11: Perf batch A — one-pass novelty scans + indexed text search
 
+**M22 — search-blob text-search fast path (`db/clickhouse.py`, `db/queries.py`).** Broad
+free-text search (`q`) was a full ILIKE scan OR'd across 6 columns + tags + attribute
+values, issued ≥3× per interaction (page + count + histogram); the old `tokenbf_v1` index
+on `message` was dead weight (ILIKE can't use it, the OR-chain defeats pruning) and is
+dropped. New `search_blob` MATERIALIZED column: `lowerUTF8` concat of exactly the searched
+fields ('\n'-separated, ZSTD(3)), with an `ngrambf_v1(3, 65536, 4, 0)` skip index. When
+ready, `add_broad_text_search` prepends `search_blob LIKE lowerUTF8(pattern)` ANDed before
+the unchanged OR-chain — a strict superset pre-filter (each field contiguous in the blob;
+lowerUTF8 both sides mirrors ILIKE's folding), so **results are identical** with the fast
+path on or off (live test incl. `%`/`_`/`\`, `ß`, Cyrillic, `İ`; `EXPLAIN indexes=1`
+confirms pruning). Upgrade is automatic and idempotent (`_ensure_search_blob` in
+`init_schema`): ADD COLUMN/INDEX, DROP old `message_idx`, then MATERIALIZE COLUMN/INDEX
+**async** (`mutations_sync=0`) — startup never blocks on a 300M-row backfill; a
+MATERIALIZED column reads correctly from unmutated parts, so only index pruning waits.
+`ClickHouseStore.search_blob_ready()` gates the fast path (column present + no pending
+`search_blob` mutation in `system.mutations`; True cached forever, False rechecked every
+60 s). Operational note: on upgraded deployments the fast path activates once
+`system.mutations` drains; failed mutations log a warning but keep the (correct, unpruned)
+fast path on. Enrichment REPLACE PARTITION recomputes the blob from post-enrichment
+attributes (live-tested).
+
 **M23(b) — batched value-novelty scans (`db/anomaly_stats.py`).** `find_value_novelty` ran
 one full `attributes`-Map scan per field (up to 15 per panel-open; ~12 GiB / ~23 s per field
 at 300M rows). All plain-attribute fields now share a single ARRAY JOIN pass

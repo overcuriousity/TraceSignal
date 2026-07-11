@@ -68,13 +68,6 @@ resolved — this file holds only the condensed, still-open action items.
   that scale measures slow. ((b) — batching per-field novelty scans into one `attributes`
   pass — landed 2026-07-11, session 50.)
 
-- [ ] **M22 residue — tokenbf text-search fast path.** Items (a) typed `IN` for String
-  columns, (c) single-round-trip histogram, and (d) novelty auto-field selection via the
-  field-stats cache landed 2026-07-06 (session 24). Remaining: broad text search is still
-  a full scan per query (~0.4 s/2.8M rows after cleanup) × histogram+count+page per
-  interaction — consider a `tokenbf_v1`-indexed fast path via `hasTokenCaseInsensitive`
-  when `q` is a plain token (needs index DDL on existing tables).
-
 - [ ] **M24 — Visualize scan-avoidance (deferred from session 33).** Every viz chart
   aggregation (`field_terms`, `field_numeric_stats`, `field_value_timeseries`, the new
   `time_punchcard`/`field_pivot`/`field_scatter`, all compare variants in `db/queries.py`)
