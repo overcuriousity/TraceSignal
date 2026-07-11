@@ -1,7 +1,25 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-11 (session 50 — perf batch: batched novelty scans (M23b), search-blob
-text-search fast path (M22)).
+Last updated: 2026-07-12 (session 51 — enricher force re-run + search_blob upgrade
+idempotency hardening).
+
+## Session 51 — 2026-07-12: Enricher force re-run (poisoned-provenance recovery) + upgrade guard fix
+
+**Enricher force re-run (`api/routers/cases.py`, `EnrichersDialog.tsx`).** Deployments that
+hit the pre-session-48c partial-staging bug still carry poisoned `SourceEnrichment` rows:
+provenance says "enriched at current config" while most events lack derived fields, so a
+manual run reports "Every ready source is up to date" forever — the only documented recovery
+was a manual SQL DELETE. The run route now takes `?force=true`, which skips the provenance
+filter and re-enriches every ready source (apply is idempotent, so forcing is always safe —
+just a full re-scan). The UI surfaces it: after a skipped run, the row's button becomes
+"Force re-run" with an explanatory tooltip and the toast points at it. Manual runs (forced or
+not) now also write an `enricher.manual_run` audit row with the source/skip lists.
+
+**search_blob upgrade idempotency (`db/clickhouse.py`).** `_ensure_search_blob` early-returned
+on column presence alone — a crash between `ADD COLUMN` and `ADD INDEX` would strand the table
+without the skip index forever (fast path correct but permanently unpruned, silently). The
+guard now requires column *and* index (`system.data_skipping_indices`); every statement is
+`IF NOT EXISTS`, so resuming a half-done upgrade is safe. Regression tests for both fixes.
 
 ## Session 50 — 2026-07-11: Perf batch A — one-pass novelty scans + indexed text search
 
