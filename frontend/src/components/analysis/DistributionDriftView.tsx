@@ -1,17 +1,17 @@
 /**
- * IntervalPeriodicityView — values whose arrival *cadence* changed between the
- * baseline window and a suspect window.
+ * DistributionDriftView — fields whose *whole value distribution* changed
+ * between the baseline window and a suspect window.
  *
- * Calls the interval_periodicity detector: per (field, value), inter-arrival
- * deltas are computed within each window; a baseline-regular value whose rate
- * breaks (missed/accelerated — Poisson-rate test, covers per-value silence)
- * or a baseline-bursty value that becomes suspiciously regular (Greenwood
- * spacing test — beaconing). Temporal-only, like ProportionShiftView: it
- * requires the "Compare windows" frame with an active baseline definition.
+ * Calls the value_distribution_drift detector: numeric fields get a
+ * Kolmogorov–Smirnov test (computed inside ClickHouse), categorical fields a
+ * k-category G-test over the top baseline categories (+ __other__). One
+ * BH-FDR pool across both branches; effect floors on KS D / total-variation
+ * distance. Temporal-only, like ProportionShiftView: it requires the
+ * "Compare windows" frame with an active baseline definition.
  */
 import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Info, Radio, TimerOff, TimerReset } from "lucide-react";
+import { AlertTriangle, ArrowDownRight, ArrowUpRight, Info, Sigma, UnfoldVertical } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
 import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
 import {
@@ -35,8 +35,8 @@ import {
 } from "./detector-hooks";
 import { Spinner } from "@/components/ui/Spinner";
 import { useBaselineStore } from "@/stores/baseline";
-import type { AnomalyMarker, Event, IntervalPeriodicityFinding } from "@/api/types";
-import { anomalyFieldLabel as fieldLabel, truncate } from "@/lib/format";
+import type { AnomalyMarker, DistributionDriftFinding, Event } from "@/api/types";
+import { anomalyFieldLabel as fieldLabel, fmtPctAdaptive as pct, truncate } from "@/lib/format";
 import { fmtTimestampCompactUtc as fmtTs } from "@/lib/time";
 
 interface Props {
@@ -49,24 +49,29 @@ interface Props {
   onJumpToTime?: (ts: string, eventId?: string) => void;
 }
 
-/** "45 s" / "12.5 min" / "3.2 h" — median cadence at readable precision. */
-function fmtInterval(seconds: number | null): string {
-  if (seconds === null) return "—";
-  if (seconds < 120) return `${seconds.toPrecision(seconds >= 10 ? 3 : 2)} s`;
-  if (seconds < 7200) return `${(seconds / 60).toPrecision(3)} min`;
-  if (seconds < 172800) return `${(seconds / 3600).toPrecision(3)} h`;
-  return `${(seconds / 86400).toPrecision(3)} d`;
+interface Contributor {
+  value: string;
+  baseline_share: number;
+  window_share: number;
+  delta: number;
 }
 
-function directionIcon(direction: IntervalPeriodicityFinding["direction"]) {
-  if (direction === "new_regularity")
-    return <Radio size={12} className="shrink-0 text-[var(--color-error)]" />;
-  if (direction === "missed")
-    return <TimerOff size={12} className="shrink-0 text-[var(--color-warning)]" />;
-  return <TimerReset size={12} className="shrink-0 text-[var(--color-error)]" />;
+function topContributor(f: DistributionDriftFinding): Contributor | undefined {
+  const list = f.details["top_contributors"] as Contributor[] | undefined;
+  return list?.[0];
 }
 
-function IntervalRow({
+function directionIcon(direction: DistributionDriftFinding["direction"]) {
+  if (direction === "up")
+    return <ArrowUpRight size={12} className="shrink-0 text-[var(--color-error)]" />;
+  if (direction === "down")
+    return <ArrowDownRight size={12} className="shrink-0 text-[var(--color-warning)]" />;
+  if (direction === "spread")
+    return <UnfoldVertical size={12} className="shrink-0 text-[var(--color-error)]" />;
+  return <Sigma size={12} className="shrink-0 text-[var(--color-error)]" />;
+}
+
+function DriftRow({
   caseId,
   timelineId,
   finding,
@@ -76,18 +81,14 @@ function IntervalRow({
 }: {
   caseId: string;
   timelineId: string;
-  finding: IntervalPeriodicityFinding;
+  finding: DistributionDriftFinding;
   onSelectEvent: (event: Event) => void;
   onDrillField?: (field: string, value: string) => void;
   onJumpToTime?: (ts: string, eventId?: string) => void;
 }) {
   const openEvent = useOpenEvent(caseId, timelineId, finding.event_id, onSelectEvent);
-
-  const beacon = finding.direction === "new_regularity";
-  const silent = finding.count === 0;
-  const lastSeenBaseline = finding.details["last_seen_baseline"] as string | undefined;
-  const expectedCount = finding.details["expected_count"] as number | undefined;
-  const rateRatio = finding.details["rate_ratio"] as number | undefined;
+  const numeric = finding.test === "ks";
+  const top = topContributor(finding);
 
   return (
     <FindingShell
@@ -98,66 +99,85 @@ function IntervalRow({
       }}
       actions={
         <FindingRowActions
-          field={finding.field}
-          value={finding.value}
-          ts={finding.event?.timestamp ?? finding.first_seen ?? lastSeenBaseline}
+          // Drill only makes sense for the categorical branch — jump to the
+          // most-shifted category's value; a numeric drift has no one value.
+          field={!numeric && top ? finding.field : undefined}
+          value={!numeric && top ? top.value : undefined}
+          ts={finding.event?.timestamp ?? finding.first_seen}
           eventId={finding.event_id}
           onDrillField={onDrillField}
           onJumpToTime={onJumpToTime}
           disposition={{
             caseId,
             timelineId,
-            detector: "interval_periodicity",
+            detector: "value_distribution_drift",
             details: finding.details,
             sourceId: finding.event?.source_id,
           }}
         />
       }
     >
-      {/* Field + direction + value */}
+      {/* Field + test badge + window */}
       <div className="flex flex-wrap items-center gap-1">
         <span className="inline-block rounded bg-[var(--color-bg-elevated)] px-1.5 py-0.5 font-mono text-xs text-[var(--color-fg-muted)]">
           {fieldLabel(finding.field)}
         </span>
         {directionIcon(finding.direction)}
+        <span className="inline-block rounded border border-[var(--color-border)] px-1 py-0.5 font-mono text-[10px] uppercase text-[var(--color-fg-muted)]">
+          {numeric ? "KS" : "G"}
+        </span>
         <span className="min-w-0 break-all font-mono text-xs font-medium text-[var(--color-fg-primary)]">
-          {truncate(finding.value)}
+          {truncate(finding.window_label)}
         </span>
       </div>
 
-      {/* Cadence change (the explainability shot) */}
+      {/* Shape change (the explainability shot) */}
       <div className="text-xs text-[var(--color-fg-muted)]">
-        {beacon ? (
+        {numeric ? (
           <>
-            bursty in the baseline, now every{" "}
+            {finding.direction === "spread" ? (
+              <>
+                spread changed, median unchanged (p05–p95{" "}
+                <span className="font-mono text-[var(--color-fg-secondary)]">
+                  {String(finding.details["baseline_p05"])}–{String(finding.details["baseline_p95"])} →{" "}
+                  {String(finding.details["window_p05"])}–{String(finding.details["window_p95"])}
+                </span>
+                )
+              </>
+            ) : (
+              <>
+                median{" "}
+                <span className="font-mono text-[var(--color-fg-secondary)]">
+                  {String(finding.details["baseline_median"])} →{" "}
+                  {String(finding.details["window_median"])}
+                </span>
+              </>
+            )}{" "}
+            (D ={" "}
             <span className="font-mono text-[var(--color-fg-secondary)]">
-              {fmtInterval(finding.window_median_interval)}
-            </span>{" "}
-            (CV{" "}
-            <span className="font-mono text-[var(--color-fg-secondary)]">
-              {finding.window_cv ?? "—"}
+              {finding.effect.toFixed(2)}
             </span>
-            , beaconing pattern)
+            {" — ≥"}
+            {pct(finding.effect)} of probability mass moved)
           </>
-        ) : silent ? (
+        ) : top ? (
           <>
-            arrived every{" "}
             <span className="font-mono text-[var(--color-fg-secondary)]">
-              {fmtInterval(finding.baseline_median_interval)}
+              {truncate(top.value)}
             </span>{" "}
-            in the baseline — 0
-            {expectedCount ? ` of ~${Math.round(expectedCount)} expected` : ""} events in{" "}
-            {String(finding.details["window_label"] ?? "the suspect window")}
+            {pct(top.baseline_share)} → {pct(top.window_share)} of events (TVD{" "}
+            <span className="font-mono text-[var(--color-fg-secondary)]">
+              {finding.effect.toFixed(2)}
+            </span>
+            )
           </>
         ) : (
           <>
-            cadence{" "}
+            distribution shifted (TVD{" "}
             <span className="font-mono text-[var(--color-fg-secondary)]">
-              {fmtInterval(finding.baseline_median_interval)} →{" "}
-              {fmtInterval(finding.window_median_interval)}
-            </span>{" "}
-            (rate ×{rateRatio !== undefined ? rateRatio.toFixed(rateRatio >= 10 ? 0 : 1) : "?"},{" "}
-            {finding.direction})
+              {finding.effect.toFixed(2)}
+            </span>
+            )
           </>
         )}
       </div>
@@ -171,24 +191,17 @@ function IntervalRow({
           </strong>
         </span>
         <span>
-          count{" "}
-          <strong className="text-[var(--color-fg-secondary)]">{finding.count}</strong> vs{" "}
-          {finding.baseline_count} baseline
+          n{" "}
+          <strong className="text-[var(--color-fg-secondary)]">{finding.window_n}</strong> vs{" "}
+          {finding.baseline_n} baseline
         </span>
-        {finding.baseline_cv !== null && !beacon && (
-          <span>
-            baseline CV{" "}
-            <strong className="text-[var(--color-fg-secondary)]">{finding.baseline_cv}</strong>
-          </span>
-        )}
-        {finding.first_seen && <span>first {fmtTs(finding.first_seen)}</span>}
-        {silent && lastSeenBaseline && <span>last seen {fmtTs(lastSeenBaseline)}</span>}
+        {finding.first_seen && <span>at {fmtTs(finding.first_seen)}</span>}
       </div>
     </FindingShell>
   );
 }
 
-export function IntervalPeriodicityView({
+export function DistributionDriftView({
   caseId,
   timelineId,
   onSelectEvent,
@@ -198,8 +211,8 @@ export function IntervalPeriodicityView({
   onJumpToTime,
 }: Props) {
   const { params: blParams, key: blKey, needsBaseline } = useBaselineRequest();
-  // Temporal-only, same frame gating as ProportionShiftView: cadence can only
-  // change between two windows, so there is no self-baseline fallback.
+  // Temporal-only, same frame gating as ProportionShiftView: a distribution
+  // can only drift between two windows, so there is no self-baseline fallback.
   const frame = useBaselineStore((s) => s.frame);
   const [selectedFields, setSelectedFields] = useState<string[] | null>(null);
   const qc = useQueryClient();
@@ -214,7 +227,7 @@ export function IntervalPeriodicityView({
       "anomalies",
       caseId,
       timelineId,
-      "interval_periodicity",
+      "value_distribution_drift",
       blKey,
       fieldsParam ?? "__auto__",
       fl.limit,
@@ -222,7 +235,7 @@ export function IntervalPeriodicityView({
     ],
     queryFn: () =>
       anomaliesApi.list(caseId, timelineId, {
-        detector: "interval_periodicity",
+        detector: "value_distribution_drift",
         limit: fl.limit,
         ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
@@ -235,7 +248,7 @@ export function IntervalPeriodicityView({
   const tagMutation = useMutation({
     mutationFn: () =>
       anomaliesApi.tag(caseId, timelineId, {
-        detector: "interval_periodicity",
+        detector: "value_distribution_drift",
         limit: fl.limit,
         ...blParams,
         ...(fieldsParam !== undefined ? { fields: fieldsParam } : {}),
@@ -248,7 +261,7 @@ export function IntervalPeriodicityView({
   const findings = useMemo(
     () =>
       (data?.results ?? []).filter(
-        (r): r is IntervalPeriodicityFinding => r.type === "interval_periodicity",
+        (r): r is DistributionDriftFinding => r.type === "value_distribution_drift",
       ),
     [data],
   );
@@ -259,25 +272,26 @@ export function IntervalPeriodicityView({
       const ts =
         f.event?.timestamp ?? f.first_seen ?? (f.details["window_start"] as string | undefined);
       if (!ts) return null;
-      const label = `${fieldLabel(f.field)}=${truncate(f.value)}`;
+      const label = `${fieldLabel(f.field)} drift (${f.window_label})`;
+      const top = topContributor(f);
       const detail =
-        f.direction === "new_regularity"
-          ? `Interval cadence: ${label} — bursty in the baseline but arrives every ` +
-            `~${fmtInterval(f.window_median_interval)} in the suspect window ` +
-            `(beaconing; q=${f.q_value.toPrecision(2)})`
-          : f.count === 0
-            ? `Interval cadence: ${label} — arrived every ~${fmtInterval(f.baseline_median_interval)} ` +
-              `in the baseline but is silent in the suspect window (q=${f.q_value.toPrecision(2)})`
-            : `Interval cadence: ${label} — arrival rate ${f.direction} in the suspect window ` +
-              `(${fmtInterval(f.baseline_median_interval)} → ${fmtInterval(f.window_median_interval)}; ` +
-              `q=${f.q_value.toPrecision(2)})`;
+        f.test === "ks"
+          ? `Distribution drift: ${fieldLabel(f.field)} — numeric distribution shifted ` +
+            `${f.direction} in ${f.window_label} (median ${String(f.details["baseline_median"])} → ` +
+            `${String(f.details["window_median"])}, KS D=${f.effect.toFixed(2)}, ` +
+            `q=${f.q_value.toPrecision(2)})`
+          : `Distribution drift: ${fieldLabel(f.field)} — category mix shifted in ${f.window_label}` +
+            (top
+              ? ` (${top.value}: ${pct(top.baseline_share)} → ${pct(top.window_share)}`
+              : " (") +
+            `, TVD=${f.effect.toFixed(2)}, q=${f.q_value.toPrecision(2)})`;
       return {
         ts,
         label,
         detail,
         eventId: f.event_id,
         sourceId: f.event?.source_id,
-        detector: "interval_periodicity" as const,
+        detector: "value_distribution_drift" as const,
         rawDetails: f.details,
         windowEnd: (f.details["window_end"] as string | undefined) ?? null,
       };
@@ -294,10 +308,10 @@ export function IntervalPeriodicityView({
       <div className="flex items-start gap-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] p-3 text-xs text-[var(--color-fg-muted)]">
         <AlertTriangle size={13} className="mt-0.5 shrink-0 text-[var(--color-warning)]" />
         <span>
-          Interval cadence compares a value's arrival rhythm between two
-          windows, so it always needs a baseline — switch the frame to{" "}
-          <strong>Compare windows</strong> and pick a baseline definition. It
-          has no scan-all-events mode.
+          Distribution drift compares a field's whole value distribution
+          between two windows, so it always needs a baseline — switch the
+          frame to <strong>Compare windows</strong> and pick a baseline
+          definition. It has no scan-all-events mode.
         </span>
       </div>
     );
@@ -331,10 +345,10 @@ export function IntervalPeriodicityView({
           <Info size={13} />
           <span>
             {data?.status === "no_data"
-              ? "No cadence findings. No events ingested yet."
+              ? "No drift findings. No events ingested yet."
               : data?.status === "insufficient_data"
-                ? "Nothing to test — the baseline window has no events, or no scanned field produced candidate values."
-                : "No value's arrival cadence changed significantly — no regular value broke rhythm, and no bursty value became suspiciously regular."}
+                ? "Nothing to test — the baseline window has no events, or no scanned field had enough samples on both sides."
+                : "No field's value distribution changed significantly between the baseline and the suspect windows."}
           </span>
         </div>
       )}
@@ -356,8 +370,8 @@ export function IntervalPeriodicityView({
             onToggleDismissed={sd.toggle}
           />
           {cap.shown.map((f, i) => (
-            <IntervalRow
-              key={`${f.field}:${f.value}:${f.direction}:${i}`}
+            <DriftRow
+              key={`${f.field}:${f.window_label}:${f.test}:${i}`}
               caseId={caseId}
               timelineId={timelineId}
               finding={f}
@@ -378,13 +392,12 @@ export function IntervalPeriodicityView({
       <div className="flex items-start gap-1.5 text-xs text-[var(--color-fg-muted)] pt-1">
         <AlertTriangle size={10} className="mt-0.5 shrink-0" />
         <span>
-          Inter-arrival gaps are measured per (field, value) inside each window.
-          Values that were regular in the baseline are tested for rate breaks
-          (a silent heartbeat is the strongest case); values that were bursty
-          are tested for suspiciously even spacing (beaconing). All tests share
-          one Benjamini–Hochberg correction, and each direction has effect
-          floors so significance alone never flags. First-seen values are
-          excluded — Rare values owns those.
+          Each finding is one field × suspect window. Numeric fields use a
+          two-sample Kolmogorov–Smirnov test (D = largest CDF gap); categorical
+          fields a G-test over the top-50 baseline categories plus __other__
+          (TVD = share of probability mass that moved). Both branches share one
+          Benjamini–Hochberg correction, and each has an effect floor so
+          significance alone never flags at large volumes.
         </span>
       </div>
     </div>

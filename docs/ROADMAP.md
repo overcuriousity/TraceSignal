@@ -139,11 +139,15 @@ absent from the baseline window are flagged per suspect window, surprise-scored 
 window's own complete-n-gram total. Temporal-only. See `docs/ANOMALY_DETECTION.md` §9
 (semantic search renumbered §10).
 
-High value first:
+D9 shipped as the `value_distribution_drift` detector (`method="drift"`): per field, one
+whole-distribution test per suspect window — ClickHouse `kolmogorovSmirnovTestIf` for
+numeric fields, a k-category G-test (top-50 + exact `__other__`, pure-math df=k−1 chi²)
+for categorical; one BH pool across both branches, `-log10(p)` score, effect floors on
+KS D / total-variation distance, field-level `(field, "*")` allowlist key. See
+`docs/ANOMALY_DETECTION.md` §10 (semantic search renumbered §11).
 
-- [ ] **D9 — Value-distribution drift** (AMiner `VariableTypeDetector`, simplified): per
-  field, compare baseline vs. detect-window value distributions with ClickHouse's built-in
-  `kolmogorovSmirnovTest()` (numeric) or frequency-vector comparison (categorical).
+Remaining:
+
 - [ ] **D10 — Event correlation rules** (AMiner `EventCorrelationDetector`): mine baseline
   implication rules "value A is followed by value B within Δt", flag violations in the detect
   window. Highest analytical payoff, heaviest lift (rule mining + hypothesis testing) — last.
@@ -209,14 +213,6 @@ L2 (per-event `normal` annotation) is resolved: dispositions
 (`finding_dispositions`, migration `0004`) subsumed the allowlist, the
 per-event `normal` annotation, and the `pinned` flag. Remaining polish:
 
-- [ ] **X1 — "Show dismissed" toggle in the detector views.** The backend
-  supports `include_dismissed=true` (findings return flagged `dismissed: true`)
-  and every view shows the `dismissed_count`; a per-view reveal toggle is not
-  wired yet.
-- [ ] **X2 — TriageMeter disposition awareness.** "Reviewed" is still inferred
-  from user *annotations* only; an event dispositioned normal/dismissed/
-  confirmed without a tag/comment doesn't count. Feed `["dispositions", …]`
-  into `computeProgress`.
 - [ ] **X3 — Event-grid indicator for event-scoped dispositions.** The legacy
   per-event-normal grid indicator was removed with the annotation; an
   indicator driven by event-scoped disposition rows could return if analysts

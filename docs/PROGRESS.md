@@ -1,9 +1,9 @@
 # TraceSignal Implementation Progress
 
-Last updated: 2026-07-11 (session 49 — visualization: interactivity, four new chart types,
+Last updated: 2026-07-11 (session 49d — visualization: interactivity, four new chart types,
 scan guardrails).
 
-## Session 49 — 2026-07-11: Visualize v3 — click-to-filter, brush-zoom, punch card / pivot / sankey / scatter, viz scan guardrails
+## Session 49d — 2026-07-11: Visualize v3 — click-to-filter, brush-zoom, punch card / pivot / sankey / scatter, viz scan guardrails
 
 Four-part visualization upgrade (user-prioritized: interactivity + new chart types + speed/
 robustness + UX polish; M24 scan-avoidance stays deferred, see ROADMAP).
@@ -68,6 +68,98 @@ Tests: backend suite green incl. new settings/gate/skew/punchcard/pivot/scatter 
 frontend 231 tests across 24 files (chartConfig round-trips, fieldFilters unit tests, chart
 smoke renders incl. pivot-click and brush-drag simulations, caption lines). ROADMAP: M24
 rescoped to scan-avoidance only; new deferred M26 (histogram-implementation unification).
+
+## Session 49c — 2026-07-11: self-review of the day's three commits, all findings fixed
+
+The 8-angle review of `7ef57bb..0b2ad6b` surfaced 10 findings; every one fixed:
+
+- **Tag crash (the real bug):** `tag_anomalies` had no `DistributionDriftFinding` branch —
+  drift findings fell into the frequency `else` and 500'd on `r.series_field`. Branch added
+  (KS and G-test content strings).
+- **Drift correctness:** equal-median KS drifts (pure spread/shape change — exactly what KS
+  catches that a median comparison can't) were mislabeled `down`; now `direction="spread"`,
+  representative event = the tail that moved outward more. Categorical `top_contributors`
+  now includes the `__other__` bucket (a tail-driven drift is headlined honestly), with the
+  representative event still taken from the best *named* category.
+- **Scan cost:** field classification for drift is now windowed — new shared
+  `_numeric_ratio_probe` (also used by `recommend_numeric_fields`, killing the duplicated
+  probe SQL) takes the baseline+suspect predicate, so auto-mode drift no longer pays an
+  unwindowed whole-case scan `proportion_shift` never paid.
+- **API shape:** `DistributionDriftFinding.value` (which held the *window label*, unlike
+  every other finding type where `value` is a field value) renamed to `window_label`
+  end to end; redundant `bl_tot`/`w_tot` test-dict keys dropped.
+- **Frontend robustness:** the show-dismissed cache detection no longer relies on the
+  positional `key[-1] === true` contract — `useShowDismissed` now contributes a named
+  `"dismissed-shown"`/`"dismissed-hidden"` key segment that `useDisposition` finds by
+  content; the KS effect is now worded honestly ("≥D of probability mass moved");
+  the show/hide link extracted into one shared `DismissedToggle` (ResultsBar +
+  OrderViolationsView); `pct` moved to `lib/format.ts` as `fmtPctAdaptive`.
+- **Enricher crash recovery:** the job-run marker now durably records
+  `completed_source_ids` (migration `0005`, `mark_enrichment_source_staged` after each
+  source finishes staging), so reconciliation grants provenance to exactly the finished
+  sources — a crashed 200-source job re-runs 1 source, not 200.
+
+Not changed (reviewed, accepted): categorical GROUP BY still ships up to 10k rows/field on
+a misclassified field (needed for the exact `__other__` mass, warned); ROADMAP's D9
+"shipped" prose follows the existing D8 precedent; the `dismissed?` field on each finding
+interface is enforced by the compiler at the generic access site.
+
+## Session 49b — 2026-07-11: D9 value_distribution_drift detector
+
+Milestone-4 D9 shipped (`detector="value_distribution_drift"`, `method="drift"`), adapted
+from AMiner's VariableTypeDetector: per field × suspect window, one whole-distribution
+test — numeric fields via ClickHouse's `kolmogorovSmirnovTestIf('two-sided')` over
+`toFloat64OrNull` (first use in the codebase; one scan per field, all windows batched
+with `-If` combinators, quantiles + drifted-direction argMin/argMax in the same scan),
+categorical fields via a 2×k G-test over the top-50 baseline categories + exact
+`__other__` bucket (folded in Python from the full GROUP BY, 10k-row scan guard). New
+pure-math helpers: general `_chi2_sf(x, df)` (regularized upper incomplete gamma on
+`math.lgamma`, df=1 delegates to the erfc form), `_g_statistic_k`, `_tvd`. One BH-FDR
+pool across both branches; score `-log10(p)`; effect floors KS D ≥ 0.1 / TVD ≥ 0.05 and
+a 20-sample-per-side floor (`TS_STAT_DRIFT_*`), fdr_q request-overridable. Findings are
+per-field (allowlist key `(field, "*")`). Wired end to end: router dispatch/serialize/
+persistence, config, frontend `DistributionDriftView` (temporal-only, cloned from
+interval view) + DetectorAccordion row, 15 new backend tests (incl. hand-computed G and
+chi² reference values), `docs/ANOMALY_DETECTION.md` §10 (similarity renumbered §11).
+Verified against live ClickHouse: `kolmogorovSmirnovTestIf` parses and clickhouse_connect
+returns the named result tuple as a *dict* (`{'d_statistic', 'p_value'}`), not an
+indexable tuple — `_ks_pair` normalizes both shapes (caught pre-deploy by probing the
+dev server; a tuple-index parse would have KeyError'd in production).
+
+## Session 49 — 2026-07-11: X1 show-dismissed toggle + X2 TriageMeter dispositions
+
+Frontend-only disposition polish (roadmap X1/X2, both closed):
+
+- **X1.** Every detector view can now reveal dismissed findings in place: a
+  `useShowDismissed` hook (detector-hooks) threads `include_dismissed=true` into the scan
+  request and the query key's last element; `ResultsBar` (and OrderViolations' bespoke bar)
+  grew a show/hide link next to the dismissed count; `FindingShell` renders dismissed rows
+  dimmed with an EyeOff badge (FrequencyView's bespoke row just dims). `useDisposition`'s
+  optimistic update branches on the key's trailing toggle flag: in a revealed cache, a
+  dismissal flags the row (`dismissed: true`, `dismissed_count`+1, `total_findings`
+  untouched) instead of removing it — matching what a refetch returns; `normal` still
+  removes (backend suppresses it regardless). `dismissed?` moved from an intersection on
+  the `AnomalyFinding` union into each finding interface so per-detector narrowing keeps it.
+- **X2.** TriageMeter "reviewed" now counts event-scoped dispositions, not just user
+  annotations: ExplorerPage consumes the `["dispositions", caseId, timelineId]` query
+  (already invalidated by every disposition mutation) and `computeProgress` unions those
+  event ids into the reviewed set. Value-scoped dispositions stay out — they don't map to
+  single events.
+
+Typecheck, oxlint, vitest (199, incl. 2 new useDisposition branch tests) all green.
+
+## Session 48c — 2026-07-11: no provenance off partial enrichment staging
+
+After the OOM crash chain, a manual enricher run reported "no job started" while the source
+was unenriched. Cause: `_apply_staged_rows` wrote a full `SourceEnrichment` provenance row for
+every source it touched — including sources whose staging was cut short by the crash (applied
+via failure cleanup or startup reconciliation). The run route skips provenance-matched sources,
+so partial provenance permanently blocked re-enrichment. Fix: `_apply_staged_rows` takes
+`complete_source_ids`; the failure path passes the sources fully staged before the error,
+startup reconciliation passes none (its scheduled re-run records provenance on success).
+Partial rows are still applied (valid values, idempotent rewrite) — the source just stays
+eligible. Audit `enricher.applied` now carries a `partial` flag. Recovery for already-poisoned
+rows: `DELETE FROM source_enrichments WHERE case_id=... AND source_id=...`, then re-run.
 
 ## Session 48b — 2026-07-11: entropy detector no longer explodes chars into rows
 

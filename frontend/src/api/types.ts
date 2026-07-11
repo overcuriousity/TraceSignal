@@ -275,6 +275,8 @@ export interface ValueNoveltyFinding {
   event_id: string | null;
   event: Event | null;
   details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
 }
 
 /** One anomalous time window from the frequency detector. */
@@ -292,6 +294,8 @@ export interface FrequencyFinding {
   event_id: string | null;
   event: Event | null;
   details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
 }
 
 /** One rare / first-seen field *combination* from the value_combo detector. */
@@ -308,6 +312,8 @@ export interface ValueComboFinding {
   event_id: string | null;
   event: Event | null;
   details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
 }
 
 /** One out-of-range numeric value from the numeric_range detector. */
@@ -325,6 +331,8 @@ export interface NumericRangeFinding {
   event_id: string | null;
   event: Event | null;
   details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
 }
 
 /** One value containing never-seen characters from the charset detector. */
@@ -341,6 +349,8 @@ export interface CharsetFinding {
   event_id: string | null;
   event: Event | null;
   details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
 }
 
 /** One entropy-outlier value from the entropy detector. */
@@ -360,6 +370,8 @@ export interface EntropyFinding {
   event_id: string | null;
   event: Event | null;
   details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
 }
 
 /** One value-share shift between windows from the proportion_shift detector. */
@@ -388,6 +400,8 @@ export interface ProportionShiftFinding {
   event_id: string | null;
   event: Event | null;
   details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
 }
 
 /** One arrival-cadence change between windows from the interval_periodicity detector. */
@@ -418,6 +432,8 @@ export interface IntervalPeriodicityFinding {
   event_id: string | null;
   event: Event | null;
   details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
 }
 
 /** One never-seen-in-baseline event-order n-gram from the sequence_novelty detector. */
@@ -439,6 +455,8 @@ export interface SequenceNoveltyFinding {
   event_id: string | null;
   event: Event | null;
   details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
 }
 
 /** One out-of-order timestamp finding from the timestamp_order detector. */
@@ -458,9 +476,41 @@ export interface TimestampOrderFinding {
   score: number;
   event: Event | null;
   details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
 }
 
-export type AnomalyFinding = (
+/** One whole-field distribution change between windows from the value_distribution_drift detector. */
+export interface DistributionDriftFinding {
+  type: "value_distribution_drift";
+  field: string;
+  /** Suspect-window label — the finding is per field, so the window names it. */
+  window_label: string;
+  /** "ks" (numeric Kolmogorov–Smirnov) | "g-test-k" (categorical G-test). */
+  test: "ks" | "g-test-k";
+  /** KS D statistic or the 2×k G statistic. */
+  statistic: number;
+  /** The floor-gated effect size: KS D again, or the total-variation distance. */
+  effect: number;
+  /** "up"/"down" (median shift) | "spread" (equal medians, shape change) | "mixed" (categorical). */
+  direction: "up" | "down" | "spread" | "mixed";
+  /** Field-bearing events on each side of the test. */
+  baseline_n: number;
+  window_n: number;
+  p_value: number;
+  /** Benjamini–Hochberg adjusted p-value across every test in the run. */
+  q_value: number;
+  /** −log10(p_value) — ranks both test families on one scale. */
+  score: number;
+  first_seen: string | null;
+  event_id: string | null;
+  event: Event | null;
+  details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
+}
+
+export type AnomalyFinding =
   | ValueNoveltyFinding
   | ValueComboFinding
   | FrequencyFinding
@@ -471,10 +521,7 @@ export type AnomalyFinding = (
   | ProportionShiftFinding
   | IntervalPeriodicityFinding
   | SequenceNoveltyFinding
-) & {
-  /** Present (true) only when the request passed `include_dismissed`. */
-  dismissed?: boolean;
-};
+  | DistributionDriftFinding;
 
 export interface AnomaliesResponse {
   status: "ok" | "no_data" | "insufficient_data";
@@ -604,7 +651,8 @@ export interface AnomalyMarker {
     | "entropy"
     | "proportion_shift"
     | "interval_periodicity"
-    | "sequence_novelty";
+    | "sequence_novelty"
+    | "value_distribution_drift";
   /** Raw structured finding data — stored verbatim on the persisted annotation. */
   rawDetails: Record<string, unknown>;
   /** End of the anomalous window, for frequency findings — enables a range highlight. */

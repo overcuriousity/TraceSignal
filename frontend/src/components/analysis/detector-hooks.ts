@@ -89,6 +89,30 @@ export function useCappedFindings<T>(findings: T[], initial = 20) {
 }
 
 /**
+ * Query-key sentinels for the show-dismissed toggle. `useDisposition` selects
+ * its optimistic-update branch by scanning the key for SHOW_DISMISSED_KEY —
+ * a named segment, so its position in the key doesn't matter.
+ */
+export const SHOW_DISMISSED_KEY = "dismissed-shown";
+export const HIDE_DISMISSED_KEY = "dismissed-hidden";
+
+/**
+ * Per-view "show dismissed" reveal toggle. When on, the scan request carries
+ * `include_dismissed=true` and dismissed findings come back flagged
+ * `dismissed: true` instead of dropped — rendered dimmed by `FindingShell`.
+ * Put `keyPart` (not the raw boolean) in the query key so toggling refetches
+ * AND `useDisposition` can recognize revealed caches by the named segment.
+ */
+export function useShowDismissed() {
+  const [enabled, setEnabled] = useState(false);
+  return {
+    enabled,
+    toggle: () => setEnabled((v) => !v),
+    keyPart: enabled ? SHOW_DISMISSED_KEY : HIDE_DISMISSED_KEY,
+  };
+}
+
+/**
  * Server-side findings limit with stepped "load more" (…→50→150→500, capped by
  * the API's `le=500`). Distinct from `useCappedFindings`, which only trims the
  * client-side render of what the server already returned — this raises how
