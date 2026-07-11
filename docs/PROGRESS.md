@@ -15,6 +15,18 @@ just a full re-scan). The UI surfaces it: after a skipped run, the row's button 
 "Force re-run" with an explanatory tooltip and the toast points at it. Manual runs (forced or
 not) now also write an `enricher.manual_run` audit row with the source/skip lists.
 
+**Enrichment apply memory guardrails (`db/clickhouse.py`).** A force re-run on the production
+host killed ClickHouse mid-`finalize_enrichment_apply` (connection refused on 8123 — server
+down, matching the session-52 OOM pattern), with M22's fresh `MATERIALIZE COLUMN/INDEX`
+background mutations running at the same time. The partition-rewrite INSERT SELECT (whole
+partition LEFT JOIN staged rows + GROUP BY into a Map) carried **no** memory limits — the only
+heavy query shape without them. It now runs under `HEAVY_SCAN_SETTINGS` (hard per-query cap,
+external group-by/sort spill, bounded threads) plus `join_algorithm = 'grace_hash'` so the
+join hash table spills to disk. A capped apply that still exceeds the budget fails one job and
+crash-recovers from Postgres staging; a dead server takes everything down. Remote-ClickHouse
+deployments should pin `TS_STAT_SCAN_MAX_MEMORY_BYTES` to the DB host's RAM (same knob as the
+detector scans).
+
 **search_blob upgrade idempotency (`db/clickhouse.py`).** `_ensure_search_blob` early-returned
 on column presence alone — a crash between `ADD COLUMN` and `ADD INDEX` would strand the table
 without the skip index forever (fast path correct but permanently unpruned, silently). The

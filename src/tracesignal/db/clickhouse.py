@@ -35,6 +35,7 @@ import pyarrow as pa
 from tracesignal.core.config import get_settings
 from tracesignal.db._arrow_schema import EVENT_ARROW_SCHEMA
 from tracesignal.db._dt import is_null_ts_sentinel
+from tracesignal.db._scan import HEAVY_SCAN_SETTINGS
 from tracesignal.models.event import Event
 
 logger = logging.getLogger(__name__)
@@ -544,6 +545,15 @@ class ClickHouseStore:
         Transiently doubles the partition's disk footprint (scratch copy).
         Caller must serialize applies per ``(case_id, source_id)`` — two
         concurrent REPLACEs would silently discard one side's keys.
+
+        The rewrite carries the same memory guardrails as the detector scans
+        (``HEAVY_SCAN_SETTINGS``: hard per-query cap + external spill +
+        bounded threads) plus ``grace_hash`` so the staged-rows join spills
+        to disk instead of holding its hash table in RAM — an unguarded
+        whole-partition JOIN + GROUP BY is exactly the query shape that can
+        OOM-kill the ClickHouse *server* on a large source (the per-query cap
+        fails one apply, which crash-recovers from staging; a dead server
+        takes every query down with it).
         """
         rows_table, events_table = self._enrichment_scratch_tables(scratch_suffix)
         partition_expr = _partition_expr(case_id, source_id)
@@ -585,7 +595,7 @@ class ClickHouseStore:
                 GROUP BY event_id
             ) AS m ON e.event_id = m.event_id
             WHERE e.case_id = {{case_id:String}} AND e.source_id = {{source_id:String}}
-            SETTINGS join_use_nulls = 0
+            {HEAVY_SCAN_SETTINGS}, join_use_nulls = 0, join_algorithm = 'grace_hash'
             """,
             parameters={
                 "case_id": case_id,
