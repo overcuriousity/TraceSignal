@@ -170,17 +170,26 @@ class TestEventsSchema:
 
 
 class _SearchBlobClient(_RecordingClient):
-    """Fake with controllable search_blob column/mutation state."""
+    """Fake with controllable search_blob column/index/mutation state."""
 
-    def __init__(self, has_column: bool, mutations: list[tuple[int, str]] | None = None):
+    def __init__(
+        self,
+        has_column: bool,
+        mutations: list[tuple[int, str]] | None = None,
+        has_index: bool | None = None,
+    ):
         super().__init__()
         self.has_column = has_column
+        # Defaults to has_column so existing column-only callers keep working.
+        self.has_index = has_column if has_index is None else has_index
         self.mutations = mutations if mutations is not None else []
 
     def query(self, query, parameters=None):
         self.queries.append((query, parameters))
         if "system.columns" in query and "search_blob" in query:
             return _FakeResult([(1 if self.has_column else 0,)])
+        if "system.data_skipping_indices" in query:
+            return _FakeResult([(1 if self.has_index else 0,)])
         if "system.mutations" in query:
             return _FakeResult(self.mutations)
         return _FakeResult([(42,)])
@@ -227,6 +236,21 @@ class TestSearchBlob:
         store.client = _SearchBlobClient(has_column=True)
         store._ensure_search_blob()
         assert store.client.commands == []
+
+    def test_ensure_resumes_when_column_present_but_index_missing(self, store):
+        # Regression: a crash between ADD COLUMN and ADD INDEX must not
+        # permanently strand the table without the index — a column-only
+        # guard would short-circuit here forever.
+        store.client = _SearchBlobClient(has_column=True, has_index=False)
+        store._ensure_search_blob()
+        cmds = store.client.commands
+        assert any("ADD COLUMN IF NOT EXISTS search_blob" in c for c in cmds)
+        assert any("ADD INDEX IF NOT EXISTS search_blob_idx" in c for c in cmds)
+        assert any("DROP INDEX IF EXISTS message_idx" in c for c in cmds)
+        assert any("MATERIALIZE COLUMN search_blob SETTINGS mutations_sync = 0" in c for c in cmds)
+        assert any(
+            "MATERIALIZE INDEX search_blob_idx SETTINGS mutations_sync = 0" in c for c in cmds
+        )
 
     def test_ready_true_when_no_pending_mutations(self, store):
         store.client = _SearchBlobClient(has_column=True, mutations=[])

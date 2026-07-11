@@ -320,6 +320,14 @@ class ClickHouseStore:
         )
         return bool(result.result_rows and result.result_rows[0][0])
 
+    def _has_search_blob_index(self) -> bool:
+        result = self.client.query(
+            "SELECT count() FROM system.data_skipping_indices "
+            "WHERE database = {db:String} AND table = 'events' AND name = 'search_blob_idx'",
+            parameters={"db": self.database},
+        )
+        return bool(result.result_rows and result.result_rows[0][0])
+
     def _ensure_search_blob(self) -> None:
         """In-place upgrade for pre-`search_blob` deployments (M22). Idempotent.
 
@@ -331,8 +339,15 @@ class ClickHouseStore:
         the fly, so queries are always correct — only the fast path's index
         pruning waits, gated by :meth:`search_blob_ready`. Synchronous
         materialization would block startup for hours on a 300M-row table.
+
+        Both column and index presence are checked (not just the column): a
+        crash between the ``ADD COLUMN`` and ``ADD INDEX`` statements below
+        would otherwise leave the index permanently missing on the next
+        startup, since a column-only guard would short-circuit here forever.
+        Every statement is itself ``IF NOT EXISTS``, so re-running against a
+        partially-upgraded table is safe.
         """
-        if self._has_search_blob_column():
+        if self._has_search_blob_column() and self._has_search_blob_index():
             return
         table = f"{self.database}.events"
         self.client.command(
