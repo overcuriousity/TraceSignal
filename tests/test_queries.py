@@ -2303,3 +2303,103 @@ def test_field_scatter_non_numeric_skips_sample_scan() -> None:
         "ORDER BY rand()" in sql
         for sql, _ in svc.store.client.queries  # type: ignore[union-attr]
     )
+
+
+# ── baseline-compare layer cache (M24c) ──────────────────────────────────────
+
+
+def _fresh_viz_cache():
+    from tracesignal.db import viz_cache
+
+    viz_cache.reset_baseline_cache()
+    return viz_cache
+
+
+_TOKEN = ("c1", (("s1", "2026-01-01T00:00:00+00:00", 10),))
+
+
+def test_compare_time_histogram_baseline_cache_warm_render_scans_primary_only() -> None:
+    _fresh_viz_cache()
+    min_ts = datetime(2024, 1, 1, tzinfo=UTC)
+    max_ts = datetime(2024, 1, 2, tzinfo=UTC)
+    svc = _seq_service(
+        [
+            ("min(", [FakeQueryResult(result_rows=[[min_ts, max_ts]])] * 2),
+            ("toStartOfInterval", [FakeQueryResult(result_rows=[])] * 6),
+        ]
+    )
+    p = EventQuery(case_id="c1", source_ids=["s1"], q="dos")
+    c = EventQuery(case_id="c1", source_ids=["s1"])
+
+    first = svc.compare_time_histogram(p, c, buckets=4, baseline_cache_token=_TOKEN)
+    # Cold with token: baseline range + 2 bucket scans — the primary range
+    # scan is skipped outright (union == baseline range in baseline mode).
+    assert len(svc.store.client.queries) == 3
+
+    second = svc.compare_time_histogram(p, c, buckets=4, baseline_cache_token=_TOKEN)
+    # Warm: only the primary's bucket scan runs.
+    assert len(svc.store.client.queries) == 4
+    assert second == first
+
+    # A changed freshness token re-scans the baseline layer.
+    other = ("c1", (("s1", "2026-02-01T00:00:00+00:00", 20),))
+    svc.compare_time_histogram(p, c, buckets=4, baseline_cache_token=other)
+    assert len(svc.store.client.queries) == 7
+
+
+def test_compare_time_histogram_without_token_stays_fully_live() -> None:
+    _fresh_viz_cache()
+    min_ts = datetime(2024, 1, 1, tzinfo=UTC)
+    max_ts = datetime(2024, 1, 2, tzinfo=UTC)
+    svc = _seq_service(
+        [
+            ("min(", [FakeQueryResult(result_rows=[[min_ts, max_ts]])] * 4),
+            ("toStartOfInterval", [FakeQueryResult(result_rows=[])] * 4),
+        ]
+    )
+    p = EventQuery(case_id="c1", source_ids=["s1"], q="dos")
+    c = EventQuery(case_id="c1", source_ids=["s1"])
+    svc.compare_time_histogram(p, c, buckets=4)
+    svc.compare_time_histogram(p, c, buckets=4)
+    # 2 range + 2 bucket scans per render, nothing cached.
+    assert len(svc.store.client.queries) == 8
+
+
+def test_compare_field_terms_baseline_cache_warm_render() -> None:
+    _fresh_viz_cache()
+    svc = _seq_service(
+        [
+            ("OVER ()", [FakeQueryResult(result_rows=[["GET", 6, 10, 2]])] * 2),
+            # One canned comparison scan only: a warm second render must not
+            # consult this FIFO again (it would raise "no fake response left").
+            ("cmp_values", [FakeQueryResult(result_rows=[["GET", 3]])]),
+        ]
+    )
+    p = EventQuery(case_id="c1", source_ids=["s1"], q="dos")
+    c = EventQuery(case_id="c1", source_ids=["s1"])
+    first = svc.compare_field_terms(p, c, "attr:method", baseline_cache_token=_TOKEN)
+    second = svc.compare_field_terms(p, c, "attr:method", baseline_cache_token=_TOKEN)
+    assert second == first
+    assert first["values"] == [{"value": "GET", "primary": 6, "comparison": 3}]
+
+
+def test_compare_field_numeric_baseline_cache_warm_render() -> None:
+    _fresh_viz_cache()
+    stats = FakeQueryResult(result_rows=[[5, 0.0, 10.0]])
+    bins = FakeQueryResult(result_rows=[[0, 5]])
+    svc = _seq_service(
+        [
+            # Cold render consumes two of each (both layers, identical rows so
+            # _run_parallel interleaving can't skew the assertion); warm render
+            # consumes one of each (primary only).
+            ("count(v), min(v), max(v)", [stats] * 3),
+            ("toInt64(floor(", [bins] * 3),
+        ]
+    )
+    p = EventQuery(case_id="c1", source_ids=["s1"], q="dos")
+    c = EventQuery(case_id="c1", source_ids=["s1"])
+    first = svc.compare_field_numeric(p, c, "attr:bytes", bins=2, baseline_cache_token=_TOKEN)
+    assert len(svc.store.client.queries) == 4
+    second = svc.compare_field_numeric(p, c, "attr:bytes", bins=2, baseline_cache_token=_TOKEN)
+    assert len(svc.store.client.queries) == 6
+    assert second == first

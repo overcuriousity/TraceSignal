@@ -694,6 +694,7 @@ async def compare_layers(
 
     primary = await _resolve_body_query(case_id, timeline_id, body.primary)
 
+    baseline_token: tuple | None = None
     if body.comparison.mode == "baseline":
         # All events of the timeline: filters dropped, timeline scope and
         # explicit time window kept — "the whole" the primary is a part of.
@@ -724,6 +725,27 @@ async def compare_layers(
             filter_modes=None,
             exclusion_modes=None,
         )
+        # M24c: freshness fingerprint for the baseline-layer cache. The
+        # comparison layer here is a strict superset of the primary (same
+        # timeline sources + explicit window, all filters dropped) — the
+        # compare_* methods' cache paths and their primary-range-scan skip
+        # both rest on that invariant; anything that could make a primary
+        # filter *add* rows outside timeline scope breaks it. computed_at
+        # moves on exactly the two source-mutation events (ingest,
+        # enrichment apply); a source without a stats row disables caching
+        # for this render (token stays None — always safe).
+        rows = await get_store().get_source_field_stats(comparison.source_ids or [])
+        by_source = {row.source_id: row for row in rows}
+        if comparison.source_ids and all(sid in by_source for sid in comparison.source_ids):
+            baseline_token = (
+                case_id,
+                tuple(
+                    sorted(
+                        (sid, by_source[sid].computed_at.isoformat(), by_source[sid].events_total)
+                        for sid in comparison.source_ids
+                    )
+                ),
+            )
     else:
         if body.comparison.filters is None:
             raise HTTPException(status_code=422, detail="mode='custom' requires 'filters'")
@@ -742,14 +764,31 @@ async def compare_layers(
     )
     if body.kind == "time":
         return await _run_regex_guarded(
-            q_regex, service.compare_time_histogram, primary, comparison, body.buckets
+            q_regex,
+            service.compare_time_histogram,
+            primary,
+            comparison,
+            body.buckets,
+            baseline_cache_token=baseline_token,
         )
     if body.kind == "terms":
         return await _run_regex_guarded(
-            q_regex, service.compare_field_terms, primary, comparison, body.field, body.limit
+            q_regex,
+            service.compare_field_terms,
+            primary,
+            comparison,
+            body.field,
+            body.limit,
+            baseline_cache_token=baseline_token,
         )
     return await _run_regex_guarded(
-        q_regex, service.compare_field_numeric, primary, comparison, body.field, body.bins
+        q_regex,
+        service.compare_field_numeric,
+        primary,
+        comparison,
+        body.field,
+        body.bins,
+        baseline_cache_token=baseline_token,
     )
 
 

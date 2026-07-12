@@ -47,6 +47,7 @@ from tracesignal.db.field_recommend import (
     timeline_cohesion_summary,
     timeline_universal_cohesion,
 )
+from tracesignal.db.viz_cache import baseline_cache
 
 # Sentinel for "no parseable timestamp" — see the definition and rationale in
 # `db/_dt.py`. Local aliases keep the historical names used throughout this
@@ -1844,27 +1845,32 @@ class EventQueryService:
         """
         if primary.start is not None and primary.end is not None:
             return ensure_utc(primary.start), ensure_utc(primary.end)
-        database = self.store.database
-        ranges = []
-        for query in (primary, comparison):
-            where, parameters = self._build_where(query)
-            # W2: each layer's range respects its own clock-skew offsets,
-            # matching `_bucketed_counts`' bucketing expression.
-            ranges.append(
-                query_timestamp_range(
-                    self.store.client,
-                    database,
-                    where,
-                    parameters,
-                    ts_expr=effective_ts_sql(query.source_offsets),
-                    settings=HEAVY_SCAN_SETTINGS,
-                )
-            )
+        ranges = [self._layer_timestamp_range(query) for query in (primary, comparison)]
         mins = [r[0] for r in ranges if r[0] is not None]
         maxs = [r[1] for r in ranges if r[1] is not None]
         if not mins or not maxs:
             return None, None
         return min(mins), max(maxs)
+
+    def _layer_timestamp_range(
+        self, query: EventQuery
+    ) -> tuple[datetime | None, datetime | None]:
+        """One layer's (min, max) data range — explicit window short-circuits.
+
+        W2: the range respects the layer's own clock-skew offsets, matching
+        `_bucketed_counts`' bucketing expression.
+        """
+        if query.start is not None and query.end is not None:
+            return ensure_utc(query.start), ensure_utc(query.end)
+        where, parameters = self._build_where(query)
+        return query_timestamp_range(
+            self.store.client,
+            self.store.database,
+            where,
+            parameters,
+            ts_expr=effective_ts_sql(query.source_offsets),
+            settings=HEAVY_SCAN_SETTINGS,
+        )
 
     def _bucketed_counts(self, query: EventQuery, interval: int) -> dict[str, int]:
         """Return epoch-aligned bucket-start (ISO) → event count for *query*."""
@@ -1886,7 +1892,11 @@ class EventQueryService:
 
     @_gated_scan
     def compare_time_histogram(
-        self, primary: EventQuery, comparison: EventQuery, buckets: int = 60
+        self,
+        primary: EventQuery,
+        comparison: EventQuery,
+        buckets: int = 60,
+        baseline_cache_token: tuple | None = None,
     ) -> dict[str, Any]:
         """Return event counts over time for two layers on one shared bucket grid.
 
@@ -1896,9 +1906,23 @@ class EventQueryService:
         that grid and zero-filled onto it, so the two series are comparable
         by construction. The response carries only raw counts; derived
         metrics (delta/rate/ratio/cumulative) are frontend transforms.
+
+        ``baseline_cache_token`` (M24c, non-None only in baseline mode, see
+        the compare endpoint): the comparison layer is a strict superset of
+        the primary — same sources and explicit window, all filters dropped —
+        so the union range equals the baseline's own range, letting the
+        primary range scan be skipped outright; the baseline range and bucket
+        counts are memoized in :py:mod:`viz_cache` keyed on the token.
         """
         self.store.init_schema()
-        min_ts, max_ts = self._union_timestamp_range(primary, comparison)
+        window = (primary.start, primary.end)
+        if baseline_cache_token is not None:
+            min_ts, max_ts = baseline_cache().get_or_compute(
+                ("time_range", baseline_cache_token, window),
+                lambda: self._layer_timestamp_range(comparison),
+            )
+        else:
+            min_ts, max_ts = self._union_timestamp_range(primary, comparison)
         if min_ts is None or max_ts is None:
             return {
                 "kind": "time",
@@ -1911,9 +1935,16 @@ class EventQueryService:
             }
 
         interval = bucket_interval_seconds(min_ts, max_ts, buckets)
+        if baseline_cache_token is not None:
+            comparison_fn = lambda: baseline_cache().get_or_compute(  # noqa: E731
+                ("time_buckets", baseline_cache_token, window, interval),
+                lambda: self._bucketed_counts(comparison, interval),
+            )
+        else:
+            comparison_fn = lambda: self._bucketed_counts(comparison, interval)  # noqa: E731
         primary_counts, comparison_counts = self._run_parallel(
             lambda: self._bucketed_counts(primary, interval),
-            lambda: self._bucketed_counts(comparison, interval),
+            comparison_fn,
         )
         starts = aligned_bucket_starts(min_ts, max_ts, interval)
         bucket_list = [
@@ -1964,7 +1995,12 @@ class EventQueryService:
 
     @_gated_scan
     def compare_field_terms(
-        self, primary: EventQuery, comparison: EventQuery, field_token: str, limit: int = 50
+        self,
+        primary: EventQuery,
+        comparison: EventQuery,
+        field_token: str,
+        limit: int = 50,
+        baseline_cache_token: tuple | None = None,
     ) -> dict[str, Any]:
         """Return top-N term counts for two layers over one shared category list.
 
@@ -1972,6 +2008,12 @@ class EventQueryService:
         list; the comparison layer is then counted against those same values
         (everything else folds into its ``other``), so both bar groups share
         categories — the terms-kind comparability invariant.
+
+        ``baseline_cache_token`` (M24c): the baseline layer's counts depend
+        on the primary's top-N value list (render-variant), so the cache key
+        includes it — hits happen only on re-renders whose primary top-N is
+        unchanged (option toggles, tab switches, repeat renders), a
+        deliberately narrower win than the time/numeric kinds.
         """
         self.store.init_schema()
         terms = self._field_terms_impl(primary, field_token, limit=limit)
@@ -1981,9 +2023,22 @@ class EventQueryService:
         comparison_by_value: dict[str, int] = {}
         comparison_total = 0
         if top_values:
-            comparison_by_value, comparison_total = self._terms_counts_for_values(
-                comparison, field_token, top_values
-            )
+            if baseline_cache_token is not None:
+                window = (primary.start, primary.end)
+                comparison_by_value, comparison_total = baseline_cache().get_or_compute(
+                    (
+                        "terms_counts",
+                        baseline_cache_token,
+                        window,
+                        field_token,
+                        tuple(top_values),
+                    ),
+                    lambda: self._terms_counts_for_values(comparison, field_token, top_values),
+                )
+            else:
+                comparison_by_value, comparison_total = self._terms_counts_for_values(
+                    comparison, field_token, top_values
+                )
 
         values = [
             {
@@ -2051,7 +2106,12 @@ class EventQueryService:
 
     @_gated_scan
     def compare_field_numeric(
-        self, primary: EventQuery, comparison: EventQuery, field_token: str, bins: int = 30
+        self,
+        primary: EventQuery,
+        comparison: EventQuery,
+        field_token: str,
+        bins: int = 30,
+        baseline_cache_token: tuple | None = None,
     ) -> dict[str, Any]:
         """Return fixed-width numeric histograms for two layers on shared bin edges.
 
@@ -2059,11 +2119,26 @@ class EventQueryService:
         both layers are bucketed on those explicit edges — the numeric-kind
         comparability invariant. Same fixed-width/reproducible-edges policy
         as :py:meth:`field_numeric_stats`.
+
+        ``baseline_cache_token`` (M24c): the baseline layer's stats and bin
+        counts are memoized; bin-count keys include the derived edges
+        (mn/bin_width), so a hit is exact regardless of what the primary
+        contributed to the union.
         """
         self.store.init_schema()
+        window = (primary.start, primary.end)
+        if baseline_cache_token is not None:
+            comparison_stats_fn = lambda: baseline_cache().get_or_compute(  # noqa: E731
+                ("num_stats", baseline_cache_token, window, field_token),
+                lambda: self._numeric_layer_stats(comparison, field_token),
+            )
+        else:
+            comparison_stats_fn = lambda: self._numeric_layer_stats(  # noqa: E731
+                comparison, field_token
+            )
         (p_count, p_mn, p_mx), (c_count, c_mn, c_mx) = self._run_parallel(
             lambda: self._numeric_layer_stats(primary, field_token),
-            lambda: self._numeric_layer_stats(comparison, field_token),
+            comparison_stats_fn,
         )
 
         mins = [m for m in (p_mn, c_mn) if m is not None]
@@ -2084,17 +2159,33 @@ class EventQueryService:
         span = mx - mn
         bin_width = span / bin_count if span > 0 else 1.0
 
+        def comparison_bins_fn() -> dict[int, int]:
+            if not c_count:
+                return {}
+            if baseline_cache_token is not None:
+                return baseline_cache().get_or_compute(
+                    (
+                        "num_bins",
+                        baseline_cache_token,
+                        window,
+                        field_token,
+                        bin_count,
+                        mn,
+                        bin_width,
+                    ),
+                    lambda: self._numeric_bin_counts(
+                        comparison, field_token, mn, bin_width, bin_count
+                    ),
+                )
+            return self._numeric_bin_counts(comparison, field_token, mn, bin_width, bin_count)
+
         primary_bins, comparison_bins = self._run_parallel(
             lambda: (
                 self._numeric_bin_counts(primary, field_token, mn, bin_width, bin_count)
                 if p_count
                 else {}
             ),
-            lambda: (
-                self._numeric_bin_counts(comparison, field_token, mn, bin_width, bin_count)
-                if c_count
-                else {}
-            ),
+            comparison_bins_fn,
         )
         bins_out = [
             {
