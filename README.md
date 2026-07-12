@@ -23,6 +23,8 @@ is powerful but operationally heavy. Vestigo aims to be the focused middle groun
 huge logs, explore them like an ELK stack, and let both classic statistical detectors and local
 embeddings surface the needles in the haystack, without needing a cluster to run it.
 
+<img width="2866" height="1589" alt="image" src="https://github.com/user-attachments/assets/d505af86-9ba2-4fe1-b448-10b18ae2d409" />
+
 ## Capabilities
 
 ### Ingestion
