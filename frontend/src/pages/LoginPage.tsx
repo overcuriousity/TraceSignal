@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useLocation, useNavigate } from "react-router-dom";
-import { ShieldAlert } from "lucide-react";
+import { VestigoMark } from "@/components/ui/VestigoMark";
 import { authApi } from "@/api/auth";
 import { ApiError } from "@/api/client";
 import { useHealth } from "@/api/health";
@@ -43,7 +43,7 @@ export function LoginPage() {
     <div className="flex h-svh items-center justify-center bg-[var(--color-bg-base)] px-4">
       <div className="w-full max-w-sm rounded-lg border border-[var(--color-border-strong)] bg-[var(--color-bg-elevated)] p-6">
         <div className="mb-1 flex items-center gap-2">
-          <ShieldAlert size={22} className="text-[var(--color-accent)]" />
+          <VestigoMark size={22} />
           <h1 className="text-lg font-semibold text-[var(--color-fg-primary)]">Vestigo</h1>
         </div>
         <p className="mb-5 text-sm text-[var(--color-fg-muted)]">Sign in to continue.</p>

@@ -1,4 +1,11 @@
-# Vestigo
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
+    <img src="docs/assets/logo.svg" alt="Vestigo" width="320">
+  </picture>
+</p>
+
+<p align="center"><em>vestigo</em> (Latin) — <em>I follow the tracks; I investigate.</em></p>
 
 A forensic-grade post-mortem log investigation platform.
 

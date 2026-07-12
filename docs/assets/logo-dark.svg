@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="260" height="56" viewBox="0 0 260 56">
+  <!-- Vestigo: track of steps, one band out of cadence (the anomaly). Dark-background variant. -->
+  <g>
+    <polygon fill="#a78bfa" points="4,7 28,7 24,14 4,14"/>
+    <polygon fill="#a78bfa" points="10,18 34,18 30,25 10,25"/>
+    <polygon fill="#22d3ee" points="24,29 48,29 44,36 24,36"/>
+    <polygon fill="#a78bfa" points="22,40 46,40 42,47 22,47"/>
+  </g>
+  <text x="62" y="37" font-family="ui-monospace, 'Cascadia Mono', 'JetBrains Mono', Menlo, Consolas, monospace" font-size="26" font-weight="700" letter-spacing="6" fill="#ede9fe">VESTIGO</text>
+</svg>

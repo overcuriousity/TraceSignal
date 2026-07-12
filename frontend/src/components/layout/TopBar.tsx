@@ -3,7 +3,6 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Wifi,
   WifiOff,
-  Activity,
   Sun,
   Moon,
   Rows2,
@@ -17,6 +16,7 @@ import { useHealth } from "@/api/health";
 import { authApi } from "@/api/auth";
 import { JobTray } from "./JobTray";
 import { Tooltip } from "@/components/ui/Tooltip";
+import { VestigoMark } from "@/components/ui/VestigoMark";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -164,7 +164,7 @@ export function TopBar() {
         to="/"
         className="flex items-center gap-2 text-[var(--color-fg-primary)] hover:text-[var(--color-accent)] transition-base"
       >
-        <Activity size={16} className="text-[var(--color-accent)]" />
+        <VestigoMark size={16} />
         <span className="font-semibold tracking-tight">Vestigo</span>
       </Link>
 
