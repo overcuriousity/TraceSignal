@@ -1,0 +1,222 @@
+{
+  "upstream": "https://github.com/overcuriousity/2timesketch",
+  "commit": "d6e5e617353eb6a41fe712d1e207cfcc8dc17cdc",
+  "version": "1.0.0",
+  "license": "MIT License",
+  "converters": [
+    {
+      "name": "apache2timesketch",
+      "filename": "apache2timesketch.py",
+      "description": "Apache HTTP Server access (combined/common, other_vhosts) and error logs (2.4 and 2.2 formats) to Timesketch timeline.",
+      "inputs": [
+        "access.log*",
+        "other_vhosts_access.log*",
+        "error.log*"
+      ],
+      "size_bytes": 63365,
+      "sha256": "6c4d99396b2d8174edee52c97d40c0066402c9deb110d446819497026d6408a3"
+    },
+    {
+      "name": "browser2timesketch",
+      "filename": "browser2timesketch.py",
+      "description": "Browser history (Firefox/Chrome/Chromium/Edge SQLite databases) to Timesketch timeline.",
+      "inputs": [
+        "places.sqlite",
+        "History (Chromium SQLite)"
+      ],
+      "size_bytes": 101161,
+      "sha256": "cde13b29ef9460252e93d8b566813c2c44c1900bda6620373e3d4b13ee405c16"
+    },
+    {
+      "name": "cloudtrail2timesketch",
+      "filename": "cloudtrail2timesketch.py",
+      "description": "AWS CloudTrail JSON/JSON.gz exports to Timesketch timeline.",
+      "inputs": [
+        "CloudTrail .json / .json.gz"
+      ],
+      "size_bytes": 42610,
+      "sha256": "d84d8cbb395f0e35d8fbdd96961613df858b4b2cee47eb15afd02b584d2df7a2"
+    },
+    {
+      "name": "cloudtrail2vestigo",
+      "filename": "cloudtrail2vestigo.py",
+      "description": "AWS CloudTrail JSON/JSON.gz exports (file or directory) to a Vestigo Parquet file for direct upload. Requires pyarrow.",
+      "inputs": [
+        "CloudTrail .json / .json.gz"
+      ],
+      "native": true,
+      "requires": [
+        "pyarrow"
+      ],
+      "size_bytes": 23124,
+      "sha256": "66c964d5e9edf224b9626a74a08ef49541a93d104f9c5bd8180d110b7129c26c"
+    },
+    {
+      "name": "cowrie2timesketch",
+      "filename": "cowrie2timesketch.py",
+      "description": "Cowrie SSH/Telnet honeypot JSON logs (plain, rotated, or gzip) to Timesketch timeline.",
+      "inputs": [
+        "cowrie.json",
+        "cowrie.json.YYYY-MM-DD",
+        "cowrie.json*.gz"
+      ],
+      "size_bytes": 43729,
+      "sha256": "c36b364b09fe477befd32bfee03407bfd33940c0e109cc835256ab91e5a90c5c"
+    },
+    {
+      "name": "evtx2timesketch",
+      "filename": "evtx2timesketch.py",
+      "description": "Windows Event Log text exports (wevtutil XML, evtx_dump XML/JSONL) to Timesketch timeline.",
+      "inputs": [
+        "wevtutil qe /f:xml export",
+        "evtx_dump --format xml",
+        "evtx_dump -o jsonl"
+      ],
+      "size_bytes": 57648,
+      "sha256": "571a277bcd19ea7358e68aa9b2902c1554898450fb4ac4badc8acc466ba0bf66"
+    },
+    {
+      "name": "filterlog2timesketch",
+      "filename": "filterlog2timesketch.py",
+      "description": "pfSense/OPNsense filterlog firewall logs to Timesketch timeline.",
+      "inputs": [
+        "filter.log (syslog filterlog lines)"
+      ],
+      "size_bytes": 51113,
+      "sha256": "18bd8d9092d9ad34ff93a7cb06c7cf8292a5b2d27a832c3a6e996841d97603dc"
+    },
+    {
+      "name": "filterlog2vestigo",
+      "filename": "filterlog2vestigo.py",
+      "description": "pfSense/OPNsense filterlog firewall logs (plain or .gz, file or directory) to a Vestigo Parquet file for direct upload. Requires pyarrow.",
+      "inputs": [
+        "filter.log (syslog filterlog lines)"
+      ],
+      "native": true,
+      "requires": [
+        "pyarrow"
+      ],
+      "size_bytes": 28904,
+      "sha256": "9cef34765cdd7cb5957cd4d2d2fcfdbceb68ce4811d1a9e9fa44d30af357faea"
+    },
+    {
+      "name": "journal2timesketch",
+      "filename": "journal2timesketch.py",
+      "description": "systemd journal (via journalctl JSON export) to Timesketch timeline.",
+      "inputs": [
+        "journal directory / journalctl -o json"
+      ],
+      "size_bytes": 38902,
+      "sha256": "874493b165471df8353e396713e23273bd5e04f59be92888676d3c3e51ba8380"
+    },
+    {
+      "name": "nginx2timesketch",
+      "filename": "nginx2timesketch.py",
+      "description": "nginx access/error/redirect logs to Timesketch timeline.",
+      "inputs": [
+        "access.log*",
+        "error.log*"
+      ],
+      "size_bytes": 46573,
+      "sha256": "6f0a2df17785135ea847491a5b8bc822c6c5a9d205d54eec43c305ce5a7ce734"
+    },
+    {
+      "name": "nginx2vestigo",
+      "filename": "nginx2vestigo.py",
+      "description": "nginx access/error/redirect logs (plain or .gz, file or directory) to a Vestigo Parquet file for direct upload. Requires pyarrow.",
+      "inputs": [
+        "access.log*",
+        "error.log*"
+      ],
+      "native": true,
+      "requires": [
+        "pyarrow"
+      ],
+      "size_bytes": 24107,
+      "sha256": "a23c6c52a4bf4a361393732e085f20f76ed1bc4c79cd06cbc9fc1a7fb7ebae16"
+    },
+    {
+      "name": "pcap2timesketch",
+      "filename": "pcap2timesketch.py",
+      "description": "Packet captures (pcap/pcapng) to Timesketch timeline, decoded to Ethernet/IPv4/IPv6/TCP/UDP/ICMP/ARP headers.",
+      "inputs": [
+        "*.pcap",
+        "*.pcapng"
+      ],
+      "size_bytes": 62362,
+      "sha256": "f33608e822a9f77787671ef236df7b9637b64a91553519117da71930ac0e3394"
+    },
+    {
+      "name": "pcap2vestigo",
+      "filename": "pcap2vestigo.py",
+      "description": "Packet captures (pcap/pcapng, file or directory) to a Vestigo Parquet file for direct upload, decoded to Ethernet/IPv4/IPv6/TCP/UDP/ICMP/ARP headers. Requires pyarrow.",
+      "inputs": [
+        "*.pcap",
+        "*.pcapng"
+      ],
+      "native": true,
+      "requires": [
+        "pyarrow"
+      ],
+      "size_bytes": 37928,
+      "sha256": "0c9ec93a649227b5ff9daf9828b73864ef0ed8d84287bce3932df9a1efbd80e7"
+    },
+    {
+      "name": "suricata2timesketch",
+      "filename": "suricata2timesketch.py",
+      "description": "Suricata IDS/IPS logs (EVE JSON, fast.log, OPNsense syslog export) to Timesketch timeline.",
+      "inputs": [
+        "eve.json",
+        "fast.log",
+        "OPNsense suricata syslog export"
+      ],
+      "size_bytes": 53516,
+      "sha256": "acbd78c630870f109bac81a733c5298041b4e5d747215ed84a76347820c9cbae"
+    },
+    {
+      "name": "suricata2vestigo",
+      "filename": "suricata2vestigo.py",
+      "description": "Suricata IDS/IPS logs (EVE JSON, fast.log, OPNsense syslog export; plain or .gz, file or directory) to a Vestigo Parquet file for direct upload. Requires pyarrow.",
+      "inputs": [
+        "eve.json",
+        "fast.log",
+        "OPNsense suricata syslog export"
+      ],
+      "native": true,
+      "requires": [
+        "pyarrow"
+      ],
+      "size_bytes": 29473,
+      "sha256": "5202a62977dd0a1500fdd19013d2b2d77f12c11c465a3cf27f7b26419f1b6e73"
+    },
+    {
+      "name": "syslog2timesketch",
+      "filename": "syslog2timesketch.py",
+      "description": "Linux syslog/auth.log (RFC 3164 plain text, rotated or gzip) to Timesketch timeline.",
+      "inputs": [
+        "auth.log*",
+        "secure*",
+        "syslog*",
+        "messages*",
+        "cron.log*"
+      ],
+      "size_bytes": 52830,
+      "sha256": "a6ea1cc1bbefbd9706b0a1491e6ccb09c290bc715fd7f2195e0ccaeb787acdb8"
+    },
+    {
+      "name": "timesketch2parquet",
+      "filename": "timesketch2parquet.py",
+      "description": "Generic Timesketch-compatible CSV/JSONL (any column set, plain or .gz, file or directory) to a Vestigo Parquet file for direct upload. Column requirements follow upstream google/timesketch's own import spec. Requires pyarrow.",
+      "inputs": [
+        "*.csv",
+        "*.jsonl"
+      ],
+      "native": true,
+      "requires": [
+        "pyarrow"
+      ],
+      "size_bytes": 30185,
+      "sha256": "2f7b520af9e9c370722350fe785fe1142863407be235c18080189ceb90c14617"
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 """Tests for events router helpers that don't require a full HTTP client.
 
-Route handlers in tracesignal.api.routers.events are plain async functions,
+Route handlers in vestigo.api.routers.events are plain async functions,
 so the pure logic (annotation-filter resolution, live-finding union,
 export-annotation indexing) is tested by calling them directly rather than
 spinning up a FastAPI TestClient.
@@ -16,9 +16,9 @@ import pytest_asyncio
 from fastapi import HTTPException
 
 from tests.conftest import _fake_user
-from tracesignal.api import deps
-from tracesignal.api.routers import events
-from tracesignal.db.postgres import Case, PostgresStore
+from vestigo.api import deps
+from vestigo.api.routers import events
+from vestigo.db.postgres import Case, PostgresStore
 
 
 @pytest_asyncio.fixture()
@@ -525,7 +525,7 @@ def test_get_field_encoder_does_not_eagerly_load_in_remote_mode(monkeypatch):
         def encode(self, texts):
             return [[0.0] for _ in texts]
 
-    import tracesignal.models.embeddings as embeddings_module
+    import vestigo.models.embeddings as embeddings_module
 
     monkeypatch.setattr(embeddings_module, "EmbeddingModel", ExplodingLoadModel)
 
@@ -803,7 +803,7 @@ async def test_run_stat_detector_dispatches_to_entropy(patched_store, monkeypatc
 
 
 def test_serialize_finding_entropy_shape():
-    from tracesignal.db.anomaly_stats import EntropyFinding
+    from vestigo.db.anomaly_stats import EntropyFinding
 
     f = EntropyFinding(
         field="attr:host",
@@ -826,7 +826,7 @@ def test_serialize_finding_entropy_shape():
 
 
 def test_serialize_finding_charset_shape():
-    from tracesignal.db.anomaly_stats import CharsetFinding
+    from vestigo.db.anomaly_stats import CharsetFinding
 
     f = CharsetFinding(
         field="attr:user",
@@ -950,7 +950,7 @@ async def test_run_stat_detector_proportion_shift_auto_fields_resolves_inventory
 
 
 def test_serialize_finding_proportion_shift_shape():
-    from tracesignal.db.anomaly_stats import ShiftFinding
+    from vestigo.db.anomaly_stats import ShiftFinding
 
     f = ShiftFinding(
         field="attr:eventid",
@@ -1036,7 +1036,7 @@ async def test_run_stat_detector_interval_request_overrides(patched_store, monke
 
 
 def test_serialize_finding_interval_periodicity_shape():
-    from tracesignal.db.anomaly_stats import IntervalFinding
+    from vestigo.db.anomaly_stats import IntervalFinding
 
     f = IntervalFinding(
         field="attr:service",
@@ -1116,7 +1116,7 @@ async def test_run_stat_detector_sequence_ngram_override(patched_store, monkeypa
 
 
 def test_serialize_finding_sequence_novelty_shape():
-    from tracesignal.db.anomaly_stats import SequenceFinding
+    from vestigo.db.anomaly_stats import SequenceFinding
 
     f = SequenceFinding(
         field="artifact",
@@ -1197,7 +1197,7 @@ async def test_run_stat_detector_excludes_normal_disposed_events(
 
 
 def _make_stat_result(status="ok", event_id="evt-1"):
-    from tracesignal.db.anomaly_stats import StatAnomalyResult, ValueFinding
+    from vestigo.db.anomaly_stats import StatAnomalyResult, ValueFinding
 
     finding = ValueFinding(
         field="artifact",
@@ -1616,7 +1616,7 @@ def test_field_encoder_caches_load_failure(monkeypatch):
     """A failed model load is cached — a broken/missing local model must not
     re-attempt a multi-second load (or a network download) on every wizard
     open."""
-    import tracesignal.models.embeddings as emb_mod
+    import vestigo.models.embeddings as emb_mod
 
     attempts: list[int] = []
 
@@ -1695,7 +1695,7 @@ class _StubQueryService:
 
 def test_stream_jsonl_prepends_meta_line_only_when_offsets_active(monkeypatch):
     monkeypatch.setattr(events, "EventQueryService", _StubQueryService)
-    from tracesignal.db.queries import EventQuery
+    from vestigo.db.queries import EventQuery
 
     eq = EventQuery(case_id="c1", source_ids=["s1"])
     with_off = list(events._stream_jsonl(eq, {}, {"s1": 3600}))
@@ -1709,7 +1709,7 @@ def test_stream_jsonl_prepends_meta_line_only_when_offsets_active(monkeypatch):
 
 def test_stream_csv_prepends_offset_comment_only_when_active(monkeypatch):
     monkeypatch.setattr(events, "EventQueryService", _StubQueryService)
-    from tracesignal.db.queries import EventQuery
+    from vestigo.db.queries import EventQuery
 
     eq = EventQuery(case_id="c1", source_ids=["s1"])
     with_off = list(events._stream_csv(eq, {}, {"s1": -120}))

@@ -1,23 +1,23 @@
 """Heavy-scan memory budget resolution and admission gate (db/_scan.py).
 
 The heavy-scan memory budget is a *total* across concurrent scans — pinned
-via ``TS_STAT_SCAN_MAX_MEMORY_BYTES`` or auto-sized to a ratio of detected
+via ``VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES`` or auto-sized to a ratio of detected
 RAM (cgroup-aware) — and each query's ``max_memory_usage`` is budget /
-``TS_STAT_SCAN_CONCURRENCY``. ``HEAVY_SCAN_GATE`` enforces that no more than
+``VESTIGO_STAT_SCAN_CONCURRENCY``. ``HEAVY_SCAN_GATE`` enforces that no more than
 that many detector scans run at once.
 """
 
 from __future__ import annotations
 
-from tracesignal.db import _scan
-from tracesignal.db._scan import (
+from vestigo.db import _scan
+from vestigo.db._scan import (
     _FALLBACK_MAX_MEMORY_BYTES,
     _resolve_scan_memory_budget,
 )
 
 
 def test_explicit_value_pins_the_budget():
-    """A nonzero TS_STAT_SCAN_MAX_MEMORY_BYTES wins over any detection."""
+    """A nonzero VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES wins over any detection."""
     assert _resolve_scan_memory_budget(12_000_000_000, 0.8, 128 << 30) == 12_000_000_000
 
 
@@ -108,7 +108,7 @@ def test_gate_admits_at_most_the_configured_concurrency():
 
 
 def test_every_detector_entry_point_is_gated():
-    from tracesignal.db.anomaly_stats import StatisticalAnomalyService
+    from vestigo.db.anomaly_stats import StatisticalAnomalyService
 
     detectors = [name for name in dir(StatisticalAnomalyService) if name.startswith("find_")]
     assert detectors, "no find_* detectors discovered"

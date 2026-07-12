@@ -1,4 +1,4 @@
-"""Tests for the pcap2tracesignal Parquet converter script.
+"""Tests for the pcap2vestigo Parquet converter script.
 
 The converter is a standalone download (not an importable package module);
 tests load it from its asset path via importlib. Fixtures are hand-built
@@ -17,22 +17,22 @@ from pathlib import Path
 import pyarrow.parquet as pq
 import pytest
 
-from tracesignal.ingestion import parquet_format
+from vestigo.ingestion import parquet_format
 
 _SCRIPT = (
     Path(__file__).parent.parent
     / "src"
-    / "tracesignal"
+    / "vestigo"
     / "assets"
     / "converters"
-    / "pcap2tracesignal.py"
+    / "pcap2vestigo.py"
 )
 DATA = Path(__file__).parent / "data"
 
 
 @pytest.fixture(scope="module")
 def converter():
-    spec = importlib.util.spec_from_file_location("pcap2tracesignal", _SCRIPT)
+    spec = importlib.util.spec_from_file_location("pcap2vestigo", _SCRIPT)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -56,7 +56,7 @@ class TestSpecParity:
     def test_output_validates_against_server_spec(self, converter, tmp_path):
         pf = _convert(converter, DATA / "sample.pcap", tmp_path / "out.parquet")
         meta = parquet_format.validate_parquet_source(pf.schema_arrow, pf.schema_arrow.metadata)
-        assert meta.converter_name == "pcap2tracesignal"
+        assert meta.converter_name == "pcap2vestigo"
         assert meta.converter_version == converter.CONVERTER_VERSION
 
     def test_rejects_non_parquet_output_extension(self, converter, tmp_path):

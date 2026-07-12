@@ -1,5 +1,5 @@
 /**
- * ExplorerPage — the heart of TraceSignal.
+ * ExplorerPage — the heart of Vestigo.
  *
  * Panels:
  *   Left:   FilterRail (collapsible via toolbar toggle)

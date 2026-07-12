@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import pyarrow as pa
 import pytest
 
-from tracesignal.db._arrow_schema import EVENT_ARROW_SCHEMA
-from tracesignal.db.clickhouse import (
+from vestigo.db._arrow_schema import EVENT_ARROW_SCHEMA
+from vestigo.db.clickhouse import (
     _EVENT_COLUMNS,
     _EVENTS_TABLE_DDL,
     ClickHouseStore,
@@ -15,8 +15,8 @@ from tracesignal.db.clickhouse import (
     _partition_expr,
     _validate_partition_id,
 )
-from tracesignal.db.postgres import generate_id
-from tracesignal.models.event import Event
+from vestigo.db.postgres import generate_id
+from vestigo.models.event import Event
 
 
 class _FakeResult:
@@ -48,7 +48,7 @@ class _RecordingClient:
 @pytest.fixture()
 def store():
     s = ClickHouseStore.__new__(ClickHouseStore)
-    s.database = "tracesignal"
+    s.database = "vestigo"
     s.client = _RecordingClient()
     return s
 
@@ -197,7 +197,7 @@ class _SearchBlobClient(_RecordingClient):
 
 class TestSearchBlob:
     def test_ddl_contains_blob_column_and_index(self):
-        from tracesignal.db.clickhouse import _SEARCH_BLOB_COLUMN_DDL, _SEARCH_BLOB_INDEX_DDL
+        from vestigo.db.clickhouse import _SEARCH_BLOB_COLUMN_DDL, _SEARCH_BLOB_INDEX_DDL
 
         assert "search_blob String MATERIALIZED lowerUTF8" in _SEARCH_BLOB_COLUMN_DDL
         assert "CODEC(ZSTD(3))" in _SEARCH_BLOB_COLUMN_DDL
@@ -354,7 +354,7 @@ class TestArrowInsert:
         assert store.insert_events(events) == 2
         (table, arrow_table), *rest = store.client.arrow_inserts
         assert not rest
-        assert table == "tracesignal.events"
+        assert table == "vestigo.events"
         assert arrow_table.num_rows == 2
         assert arrow_table.schema == EVENT_ARROW_SCHEMA
 
@@ -365,7 +365,7 @@ class TestArrowInsert:
     def test_insert_events_arrow_passthrough(self, store):
         batch = _events_to_record_batch([_make_event(7)])
         assert store.insert_events_arrow(batch) == 1
-        assert store.client.arrow_inserts[0][0] == "tracesignal.events"
+        assert store.client.arrow_inserts[0][0] == "vestigo.events"
 
 
 class TestDeleteSourceEventsErrors:

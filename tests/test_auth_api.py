@@ -48,7 +48,7 @@ def test_bad_credentials_are_rejected_and_audited(client, admin_bootstrap):
 
 
 def test_login_backoff_returns_429_after_threshold(client, admin_bootstrap):
-    """After TS_LOGIN_BACKOFF_THRESHOLD (default 5) consecutive failures the
+    """After VESTIGO_LOGIN_BACKOFF_THRESHOLD (default 5) consecutive failures the
     next attempt is rejected with 429 and a Retry-After header — even with the
     correct password, until the delay elapses."""
     for _ in range(5):
@@ -99,7 +99,7 @@ def test_admin_mutation_blocked_until_password_rotated(client, admin_bootstrap):
     """PR #7 review finding #1: admin.py never opted in to
     require_password_current, so the bootstrap admin could mint a permanent
     admin via POST /api/admin/users before ever rotating the one-time
-    TS_ADMIN_PASSWORD. The gate now lives in AuthAuditMiddleware, applied to
+    VESTIGO_ADMIN_PASSWORD. The gate now lives in AuthAuditMiddleware, applied to
     every mutating /api/* request regardless of router opt-in."""
     login(client, admin_bootstrap["username"], admin_bootstrap["password"])
     resp = client.post(

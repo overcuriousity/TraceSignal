@@ -1,4 +1,4 @@
-"""Tests for the `tsig` CLI: case listing, case/user validation on ingest,
+"""Tests for the `vestigo` CLI: case listing, case/user validation on ingest,
 and the ScalarForensic-style progress widget's math.
 
 Test bodies are sync (not `async def`): the CLI commands themselves call
@@ -15,11 +15,11 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from tracesignal.cli import main as cli_main
-from tracesignal.cli.progress import BytesProgressPrinter
-from tracesignal.core.eta import ETATracker
-from tracesignal.db.postgres import PostgresStore, generate_id
-from tracesignal.ingestion.pipeline import IngestionResult
+from vestigo.cli import main as cli_main
+from vestigo.cli.progress import BytesProgressPrinter
+from vestigo.core.eta import ETATracker
+from vestigo.db.postgres import PostgresStore, generate_id
+from vestigo.ingestion.pipeline import IngestionResult
 
 runner = CliRunner()
 
@@ -111,7 +111,7 @@ def _list_sources(store: PostgresStore, case_id: str):
 
 
 # --------------------------------------------------------------------------
-# tsig cases list
+# vestigo cases list
 # --------------------------------------------------------------------------
 
 
@@ -137,7 +137,7 @@ def test_cases_list_shows_owner_and_team(store):
 
 
 # --------------------------------------------------------------------------
-# tsig ingest — case validation
+# vestigo ingest — case validation
 # --------------------------------------------------------------------------
 
 
@@ -174,7 +174,7 @@ def test_ingest_success_sets_created_by_and_audit(store, tmp_path):
 
 
 # --------------------------------------------------------------------------
-# tsig ingest — user attribution
+# vestigo ingest — user attribution
 # --------------------------------------------------------------------------
 
 

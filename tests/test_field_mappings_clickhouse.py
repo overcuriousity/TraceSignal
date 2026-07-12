@@ -14,10 +14,10 @@ from pathlib import Path
 
 import pytest
 
-from tracesignal.db.anomaly_stats import StatisticalAnomalyService
-from tracesignal.db.clickhouse import ClickHouseStore
-from tracesignal.db.queries import EventQuery, EventQueryService
-from tracesignal.models.event import Event
+from vestigo.db.anomaly_stats import StatisticalAnomalyService
+from vestigo.db.clickhouse import ClickHouseStore
+from vestigo.db.queries import EventQuery, EventQueryService
+from vestigo.models.event import Event
 
 CASE_ID = f"tc-fieldmap-{uuid.uuid4().hex[:8]}"
 SRC_A, SRC_B = "src-a", "src-b"

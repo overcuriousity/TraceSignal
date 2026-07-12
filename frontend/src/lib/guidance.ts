@@ -6,7 +6,7 @@
 
 export const guidance = {
   casesPage: {
-    title: "How TraceSignal is organized",
+    title: "How Vestigo is organized",
     body:
       "A case is the investigation container: it holds the original log files " +
       "(sources, hashed and immutable), the timelines composed from them, and " +
@@ -21,8 +21,8 @@ export const guidance = {
       {
         title: "Normalize your input data",
         body:
-          "TraceSignal ingests Timesketch-compatible CSV/JSONL (and Plaso exports) plus " +
-          "TraceSignal Parquet files produced by the converter scripts in the Parser " +
+          "Vestigo ingests Timesketch-compatible CSV/JSONL (and Plaso exports) plus " +
+          "Vestigo Parquet files produced by the converter scripts in the Parser " +
           "downloads panel. Common raw formats — nginx, firewall, CloudTrail, Suricata, " +
           "pcap — convert to compact Parquet with full provenance; the remaining " +
           "stdlib-only scripts emit CSV/JSONL. All converters run offline with plain " +
@@ -62,7 +62,7 @@ export const guidance = {
     // Both prompts restate docs/INPUT_FORMATS.md as an LLM instruction — keep
     // them in sync with that spec (and with ingestion/parquet_format.py).
     // Parquet interchange format v1: strict schema + footer metadata.
-    llmPromptParquet: `Write a single-file Python 3.10+ script that converts a custom log format into a TraceSignal interchange Parquet file (format version 1), following this spec exactly.
+    llmPromptParquet: `Write a single-file Python 3.10+ script that converts a custom log format into a Vestigo interchange Parquet file (format version 1), following this spec exactly.
 
 DEPENDENCY
 - pyarrow is the ONLY third-party dependency. Everything else: standard library.
@@ -102,10 +102,10 @@ COLUMN SEMANTICS
 - attributes: string-to-string map holding every format-specific field (IPs, status codes, usernames, ...) with snake_case keys. Keep each value atomic — no packed/pipe-joined values. Omit empty-string values.
 
 REQUIRED FOOTER METADATA (schema.with_metadata({...}))
-- "tracesignal.format_version": "1"
-- "tracesignal.converter_name": a short converter identifier, e.g. "myapp2tracesignal"
-- "tracesignal.converter_version": a version string, e.g. "1.0.0"
-- "tracesignal.original_files": JSON array of {"name": str, "sha256": str, "size_bytes": int}, one entry per raw input file
+- "vestigo.format_version": "1"
+- "vestigo.converter_name": a short converter identifier, e.g. "myapp2vestigo"
+- "vestigo.converter_version": a version string, e.g. "1.0.0"
+- "vestigo.original_files": JSON array of {"name": str, "sha256": str, "size_bytes": int}, one entry per raw input file
 
 CLI CONVENTION
 - argparse with: -i/--input (required; file, directory, or glob), -o/--output (required; .parquet path), -v/--verbose (progress to stderr).
@@ -119,7 +119,7 @@ CONSTRAINTS
 Here is a sample of my log format:
 [PASTE A REPRESENTATIVE SAMPLE OF YOUR LOG LINES HERE]`,
     // Timesketch-compatible CSV/JSONL: lenient schema, stdlib-only script.
-    llmPromptCsv: `Write a single-file Python 3.10+ script that converts a custom log format into a Timesketch-compatible timeline that TraceSignal can ingest, following this spec exactly.
+    llmPromptCsv: `Write a single-file Python 3.10+ script that converts a custom log format into a Timesketch-compatible timeline that Vestigo can ingest, following this spec exactly.
 
 OUTPUT FORMAT
 - Emit CSV (default) or JSONL (one JSON object per line, UTF-8), selectable with -f/--format {csv,jsonl}.

@@ -9,7 +9,7 @@ import py_compile
 import pytest
 
 from tests.conftest import as_admin
-from tracesignal.api.routers.converters import ASSETS_DIR
+from vestigo.api.routers.converters import ASSETS_DIR
 
 
 def test_assets_directory_matches_manifest() -> None:
@@ -51,27 +51,27 @@ def test_list_and_download(client, admin_bootstrap) -> None:
     # alternative alongside the native pyarrow-based Parquet converter.
     for stem in ("cloudtrail", "filterlog", "nginx", "pcap", "suricata"):
         assert f"{stem}2timesketch" in names
-        assert f"{stem}2tracesignal" in names
+        assert f"{stem}2vestigo" in names
     # timesketch2parquet is a generic converter with no vendored counterpart
     # to pair with (it's new, not a port of an existing *2timesketch script).
     assert "timesketch2parquet" in names
 
-    resp = client.get("/api/converters/nginx2tracesignal")
+    resp = client.get("/api/converters/nginx2vestigo")
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/plain")
     # Download must be byte-identical to the committed asset.
-    assert resp.content == (ASSETS_DIR / "nginx2tracesignal.py").read_bytes()
+    assert resp.content == (ASSETS_DIR / "nginx2vestigo.py").read_bytes()
 
 
 def test_native_converter_entries_flagged() -> None:
     manifest = json.loads((ASSETS_DIR / "manifest.json").read_text(encoding="utf-8"))
     by_name = {c["name"]: c for c in manifest["converters"]}
     for name in (
-        "nginx2tracesignal",
-        "cloudtrail2tracesignal",
-        "filterlog2tracesignal",
-        "pcap2tracesignal",
-        "suricata2tracesignal",
+        "nginx2vestigo",
+        "cloudtrail2vestigo",
+        "filterlog2vestigo",
+        "pcap2vestigo",
+        "suricata2vestigo",
         "timesketch2parquet",
     ):
         assert by_name[name]["native"] is True

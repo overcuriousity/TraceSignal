@@ -3,8 +3,8 @@ validation, discovery rewriting, and SQL integration via the query builder."""
 
 from __future__ import annotations
 
-from tracesignal.db.anomaly_stats import _col_expr
-from tracesignal.db.field_mappings import (
+from vestigo.db.anomaly_stats import _col_expr
+from vestigo.db.field_mappings import (
     apply_mappings_to_attribute_keys,
     mapping_coalesce_expr,
     resolve_mapping,
@@ -142,14 +142,14 @@ def test_anomaly_col_expr_without_mappings_unchanged():
 
 def _service_with_fake_store():
     from tests.test_queries import FakeClickHouseStore
-    from tracesignal.db.queries import EventQueryService
+    from vestigo.db.queries import EventQueryService
 
     store = FakeClickHouseStore()
     return EventQueryService(store=store), store
 
 
 def test_field_filter_on_canonical_field_generates_coalesce_sql():
-    from tracesignal.db.queries import EventQuery
+    from vestigo.db.queries import EventQuery
 
     service, store = _service_with_fake_store()
     service.query(
@@ -167,7 +167,7 @@ def test_field_filter_on_canonical_field_generates_coalesce_sql():
 
 
 def test_field_exclusion_and_raw_attr_filter_bypass():
-    from tracesignal.db.queries import EventQuery
+    from vestigo.db.queries import EventQuery
 
     service, store = _service_with_fake_store()
     service.query(
@@ -186,7 +186,7 @@ def test_field_exclusion_and_raw_attr_filter_bypass():
 
 
 def test_field_terms_groups_by_coalesced_canonical():
-    from tracesignal.db.queries import EventQuery
+    from vestigo.db.queries import EventQuery
 
     service, store = _service_with_fake_store()
     service.field_terms(

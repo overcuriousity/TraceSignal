@@ -1,5 +1,5 @@
 name: Feature request
-description: Suggest an improvement or new capability for TraceSignal.
+description: Suggest an improvement or new capability for Vestigo.
 labels: ["enhancement"]
 body:
   - type: textarea

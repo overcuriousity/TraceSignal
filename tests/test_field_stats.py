@@ -12,10 +12,10 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
-from tracesignal.db import field_stats
-from tracesignal.db.anomaly_stats import StatisticalAnomalyService
-from tracesignal.db.clickhouse import ClickHouseStore
-from tracesignal.db.field_stats import (
+from vestigo.db import field_stats
+from vestigo.db.anomaly_stats import StatisticalAnomalyService
+from vestigo.db.clickhouse import ClickHouseStore
+from vestigo.db.field_stats import (
     EFFECTIVE_STATS_VERSION,
     compute_source_field_stats,
     ensure_source_field_stats,
@@ -24,9 +24,9 @@ from tracesignal.db.field_stats import (
     merged_list_fields,
     refresh_source_field_stats,
 )
-from tracesignal.db.postgres import PostgresStore
-from tracesignal.db.queries import EventQueryService
-from tracesignal.models.event import Event
+from vestigo.db.postgres import PostgresStore
+from vestigo.db.queries import EventQueryService
+from vestigo.models.event import Event
 
 CASE_ID = f"tc-fieldstats-{uuid.uuid4().hex[:8]}"
 SRC_A, SRC_B = "fs-src-a", "fs-src-b"
@@ -216,8 +216,8 @@ def test_compute_payload_top_values_ordering(ch_store):
 
 
 def test_merged_field_terms_matches_live(ch_store):
-    from tracesignal.db.field_stats import merged_field_terms
-    from tracesignal.db.queries import EventQuery
+    from vestigo.db.field_stats import merged_field_terms
+    from vestigo.db.queries import EventQuery
 
     svc = EventQueryService(store=ch_store)
     stats = _stats_for(ch_store)
@@ -274,7 +274,7 @@ def _synthetic_stats() -> dict:
 
 
 def test_merged_field_terms_merge_math():
-    from tracesignal.db.field_stats import merged_field_terms
+    from vestigo.db.field_stats import merged_field_terms
 
     result = merged_field_terms(_synthetic_stats(), "attr:user", 50)
     # y: 1+3=4, x: 3 — counts sum, rank (-count, value).
@@ -291,7 +291,7 @@ def test_merged_field_terms_merge_math():
 
 
 def test_merged_field_terms_fallbacks():
-    from tracesignal.db.field_stats import _TOP_VALUES_PER_FIELD, merged_field_terms
+    from vestigo.db.field_stats import _TOP_VALUES_PER_FIELD, merged_field_terms
 
     stats = _synthetic_stats()
     # limit beyond the cached per-field top-N.

@@ -1,6 +1,6 @@
 """Placeholder test to verify pytest is wired."""
 
-from tracesignal import __version__
+from vestigo import __version__
 
 
 def test_version() -> None:

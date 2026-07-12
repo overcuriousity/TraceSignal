@@ -83,7 +83,7 @@ export function buildCaptionLines(args: {
   const lines: (string | undefined)[] = [];
 
   lines.push(
-    `TraceSignal — ${headerLabel ?? "visualization"} — case ${caseId} / timeline ${timelineId ?? ""}`,
+    `Vestigo — ${headerLabel ?? "visualization"} — case ${caseId} / timeline ${timelineId ?? ""}`,
   );
   lines.push(
     facts.focusedValue != null && field

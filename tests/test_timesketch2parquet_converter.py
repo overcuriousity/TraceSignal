@@ -2,7 +2,7 @@
 
 The converter is a standalone download (not an importable package module);
 tests load it from its asset path via importlib. Column requirements follow
-upstream google/timesketch's own CSV/JSONL import spec, not TraceSignal's
+upstream google/timesketch's own CSV/JSONL import spec, not Vestigo's
 server-side generic-CSV parser conventions (see the module docstring).
 """
 
@@ -16,12 +16,12 @@ from pathlib import Path
 import pyarrow.parquet as pq
 import pytest
 
-from tracesignal.ingestion import parquet_format
+from vestigo.ingestion import parquet_format
 
 _SCRIPT = (
     Path(__file__).parent.parent
     / "src"
-    / "tracesignal"
+    / "vestigo"
     / "assets"
     / "converters"
     / "timesketch2parquet.py"

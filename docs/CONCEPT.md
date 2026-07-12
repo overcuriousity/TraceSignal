@@ -1,4 +1,4 @@
-# TraceSignal — Application Concept
+# Vestigo — Application Concept
 
 ## 1. Vision (one-liner)
 A local-first, forensic-grade log investigation platform for small security teams: ingest Timesketch-compatible timelines at scale, explore them through an ELK-like web interface, and detect anomalies by embedding every log line into a vector database.
@@ -9,7 +9,7 @@ Incident responders and forensic analysts work with massive timeline-shaped data
 - **Notebook scripts** that are flexible but not reproducible or team-friendly.
 - **Timesketch** which is powerful but operationally heavy and broad.
 
-TraceSignal is a focused, self-hosted alternative: ingest huge logs, explore them like an ELK stack, and let local embeddings surface the needles in the haystack.
+Vestigo is a focused, self-hosted alternative: ingest huge logs, explore them like an ELK stack, and let local embeddings surface the needles in the haystack.
 
 ## 3. Target User
 **Small security team (2–10 analysts), self-hosted, often airgapped.**
@@ -47,7 +47,7 @@ The current vocabulary is defined and implemented in
   - Plaso CSV / JSONL
   - Generic CSV with configurable column mapping
   - Generic JSONL (one event per line)
-  - TraceSignal Parquet interchange files produced by the downloadable converter scripts
+  - Vestigo Parquet interchange files produced by the downloadable converter scripts
     (raw-log provenance embedded per row; see `docs/MODEL_REFINEMENT.md`)
 - Streaming parser: handle 80 GiB+ inputs without loading everything into RAM.
 - Per-event SHA-256 hash and provenance metadata (source file, byte offset, parser config).
@@ -79,7 +79,7 @@ The current vocabulary is defined and implemented in
 - Explain scores by showing nearest neighbors and distance metrics.
 
 ### 6.5 Deployment & Operation
-- TraceSignal is a native Python application managed with `uv`.
+- Vestigo is a native Python application managed with `uv`.
 - Backing services (PostgreSQL, ClickHouse, Qdrant) are external; the operator provides them via Docker, native packages, managed services, etc.
 - Optional reference `docker-compose.yml` for one-command setup.
 - Airgapped mode by default: no outbound network calls for model downloads or telemetry.
@@ -123,4 +123,4 @@ Decisions are recorded in [`docs/TECH_STACK.md`](./TECH_STACK.md):
 3. ✅ Implement the Case / Source / Timeline / Artifact model refactor.
 4. ✅ Rebuild the frontend UI (React 19 + Vite).
 5. ✅ Implement authentication (session-cookie auth + optional OIDC, case-RBAC, teams, audit trail).
-6. ✅ Implement strict offline-mode enforcement (`TS_ALLOW_ONLINE` gates model downloads via `HF_HUB_OFFLINE`; frontend build no longer runs `npm install` on every start).
+6. ✅ Implement strict offline-mode enforcement (`VESTIGO_ALLOW_ONLINE` gates model downloads via `HF_HUB_OFFLINE`; frontend build no longer runs `npm install` on every start).

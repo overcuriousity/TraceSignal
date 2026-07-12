@@ -48,7 +48,7 @@ interface Props {
 }
 
 const EMBEDDINGS_UNAVAILABLE_HINT =
-  "Embeddings are not available on this server — install the 'embeddings' extra or configure a remote embedding endpoint (TS_EMBEDDING_API_BASE_URL).";
+  "Embeddings are not available on this server — install the 'embeddings' extra or configure a remote embedding endpoint (VESTIGO_EMBEDDING_API_BASE_URL).";
 
 const TOP_LEVEL_LABELS: Record<string, string> = {
   message: "Message",

@@ -8,8 +8,8 @@ from typing import Any
 
 import pytest
 
-from tracesignal.db._dt import NULL_TS_SENTINEL, TS_NOT_SENTINEL_SQL
-from tracesignal.db.queries import (
+from vestigo.db._dt import NULL_TS_SENTINEL, VESTIGO_NOT_SENTINEL_SQL
+from vestigo.db.queries import (
     EventQuery,
     EventQueryService,
     TagFilter,
@@ -83,7 +83,7 @@ class FakeClickHouseStore:
     """Minimal ClickHouseStore stand-in."""
 
     def __init__(self, event_rows: list[list[Any]] | None = None) -> None:
-        self.database = "tracesignal"
+        self.database = "vestigo"
         self.client = FakeClickHouseClient(event_rows)
         self.schema_initialized = False
         # M22 fast path off by default: existing SQL-shape tests pin the
@@ -288,14 +288,14 @@ def test_time_range_filter_excludes_sentinel_rows(service: EventQueryService) ->
     # column.
     service.query(EventQuery(case_id="case-1", start=datetime(2024, 1, 1, tzinfo=UTC)))
     query, _ = _last_query(service)
-    assert TS_NOT_SENTINEL_SQL in query
+    assert VESTIGO_NOT_SENTINEL_SQL in query
 
 
 def test_no_time_range_no_sentinel_guard(service: EventQueryService) -> None:
     # Without a time filter, sentinel rows are regular grid citizens.
     service.query(EventQuery(case_id="case-1"))
     query, _ = _last_query(service)
-    assert TS_NOT_SENTINEL_SQL not in query
+    assert VESTIGO_NOT_SENTINEL_SQL not in query
 
 
 def test_normalize_event_row_presents_sentinel_timestamp_as_null() -> None:
@@ -338,7 +338,7 @@ def test_active_offset_orders_by_corrected_timestamp(service: EventQueryService)
     assert params["clk_off_src"] == ["s2"]
     assert params["clk_off_val"] == [3600]
     # The sentinel is never shifted — the correction is gated on it.
-    assert TS_NOT_SENTINEL_SQL in query
+    assert VESTIGO_NOT_SENTINEL_SQL in query
 
 
 def test_active_offset_time_filter_widens_raw_bound(service: EventQueryService) -> None:
@@ -1235,7 +1235,7 @@ def test_list_fields_returns_sorted_attribute_keys() -> None:
 
 
 def test_list_fields_returns_top_level_columns() -> None:
-    from tracesignal.db.queries import TOP_LEVEL_DISPLAY_COLUMNS
+    from vestigo.db.queries import TOP_LEVEL_DISPLAY_COLUMNS
 
     svc = _fields_service([])
     result = svc.list_fields("c1", ["s1"])
@@ -1341,14 +1341,14 @@ def test_histogram_queries_exclude_sentinel_rows() -> None:
     svc = _histogram_service(min_ts, max_ts, [[min_ts, 1]])
     svc.histogram(EventQuery(case_id="c1", source_ids=["s1"]), buckets=60)
     derived_sql = svc.store.client.queries[-1][0]  # type: ignore[union-attr]
-    assert derived_sql.count(TS_NOT_SENTINEL_SQL) == 2  # CTE range + bucket scan
+    assert derived_sql.count(VESTIGO_NOT_SENTINEL_SQL) == 2  # CTE range + bucket scan
 
     svc2 = _histogram_service(min_ts, max_ts, [[min_ts, 1]])
     svc2.histogram(
         EventQuery(case_id="c1", source_ids=["s1"], start=min_ts, end=max_ts), buckets=60
     )
     explicit_sql = svc2.store.client.queries[-1][0]  # type: ignore[union-attr]
-    assert TS_NOT_SENTINEL_SQL in explicit_sql
+    assert VESTIGO_NOT_SENTINEL_SQL in explicit_sql
 
 
 def test_histogram_empty_dataset_returns_empty_buckets() -> None:
@@ -1880,7 +1880,7 @@ def test_compare_field_numeric_no_numeric_values_returns_empty() -> None:
 
 def test_guard_encoder_degrades_on_failure() -> None:
     """A failing encoder is caught, disabled after first error, returns []."""
-    from tracesignal.db.queries import _guard_encoder
+    from vestigo.db.queries import _guard_encoder
 
     calls = {"n": 0}
 
@@ -1896,7 +1896,7 @@ def test_guard_encoder_degrades_on_failure() -> None:
 
 
 def test_guard_encoder_passes_through_success_and_none() -> None:
-    from tracesignal.db.queries import _guard_encoder
+    from vestigo.db.queries import _guard_encoder
 
     assert _guard_encoder(None) is None
 
@@ -1912,7 +1912,7 @@ def test_embedding_wizard_scans_carry_memory_settings(service):
     """Both wizard scans (artifact inventory reading the attributes map, and
     the randomized sample) are whole-corpus queries and must carry the shared
     heavy-scan SETTINGS clause (see db/_scan.py)."""
-    from tracesignal.db._scan import HEAVY_SCAN_SETTINGS
+    from vestigo.db._scan import HEAVY_SCAN_SETTINGS
 
     service.list_fields_by_artifact("case", ["s1"], encode=None)
     queries = [q for q, _ in service.store.client.queries]
@@ -1930,7 +1930,7 @@ def test_viz_aggregations_carry_memory_settings() -> None:
     clause (db/_scan.py) — a chart over a high-cardinality field is a
     whole-corpus GROUP BY exactly like a detector scan, and without the
     per-query memory cap N concurrent charts can stack unbounded scans."""
-    from tracesignal.db._scan import HEAVY_SCAN_SETTINGS
+    from vestigo.db._scan import HEAVY_SCAN_SETTINGS
 
     min_ts = datetime(2024, 1, 1, tzinfo=UTC)
     max_ts = datetime(2024, 1, 2, tzinfo=UTC)
@@ -1976,7 +1976,7 @@ def test_viz_aggregations_carry_memory_settings() -> None:
 
 
 def test_viz_compare_aggregations_carry_memory_settings() -> None:
-    from tracesignal.db._scan import HEAVY_SCAN_SETTINGS
+    from vestigo.db._scan import HEAVY_SCAN_SETTINGS
 
     min_ts = datetime(2024, 1, 1, tzinfo=UTC)
     max_ts = datetime(2024, 1, 1, 2, tzinfo=UTC)
@@ -2046,8 +2046,8 @@ def test_viz_public_aggregations_acquire_scan_gate_once(monkeypatch: Any) -> Non
     """Public viz aggregations acquire the admission gate exactly once — the
     nested field_terms call inside field_value_timeseries / compare_field_terms
     must go through the ungated impl, or a BoundedSemaphore(1) deployment
-    (TS_STAT_SCAN_CONCURRENCY=1) would deadlock against itself."""
-    import tracesignal.db.queries as queries_mod
+    (VESTIGO_STAT_SCAN_CONCURRENCY=1) would deadlock against itself."""
+    import vestigo.db.queries as queries_mod
 
     min_ts = datetime(2024, 1, 1, tzinfo=UTC)
     max_ts = datetime(2024, 1, 2, tzinfo=UTC)
@@ -2169,8 +2169,8 @@ def test_time_punchcard_returns_sparse_cells_and_totals() -> None:
     # the punch card — and sentinel (undated) rows excluded.
     assert "toDayOfWeek(timestamp, 0, 'UTC')" in sql
     assert "toHour(timestamp, 'UTC')" in sql
-    assert TS_NOT_SENTINEL_SQL in sql
-    from tracesignal.db._scan import HEAVY_SCAN_SETTINGS
+    assert VESTIGO_NOT_SENTINEL_SQL in sql
+    from vestigo.db._scan import HEAVY_SCAN_SETTINGS
 
     assert HEAVY_SCAN_SETTINGS in sql
 
@@ -2221,7 +2221,7 @@ def test_field_pivot_builds_matrix_with_other_rollup() -> None:
     assert matrix_params.get("field_key_y") == "status"
     assert matrix_params.get("pivot_x_values") == ["auth"]
     assert matrix_params.get("pivot_y_values") == ["200"]
-    from tracesignal.db._scan import HEAVY_SCAN_SETTINGS
+    from vestigo.db._scan import HEAVY_SCAN_SETTINGS
 
     assert HEAVY_SCAN_SETTINGS in matrix_sql
 
@@ -2244,7 +2244,7 @@ def test_field_pivot_empty_axis_skips_matrix_scan() -> None:
 
 def test_field_pivot_acquires_scan_gate_once(monkeypatch: Any) -> None:
     """The two parallel terms scans run under the parent's single gate slot."""
-    import tracesignal.db.queries as queries_mod
+    import vestigo.db.queries as queries_mod
 
     gate = _CountingGate()
     monkeypatch.setattr(queries_mod, "HEAVY_SCAN_GATE", gate)
@@ -2290,7 +2290,7 @@ def test_field_scatter_samples_points_with_true_extents() -> None:
         if "ORDER BY rand()" in sql
     )
     assert "LIMIT 2" in sample_sql
-    from tracesignal.db._scan import HEAVY_SCAN_SETTINGS
+    from vestigo.db._scan import HEAVY_SCAN_SETTINGS
 
     assert HEAVY_SCAN_SETTINGS in sample_sql
     assert "toFloat64OrNull(toString(" in sample_sql
@@ -2315,7 +2315,7 @@ def test_field_scatter_non_numeric_skips_sample_scan() -> None:
 
 
 def _fresh_viz_cache():
-    from tracesignal.db import viz_cache
+    from vestigo.db import viz_cache
 
     viz_cache.reset_baseline_cache()
     return viz_cache

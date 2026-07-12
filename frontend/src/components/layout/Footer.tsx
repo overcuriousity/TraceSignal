@@ -13,7 +13,7 @@ export function Footer() {
     <footer className="flex h-7 shrink-0 items-center justify-between border-t border-[var(--color-border)] bg-[var(--color-bg-surface)] px-4 text-[11px] text-[var(--color-fg-muted)]">
       <span className="flex items-center gap-1.5">
         <Activity size={11} className="text-[var(--color-accent)]" />
-        <span className="font-medium text-[var(--color-fg-secondary)]">TraceSignal</span>
+        <span className="font-medium text-[var(--color-fg-secondary)]">Vestigo</span>
         <span className="italic">· Every trace confesses. Nothing is ever forgotten.</span>
       </span>
       <span>Airgapped by default · v{__APP_VERSION__}</span>

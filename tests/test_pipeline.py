@@ -5,10 +5,10 @@ from typing import Any
 
 import pytest
 
-from tracesignal.db.clickhouse import ClickHouseStore
-from tracesignal.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
-from tracesignal.models.embeddings import EmbeddingConfig, EmbeddingModel
-from tracesignal.models.event import Event
+from vestigo.db.clickhouse import ClickHouseStore
+from vestigo.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
+from vestigo.models.embeddings import EmbeddingConfig, EmbeddingModel
+from vestigo.models.event import Event
 
 
 class FakeClickHouseStore:
@@ -111,7 +111,7 @@ class FakeQdrantStore:
 
     @staticmethod
     def _name(case_id: str, embedding_config_hash: str) -> str:
-        return f"tracesignal_{case_id}_{embedding_config_hash}"
+        return f"vestigo_{case_id}_{embedding_config_hash}"
 
 
 class FakeEmbeddingModel(EmbeddingModel):
@@ -197,9 +197,9 @@ def test_pipeline_batches_inserts(sample_jsonl: Path) -> None:
 def test_pipeline_default_batch_size_from_settings(
     sample_jsonl: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from tracesignal.core.config import get_settings
+    from vestigo.core.config import get_settings
 
-    monkeypatch.setenv("TS_INGEST_BATCH_SIZE", "2")
+    monkeypatch.setenv("VESTIGO_INGEST_BATCH_SIZE", "2")
     get_settings.cache_clear()
     try:
         pipeline = IngestionPipeline(
@@ -389,7 +389,7 @@ class _ArrowFakeParser:
         raise AssertionError("arrow-capable parser must not fall back to parse()")
 
     def parse_arrow_batches(self, path: Path, on_progress=None):
-        from tracesignal.db.clickhouse import _events_to_record_batch
+        from vestigo.db.clickhouse import _events_to_record_batch
 
         def _generate():
             done = 0
@@ -428,7 +428,7 @@ def test_pipeline_arrow_branch_bulk_inserts(sample_jsonl: Path) -> None:
         file_hash="a" * 64,
     )
     parser = _ArrowFakeParser([[_arrow_event(1), _arrow_event(2)], [_arrow_event(3)]])
-    from tracesignal.ingestion.pipeline import IngestionResult
+    from vestigo.ingestion.pipeline import IngestionResult
 
     result = IngestionResult(case_id="case1", source_id="source1", files=[sample_jsonl])
     pipeline._ingest_file(sample_jsonl, parser, result)
@@ -452,7 +452,7 @@ def test_pipeline_arrow_branch_reports_progress(sample_jsonl: Path) -> None:
         progress_callback=lambda total, processed: calls.append((total, processed)),
     )
     parser = _ArrowFakeParser([[_arrow_event(1)], [_arrow_event(2)]])
-    from tracesignal.ingestion.pipeline import IngestionResult
+    from vestigo.ingestion.pipeline import IngestionResult
 
     result = IngestionResult(case_id="case1", source_id="source1", files=[sample_jsonl])
     pipeline._ingest_file(sample_jsonl, parser, result, total_bytes=500, bytes_before_file=50)

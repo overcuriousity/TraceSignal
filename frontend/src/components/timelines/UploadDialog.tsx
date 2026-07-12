@@ -88,7 +88,7 @@ export function UploadDialog({ caseId }: Props) {
       </DialogTrigger>
       <DialogContent
         title="Upload source file"
-        description="Uploading creates a new Source and adds it to the default timeline. Supported formats: Timesketch CSV, JSONL, TraceSignal Parquet (from a converter script). Parser auto-detected if omitted."
+        description="Uploading creates a new Source and adds it to the default timeline. Supported formats: Timesketch CSV, JSONL, Vestigo Parquet (from a converter script). Parser auto-detected if omitted."
       >
         <div className="space-y-4">
           {/* Drop zone */}
@@ -158,7 +158,7 @@ export function UploadDialog({ caseId }: Props) {
               </span>
             </label>
             <Input
-              placeholder="e.g. timesketch_csv, jsonl, tracesignal_parquet"
+              placeholder="e.g. timesketch_csv, jsonl, vestigo_parquet"
               value={parser}
               onChange={(e) => setParser(e.target.value)}
             />

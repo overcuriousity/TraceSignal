@@ -15,12 +15,12 @@ from pathlib import Path
 
 import pytest
 
-from tracesignal.db.clickhouse import (
+from vestigo.db.clickhouse import (
     _EVENTS_TABLE_DDL,
     ClickHouseStore,
 )
-from tracesignal.db.queries import EventQuery, EventQueryService
-from tracesignal.models.event import Event
+from vestigo.db.queries import EventQuery, EventQueryService
+from vestigo.models.event import Event
 
 CASE_ID = f"tc-blob-{uuid.uuid4().hex[:8]}"
 SOURCE_ID = "src-blob"

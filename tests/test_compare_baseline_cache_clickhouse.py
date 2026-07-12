@@ -18,10 +18,10 @@ from pathlib import Path
 
 import pytest
 
-from tracesignal.db import viz_cache
-from tracesignal.db.clickhouse import ClickHouseStore
-from tracesignal.db.queries import EventQuery, EventQueryService
-from tracesignal.models.event import Event
+from vestigo.db import viz_cache
+from vestigo.db.clickhouse import ClickHouseStore
+from vestigo.db.queries import EventQuery, EventQueryService
+from vestigo.models.event import Event
 
 CASE_ID = f"tc-cmpcache-{uuid.uuid4().hex[:8]}"
 SOURCE_ID = "src-cmpcache"

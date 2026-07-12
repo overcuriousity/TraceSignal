@@ -7,7 +7,7 @@ from __future__ import annotations
 import pytest
 
 from tests.conftest import as_admin
-from tracesignal.db.postgres import FindingDisposition, dispositions_hash
+from vestigo.db.postgres import FindingDisposition, dispositions_hash
 
 
 def _setup_case(client) -> tuple[str, str]:

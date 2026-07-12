@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from "react";
 import { ChevronDown, ChevronRight, Compass } from "lucide-react";
 
-const STORAGE_PREFIX = "tsig-guidance-";
+const STORAGE_PREFIX = "vestigo-guidance-";
 
 function readCollapsed(id: string): boolean {
   try {

@@ -1,4 +1,4 @@
-# TraceSignal Roadmap — Phase 2 (hardening backlog)
+# Vestigo Roadmap — Phase 2 (hardening backlog)
 
 Phase 1 (source management, timelines, explorer, anomaly engine, auth/RBAC/audit,
 visualization, converters) is complete — see
@@ -10,16 +10,16 @@ The audit's Critical/High items were fixed directly on `fix/audit-critical-high`
 - ✅ **C1** — Dockerfile CMD pointed at a nonexistent `api.main:app`; now `--factory create_app`.
 - ✅ **H1** — CSV parser read the whole file into memory (`lines = list(fh)`); now streams with
   incremental byte-offset/line tracking (`ingestion/parser.py::_RecordTrackingIterator`).
-- ✅ **H2** — Airgap enforcement: `tsig-web` no longer runs `npm install` on every start
-  (builds only when `dist/` is missing; `TS_FRONTEND_REBUILD=1` forces); uvicorn reloader is
-  development-only; embedding model load forces `HF_HUB_OFFLINE` unless `TS_ALLOW_ONLINE` and
+- ✅ **H2** — Airgap enforcement: `vestigo-web` no longer runs `npm install` on every start
+  (builds only when `dist/` is missing; `VESTIGO_FRONTEND_REBUILD=1` forces); uvicorn reloader is
+  development-only; embedding model load forces `HF_HUB_OFFLINE` unless `VESTIGO_ALLOW_ONLINE` and
   fails with an actionable message instead of silently downloading.
 - ✅ **H3** — Blocking ClickHouse calls in async handlers (`list_events`, histogram, bulk
   annotate, field/artifact/tag listings, embedding-field recommenders) now go through
   `run_in_threadpool`, matching viz/anomaly endpoints. Convention: **every**
   `EventQueryService` call from an `async def` handler must be threadpool-wrapped.
 - ✅ **H4** — Uploads: single-pass copy+hash off the event loop
-  (`ingestion/files.py::copy_and_hash`), capped by `TS_MAX_UPLOAD_BYTES`
+  (`ingestion/files.py::copy_and_hash`), capped by `VESTIGO_MAX_UPLOAD_BYTES`
   (default 10 GiB, 0 disables) with a 413 mid-stream rejection.
 
 Point-in-time PR review findings are archived under `docs/archive/PR{N}_REVIEW_FINDINGS.md`
@@ -38,9 +38,9 @@ resolved — this file holds only the condensed, still-open action items.
   module).
 
 - [ ] **M25 — Port remaining converters to the Parquet interchange format.** M20 shipped the
-  bulk Arrow insert, the upload hardlink-retention fix, the TraceSignal Parquet interchange
+  bulk Arrow insert, the upload hardlink-retention fix, the Vestigo Parquet interchange
   format v1 (`ingestion/parquet_format.py`, `ingestion/parquet_reader.py`), and the
-  `nginx2tracesignal.py` converter (pilot). This session added native `*2tracesignal.py`
+  `nginx2vestigo.py` converter (pilot). This session added native `*2vestigo.py`
   Parquet converters for filterlog, suricata, cloudtrail, and pcap, each with its own
   `tests/test_<name>_converter.py`. Decision (mid-session, user request): the vendored
   `*2timesketch` scripts stay vendored **permanently** as a minimal-dependency (stdlib-only,
@@ -51,12 +51,12 @@ resolved — this file holds only the condensed, still-open action items.
   pilot, still open: benchmark converter worker-count/parallel-threshold defaults on a
   multi-GB log; parallel `.gz` parsing (seek-point indexing) deferred; pcap intra-file
   parallelism (record-boundary chunking, analogous to nginx's newline chunking) deferred —
-  `pcap2tracesignal.py` currently parallelizes only across files, one worker process per file.
+  `pcap2vestigo.py` currently parallelizes only across files, one worker process per file.
   Also added `timesketch2parquet.py` — a generic Timesketch-compatible CSV/JSONL converter (any
   column set, no per-source parsing) with no vendored counterpart; column requirements follow
   upstream `google/timesketch`'s own import spec exactly (`message`/`timestamp_desc`/`datetime`
   mandatory, `timestamp` substitutable for `datetime` in CSV, `tag` the only other recognized
-  column), not TraceSignal's own server-side generic-CSV parser's extra recognized columns. CSV
+  column), not Vestigo's own server-side generic-CSV parser's extra recognized columns. CSV
   parsing is single-process only (a logical record can span multiple physical lines via quoted
   embedded newlines, unsafe to newline-chunk); JSONL gets full nginx-style chunked
   multiprocessing. CSV intra-file parallelism (record-boundary-aware chunking) deferred,
@@ -139,7 +139,7 @@ expectations. Ordered: easy+high value first, then easy+low value, then hard+hig
 
 Easy, low value (deferred, revisit on demand):
 
-- [ ] **W4 — Python client library.** REST API + `tsig` CLI exist; a thin typed client for
+- [ ] **W4 — Python client library.** REST API + `vestigo` CLI exist; a thin typed client for
   Jupyter/pandas workflows is cheap but no user has asked yet.
 
 Hard, high value:

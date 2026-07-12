@@ -15,11 +15,11 @@ import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
 
-from tracesignal.api import deps
-from tracesignal.api.main import create_app
-from tracesignal.core.config import get_settings
-from tracesignal.core.login_backoff import reset_login_backoff
-from tracesignal.db.postgres import PostgresStore, User
+from vestigo.api import deps
+from vestigo.api.main import create_app
+from vestigo.core.config import get_settings
+from vestigo.core.login_backoff import reset_login_backoff
+from vestigo.db.postgres import PostgresStore, User
 
 
 @pytest_asyncio.fixture()
@@ -35,11 +35,11 @@ async def store(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def admin_bootstrap(monkeypatch):
-    """Seed TS_ADMIN_* env vars and clear the settings cache so the app
+    """Seed VESTIGO_ADMIN_* env vars and clear the settings cache so the app
     bootstraps a fresh administrator on startup. Cache is cleared again on
     teardown so later tests aren't affected by this test's env."""
-    monkeypatch.setenv("TS_ADMIN_USERNAME", "admin")
-    monkeypatch.setenv("TS_ADMIN_PASSWORD", "bootstrap-pass-123")
+    monkeypatch.setenv("VESTIGO_ADMIN_USERNAME", "admin")
+    monkeypatch.setenv("VESTIGO_ADMIN_PASSWORD", "bootstrap-pass-123")
     get_settings.cache_clear()
     yield {"username": "admin", "password": "bootstrap-pass-123"}
     get_settings.cache_clear()

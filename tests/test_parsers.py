@@ -1,19 +1,19 @@
-"""Tests for TraceSignal streaming parsers."""
+"""Tests for Vestigo streaming parsers."""
 
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from tracesignal.db._dt import NULL_TS_SENTINEL
-from tracesignal.ingestion.parser import (
+from vestigo.db._dt import NULL_TS_SENTINEL
+from vestigo.ingestion.parser import (
     JsonlParser,
     TimesketchCsvParser,
     _normalise_tag_field,
     detect_format,
     get_parser,
 )
-from tracesignal.models.event import Event, ParserConfig, content_hash
+from vestigo.models.event import Event, ParserConfig, content_hash
 
 
 @pytest.fixture
@@ -233,7 +233,7 @@ def test_event_text_for_embedding() -> None:
 
 
 def test_parse_timestamp_normalizes_common_formats() -> None:
-    from tracesignal.models.event import _parse_timestamp
+    from vestigo.models.event import _parse_timestamp
 
     assert _parse_timestamp("2024-01-01T00:00:00+00:00") == datetime(
         2024, 1, 1, 0, 0, 0, tzinfo=UTC

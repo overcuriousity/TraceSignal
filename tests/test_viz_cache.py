@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 
-from tracesignal.db.viz_cache import LruCache, baseline_cache, reset_baseline_cache
+from vestigo.db.viz_cache import LruCache, baseline_cache, reset_baseline_cache
 
 
 def test_get_or_compute_caches_and_evicts_lru():

@@ -110,7 +110,7 @@ export const useUiStore = create<UiState>()(
         set((s) => ({ columnWidths: { ...s.columnWidths, [id]: width } })),
     }),
     {
-      name: "tsig-ui",
+      name: "vestigo-ui",
       version: 4,
       migrate: (persistedState, version) => {
         const state = persistedState as UiState;

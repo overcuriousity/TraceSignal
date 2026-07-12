@@ -1,31 +1,31 @@
 ---
 name: verify
-description: Build/launch/drive recipe to verify TraceSignal changes end-to-end against the real API, using the podman dev services but isolated databases.
+description: Build/launch/drive recipe to verify Vestigo changes end-to-end against the real API, using the podman dev services but isolated databases.
 ---
 
-# Verifying TraceSignal changes end-to-end
+# Verifying Vestigo changes end-to-end
 
 Backing services (Postgres/ClickHouse/Qdrant) run via `podman compose up -d`
 and are usually already up (`podman ps`). Never verify against the dev
 databases — isolate with fresh DB names instead:
 
 ```bash
-podman exec tracesignal-postgres-1 psql -U tracesignal -c "CREATE DATABASE tsig_verify"
+podman exec vestigo-postgres-1 psql -U vestigo -c "CREATE DATABASE tsig_verify"
 
-TS_POSTGRES_URL="postgresql+asyncpg://tracesignal:tracesignal@localhost:5432/tsig_verify" \
-TS_CLICKHOUSE_DATABASE="tsig_verify" \
-TS_QDRANT_COLLECTION_PREFIX="tsig_verify" \
-TS_ADMIN_PASSWORD="verifypass123" \
-TS_ENVIRONMENT="production" \
-uv run uvicorn tracesignal.web.app:app --port 8099   # run in background
+VESTIGO_POSTGRES_URL="postgresql+asyncpg://vestigo:vestigo@localhost:5432/tsig_verify" \
+VESTIGO_CLICKHOUSE_DATABASE="tsig_verify" \
+VESTIGO_QDRANT_COLLECTION_PREFIX="tsig_verify" \
+VESTIGO_ADMIN_PASSWORD="verifypass123" \
+VESTIGO_ENVIRONMENT="production" \
+uv run uvicorn vestigo.web.app:app --port 8099   # run in background
 ```
 
 - The app auto-creates the ClickHouse database and runs Alembic on startup.
-- `TS_ENVIRONMENT=production` avoids the dev auto-reloader (a file watcher
+- `VESTIGO_ENVIRONMENT=production` avoids the dev auto-reloader (a file watcher
   that restarts mid-verification). Port 8099 avoids clashing with a dev
   instance on 8080. Ready when `GET /api/health` answers.
-- `tsig-web` builds `frontend/dist` if missing — importing
-  `tracesignal.web.app` triggers that too; a prebuilt dist is served as-is.
+- `vestigo-web` builds `frontend/dist` if missing — importing
+  `vestigo.web.app` triggers that too; a prebuilt dist is served as-is.
 
 ## Auth (session cookie)
 
@@ -58,8 +58,8 @@ Timesketch CSV ingests with zero config; columns `datetime,timestamp_desc,source
 ## Cleanup
 
 ```bash
-pkill -f "uvicorn tracesignal.web.app:app --port 8099"
-podman exec tracesignal-postgres-1 psql -U tracesignal -c "DROP DATABASE IF EXISTS tsig_verify"
+pkill -f "uvicorn vestigo.web.app:app --port 8099"
+podman exec vestigo-postgres-1 psql -U vestigo -c "DROP DATABASE IF EXISTS tsig_verify"
 curl -s "http://localhost:8123/" --data "DROP DATABASE IF EXISTS tsig_verify"
 ```
 

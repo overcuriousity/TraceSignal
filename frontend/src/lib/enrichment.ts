@@ -4,7 +4,7 @@
  *
  * Derived attribute keys follow `<attr_key>:<output_field>` (e.g.
  * `src_ip:geo_country`), written by the backend enrichment job — the
- * canonical definition lives in `src/tracesignal/enrichers/base.py`
+ * canonical definition lives in `src/vestigo/enrichers/base.py`
  * (`FIELD_KEY_SEPARATOR` / `derived_field_key`); keep the two in sync.
  */
 

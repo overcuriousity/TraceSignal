@@ -4,7 +4,7 @@
 Reads a local checkout of https://github.com/overcuriousity/2timesketch and, for each
 converter, inlines the shared ``timesketch_converters.common`` module, the source-specific
 module, and the CLI entry script into one stdlib-only ``.py`` file under
-``src/tracesignal/assets/converters/``. A ``manifest.json`` with per-file metadata
+``src/vestigo/assets/converters/``. A ``manifest.json`` with per-file metadata
 (description, inputs, upstream commit, sha256) is written alongside; the API serves both.
 
 The outputs are committed. Re-run this script to re-sync with upstream:
@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-ASSETS_DIR = REPO_ROOT / "src" / "tracesignal" / "assets" / "converters"
+ASSETS_DIR = REPO_ROOT / "src" / "vestigo" / "assets" / "converters"
 UPSTREAM_URL = "https://github.com/overcuriousity/2timesketch"
 
 # name -> (module basename, entry script, description, supported inputs)

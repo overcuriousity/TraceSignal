@@ -7,11 +7,11 @@ import asyncio
 import pytest
 
 from tests.conftest import as_admin, login
-from tracesignal.api.routers import stream as stream_module
-from tracesignal.api.routers.stream import _event_stream
-from tracesignal.core.config import get_settings
-from tracesignal.core.events_bus import CaseEventBus, get_event_bus
-from tracesignal.core.security import new_session_token, session_expiry
+from vestigo.api.routers import stream as stream_module
+from vestigo.api.routers.stream import _event_stream
+from vestigo.core.config import get_settings
+from vestigo.core.events_bus import CaseEventBus, get_event_bus
+from vestigo.core.security import new_session_token, session_expiry
 
 
 class _ImmediatelyDisconnectingRequest:
@@ -103,7 +103,7 @@ async def test_stream_closes_when_session_is_revoked_mid_stream(client, admin_bo
     # 20 seconds.
     stream_module._KEEPALIVE_SECONDS = 0.01
     try:
-        from tracesignal.db.postgres import Case as CaseModel
+        from vestigo.db.postgres import Case as CaseModel
 
         case_row = CaseModel(id=case["id"], name=case["name"], owner_id=me["id"])
         request = _NeverDisconnectingRequest(session.id)

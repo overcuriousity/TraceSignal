@@ -11,14 +11,14 @@ import pytest_asyncio
 from fastapi import BackgroundTasks, HTTPException
 
 from tests.conftest import _fake_user
-from tracesignal.api import deps
-from tracesignal.api.routers import cases
-from tracesignal.api.routers.cases import upload_source
-from tracesignal.core.config import get_settings
-from tracesignal.core.jobs import get_job_store
-from tracesignal.db.postgres import PostgresStore
-from tracesignal.ingestion.files import UploadTooLargeError, copy_and_hash, hash_file
-from tracesignal.ingestion.pipeline import IngestionResult
+from vestigo.api import deps
+from vestigo.api.routers import cases
+from vestigo.api.routers.cases import upload_source
+from vestigo.core.config import get_settings
+from vestigo.core.jobs import get_job_store
+from vestigo.db.postgres import PostgresStore
+from vestigo.ingestion.files import UploadTooLargeError, copy_and_hash, hash_file
+from vestigo.ingestion.pipeline import IngestionResult
 
 
 class _UploadFile:
@@ -226,9 +226,9 @@ async def test_oversized_upload_rejected_with_413(
     case: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An upload larger than TS_MAX_UPLOAD_BYTES is rejected mid-stream and
+    """An upload larger than VESTIGO_MAX_UPLOAD_BYTES is rejected mid-stream and
     creates neither a source row nor a job."""
-    monkeypatch.setenv("TS_MAX_UPLOAD_BYTES", "8")
+    monkeypatch.setenv("VESTIGO_MAX_UPLOAD_BYTES", "8")
     get_settings.cache_clear()
     try:
         case_obj = await store.get_case(case)
@@ -289,7 +289,7 @@ async def test_ingesting_source_excluded_from_timeline_scope(
     case: str,
 ) -> None:
     """_resolve_timeline_scope must never return a half-ingested source."""
-    from tracesignal.api.routers.events import _resolve_timeline_scope
+    from vestigo.api.routers.events import _resolve_timeline_scope
 
     await store.create_source(case, "s_ready", "ready one", file_hash="h1", size_bytes=1)
     await store.create_source(
@@ -310,7 +310,7 @@ async def test_embed_refuses_ingesting_sources(
 ) -> None:
     """Embedding persists vectors — it must refuse a timeline with a
     half-ingested member instead of silently embedding partial data."""
-    from tracesignal.api.routers.cases import start_timeline_embedding
+    from vestigo.api.routers.cases import start_timeline_embedding
 
     await store.create_source(
         case, "s_pending", "pending one", file_hash="h2", size_bytes=1, status="ingesting"
@@ -339,7 +339,7 @@ async def test_startup_reconciliation_removes_orphaned_ingests(
 ) -> None:
     """A source stuck in "ingesting" on boot (in-memory job lost to a restart)
     is cleaned up like a failed ingest, so the file can be re-uploaded."""
-    from tracesignal.api import main as api_main
+    from vestigo.api import main as api_main
 
     await store.create_source(
         case, "s_orphan", "orphan", file_hash="h9", size_bytes=1, status="ingesting"
@@ -352,7 +352,7 @@ async def test_startup_reconciliation_removes_orphaned_ingests(
             deleted.append((case_id, source_id))
 
     monkeypatch.setattr(api_main, "ClickHouseStore", FakeClickHouse, raising=False)
-    monkeypatch.setattr("tracesignal.db.clickhouse.ClickHouseStore", FakeClickHouse)
+    monkeypatch.setattr("vestigo.db.clickhouse.ClickHouseStore", FakeClickHouse)
 
     await api_main._reconcile_orphaned_ingests()
 
@@ -444,7 +444,7 @@ async def test_source_delete_succeeds_and_audits(
 async def test_receive_upload_to_tmp_413_cleans_up(tmp_path, monkeypatch):
     import tempfile
 
-    from tracesignal.api.uploads import receive_upload_to_tmp
+    from vestigo.api.uploads import receive_upload_to_tmp
 
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     upload = _UploadFile("big.bin", b"x" * 100)
@@ -461,7 +461,7 @@ async def test_receive_upload_to_tmp_returns_hash_and_size(tmp_path, monkeypatch
     import hashlib
     import tempfile
 
-    from tracesignal.api.uploads import receive_upload_to_tmp
+    from vestigo.api.uploads import receive_upload_to_tmp
 
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     payload = b"hello world"
@@ -526,13 +526,13 @@ def test_retain_file_short_circuits_when_retained(tmp_path: Path, monkeypatch) -
 
 
 def _interchange_parquet_bytes() -> bytes:
-    """Build a minimal valid TraceSignal interchange parquet in memory."""
+    """Build a minimal valid Vestigo interchange parquet in memory."""
     import io
 
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    from tracesignal.ingestion import parquet_format
+    from vestigo.ingestion import parquet_format
 
     row = {
         "source_file": "access.log",
@@ -552,7 +552,7 @@ def _interchange_parquet_bytes() -> bytes:
 
     meta = {
         parquet_format.META_FORMAT_VERSION: parquet_format.FORMAT_VERSION,
-        parquet_format.META_CONVERTER_NAME: "nginx2tracesignal",
+        parquet_format.META_CONVERTER_NAME: "nginx2vestigo",
         parquet_format.META_CONVERTER_VERSION: "1.0.0",
         parquet_format.META_ORIGINAL_FILES: _json.dumps(
             [{"name": "access.log", "sha256": "a" * 64, "size_bytes": 10}]
@@ -571,9 +571,9 @@ async def test_parquet_upload_records_converter_identity(store: PostgresStore, c
     case_obj = await store.get_case(case)
     response = await _upload(case_obj, "events.parquet", _interchange_parquet_bytes())
     # The Source's parser is the embedded converter identity, not the format string.
-    assert response.parser == "nginx2tracesignal@1.0.0"
+    assert response.parser == "nginx2vestigo@1.0.0"
     source = await store.get_source(case, response.source_id)
-    assert source.parser == "nginx2tracesignal@1.0.0"
+    assert source.parser == "nginx2vestigo@1.0.0"
 
 
 @pytest.mark.asyncio
@@ -591,6 +591,6 @@ async def test_non_interchange_parquet_rejected_400(store: PostgresStore, case: 
     with pytest.raises(HTTPException) as exc_info:
         await _upload(case_obj, "events.parquet", sink.getvalue())
     assert exc_info.value.status_code == 400
-    assert "TraceSignal" in exc_info.value.detail
+    assert "Vestigo" in exc_info.value.detail
     # No orphaned source row.
     assert await store.list_sources(case) == []

@@ -44,8 +44,8 @@ def test_upload_asset_unknown_enricher_404(client, admin_bootstrap, store):
 
 
 def test_upload_asset_assetless_enricher_400(client, admin_bootstrap, store, monkeypatch):
-    from tracesignal.enrichers import registry
-    from tracesignal.enrichers.base import AvailabilityResult, Enricher
+    from vestigo.enrichers import registry
+    from vestigo.enrichers.base import AvailabilityResult, Enricher
 
     class Stub(Enricher):
         key = "stub-no-asset"
@@ -73,7 +73,7 @@ def test_upload_asset_assetless_enricher_400(client, admin_bootstrap, store, mon
 
 def test_invalid_geoip_database_rejected(client, admin_bootstrap, store, tmp_path, monkeypatch):
     monkeypatch.setattr(
-        "tracesignal.enrichers.geoip.geoip_database_path", lambda: tmp_path / "GeoLite2-City.mmdb"
+        "vestigo.enrichers.geoip.geoip_database_path", lambda: tmp_path / "GeoLite2-City.mmdb"
     )
     as_admin(client, admin_bootstrap)
     resp = client.post(
@@ -121,7 +121,7 @@ def test_country_flavored_database_rejected_with_actionable_message(
 
     monkeypatch.setattr(geoip2.database, "Reader", _CountryReader)
     monkeypatch.setattr(
-        "tracesignal.enrichers.geoip.geoip_database_path", lambda: tmp_path / "GeoLite2-City.mmdb"
+        "vestigo.enrichers.geoip.geoip_database_path", lambda: tmp_path / "GeoLite2-City.mmdb"
     )
 
     as_admin(client, admin_bootstrap)
@@ -149,12 +149,12 @@ def test_city_database_upload_installs_and_writes_sidecar(
 
     import geoip2.database
 
-    from tracesignal.enrichers import registry
-    from tracesignal.enrichers.geoip import GeoIPEnricher, read_geoip_sidecar
+    from vestigo.enrichers import registry
+    from vestigo.enrichers.geoip import GeoIPEnricher, read_geoip_sidecar
 
     target = tmp_path / "GeoLite2-City.mmdb"
     monkeypatch.setattr(geoip2.database, "Reader", _FakeReader)
-    monkeypatch.setattr("tracesignal.enrichers.geoip.geoip_database_path", lambda: target)
+    monkeypatch.setattr("vestigo.enrichers.geoip.geoip_database_path", lambda: target)
     # Other tests may have registered a GeoIP instance pinned to their own
     # tmp path; pin a fresh default-path instance for this test only.
     monkeypatch.setitem(registry._REGISTRY, "geoip", GeoIPEnricher())
@@ -179,11 +179,11 @@ def test_city_database_upload_installs_and_writes_sidecar(
 
 
 def test_config_list_reports_asset_state(client, admin_bootstrap, store, tmp_path, monkeypatch):
-    from tracesignal.enrichers import registry
-    from tracesignal.enrichers.geoip import GeoIPEnricher
+    from vestigo.enrichers import registry
+    from vestigo.enrichers.geoip import GeoIPEnricher
 
     missing_path = tmp_path / "missing.mmdb"
-    monkeypatch.setattr("tracesignal.enrichers.geoip.geoip_database_path", lambda: missing_path)
+    monkeypatch.setattr("vestigo.enrichers.geoip.geoip_database_path", lambda: missing_path)
     monkeypatch.setitem(registry._REGISTRY, "geoip", GeoIPEnricher())
     registry.refresh_availability("geoip")
 
@@ -201,8 +201,8 @@ def test_config_list_reports_asset_state(client, admin_bootstrap, store, tmp_pat
 
 
 def test_list_enrichers_reports_geoip_unavailable(client, admin_bootstrap, store, tmp_path):
-    from tracesignal.enrichers import registry
-    from tracesignal.enrichers.geoip import GeoIPEnricher
+    from vestigo.enrichers import registry
+    from vestigo.enrichers.geoip import GeoIPEnricher
 
     registry.register(GeoIPEnricher(db_path=tmp_path / "missing.mmdb"))
     registry.refresh_availability()

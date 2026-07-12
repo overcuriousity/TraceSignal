@@ -205,7 +205,7 @@ export function SettingsPage() {
             Your audit trail
           </h2>
           <p className="mb-4 text-sm text-[var(--color-fg-muted)]">
-            Download a record of everything you've done in TraceSignal — useful for reproducing
+            Download a record of everything you've done in Vestigo — useful for reproducing
             or documenting your own investigative steps.
           </p>
           {auditError && <p className="mb-2 text-xs text-[var(--color-danger)]">{auditError}</p>}

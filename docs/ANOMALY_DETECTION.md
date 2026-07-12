@@ -9,7 +9,7 @@ file and the "Method" tab copy in the same commit — see
 [Reality check](#reality-check-2026-07) at the bottom for the audit that
 produced this file and what was fixed as part of it.
 
-There are eleven independent analysis tools in TraceSignal:
+There are eleven independent analysis tools in Vestigo:
 
 1. [Value novelty](#1-value-novelty-rare--first-seen-values) — rare/new field values, single field or [combinations](#value-combinations-the-value_combo-variant) (ClickHouse, no ML)
 2. [Frequency anomalies](#2-frequency-anomalies-volume-spikes--silences) — volume spikes/silences (ClickHouse, no ML)
@@ -27,8 +27,8 @@ The first ten are **statistical detectors**: pure counting and arithmetic over
 already-ingested events, no machine learning, no network calls, work the
 instant ingestion finishes. The eleventh needs an explicit embedding step first.
 
-Code: `src/tracesignal/db/anomaly_stats.py` (detectors 1–10),
-`src/tracesignal/db/similarity.py` (detector 11). UI: `frontend/src/components/analysis/`.
+Code: `src/vestigo/db/anomaly_stats.py` (detectors 1–10),
+`src/vestigo/db/similarity.py` (detector 11). UI: `frontend/src/components/analysis/`.
 
 ### Query-cost discipline (all statistical detectors)
 
@@ -45,8 +45,8 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
 - **`HEAVY_SCAN_SETTINGS` on every whole-corpus scan** (`max_threads = 8`,
   spill thresholds for GROUP BY and plain ORDER BY at min(4 GB, half the
   per-query cap), `max_memory_usage` = total budget / concurrency — the
-  budget auto-sizes to `TS_STAT_SCAN_MEMORY_RATIO` (0.8) of detected RAM,
-  cgroup-aware; pin it with `TS_STAT_SCAN_MAX_MEMORY_BYTES` when ClickHouse
+  budget auto-sizes to `VESTIGO_STAT_SCAN_MEMORY_RATIO` (0.8) of detected RAM,
+  cgroup-aware; pin it with `VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES` when ClickHouse
   is on a different host, ~70% of *that* host's RAM): large GROUP BY states
   and plain ORDER BY sorts spill to disk, and a runaway query fails alone
   instead of taking the server with it. Any new detector query that touches
@@ -54,7 +54,7 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   is no substitute — containerized servers misdetect total memory (observed
   503 GiB on a 128 GiB VM), so this per-query cap is the real bound.
 - **`HEAVY_SCAN_GATE` admission control on every `find_*` detector**: at most
-  `TS_STAT_SCAN_CONCURRENCY` (2) heavy scans run against ClickHouse at once;
+  `VESTIGO_STAT_SCAN_CONCURRENCY` (2) heavy scans run against ClickHouse at once;
   surplus scans queue in the app. `max_memory_usage` is per *query* — without
   the gate, N parallel detector requests (one anomaly-panel load fires
   several) each carry a full cap and stack past the ClickHouse host's RAM;
@@ -73,7 +73,7 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   a non-Nullable sort-key column; events without a parseable timestamp carry
   `2299-12-31 23:59:59.999 UTC` (`db/_dt.py NULL_TS_SENTINEL`) and are
   presented as `null` by the API. Every aggregate/bucket over `timestamp`
-  must exclude them via `TS_NOT_SENTINEL_SQL` — exactly where the old
+  must exclude them via `VESTIGO_NOT_SENTINEL_SQL` — exactly where the old
   Nullable schema used `timestamp IS NOT NULL`.
 - **Per-source clock-skew offsets (W2) are honored.** When a source carries a
   nonzero `time_offset_seconds`, every window predicate, bucket, representative
@@ -684,7 +684,7 @@ invisible characters are visible in the report.
   can't crowd them out (categoricals otherwise sort first); the Fields picker's
   "auto" preview mirrors this selection.
 - **Tuning:** the rare-character floor is its own setting,
-  `stat_charset_rarity_floor` (`TS_STAT_CHARSET_RARITY_FLOOR`, default 3),
+  `stat_charset_rarity_floor` (`VESTIGO_STAT_CHARSET_RARITY_FLOOR`, default 3),
   separate from value novelty's `stat_rarity_floor` so the two detectors can be
   tuned independently — they count different things (distinct-values-per-char
   vs. value occurrences).
@@ -836,21 +836,21 @@ be mostly noise. All tests in a run are therefore corrected together with the
 **Benjamini–Hochberg procedure**, and each finding carries its adjusted
 `q_value`. Read q as: *of everything this run flagged, at most about this
 fraction is expected to be a false alarm* — q ≤ 0.05 (the default,
-`TS_STAT_SHIFT_FDR_Q`) means at most ~5% of the flagged set, not 5% per test.
+`VESTIGO_STAT_SHIFT_FDR_Q`) means at most ~5% of the flagged set, not 5% per test.
 
 ### The effect floor: significant ≠ meaningful
 
 On a 100M-event baseline, a shift from 1.00% to 1.02% is overwhelmingly
 "significant" — and completely uninteresting. A finding therefore also needs
 the share to change by at least a minimum **rate ratio** (default 2×, either
-direction; `TS_STAT_SHIFT_MIN_RATIO`). Both thresholds are echoed in every
+direction; `VESTIGO_STAT_SHIFT_MIN_RATIO`). Both thresholds are echoed in every
 finding's `details` (`q_threshold`, `min_ratio`, `m_tests`) and snapshotted
 into the persisted `DetectorRun`, so a run stays reproducible after the
 defaults change.
 
 ### The candidate cap, honestly
 
-Per field, ClickHouse returns at most `TS_STAT_SHIFT_MAX_CANDIDATES_PER_FIELD`
+Per field, ClickHouse returns at most `VESTIGO_STAT_SHIFT_MAX_CANDIDATES_PER_FIELD`
 (default 2000) candidate values, highest total volume first — a power-based,
 direction-neutral ordering (low-volume values almost never had the statistical
 power to reach significance anyway). The BH correction runs over exactly the
@@ -968,11 +968,11 @@ one **Benjamini–Hochberg** FDR pool; each finding carries its adjusted
 flags — each direction adds an effect floor:
 
 - Cadence break: the arrival **rate must change by at least `min_ratio`×**
-  (default 2, `TS_STAT_INTERVAL_MIN_RATE_RATIO`; Haldane +0.5 smoothing on a
+  (default 2, `VESTIGO_STAT_INTERVAL_MIN_RATE_RATIO`; Haldane +0.5 smoothing on a
   zero count for the ratio display only).
-- Beaconing: the window CV must be **≤ 0.3** (`TS_STAT_INTERVAL_BEACON_CV_MAX`
+- Beaconing: the window CV must be **≤ 0.3** (`VESTIGO_STAT_INTERVAL_BEACON_CV_MAX`
   — a real cadence, not merely "eviction-order regular") **and** the active
-  span must cover **≥ 50%** of the window (`TS_STAT_INTERVAL_BEACON_MIN_SPAN`),
+  span must cover **≥ 50%** of the window (`VESTIGO_STAT_INTERVAL_BEACON_MIN_SPAN`),
   so a short dense burst of eleven evenly spaced events never reads as
   beaconing.
 
@@ -982,7 +982,7 @@ persisted `DetectorRun`, so a run stays reproducible after the defaults change.
 ### The candidate cap, honestly
 
 Same treatment as proportion shift: per field ClickHouse returns at most
-`TS_STAT_INTERVAL_MAX_CANDIDATES_PER_FIELD` (default 2000) values, highest total
+`VESTIGO_STAT_INTERVAL_MAX_CANDIDATES_PER_FIELD` (default 2000) values, highest total
 volume first; when a field hits the cap the BH test count is understated for
 that field and the run attaches a warning. Treat marginal q-values on a capped
 field as exploratory.
@@ -1058,14 +1058,14 @@ suspect window with fewer than 50 complete n-grams gets a `warnings` entry.
 
 **Parameters.**
 
-- `ngram_size` (request) / `TS_STAT_SEQUENCE_NGRAM` (server default 3, the
+- `ngram_size` (request) / `VESTIGO_STAT_SEQUENCE_NGRAM` (server default 3, the
   AMiner default sequence length) — validated 2–5; the effective n is
   snapshotted into the persisted `DetectorRun`.
 - `series_field` (request, default `artifact`) — the single grouping field the
   sequence is built over (shared with the frequency detector's group-by; not
   the multi-field `fields` picker). Any field token works, including
   `attr:<key>` and mapped canonical fields.
-- `TS_STAT_SEQUENCE_MAX_CANDIDATES` (default 2000) — cap on novel n-grams
+- `VESTIGO_STAT_SEQUENCE_MAX_CANDIDATES` (default 2000) — cap on novel n-grams
   fetched per run, lowest suspect volume (rarest) first; hitting it attaches a
   warning.
 
@@ -1165,17 +1165,17 @@ ever read windowed rows, so classifying fields never pays a whole-case scan.
 ### Multiple testing and the effect floors
 
 Every (field × suspect window) test from **both branches** lands in one
-Benjamini–Hochberg pool (`TS_STAT_DRIFT_FDR_Q`, default 0.05) — same q-value
+Benjamini–Hochberg pool (`VESTIGO_STAT_DRIFT_FDR_Q`, default 0.05) — same q-value
 reading as proportion shift. Because both branches must rank on one scale and
 their raw statistics live on different scales (D vs. G), the **score is
 `−log10(p)`**, the interval-cadence convention.
 
 Significance alone never flags: each branch has its own effect floor, both in
 the *fraction-of-probability-mass* family so one intuition covers both —
-numeric findings need **D ≥ 0.1** (`TS_STAT_DRIFT_MIN_KS_D`), categorical
-findings need a **total-variation distance ≥ 0.05** (`TS_STAT_DRIFT_MIN_TVD`;
+numeric findings need **D ≥ 0.1** (`VESTIGO_STAT_DRIFT_MIN_KS_D`), categorical
+findings need a **total-variation distance ≥ 0.05** (`VESTIGO_STAT_DRIFT_MIN_TVD`;
 TVD = 0.5·Σ|share difference|, the categorical analog of D). Sides with fewer
-than `TS_STAT_DRIFT_MIN_SAMPLES` (20) field-bearing events are skipped
+than `VESTIGO_STAT_DRIFT_MIN_SAMPLES` (20) field-bearing events are skipped
 entirely — excluded from the FDR pool, with a warning — rather than tested on
 noise. Effect floors are server config only; the request can override `fdr_q`
 but the floors' units are branch-specific.
@@ -1287,7 +1287,7 @@ significance when the analysis covered only part of the timeline — are gone.
 Per-event "mark normal" was unified into the value-level detector allowlist
 (roadmap D11); the legacy `normal` annotation was still honored but no longer
 created outside timestamp-order findings. Schema for both new tables is managed
-by Alembic (`src/tracesignal/db/migrations`), which this change also adopted.
+by Alembic (`src/vestigo/db/migrations`), which this change also adopted.
 
 ## Unified disposition taxonomy (2026-07)
 

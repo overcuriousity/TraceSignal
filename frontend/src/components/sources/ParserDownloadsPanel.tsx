@@ -1,6 +1,6 @@
 /**
  * Case-page download list for the offline converter scripts (issue #11):
- * "optimized" (*2tracesignal, compact Parquet output) vs. "other"
+ * "optimized" (*2vestigo, compact Parquet output) vs. "other"
  * (*2timesketch, stdlib-only CSV/JSONL). Replaces the converter list that
  * used to live inside UploadDialog.
  */
@@ -39,7 +39,7 @@ type Mode = "optimized" | "other";
 
 const BLURB: Record<Mode, string> = {
   optimized:
-    "*2tracesignal scripts emit a compact, typed Parquet file uploaded directly — " +
+    "*2vestigo scripts emit a compact, typed Parquet file uploaded directly — " +
     "the server bulk-inserts it via Arrow, skipping row-by-row CSV/JSON parsing " +
     "entirely. Smaller on disk, faster to ingest, and carries forensic provenance " +
     "(source hash, byte offset, content hash) in the schema itself. Needs pyarrow.",

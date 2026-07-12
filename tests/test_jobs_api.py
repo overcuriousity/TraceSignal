@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from tests.conftest import as_admin, login
-from tracesignal.core.jobs import get_job_store
+from vestigo.core.jobs import get_job_store
 
 
 def _create_user(client, username: str, password: str = "abcdefgh12") -> dict:
