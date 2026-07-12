@@ -1,4 +1,4 @@
-"""Tests for the server-side TraceSignal interchange Parquet reader."""
+"""Tests for the server-side Vestigo interchange Parquet reader."""
 
 from __future__ import annotations
 
@@ -12,20 +12,15 @@ import pyarrow.parquet as pq
 import pytest
 
 from tests.test_pipeline import FakeClickHouseStore
-from tracesignal.db._arrow_schema import EVENT_ARROW_SCHEMA
-from tracesignal.ingestion import parquet_format
-from tracesignal.ingestion.parquet_reader import ParquetEventsParser
-from tracesignal.ingestion.parser import detect_format, get_parser
-from tracesignal.ingestion.pipeline import IngestionPipeline
-from tracesignal.models.event import Event, derive_event_id
+from vestigo.db._arrow_schema import EVENT_ARROW_SCHEMA
+from vestigo.ingestion import parquet_format
+from vestigo.ingestion.parquet_reader import ParquetEventsParser
+from vestigo.ingestion.parser import detect_format, get_parser
+from vestigo.ingestion.pipeline import IngestionPipeline
+from vestigo.models.event import Event, derive_event_id
 
 _SCRIPT = (
-    Path(__file__).parent.parent
-    / "src"
-    / "tracesignal"
-    / "assets"
-    / "converters"
-    / "nginx2tracesignal.py"
+    Path(__file__).parent.parent / "src" / "vestigo" / "assets" / "converters" / "nginx2vestigo.py"
 )
 DATA = Path(__file__).parent / "data"
 
@@ -33,7 +28,7 @@ DATA = Path(__file__).parent / "data"
 @pytest.fixture(scope="module")
 def converter_output(tmp_path_factory) -> Path:
     """A real converter-produced parquet file from the nginx fixture."""
-    spec = importlib.util.spec_from_file_location("nginx2tracesignal", _SCRIPT)
+    spec = importlib.util.spec_from_file_location("nginx2vestigo", _SCRIPT)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     out = tmp_path_factory.mktemp("parquet") / "access.parquet"
@@ -43,7 +38,7 @@ def converter_output(tmp_path_factory) -> Path:
 
 def _parser(**overrides) -> ParquetEventsParser:
     kwargs: dict = {
-        "format_name": "tracesignal_parquet",
+        "format_name": "vestigo_parquet",
         "case_id": "case-p",
         "source_id": "src-p",
         "file_hash": "d" * 64,
@@ -55,7 +50,7 @@ def _parser(**overrides) -> ParquetEventsParser:
 
 class TestRegistry:
     def test_detect_format_parquet(self, tmp_path):
-        assert detect_format(tmp_path / "x.parquet") == "tracesignal_parquet"
+        assert detect_format(tmp_path / "x.parquet") == "vestigo_parquet"
 
     def test_get_parser_returns_reader(self):
         assert isinstance(_parser(), ParquetEventsParser)
@@ -79,7 +74,7 @@ class TestArrowBatches:
         for row in rows:
             assert row["case_id"] == "case-p"
             assert row["source_id"] == "src-p"
-            assert row["parser_name"] == "nginx2tracesignal"
+            assert row["parser_name"] == "nginx2vestigo"
             assert row["parser_version"]
             assert row["line_number"] == 0
             assert row["embedding_model"] == ""
@@ -148,7 +143,7 @@ class TestValidation:
     def _good_meta(self) -> dict[str, str]:
         return {
             parquet_format.META_FORMAT_VERSION: parquet_format.FORMAT_VERSION,
-            parquet_format.META_CONVERTER_NAME: "x2tracesignal",
+            parquet_format.META_CONVERTER_NAME: "x2vestigo",
             parquet_format.META_CONVERTER_VERSION: "1.0.0",
             parquet_format.META_ORIGINAL_FILES: json.dumps(
                 [{"name": "x.log", "sha256": "a" * 64, "size_bytes": 1}]
@@ -157,14 +152,14 @@ class TestValidation:
 
     def test_rejects_plain_parquet(self, tmp_path):
         path = self._write(tmp_path / "x.parquet", parquet_format.PARQUET_EVENT_SCHEMA, {})
-        with pytest.raises(ValueError, match="Not a TraceSignal interchange"):
+        with pytest.raises(ValueError, match="Not a Vestigo interchange"):
             list(_parser().parse_arrow_batches(path))
 
     def test_rejects_wrong_version(self, tmp_path):
         meta = self._good_meta()
         meta[parquet_format.META_FORMAT_VERSION] = "999"
         path = self._write(tmp_path / "x.parquet", parquet_format.PARQUET_EVENT_SCHEMA, meta)
-        with pytest.raises(ValueError, match="Unsupported TraceSignal Parquet format version"):
+        with pytest.raises(ValueError, match="Unsupported Vestigo Parquet format version"):
             list(_parser().parse_arrow_batches(path))
 
     def test_rejects_missing_columns(self, tmp_path):
@@ -179,6 +174,19 @@ class TestValidation:
         path = self._write(tmp_path / "x.parquet", parquet_format.PARQUET_EVENT_SCHEMA, meta)
         with pytest.raises(ValueError, match="no original evidence files"):
             list(_parser().parse_arrow_batches(path))
+
+    def test_accepts_legacy_tracesignal_keys(self, tmp_path):
+        """Files from pre-rename (*2tracesignal.py) converters still validate."""
+        meta = {
+            key.replace("vestigo.", "tracesignal.", 1): value
+            for key, value in self._good_meta().items()
+        }
+        path = self._write(tmp_path / "x.parquet", parquet_format.PARQUET_EVENT_SCHEMA, meta)
+        parsed = parquet_format.validate_parquet_source(
+            pq.ParquetFile(path).schema_arrow, pq.ParquetFile(path).schema_arrow.metadata
+        )
+        assert parsed.converter_name == "x2vestigo"
+        assert parsed.original_files[0].name == "x.log"
 
     def test_rejects_wrong_column_type(self, tmp_path):
         fields = [
@@ -209,7 +217,7 @@ class TestNullHandling:
         }
         meta = {
             parquet_format.META_FORMAT_VERSION: parquet_format.FORMAT_VERSION,
-            parquet_format.META_CONVERTER_NAME: "x2tracesignal",
+            parquet_format.META_CONVERTER_NAME: "x2vestigo",
             parquet_format.META_CONVERTER_VERSION: "1.0.0",
             parquet_format.META_ORIGINAL_FILES: json.dumps(
                 [{"name": "x.log", "sha256": "a" * 64, "size_bytes": 1}]
@@ -247,7 +255,7 @@ class TestNullHandling:
         row[column] = None
         meta = {
             parquet_format.META_FORMAT_VERSION: parquet_format.FORMAT_VERSION,
-            parquet_format.META_CONVERTER_NAME: "x2tracesignal",
+            parquet_format.META_CONVERTER_NAME: "x2vestigo",
             parquet_format.META_CONVERTER_VERSION: "1.0.0",
             parquet_format.META_ORIGINAL_FILES: json.dumps(
                 [{"name": "x.log", "sha256": "a" * 64, "size_bytes": 1}]

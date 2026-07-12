@@ -7,9 +7,9 @@ from datetime import UTC, datetime
 import pytest
 import pytest_asyncio
 
-from tracesignal.db.postgres import PostgresStore
-from tracesignal.enrichers.base import AvailabilityResult
-from tracesignal.enrichers.geoip import IPV4_REGEX, GeoIPEnricher
+from vestigo.db.postgres import PostgresStore
+from vestigo.enrichers.base import AvailabilityResult
+from vestigo.enrichers.geoip import IPV4_REGEX, GeoIPEnricher
 
 
 @pytest_asyncio.fixture()
@@ -55,14 +55,14 @@ def test_ipv4_regex_rejects_hostnames_and_partial_matches():
 
 
 def test_registry_lists_geoip_and_caches_availability(tmp_path, monkeypatch):
-    from tracesignal.enrichers import registry
+    from vestigo.enrichers import registry
 
     monkeypatch.setattr(
-        "tracesignal.enrichers.geoip.geoip_database_path", lambda: tmp_path / "missing.mmdb"
+        "vestigo.enrichers.geoip.geoip_database_path", lambda: tmp_path / "missing.mmdb"
     )
     # Re-register a fresh GeoIP instance pointed at the patched path so
     # check_availability() actually observes the monkeypatched location.
-    from tracesignal.enrichers.geoip import GeoIPEnricher
+    from vestigo.enrichers.geoip import GeoIPEnricher
 
     registry.register(GeoIPEnricher(db_path=tmp_path / "missing.mmdb"))
 
@@ -75,8 +75,8 @@ def test_registry_lists_geoip_and_caches_availability(tmp_path, monkeypatch):
 
 
 def test_refresh_availability_single_key_only_touches_that_enricher(monkeypatch):
-    from tracesignal.enrichers import registry
-    from tracesignal.enrichers.base import Enricher
+    from vestigo.enrichers import registry
+    from vestigo.enrichers.base import Enricher
 
     calls: list[str] = []
 
@@ -310,8 +310,8 @@ async def test_delete_staged_rows_for_job_discards_only_that_job(store):
 def test_process_batch_emits_one_row_per_event_with_field_map():
     """M16 staging grain: multi-attribute, multi-output events collapse into
     a single staging row whose ``fields`` map carries every derived key."""
-    from tracesignal.enrichers.base import Enricher
-    from tracesignal.enrichers.jobs import _process_batch
+    from vestigo.enrichers.base import Enricher
+    from vestigo.enrichers.jobs import _process_batch
 
     class StubEnricher(Enricher):
         key = "stub"
@@ -351,8 +351,8 @@ def test_process_batch_emits_one_row_per_event_with_field_map():
 def test_process_batch_dedups_lookups_per_distinct_value():
     """A repeated raw value is looked up once, then served from the shared
     value cache — the per-distinct-value dedup that keeps GeoIP runs fast."""
-    from tracesignal.enrichers.base import Enricher
-    from tracesignal.enrichers.jobs import _process_batch
+    from vestigo.enrichers.base import Enricher
+    from vestigo.enrichers.jobs import _process_batch
 
     class CountingEnricher(Enricher):
         key = "count"
@@ -394,7 +394,7 @@ async def test_init_schema_drops_legacy_staging_table(tmp_path):
     its legacy row-per-field shape."""
     from sqlalchemy import text
 
-    from tracesignal.db.postgres import Base
+    from vestigo.db.postgres import Base
 
     db_path = tmp_path / "legacy_staging.db"
     s = PostgresStore(url=f"sqlite+aiosqlite:///{db_path}")
@@ -523,7 +523,7 @@ async def _stage_one_row(store, job_id="job1", value="DE", config_hash="hash1"):
 
 @pytest.mark.asyncio
 async def test_reconcile_orphaned_enrichment_jobs_applies_and_returns_reruns(store):
-    from tracesignal.enrichers.jobs import reconcile_orphaned_enrichment_jobs
+    from vestigo.enrichers.jobs import reconcile_orphaned_enrichment_jobs
 
     await store.create_case("c1", "Case One")
     await store.create_source("c1", "s1", "src", file_hash="a" * 64, size_bytes=1)
@@ -558,7 +558,7 @@ async def test_reconcile_grants_provenance_to_marker_completed_sources(store):
     ``mark_enrichment_source_staged`` appends each finished source to the
     durable marker, and reconciliation grants exactly those provenance.
     """
-    from tracesignal.enrichers.jobs import reconcile_orphaned_enrichment_jobs
+    from vestigo.enrichers.jobs import reconcile_orphaned_enrichment_jobs
 
     await store.create_case("c1", "Case One")
     await store.create_source("c1", "s1", "src", file_hash="a" * 64, size_bytes=1)
@@ -579,7 +579,7 @@ async def test_reconcile_grants_provenance_to_marker_completed_sources(store):
 
 @pytest.mark.asyncio
 async def test_reconcile_leaves_marker_and_rows_when_apply_fails(store):
-    from tracesignal.enrichers.jobs import reconcile_orphaned_enrichment_jobs
+    from vestigo.enrichers.jobs import reconcile_orphaned_enrichment_jobs
 
     await store.create_case("c1", "Case One")
     await store.create_source("c1", "s1", "src", file_hash="a" * 64, size_bytes=1)
@@ -598,7 +598,7 @@ async def test_reconcile_leaves_marker_and_rows_when_apply_fails(store):
 
 @pytest.mark.asyncio
 async def test_apply_skips_and_discards_rows_for_deleted_source(store):
-    from tracesignal.enrichers.jobs import _apply_staged_rows
+    from vestigo.enrichers.jobs import _apply_staged_rows
 
     await store.create_case("c1", "Case One")
     # Source "s1" is never created — simulates deletion mid-job.
@@ -639,10 +639,10 @@ class _FakeCHClient:
 
 
 def _fake_ch_store():
-    from tracesignal.db.clickhouse import ClickHouseStore
+    from vestigo.db.clickhouse import ClickHouseStore
 
     store = ClickHouseStore.__new__(ClickHouseStore)
-    store.database = "tsig"
+    store.database = "vestigo"
     store.client = _FakeCHClient()
     return store
 
@@ -660,7 +660,10 @@ def test_apply_enrichments_runs_atomic_partition_rewrite():
     client = store.client
     # Triples inserted into the scratch rows table.
     assert client.inserts == [
-        ("tsig.tmp_enrich_rows_job1", [("e1", "ip:geo_country", "DE"), ("e1", "ip:geo_city", "X")])
+        (
+            "vestigo.tmp_enrich_rows_job1",
+            [("e1", "ip:geo_country", "DE"), ("e1", "ip:geo_city", "X")],
+        )
     ]
     # Enriched partition copy built via mapUpdate join, pinned join_use_nulls.
     # The source map is first passed through mapFilter to strip this enricher's
@@ -674,12 +677,12 @@ def test_apply_enrichments_runs_atomic_partition_rewrite():
     commands = client.commands
     replace = [c for c in commands if "REPLACE PARTITION" in c]
     assert replace == [
-        "ALTER TABLE tsig.events REPLACE PARTITION tuple('c1', 's1') "
-        "FROM tsig.tmp_enrich_events_job1"
+        "ALTER TABLE vestigo.events REPLACE PARTITION tuple('c1', 's1') "
+        "FROM vestigo.tmp_enrich_events_job1"
     ]
     assert commands[-2:] == [
-        "DROP TABLE IF EXISTS tsig.tmp_enrich_events_job1",
-        "DROP TABLE IF EXISTS tsig.tmp_enrich_rows_job1",
+        "DROP TABLE IF EXISTS vestigo.tmp_enrich_events_job1",
+        "DROP TABLE IF EXISTS vestigo.tmp_enrich_rows_job1",
     ]
 
 
@@ -695,8 +698,8 @@ def test_drop_stale_enrichment_scratch_tables():
     store = _fake_ch_store()
     store.client.query_rows = [("tmp_enrich_rows_x",), ("tmp_enrich_events_x",)]
     assert store.drop_stale_enrichment_scratch_tables() == 2
-    assert "DROP TABLE IF EXISTS tsig.tmp_enrich_rows_x" in store.client.commands
-    assert "DROP TABLE IF EXISTS tsig.tmp_enrich_events_x" in store.client.commands
+    assert "DROP TABLE IF EXISTS vestigo.tmp_enrich_rows_x" in store.client.commands
+    assert "DROP TABLE IF EXISTS vestigo.tmp_enrich_events_x" in store.client.commands
 
 
 # ---------------------------------------------------------------------------
@@ -759,7 +762,7 @@ def test_spawn_pins_identity_against_mid_run_db_replacement(tmp_path, monkeypatc
 
 
 def test_base_close_is_noop():
-    from tracesignal.enrichers.base import Enricher
+    from vestigo.enrichers.base import Enricher
 
     class Stub(Enricher):
         key = "stub"
@@ -778,7 +781,7 @@ def test_base_close_is_noop():
 
 
 def test_enricher_run_guard_claim_release():
-    from tracesignal.enrichers import jobs
+    from vestigo.enrichers import jobs
 
     assert jobs.get_active_enricher_run("t1", "geoip") is None
     assert jobs.try_claim_enricher_run("t1", "geoip", "jobA") is None
@@ -793,7 +796,7 @@ def test_enricher_run_guard_claim_release():
 
 
 def test_iter_source_events_batches_and_stops():
-    from tracesignal.db.clickhouse import ClickHouseStore
+    from vestigo.db.clickhouse import ClickHouseStore
 
     calls: list[str | None] = []
 
@@ -823,7 +826,7 @@ def test_iter_source_events_batches_and_stops():
 
 
 def test_effective_enricher_state_resolution():
-    from tracesignal.enrichers.base import effective_enricher_state
+    from vestigo.enrichers.base import effective_enricher_state
 
     # Explicit row always wins, in either direction.
     assert effective_enricher_state(True, "automatic", False) == (True, "automatic")
@@ -836,7 +839,7 @@ def test_effective_enricher_state_resolution():
 
 
 def test_config_hash_deterministic_and_sensitive_to_extras():
-    from tracesignal.enrichers.base import Enricher
+    from vestigo.enrichers.base import Enricher
 
     class Stub(Enricher):
         key = "stub"
@@ -864,7 +867,7 @@ def test_config_hash_deterministic_and_sensitive_to_extras():
 def test_geoip_config_extras_reads_and_writes_sidecar(tmp_path, monkeypatch):
     import geoip2.database
 
-    from tracesignal.enrichers.geoip import read_geoip_sidecar, write_geoip_sidecar
+    from vestigo.enrichers.geoip import read_geoip_sidecar, write_geoip_sidecar
 
     db_path = tmp_path / "GeoLite2-City.mmdb"
     db_path.write_bytes(b"fake-mmdb-content")
@@ -914,7 +917,7 @@ def test_geoip_config_extras_reads_and_writes_sidecar(tmp_path, monkeypatch):
 def test_geoip_availability_uses_sidecar_without_opening_reader(tmp_path, monkeypatch):
     import geoip2.database
 
-    from tracesignal.enrichers.geoip import write_geoip_sidecar
+    from vestigo.enrichers.geoip import write_geoip_sidecar
 
     db_path = tmp_path / "GeoLite2-City.mmdb"
     db_path.write_bytes(b"fake-mmdb-content")
@@ -958,7 +961,7 @@ def test_geoip_availability_uses_sidecar_without_opening_reader(tmp_path, monkey
 
 
 def test_derived_field_key_contract():
-    from tracesignal.enrichers.base import derived_field_key
+    from vestigo.enrichers.base import derived_field_key
 
     assert derived_field_key("src_ip", "geo_country") == "src_ip:geo_country"
 
@@ -966,8 +969,8 @@ def test_derived_field_key_contract():
 def test_geoip_asset_status_and_install(tmp_path, monkeypatch):
     import geoip2.database
 
-    from tracesignal.enrichers.base import AssetValidationError
-    from tracesignal.enrichers.geoip import read_geoip_sidecar
+    from vestigo.enrichers.base import AssetValidationError
+    from vestigo.enrichers.geoip import read_geoip_sidecar
 
     db_path = tmp_path / "data" / "GeoLite2-City.mmdb"
     enricher = GeoIPEnricher(db_path=db_path)
@@ -1017,7 +1020,7 @@ def test_geoip_asset_status_and_install(tmp_path, monkeypatch):
 
 
 def test_install_asset_default_raises_for_assetless_enricher(tmp_path):
-    from tracesignal.enrichers.base import Enricher
+    from vestigo.enrichers.base import Enricher
 
     class Stub(Enricher):
         key = "stub"
@@ -1066,11 +1069,11 @@ def test_enrich_value_invalid_ip_returns_none_but_reader_errors_propagate(tmp_pa
 async def test_manual_run_skips_sources_already_enriched_at_current_config(store, monkeypatch):
     from fastapi import BackgroundTasks
 
-    from tracesignal.api import deps
-    from tracesignal.api.routers.cases import run_timeline_enricher
-    from tracesignal.db.postgres import User
-    from tracesignal.enrichers import registry
-    from tracesignal.enrichers.base import Enricher
+    from vestigo.api import deps
+    from vestigo.api.routers.cases import run_timeline_enricher
+    from vestigo.db.postgres import User
+    from vestigo.enrichers import registry
+    from vestigo.enrichers.base import Enricher
 
     class Stub(Enricher):
         key = "stub-skip"
@@ -1091,7 +1094,7 @@ async def test_manual_run_skips_sources_already_enriched_at_current_config(store
     # The re-run path constructs a ClickHouseStore and claims a run slot before
     # returning (the job body only runs later via BackgroundTasks, never here).
     # Stub the client so no real ClickHouse is needed.
-    monkeypatch.setattr("tracesignal.api.routers.cases.ClickHouseStore", lambda: object())
+    monkeypatch.setattr("vestigo.api.routers.cases.ClickHouseStore", lambda: object())
 
     case = await store.create_case("ck", "Skip Case")
     timeline = await store.create_timeline("ck", "tk", "Skip Timeline")
@@ -1143,7 +1146,7 @@ async def test_manual_run_skips_sources_already_enriched_at_current_config(store
     assert res["source_ids"] == ["sk"]
     assert res["skipped_source_ids"] == []
     # Release the slot claimed by the re-run so it doesn't leak into other tests.
-    from tracesignal.enrichers import jobs as _jobs
+    from vestigo.enrichers import jobs as _jobs
 
     _jobs._release_enricher_run(timeline.id, "stub-skip", res["job_id"])
 
@@ -1177,15 +1180,15 @@ async def test_manual_run_skips_sources_already_enriched_at_current_config(store
 async def test_manual_run_409_and_auto_trigger_skip_when_run_active(store, monkeypatch):
     from fastapi import BackgroundTasks, HTTPException
 
-    from tracesignal.api import deps
-    from tracesignal.api.routers.cases import (
+    from vestigo.api import deps
+    from vestigo.api.routers.cases import (
         _trigger_automatic_enrichments,
         run_timeline_enricher,
     )
-    from tracesignal.core.jobs import JobStore
-    from tracesignal.db.postgres import User
-    from tracesignal.enrichers import jobs, registry
-    from tracesignal.enrichers.base import Enricher
+    from vestigo.core.jobs import JobStore
+    from vestigo.db.postgres import User
+    from vestigo.enrichers import jobs, registry
+    from vestigo.enrichers.base import Enricher
 
     class Stub(Enricher):
         key = "stub-guard"
@@ -1239,10 +1242,10 @@ async def test_manual_run_409_and_auto_trigger_skip_when_run_active(store, monke
 
 @pytest.mark.asyncio
 async def test_run_enrichment_job_stamps_config_hash_and_fails_loudly(store, monkeypatch):
-    from tracesignal.core.jobs import JobStore
-    from tracesignal.enrichers import registry
-    from tracesignal.enrichers.base import Enricher
-    from tracesignal.enrichers.jobs import get_active_enricher_run, run_enrichment_job
+    from vestigo.core.jobs import JobStore
+    from vestigo.enrichers import registry
+    from vestigo.enrichers.base import Enricher
+    from vestigo.enrichers.jobs import get_active_enricher_run, run_enrichment_job
 
     class Stub(Enricher):
         key = "stub-ok"
@@ -1261,7 +1264,7 @@ async def test_run_enrichment_job_stamps_config_hash_and_fails_loudly(store, mon
     await store.create_case("c1", "Case One")
     await store.create_source("c1", "s1", "src", file_hash="b" * 64, size_bytes=1)
 
-    from tracesignal.db.clickhouse import ClickHouseStore
+    from vestigo.db.clickhouse import ClickHouseStore
 
     class _FakeCH(_RecordingClickHouse):
         iter_source_events = ClickHouseStore.iter_source_events
@@ -1330,10 +1333,10 @@ async def test_failed_run_records_provenance_only_for_fully_staged_sources(store
     written off partial staging would permanently block finishing the source
     ("no enricher started" with the source left unenriched).
     """
-    from tracesignal.core.jobs import JobStore
-    from tracesignal.enrichers import registry
-    from tracesignal.enrichers.base import Enricher
-    from tracesignal.enrichers.jobs import run_enrichment_job
+    from vestigo.core.jobs import JobStore
+    from vestigo.enrichers import registry
+    from vestigo.enrichers.base import Enricher
+    from vestigo.enrichers.jobs import run_enrichment_job
 
     class StubSecondSourceBoom(Enricher):
         key = "stub-partial"
@@ -1355,7 +1358,7 @@ async def test_failed_run_records_provenance_only_for_fully_staged_sources(store
     await store.create_source("c1", "s1", "src1", file_hash="c" * 64, size_bytes=1)
     await store.create_source("c1", "s2", "src2", file_hash="d" * 64, size_bytes=1)
 
-    from tracesignal.db.clickhouse import ClickHouseStore
+    from vestigo.db.clickhouse import ClickHouseStore
 
     class _FakeCH(_RecordingClickHouse):
         iter_source_events = ClickHouseStore.iter_source_events
@@ -1395,10 +1398,10 @@ async def test_eligibility_fanout_builds_one_clickhouse_store_per_check(store, m
     # clickhouse_connect clients are not thread-safe — the enrichers-list
     # endpoint must construct a fresh ClickHouseStore inside each threadpool
     # eligibility check instead of sharing one client across the gather fan-out.
-    from tracesignal.api import deps
-    from tracesignal.api.routers.cases import list_timeline_enrichers
-    from tracesignal.enrichers import registry
-    from tracesignal.enrichers.base import EligibilityResult, Enricher
+    from vestigo.api import deps
+    from vestigo.api.routers.cases import list_timeline_enrichers
+    from vestigo.enrichers import registry
+    from vestigo.enrichers.base import EligibilityResult, Enricher
 
     seen_stores: list[object] = []
 
@@ -1443,7 +1446,7 @@ async def test_eligibility_fanout_builds_one_clickhouse_store_per_check(store, m
         created += 1
         return _FakeStore()
 
-    monkeypatch.setattr("tracesignal.api.routers.cases.ClickHouseStore", _make_store)
+    monkeypatch.setattr("vestigo.api.routers.cases.ClickHouseStore", _make_store)
 
     case = await store.create_case("cf", "Fanout Case")
     timeline = await store.create_timeline("cf", "tf", "Fanout Timeline")

@@ -1,8 +1,8 @@
-"""Tests for tracesignal.db._columns — shared field-token routing (F10)."""
+"""Tests for vestigo.db._columns — shared field-token routing (F10)."""
 
 from __future__ import annotations
 
-from tracesignal.db._columns import TOP_LEVEL_EVENT_COLUMNS, resolve_column_token
+from vestigo.db._columns import TOP_LEVEL_EVENT_COLUMNS, resolve_column_token
 
 
 def test_resolve_top_level_column():

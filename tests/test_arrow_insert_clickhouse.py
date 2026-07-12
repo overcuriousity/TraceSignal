@@ -14,8 +14,8 @@ from pathlib import Path
 
 import pytest
 
-from tracesignal.db.clickhouse import ClickHouseStore, _events_to_record_batch
-from tracesignal.models.event import Event
+from vestigo.db.clickhouse import ClickHouseStore, _events_to_record_batch
+from vestigo.models.event import Event
 
 CASE_ID = f"tc-arrow-{uuid.uuid4().hex[:8]}"
 SOURCE_ID = "src-arrow"

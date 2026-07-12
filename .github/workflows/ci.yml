@@ -21,13 +21,13 @@ jobs:
       postgres:
         image: docker.io/library/postgres:17-alpine
         env:
-          POSTGRES_USER: tracesignal
-          POSTGRES_PASSWORD: tracesignal
-          POSTGRES_DB: tracesignal
+          POSTGRES_USER: vestigo
+          POSTGRES_PASSWORD: vestigo
+          POSTGRES_DB: vestigo
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U tracesignal -d tracesignal"
+          --health-cmd "pg_isready -U vestigo -d vestigo"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
@@ -91,13 +91,13 @@ jobs:
       postgres:
         image: docker.io/library/postgres:17-alpine
         env:
-          POSTGRES_USER: tracesignal
-          POSTGRES_PASSWORD: tracesignal
-          POSTGRES_DB: tracesignal
+          POSTGRES_USER: vestigo
+          POSTGRES_PASSWORD: vestigo
+          POSTGRES_DB: vestigo
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U tracesignal -d tracesignal"
+          --health-cmd "pg_isready -U vestigo -d vestigo"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
@@ -124,19 +124,19 @@ jobs:
         run: timeout 30 sh -c 'until curl -sf http://localhost:6333/healthz; do sleep 1; done'
 
       - name: Build image
-        run: docker build -t tracesignal:smoke .
+        run: docker build -t vestigo:smoke .
 
       - name: Run app container
         # --network host so the container reaches the service containers'
         # host-published localhost ports — the same topology the backend
         # test job's suite relies on.
         run: >-
-          docker run -d --name tracesignal-smoke --network host
-          -e TS_POSTGRES_URL=postgresql+asyncpg://tracesignal:tracesignal@localhost:5432/tracesignal
-          -e TS_CLICKHOUSE_URL=http://localhost:8123
-          -e TS_QDRANT_URL=http://localhost:6333
-          -e TS_ADMIN_PASSWORD=smoke-test-boot-pass
-          tracesignal:smoke
+          docker run -d --name vestigo-smoke --network host
+          -e VESTIGO_POSTGRES_URL=postgresql+asyncpg://vestigo:vestigo@localhost:5432/vestigo
+          -e VESTIGO_CLICKHOUSE_URL=http://localhost:8123
+          -e VESTIGO_QDRANT_URL=http://localhost:6333
+          -e VESTIGO_ADMIN_PASSWORD=smoke-test-boot-pass
+          vestigo:smoke
 
       - name: Health endpoint responds
         # Generous window: the lifespan runs schema init + startup
@@ -151,7 +151,7 @@ jobs:
 
       - name: App logs on failure
         if: failure()
-        run: docker logs tracesignal-smoke || true
+        run: docker logs vestigo-smoke || true
 
   frontend:
     name: Frontend (typecheck + lint + build)

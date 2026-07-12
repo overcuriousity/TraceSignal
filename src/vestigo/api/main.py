@@ -1,0 +1,475 @@
+"""FastAPI application factory and API routers."""
+
+import asyncio
+import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
+from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+from vestigo import __version__
+from vestigo.api.deps import get_store, resolve_user_optional
+from vestigo.api.routers import (
+    admin,
+    auth,
+    baselines,
+    cases,
+    converters,
+    dispositions,
+    enrichers,
+    events,
+    jobs,
+    stream,
+    viz,
+)
+from vestigo.core.config import get_settings
+from vestigo.core.security import hash_password
+from vestigo.db.postgres import EnrichmentJobRun, PostgresStore, generate_id
+from vestigo.models.embeddings import embeddings_available
+
+logger = logging.getLogger(__name__)
+
+_FRONTEND_DIST = Path(__file__).resolve().parents[3] / "frontend" / "dist"
+
+# API paths reachable without an authenticated session. Everything else under
+# /api/* requires a valid session cookie (enforced by the middleware below);
+# the SPA catch-all route serves static files only, so it stays exempt too.
+_AUTH_EXEMPT_PREFIXES = (
+    "/api/health",
+    "/api/auth/login",
+    "/api/auth/oidc/",
+    "/api/docs",
+    "/api/openapi.json",
+)
+
+_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _is_exempt(path: str) -> bool:
+    return any(path == p or path.startswith(p) for p in _AUTH_EXEMPT_PREFIXES)
+
+
+def _requires_password_current(path: str, method: str) -> bool:
+    """Whether ``method path`` should be blocked while a password rotation is pending.
+
+    Every mutating ``/api/*`` request is gated except the self-service
+    ``/api/auth/*`` routes (login, logout, profile update, and the
+    change-password endpoint itself) — a user stuck in forced rotation must
+    still be able to log out or change their password. Case/events routers
+    also apply ``deps.require_password_current`` directly as defense in
+    depth; this is the actual enforcement boundary, closing the gap where
+    ``admin.py`` never opted in to that per-route dependency (PR #7 review
+    finding #1).
+    """
+    return method in _MUTATING_METHODS and not path.startswith("/api/auth/")
+
+
+async def _seed_admin() -> None:
+    """Seed the first administrator on startup if no users exist yet.
+
+    The seeded password is one-time: ``must_change_password=True`` forces a
+    rotation on first login, which invalidates ``VESTIGO_ADMIN_PASSWORD`` the
+    moment it's changed (see ``auth.change_my_password``).
+    """
+    settings = get_settings()
+    store = get_store()
+    if await store.list_users():
+        return
+    if not settings.admin_password:
+        logger.error(
+            "No users exist yet and VESTIGO_ADMIN_PASSWORD is not set. Set it and "
+            "restart to bootstrap the first administrator account."
+        )
+        return
+    password_hash = await asyncio.to_thread(hash_password, settings.admin_password)
+    await store.create_user(
+        user_id=generate_id("user"),
+        username=settings.admin_username,
+        password_hash=password_hash,
+        is_admin=True,
+        must_change_password=True,
+    )
+    logger.info(
+        "Seeded administrator account %r (password must be changed on first login).",
+        settings.admin_username,
+    )
+
+
+async def _reconcile_orphaned_ingests() -> None:
+    """Clean up sources stuck in "ingesting" from a mid-ingest restart.
+
+    Ingestion jobs live in the in-memory JobStore, so on a fresh boot any
+    source still marked "ingesting" has no job that will ever finish it.
+    Its partial ClickHouse events and its row are removed — the same cleanup
+    a failed ingest performs — so the file can simply be re-uploaded (the
+    duplicate check is keyed on file_hash and would otherwise reject the
+    retry forever). Each removal is recorded in the audit log.
+
+    Best-effort: ClickHouse being unreachable at startup must not prevent
+    the app from booting; the orphan stays "ingesting" (still invisible to
+    queries) and is retried on the next restart.
+    """
+    store = get_store()
+    orphans = await store.list_ingesting_sources()
+    if not orphans:
+        return
+    from vestigo.api.routers.cases import _retention_path
+    from vestigo.db.clickhouse import ClickHouseStore
+
+    try:
+        clickhouse = ClickHouseStore()
+    except Exception:
+        logger.exception(
+            "Failed to reach ClickHouse while reconciling %d orphaned ingesting source(s); "
+            "retrying on next restart.",
+            len(orphans),
+        )
+        return
+
+    # Each orphan is cleaned up independently — a failure on one (e.g. a
+    # transient ClickHouse error on its partition) must not stop the rest
+    # of the batch from being reconciled this boot.
+    for source in orphans:
+        try:
+            await asyncio.to_thread(clickhouse.delete_source_events, source.case_id, source.id)
+            await store.delete_source(source.case_id, source.id)
+            if not await store.source_hash_in_use(source.file_hash, exclude_source_id=source.id):
+                _retention_path(source.file_hash).unlink(missing_ok=True)
+            await store.record_audit(
+                action="source.ingest_interrupted",
+                case_id=source.case_id,
+                target_type="source",
+                target_id=source.id,
+                detail={"filename": source.filename, "file_hash": source.file_hash},
+            )
+            logger.warning(
+                "Removed source %r (case %s): its ingestion was interrupted by a restart. "
+                "Re-upload the file to ingest it.",
+                source.name,
+                source.case_id,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to reconcile orphaned source %r (case %s); it stays 'ingesting' and "
+                "will be retried on the next restart.",
+                source.name,
+                source.case_id,
+            )
+
+
+async def _reconcile_orphaned_enrichment_jobs() -> list[EnrichmentJobRun]:
+    """Recover enrichment jobs left running by a mid-run restart. See ``enrichers/jobs.py``.
+
+    Returns the recovered runs so the lifespan can schedule re-runs once
+    enricher availability has been refreshed.
+    """
+    from vestigo.db.clickhouse import ClickHouseStore
+    from vestigo.enrichers.jobs import reconcile_orphaned_enrichment_jobs
+
+    store = get_store()
+    try:
+        ch_store = ClickHouseStore()
+        # A crash mid-apply can leave tmp_enrich_* scratch tables behind;
+        # they carry no state (Postgres staging is the source of truth).
+        dropped = await asyncio.to_thread(ch_store.drop_stale_enrichment_scratch_tables)
+        if dropped:
+            logger.info("Dropped %d stale enrichment scratch table(s).", dropped)
+        return await reconcile_orphaned_enrichment_jobs(store, ch_store)
+    except Exception:
+        logger.exception("Failed to reconcile orphaned enrichment jobs; retrying on next restart.")
+        return []
+
+
+def _redact_url(url: str | None) -> str:
+    """Strip credentials from a URL for logging."""
+    if not url:
+        return "(unset)"
+    parsed = urlsplit(url if "://" in url else f"//{url}")
+    if parsed.username or parsed.password:
+        host = parsed.hostname or ""
+        netloc = f"***@{host}" + (f":{parsed.port}" if parsed.port else "")
+        return urlunsplit(parsed._replace(netloc=netloc))
+    return url
+
+
+def _log_config_report() -> None:
+    """One startup block stating the resolved deployment-critical config."""
+    settings = get_settings()
+    logger.info(
+        "Config: environment=%s offline=%s (VESTIGO_ALLOW_ONLINE=%s%s) "
+        "postgres=%s clickhouse=%s qdrant=%s audit_enabled=%s oidc_enabled=%s "
+        "auth_cookie_secure=%s",
+        settings.environment,
+        not settings.allow_online,
+        settings.allow_online,
+        "" if settings.allow_online else ", HF_HUB_OFFLINE forced for embedding models",
+        _redact_url(settings.postgres_url),
+        _redact_url(settings.clickhouse_url),
+        settings.qdrant_path or _redact_url(settings.qdrant_url),
+        settings.audit_enabled,
+        settings.oidc_enabled,
+        settings.auth_cookie_secure,
+    )
+    if settings.environment == "production" and not settings.auth_cookie_secure:
+        logger.warning(
+            "environment=production but VESTIGO_AUTH_COOKIE_SECURE=false — session cookies "
+            "will be sent over plain HTTP. Set VESTIGO_AUTH_COOKIE_SECURE=1 behind TLS."
+        )
+
+
+async def _startup_recovery(store: PostgresStore) -> None:
+    """Best-effort recovery + housekeeping, run *after* the app is serving.
+
+    Deliberately not awaited inside the lifespan before ``yield``: every step
+    here touches ClickHouse (orphan reconciliation applies staged rows, re-runs
+    query timelines), and a slow or unreachable ClickHouse would otherwise wedge
+    the ASGI lifespan startup — uvicorn never begins accepting connections and
+    the reverse proxy returns 502. Booting the HTTP server must not depend on
+    ClickHouse being reachable; each step below already self-heals on the next
+    restart if it fails, so running them in the background is safe.
+    """
+    try:
+        await _reconcile_orphaned_ingests()
+        enrichment_reruns = await _reconcile_orphaned_enrichment_jobs()
+
+        from vestigo.enrichers.registry import refresh_availability
+
+        # Re-runs are scheduled only after availability is refreshed — they skip
+        # enrichers whose runtime requirements (e.g. GeoIP database) are missing.
+        await asyncio.to_thread(refresh_availability)
+        if enrichment_reruns:
+            from vestigo.core.jobs import get_job_store
+            from vestigo.enrichers.jobs import schedule_enrichment_reruns
+
+            try:
+                await schedule_enrichment_reruns(enrichment_reruns, get_job_store(), store)
+            except Exception:
+                logger.exception("Failed to schedule enrichment re-runs after recovery.")
+        # No cron/scheduler in this single-process deployment (see JobStore),
+        # so a startup-only sweep is the simple option — good enough to keep
+        # `sessions` from growing unbounded across restarts without adding a
+        # background task loop for a purely housekeeping concern.
+        purged = await store.purge_expired_sessions()
+        if purged:
+            logger.info("Purged %d expired session(s) on startup.", purged)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Startup recovery failed; it retries on the next restart.")
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    _log_config_report()
+    store = get_store()
+    # Only Postgres schema + admin seeding block startup — both are fast and
+    # required before the first request. Everything ClickHouse-dependent is
+    # deferred to a background task so booting can't hang behind it (502s).
+    await store.init_schema()
+    await _seed_admin()
+
+    recovery_task = asyncio.create_task(_startup_recovery(store))
+    try:
+        yield
+    finally:
+        recovery_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await recovery_task
+
+
+class AuthAuditMiddleware:
+    """Gate unauthenticated access to /api/* and append one audit row per request.
+
+    Deliberately a plain ASGI middleware, **not** ``@app.middleware("http")``
+    (Starlette's ``BaseHTTPMiddleware``) — that wrapper buffers/re-frames the
+    response through an in-memory stream, which breaks disconnect detection
+    and effectively hangs long-lived ``StreamingResponse``s (this app's SSE
+    live-collaboration endpoint being exactly that case). A pure ASGI
+    middleware passes ``receive``/``send`` straight through, so streaming and
+    client-disconnect propagation both work correctly.
+
+    Authorization (which case/admin actions a given user may take) still
+    happens in the route dependencies (``deps.get_current_user``,
+    ``deps.require_case``); this middleware only establishes *who* is calling
+    (if anyone) and enforces that a session exists at all for non-exempt API
+    paths. Resolving the user here means route handlers reuse the cached
+    value via ``request.state.user`` instead of re-querying the session store.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope, receive=receive)
+        path = request.url.path
+        settings = get_settings()
+
+        user = None
+        if path.startswith("/api/"):
+            user = await resolve_user_optional(request)
+            if user is None and not _is_exempt(path):
+                response = JSONResponse(status_code=401, content={"detail": "Not authenticated"})
+                await response(scope, receive, send)
+                return
+            if (
+                user is not None
+                and user.must_change_password
+                and _requires_password_current(path, request.method)
+            ):
+                response = JSONResponse(
+                    status_code=403,
+                    content={"detail": "Password change required before continuing"},
+                )
+                await response(scope, receive, send)
+                return
+
+        status_holder: dict[str, int] = {}
+
+        async def _send(message: dict) -> None:
+            if message["type"] == "http.response.start":
+                status_holder["status_code"] = message["status"]
+            await send(message)
+
+        try:
+            await self.app(scope, receive, _send)
+        except Exception:
+            # /api/auth/* handlers write their own enriched audit row on
+            # success, but an exception raised before that call leaves zero
+            # trace otherwise — for a forensic platform, a baseline row here
+            # (even without the handler's semantic detail) is the safer
+            # contract than silence.
+            if settings.audit_enabled and path.startswith("/api/auth/"):
+                fallback_user = user or getattr(request.state, "user", None)
+                try:
+                    await get_store().record_audit(
+                        action="api.request_failed",
+                        actor=fallback_user,
+                        method=request.method,
+                        path=path,
+                        ip=request.client.host if request.client else None,
+                        user_agent=request.headers.get("user-agent"),
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to write fallback audit log row for %s %s", request.method, path
+                    )
+            raise
+
+        should_audit = (
+            settings.audit_enabled
+            and path.startswith("/api/")
+            and not path.startswith("/api/auth/")
+            and request.method in _MUTATING_METHODS
+        )
+        if should_audit:
+            # /api/auth/* actions (login, logout, password change, OIDC) write
+            # their own enriched audit rows with a semantic action label;
+            # logging them again here would duplicate with less detail. GETs
+            # are excluded too — polling (JobTray, TopBar, list refetches)
+            # otherwise buries the security-relevant mutating rows this audit
+            # log exists to surface.
+            user = user or getattr(request.state, "user", None)
+            route = scope.get("route")
+            route_path = getattr(route, "path", path)
+            case_id = (scope.get("path_params") or {}).get("case_id")
+            try:
+                await get_store().record_audit(
+                    action="api.request",
+                    actor=user,
+                    method=request.method,
+                    path=path,
+                    route=route_path,
+                    case_id=case_id,
+                    status_code=status_holder.get("status_code"),
+                    ip=request.client.host if request.client else None,
+                    user_agent=request.headers.get("user-agent"),
+                )
+            except Exception:
+                # Audit logging must never take down the actual request.
+                logger.exception("Failed to write audit log row for %s %s", request.method, path)
+
+
+def create_app() -> FastAPI:
+    """Create and configure the FastAPI application."""
+    # Root logging was never configured anywhere, so every app-level
+    # logger.info (session purges, recovery sweeps, the config report below)
+    # silently vanished — only uvicorn's own loggers were visible. basicConfig
+    # is a no-op if the embedding process already configured logging.
+    logging.basicConfig(
+        level=get_settings().log_level.upper(),
+        format="%(levelname)s:     %(name)s — %(message)s",
+    )
+    app = FastAPI(
+        title="Vestigo",
+        description="Local-first forensic log investigation platform.",
+        version=__version__,
+        docs_url="/api/docs",
+        openapi_url="/api/openapi.json",
+        lifespan=_lifespan,
+    )
+
+    # Starlette applies middleware in reverse of registration order (last
+    # added = outermost), so AuthAuditMiddleware is added first here — that
+    # makes CORSMiddleware outermost, so it always gets a chance to answer
+    # (and stamp CORS headers on) cross-origin preflight OPTIONS requests
+    # and 401 responses, instead of AuthAuditMiddleware short-circuiting
+    # them first with a bare, header-less 401.
+    app.add_middleware(AuthAuditMiddleware)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:5173", "http://localhost:8080"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.get("/api/health", response_class=JSONResponse)
+    async def health() -> dict:
+        return {
+            "status": "ok",
+            "version": __version__,
+            "oidc_enabled": get_settings().oidc_enabled,
+            # False when the 'embeddings' extra is not installed and no
+            # remote embedding endpoint is configured — embed jobs and
+            # semantic search return 503 in that state.
+            "embeddings_available": embeddings_available(),
+        }
+
+    app.include_router(auth.router)
+    app.include_router(admin.router)
+    app.include_router(enrichers.router)
+    app.include_router(cases.router)
+    app.include_router(baselines.router)
+    app.include_router(dispositions.router)
+    app.include_router(events.router)
+    app.include_router(viz.router)
+    app.include_router(jobs.router)
+    app.include_router(stream.router)
+    app.include_router(converters.router)
+
+    # Serve the built frontend when frontend/dist exists.
+    # Run `npm run build` inside frontend/ once; vestigo-web then serves everything.
+    # For development with HMR, run `npm run dev` (port 5173) alongside vestigo-web instead.
+    if _FRONTEND_DIST.is_dir():
+        assets_dir = _FRONTEND_DIST / "assets"
+        if assets_dir.is_dir():
+            app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+        @app.get("/{full_path:path}", include_in_schema=False)
+        async def serve_frontend(full_path: str) -> FileResponse:
+            candidate = _FRONTEND_DIST / full_path
+            if candidate.is_file():
+                return FileResponse(candidate)
+            return FileResponse(_FRONTEND_DIST / "index.html")
+
+    return app

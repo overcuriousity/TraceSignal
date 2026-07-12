@@ -1,10 +1,10 @@
-"""Tests for tracesignal.db._dt — shared UTC datetime normalization."""
+"""Tests for vestigo.db._dt — shared UTC datetime normalization."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta, timezone
 
-from tracesignal.db._dt import ensure_utc, to_clickhouse_utc
+from vestigo.db._dt import ensure_utc, to_clickhouse_utc
 
 
 def test_ensure_utc_attaches_utc_to_naive_datetime():

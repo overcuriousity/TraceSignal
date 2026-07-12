@@ -11,7 +11,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import text
 
-import tracesignal.db.postgres as pg
+import vestigo.db.postgres as pg
 
 
 def _alembic(sync_conn: Any, verb: str, target: str) -> None:

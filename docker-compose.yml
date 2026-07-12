@@ -1,5 +1,5 @@
-# Reference deployment for the TraceSignal backing services (Postgres, ClickHouse, Qdrant).
-# TraceSignal itself is a native Python/uv app and runs directly on the host (see README
+# Reference deployment for the Vestigo backing services (Postgres, ClickHouse, Qdrant).
+# Vestigo itself is a native Python/uv app and runs directly on the host (see README
 # "Quick start"); uncomment the `app` service below for a containerized all-in-one instead.
 #
 # All published ports are bound to 127.0.0.1 on purpose: these services run with default or
@@ -12,15 +12,15 @@ services:
   postgres:
     image: docker.io/library/postgres:17-alpine
     environment:
-      POSTGRES_USER: tracesignal
-      POSTGRES_PASSWORD: tracesignal
-      POSTGRES_DB: tracesignal
+      POSTGRES_USER: vestigo
+      POSTGRES_PASSWORD: vestigo
+      POSTGRES_DB: vestigo
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U tracesignal -d tracesignal"]
+      test: ["CMD-SHELL", "pg_isready -U vestigo -d vestigo"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -55,7 +55,7 @@ services:
       - "127.0.0.1:6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
-    # Uncomment to require an API key (must match TS_QDRANT_API_KEY on `app`):
+    # Uncomment to require an API key (must match VESTIGO_QDRANT_API_KEY on `app`):
     # environment:
     #   QDRANT__SERVICE__API_KEY: change-me
     healthcheck:
@@ -73,37 +73,37 @@ services:
 #    ports:
 #      - "8080:8080"
 #    environment:
-#      TS_ENVIRONMENT: production
-#      TS_LOG_LEVEL: INFO
-#      TS_ALLOW_ONLINE: "false"
-#      TS_POSTGRES_URL: postgresql+asyncpg://tracesignal:tracesignal@postgres:5432/tracesignal
-#      TS_CLICKHOUSE_URL: http://clickhouse:8123
-#      TS_CLICKHOUSE_DATABASE: tracesignal
-#      TS_CLICKHOUSE_USERNAME: default
-#      TS_CLICKHOUSE_PASSWORD: ""
-#      TS_QDRANT_URL: http://qdrant:6333
-#      # TS_QDRANT_API_KEY: change-me
-#      TS_QDRANT_COLLECTION_PREFIX: tracesignal
-#      TS_EMBEDDING_MODEL: all-MiniLM-L6-v2
-#      TS_EMBEDDING_DEVICE: cpu
-#      TS_EMBEDDING_BATCH_SIZE: 64
-#      TS_INGEST_BATCH_SIZE: 20000
-#      TS_MAX_UPLOAD_BYTES: 10737418240
+#      VESTIGO_ENVIRONMENT: production
+#      VESTIGO_LOG_LEVEL: INFO
+#      VESTIGO_ALLOW_ONLINE: "false"
+#      VESTIGO_POSTGRES_URL: postgresql+asyncpg://vestigo:vestigo@postgres:5432/vestigo
+#      VESTIGO_CLICKHOUSE_URL: http://clickhouse:8123
+#      VESTIGO_CLICKHOUSE_DATABASE: vestigo
+#      VESTIGO_CLICKHOUSE_USERNAME: default
+#      VESTIGO_CLICKHOUSE_PASSWORD: ""
+#      VESTIGO_QDRANT_URL: http://qdrant:6333
+#      # VESTIGO_QDRANT_API_KEY: change-me
+#      VESTIGO_QDRANT_COLLECTION_PREFIX: vestigo
+#      VESTIGO_EMBEDDING_MODEL: all-MiniLM-L6-v2
+#      VESTIGO_EMBEDDING_DEVICE: cpu
+#      VESTIGO_EMBEDDING_BATCH_SIZE: 64
+#      VESTIGO_INGEST_BATCH_SIZE: 20000
+#      VESTIGO_MAX_UPLOAD_BYTES: 10737418240
 #      # Change this before any real/shared deployment — it's a one-time
 #      # bootstrap credential; the admin is forced to rotate it on first login.
-#      TS_ADMIN_USERNAME: admin
-#      TS_ADMIN_PASSWORD: change-me-on-first-login
-#      TS_LOGIN_BACKOFF_THRESHOLD: 5
-#      TS_LOGIN_BACKOFF_BASE_SECONDS: 2.0
-#      TS_LOGIN_BACKOFF_MAX_SECONDS: 300.0
-#      TS_SESSION_TTL_HOURS: 168
-#      TS_AUTH_COOKIE_NAME: tv_session
+#      VESTIGO_ADMIN_USERNAME: admin
+#      VESTIGO_ADMIN_PASSWORD: change-me-on-first-login
+#      VESTIGO_LOGIN_BACKOFF_THRESHOLD: 5
+#      VESTIGO_LOGIN_BACKOFF_BASE_SECONDS: 2.0
+#      VESTIGO_LOGIN_BACKOFF_MAX_SECONDS: 300.0
+#      VESTIGO_SESSION_TTL_HOURS: 168
+#      VESTIGO_AUTH_COOKIE_NAME: tv_session
 #      # Set to true only when serving over HTTPS (e.g. behind a TLS reverse
 #      # proxy) — the cookie won't be sent over plain HTTP otherwise.
-#      TS_AUTH_COOKIE_SECURE: "false"
-#      TS_AUTH_COOKIE_SAMESITE: lax
-#      TS_AUDIT_ENABLED: "true"
-#      TS_OIDC_ENABLED: "false"
+#      VESTIGO_AUTH_COOKIE_SECURE: "false"
+#      VESTIGO_AUTH_COOKIE_SAMESITE: lax
+#      VESTIGO_AUDIT_ENABLED: "true"
+#      VESTIGO_OIDC_ENABLED: "false"
 #    depends_on:
 #      postgres:
 #        condition: service_healthy

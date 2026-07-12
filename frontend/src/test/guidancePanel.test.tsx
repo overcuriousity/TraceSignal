@@ -29,11 +29,11 @@ describe("GuidancePanel", () => {
     );
     fireEvent.click(screen.getByRole("button"));
     expect(screen.queryByText("steps")).not.toBeInTheDocument();
-    expect(localStorage.getItem("tsig-guidance-t2")).toBe("collapsed");
+    expect(localStorage.getItem("vestigo-guidance-t2")).toBe("collapsed");
   });
 
   it("starts collapsed when localStorage says so", () => {
-    localStorage.setItem("tsig-guidance-t3", "collapsed");
+    localStorage.setItem("vestigo-guidance-t3", "collapsed");
     render(
       <GuidancePanel id="t3" title="Workflow">
         <p>steps</p>
@@ -44,7 +44,7 @@ describe("GuidancePanel", () => {
   });
 
   it("re-expands and clears the persisted state", () => {
-    localStorage.setItem("tsig-guidance-t4", "collapsed");
+    localStorage.setItem("vestigo-guidance-t4", "collapsed");
     render(
       <GuidancePanel id="t4" title="Workflow">
         <p>steps</p>
@@ -52,11 +52,11 @@ describe("GuidancePanel", () => {
     );
     fireEvent.click(screen.getByRole("button"));
     expect(screen.getByText("steps")).toBeInTheDocument();
-    expect(localStorage.getItem("tsig-guidance-t4")).toBeNull();
+    expect(localStorage.getItem("vestigo-guidance-t4")).toBeNull();
   });
 
   it("keeps collapse state independent per panel id", () => {
-    localStorage.setItem("tsig-guidance-a", "collapsed");
+    localStorage.setItem("vestigo-guidance-a", "collapsed");
     render(
       <>
         <GuidancePanel id="a" title="Panel A">

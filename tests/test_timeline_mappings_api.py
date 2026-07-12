@@ -6,7 +6,7 @@ from __future__ import annotations
 import pytest
 
 from tests.conftest import as_admin
-from tracesignal.api.routers import cases as cases_router
+from vestigo.api.routers import cases as cases_router
 
 MAPPINGS = {"ip_address": ["src_ip", "ip_addr"]}
 

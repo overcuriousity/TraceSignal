@@ -1,7 +1,7 @@
 # TLS reverse proxy (nginx)
 
-TraceSignal (`tsig-web`) listens on plain HTTP, `0.0.0.0:8080`
-(`src/tracesignal/web/app.py`). It has no TLS support of its own — put nginx in front of it
+Vestigo (`vestigo-web`) listens on plain HTTP, `0.0.0.0:8080`
+(`src/vestigo/web/app.py`). It has no TLS support of its own — put nginx in front of it
 to terminate HTTPS for LAN/production use. Config: `docs/nginx-tls.conf`.
 
 Certbot/Let's Encrypt is out of scope here (this host is airgapped/LAN-only per
@@ -12,12 +12,12 @@ Certbot/Let's Encrypt is out of scope here (this host is airgapped/LAN-only per
 ```bash
 sudo mkdir -p /etc/nginx/tls
 sudo openssl req -x509 -nodes -newkey rsa:4096 \
-  -keyout /etc/nginx/tls/tracesignal.key \
-  -out    /etc/nginx/tls/tracesignal.crt \
+  -keyout /etc/nginx/tls/vestigo.key \
+  -out    /etc/nginx/tls/vestigo.crt \
   -days 825 \
-  -subj "/CN=tracesignal.example.internal" \
-  -addext "subjectAltName=DNS:tracesignal.example.internal,IP:192.168.18.125"
-sudo chmod 600 /etc/nginx/tls/tracesignal.key
+  -subj "/CN=vestigo.example.internal" \
+  -addext "subjectAltName=DNS:vestigo.example.internal,IP:192.168.18.125"
+sudo chmod 600 /etc/nginx/tls/vestigo.key
 ```
 
 Adjust `-subj`/`subjectAltName` to your actual hostname/IP — browsers and most HTTP clients
@@ -28,25 +28,25 @@ issuing it.
 ## 2. Install the nginx config
 
 ```bash
-sudo cp docs/nginx-tls.conf /etc/nginx/sites-available/tracesignal.conf
-sudo ln -s /etc/nginx/sites-available/tracesignal.conf /etc/nginx/sites-enabled/
+sudo cp docs/nginx-tls.conf /etc/nginx/sites-available/vestigo.conf
+sudo ln -s /etc/nginx/sites-available/vestigo.conf /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
 Edit `server_name` and the cert paths in the copied file to match your environment first.
 
-## 3. Required TraceSignal-side settings
+## 3. Required Vestigo-side settings
 
 Once TLS terminates at nginx, the app itself still thinks it's plain HTTP — two settings need
-to change (`TS_*` env vars, see `src/tracesignal/core/config.py`):
+to change (`VESTIGO_*` env vars, see `src/vestigo/core/config.py`):
 
-- `TS_AUTH_COOKIE_SECURE=1` — the session cookie's `Secure` flag defaults to `false`
+- `VESTIGO_AUTH_COOKIE_SECURE=1` — the session cookie's `Secure` flag defaults to `false`
   (`auth_cookie_secure`, dev default). Behind TLS this **must** be `1`, otherwise the session
   cookie is sent unflagged and a browser would still attach it over a stray HTTP request.
-- `TS_ENVIRONMENT=production` — disables uvicorn's auto-reload watcher, which isn't wanted
+- `VESTIGO_ENVIRONMENT=production` — disables uvicorn's auto-reload watcher, which isn't wanted
   once nginx is fronting things for real use.
 
-If OIDC SSO is enabled (`TS_OIDC_ENABLED=1`), also update `TS_OIDC_REDIRECT_URL` to the
+If OIDC SSO is enabled (`VESTIGO_OIDC_ENABLED=1`), also update `VESTIGO_OIDC_REDIRECT_URL` to the
 `https://` form of your callback URL — the IdP redirect target must match what nginx exposes,
 not `http://localhost:8080`.
 
@@ -61,7 +61,7 @@ not `http://localhost:8080`.
   keeps the 300s body/send timeouts from `location /` instead of nginx's 60s defaults. A 20s
   server-side keepalive is already built in (`_KEEPALIVE_SECONDS`), so `proxy_read_timeout
   3600s` just needs to outlive several keepalives, not be infinite.
-- `X-Forwarded-For` is forwarded for logging only — TraceSignal deliberately does **not**
+- `X-Forwarded-For` is forwarded for logging only — Vestigo deliberately does **not**
   trust it for access-control decisions (see comment in `api/routers/auth.py`), since this
   is meant to run on a LAN where the header would otherwise be attacker-controlled.
 - No upstream `Connection: upgrade`/websocket handling is configured — the app has no

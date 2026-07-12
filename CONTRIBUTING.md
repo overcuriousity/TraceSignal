@@ -1,4 +1,4 @@
-# Contributing to TraceSignal
+# Contributing to Vestigo
 
 Thanks for considering a contribution. This is a small forensic-tooling
 project — keep changes focused and read `CLAUDE.md` first, it documents the
@@ -9,7 +9,7 @@ architecture and conventions that both humans and AI assistants follow here.
 ```bash
 uv sync                          # backend deps
 podman compose up -d              # PostgreSQL, ClickHouse, Qdrant for local dev
-uv run tsig-web                   # API + built frontend on :8080
+uv run vestigo-web                   # API + built frontend on :8080
 ```
 
 Frontend, for active UI work:
@@ -40,7 +40,7 @@ CI runs all of the above; a red check blocks merge.
   changing their fields changes their identity (new Qdrant collection, etc.),
   so don't casually rename/remove fields on them.
 - Airgapped/offline-by-default is a design goal — no new code path should
-  reach the network unconditionally. `TS_ALLOW_ONLINE` gates optional online
+  reach the network unconditionally. `VESTIGO_ALLOW_ONLINE` gates optional online
   behavior; OIDC SSO is the one deliberate exception (see `docs/TECH_STACK.md`).
 - `core/jobs.py::JobStore` is intentionally in-memory/ephemeral — don't add
   persistence there without discussing the deployment-model implications

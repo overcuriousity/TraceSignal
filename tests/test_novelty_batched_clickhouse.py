@@ -15,14 +15,14 @@ from pathlib import Path
 
 import pytest
 
-from tracesignal.db.anomaly_stats import (
+from vestigo.db.anomaly_stats import (
     AnalysisWindows,
     StatisticalAnomalyService,
     TimeWindow,
     _window_preds,
 )
-from tracesignal.db.clickhouse import ClickHouseStore
-from tracesignal.models.event import Event
+from vestigo.db.clickhouse import ClickHouseStore
+from vestigo.models.event import Event
 
 CASE_ID = f"tc-novbatch-{uuid.uuid4().hex[:8]}"
 SOURCE_ID = "src-novbatch"

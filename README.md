@@ -1,8 +1,15 @@
-# TraceSignal
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
+    <img src="docs/assets/logo.svg" alt="Vestigo" width="320">
+  </picture>
+</p>
+
+<p align="center"><em>vestigo</em> (Latin) — <em>I follow the tracks; I investigate.</em></p>
 
 A forensic-grade post-mortem log investigation platform.
 
-TraceSignal ingests Timesketch-compatible timelines at scale, lets analysts explore events
+Vestigo ingests Timesketch-compatible timelines at scale, lets analysts explore events
 through an ELK-like web interface, and surfaces anomalies both statistically and by embedding
 every log line into a vector database. It's built to run airgapped if needed — with reproducible, auditable processing at every step.
 
@@ -12,7 +19,7 @@ Incident responders and forensic analysts work with massive timeline-shaped data
 output, Windows Event Logs, endpoint telemetry, cloud audit trails). The usual options force a
 tradeoff: a full SIEM is expensive, noisy, and not timeline-native; notebook scripts are
 flexible but not reproducible or team-friendly; [Timesketch](https://github.com/google/timesketch)
-is powerful but operationally heavy. TraceSignal aims to be the focused middle ground — ingest
+is powerful but operationally heavy. Vestigo aims to be the focused middle ground — ingest
 huge logs, explore them like an ELK stack, and let both classic statistical detectors and local
 embeddings surface the needles in the haystack, without needing a cluster to run it.
 
@@ -23,11 +30,11 @@ embeddings surface the needles in the haystack, without needing a cluster to run
   loading everything into memory.
 - Every ingested file (**Source**) is SHA-256 hashed and retained content-addressed for
   re-download — forensic provenance and immutability by construction.
-- CLI-available (`tsig ingest`), so ingestion is scriptable and reproducible outside the web UI.
+- CLI-available (`vestigo ingest`), so ingestion is scriptable and reproducible outside the web UI.
   For very large files (tens of GiB and up), prefer it over the web upload: it streams straight
-  from disk — no HTTP upload, no temp copy, no `TS_MAX_UPLOAD_BYTES` cap — with live
-  progress/ETA and per-user Source attribution for chain-of-custody. See `tsig ingest --help`.
-- A separate, user-triggered embedding job (`tsig embed` / the embed wizard) computes vectors
+  from disk — no HTTP upload, no temp copy, no `VESTIGO_MAX_UPLOAD_BYTES` cap — with live
+  progress/ETA and per-user Source attribution for chain-of-custody. See `vestigo ingest --help`.
+- A separate, user-triggered embedding job (`vestigo embed` / the embed wizard) computes vectors
   after ingestion — ingestion itself stays fast and embedding-free until you ask for it.
 - Downloadable converter scripts (nginx, filterlog, suricata, cloudtrail, pcap, and more) parse
   vendor-specific log formats client-side into typed, columnar **Parquet**, which the server
@@ -85,7 +92,7 @@ embeddings surface the needles in the haystack, without needing a cluster to run
   Qdrant (vectors). None of them run inside the app itself.
 - **Frontend**: React 19 + Vite + TypeScript, served as a static build directly from Uvicorn
   (no separate web server required).
-- **CLI**: a Typer-based `tsig` command mirrors the API/UI for scriptable, offline-friendly use.
+- **CLI**: a Typer-based `vestigo` command mirrors the API/UI for scriptable, offline-friendly use.
 
 ## Quick start
 
@@ -105,12 +112,12 @@ no credentials, so they are deliberately unreachable from the LAN. The app's def
 
 ```bash
 uv sync
-uv run tsig-web
+uv run vestigo-web
 ```
 
 The base install ships without the local embedding stack (~2 GB of torch +
-sentence-transformers). To use local embeddings (`tsig embed`, semantic search), install the
-extra: `uv sync --extra embeddings`. Alternatively point `TS_EMBEDDING_API_BASE_URL` at a
+sentence-transformers). To use local embeddings (`vestigo embed`, semantic search), install the
+extra: `uv sync --extra embeddings`. Alternatively point `VESTIGO_EMBEDDING_API_BASE_URL` at a
 remote OpenAI-compatible endpoint — no extra needed. Without either, embedding endpoints
 return a clear 503 and `/api/health` reports `embeddings_available: false`; everything else
 works normally.
@@ -119,10 +126,16 @@ The API is available at `http://localhost:8080` (OpenAPI docs at `/api/docs`), s
 built frontend from `frontend/dist` (auto-built on first run).
 
 For active frontend development, run `npm install && npm run dev` in `frontend/` alongside
-`uv run tsig-web` — see `frontend/README.md`. Configuration is env-driven (`TS_*` variables); see
+`uv run vestigo-web` — see `frontend/README.md`. Configuration is env-driven (`VESTIGO_*` variables); see
 `.env.example` for the full list.
 
 ### Docker/Podman Compose (optional containerized app)
+
+Released application images are published to GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/overcuriousity/vestigo:latest
+```
 
 `docker-compose.yml` ships with a **commented-out** `app` service that builds the image from
 the local checkout (`Dockerfile`) and reaches the backing services over the compose-internal
@@ -130,17 +143,17 @@ network. Uncomment it, then `docker compose up -d` (or `podman compose up -d`) b
 full stack in one command.
 
 **This compose file is a reference/evaluation deployment, not a production hardening guide.**
-It ships with fixed, well-known defaults so it works out of the box: `postgres`/`tracesignal`
-DB credentials, no ClickHouse/Qdrant auth, and a one-time `TS_ADMIN_PASSWORD` bootstrap secret
+It ships with fixed, well-known defaults so it works out of the box: `postgres`/`vestigo`
+DB credentials, no ClickHouse/Qdrant auth, and a one-time `VESTIGO_ADMIN_PASSWORD` bootstrap secret
 (forced to rotate on first login). For any deployment reachable by more than you — and
-generally for real production use — prefer the native `uv run tsig-web` install against
+generally for real production use — prefer the native `uv run vestigo-web` install against
 properly credentialed, network-restricted backing services, and set your own
-`TS_ADMIN_PASSWORD`/`TS_*_PASSWORD`/`TS_QDRANT_API_KEY` values rather than the compose
+`VESTIGO_ADMIN_PASSWORD`/`VESTIGO_*_PASSWORD`/`VESTIGO_QDRANT_API_KEY` values rather than the compose
 defaults.
 
 ### Airgapped installation
 
-TraceSignal's application layer (backend + frontend) can be installed fully offline. **The
+Vestigo's application layer (backend + frontend) can be installed fully offline. **The
 three backing services — PostgreSQL, ClickHouse, Qdrant — are out of scope for this
 procedure**: provision them on the airgapped network however you normally handle offline
 service deployment (e.g. `podman load` of pre-pulled images, or native packages).
@@ -162,32 +175,55 @@ On a machine **with internet access**:
 On the **airgapped machine**:
 
 1. Copy the repository from the portable drive.
-2. Point `TS_POSTGRES_URL`, `TS_CLICKHOUSE_URL`, and `TS_QDRANT_URL` (in `.env`, copied from
+2. Point `VESTIGO_POSTGRES_URL`, `VESTIGO_CLICKHOUSE_URL`, and `VESTIGO_QDRANT_URL` (in `.env`, copied from
    `.env.example`) at the already-running backing services on the isolated network.
 3. Run the app directly from the carried-over virtualenv — no `uv sync` or `npm install`
    needed, since both were already resolved on the online machine:
    ```bash
-   .venv/bin/tsig-web
+   .venv/bin/vestigo-web
    ```
    Because `frontend/dist/` was carried over and the app is started via the `.venv` entry
    point directly (not `uv run`, which would try to re-resolve the environment), no network
-   access is required at any point on the airgapped machine. `TS_ALLOW_ONLINE=false` (the
+   access is required at any point on the airgapped machine. `VESTIGO_ALLOW_ONLINE=false` (the
    default) additionally keeps the embedding pipeline from reaching any remote endpoint.
 4. Same binary compatibility requirements apply as any offline Python deployment: build and
    run on matching OS/architecture (e.g. build on the same Linux distribution/glibc version
    you'll run on), since the `.venv/` carries compiled wheels (PyTorch, onnxruntime, etc.).
 
+## Stability & upgrades
+
+What the 1.0 line guarantees, and what it doesn't:
+
+- **PostgreSQL metadata schema** is Alembic-managed; the app migrates to the current head
+  automatically on startup. Upgrading a 1.0.x deployment is: stop, update code/image, start.
+- **Parquet interchange format v1** (converter output) is stable: files produced by any 1.0
+  converter script remain ingestible by any 1.0 server. Files written by pre-rename
+  (`*2tracesignal.py`) converters are still accepted.
+- **Forensic identity is append-only**: parser/embedding config hashes (`config_hash()`)
+  identify processing configurations; existing hashes never change meaning within 1.0.x.
+- **ClickHouse and Qdrant schemas** have no in-place migration story yet: within 1.0.x they
+  won't change; a future change would come with an explicit re-ingest/re-embed procedure in
+  the release notes, never a silent one.
+- The REST API is versioned by the app itself (`/api/health` reports the version); breaking
+  API changes are reserved for 2.0.
+
+**Upgrading from a pre-1.0 (TraceSignal) deployment:** the project was renamed for 1.0 —
+CLI `tsig` → `vestigo`, env vars `TS_*` → `VESTIGO_*`, and default backing-store names are
+now `vestigo`. Existing data stays where it is: rename your env vars and pin the old names
+via `VESTIGO_POSTGRES_URL`, `VESTIGO_CLICKHOUSE_DATABASE`, and
+`VESTIGO_QDRANT_COLLECTION_PREFIX`. See [CHANGELOG.md](CHANGELOG.md).
+
 ## Inspiration
 
-TraceSignal's design draws on two projects:
+Vestigo's design draws on two projects:
 
 - **[Timesketch](https://github.com/google/timesketch)** — for the timeline-centric
   investigation model (Plaso-compatible ingestion, ELK-like exploration, saved views,
-  collaborative annotation) that TraceSignal aims to make lighter-weight and easier to
+  collaborative annotation) that Vestigo aims to make lighter-weight and easier to
   self-host.
 - **[ait-aecid/logdata-anomaly-miner](https://github.com/ait-aecid/logdata-anomaly-miner)** —
   for the statistical, non-ML approach to log anomaly detection (rare-value and frequency
-  detectors) that TraceSignal's `db/anomaly_stats.py` engine adapts to run directly over
+  detectors) that Vestigo's `db/anomaly_stats.py` engine adapts to run directly over
   ClickHouse alongside the vector-backed similarity search.
 
 The goal is to land somewhere between the two: Timesketch's investigative UX combined with
@@ -203,6 +239,7 @@ analysis system for a small, self-hosted team.
 - [Model Refinement](docs/MODEL_REFINEMENT.md) — approved Case / Source / Timeline / Artifact redesign
 - [Roadmap](docs/ROADMAP.md)
 - [Progress](docs/PROGRESS.md)
+- [Changelog](CHANGELOG.md)
 
 ## License
 

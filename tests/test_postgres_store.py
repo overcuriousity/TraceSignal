@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import pytest_asyncio
 
-from tracesignal.db.postgres import PostgresStore
+from vestigo.db.postgres import PostgresStore
 
 
 @pytest_asyncio.fixture()
@@ -202,7 +202,7 @@ async def test_init_schema_adopts_pre_alembic_db(tmp_path):
     normalized by the legacy fixups, stamped at 0001, then upgraded."""
     from sqlalchemy import inspect, text
 
-    from tracesignal.db.postgres import Base
+    from vestigo.db.postgres import Base
 
     s = PostgresStore(url=f"sqlite+aiosqlite:///{tmp_path}/legacy.db")
     async with s.engine.begin() as conn:

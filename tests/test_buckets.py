@@ -1,10 +1,10 @@
-"""Tests for tracesignal.db._buckets — shared bucket-grid helpers."""
+"""Tests for vestigo.db._buckets — shared bucket-grid helpers."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from tracesignal.db._buckets import aligned_bucket_starts, bucket_interval_seconds
+from vestigo.db._buckets import aligned_bucket_starts, bucket_interval_seconds
 
 
 def test_aligned_bucket_starts_includes_trailing_partial_bucket():

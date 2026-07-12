@@ -1,6 +1,6 @@
 """Unit tests for the in-memory login backoff tracker (fake clock, no sleeps)."""
 
-from tracesignal.core.login_backoff import LoginBackoff
+from vestigo.core.login_backoff import LoginBackoff
 
 
 class FakeClock:

@@ -1,8 +1,8 @@
 # Input Data Formats
 
-TraceSignal ingests three file formats: **CSV**, **JSONL**, and **Parquet**. This document
-specifies exactly what each format must contain to normalize cleanly into a TraceSignal
-`Event` (`src/tracesignal/models/event.py`). Read this before writing a converter or hand-
+Vestigo ingests three file formats: **CSV**, **JSONL**, and **Parquet**. This document
+specifies exactly what each format must contain to normalize cleanly into a Vestigo
+`Event` (`src/vestigo/models/event.py`). Read this before writing a converter or hand-
 crafting an ingest file.
 
 All three formats normalize to the same target: one row/line/record per event, with a common
@@ -16,7 +16,7 @@ survive as attributes so an examiner can inspect the original data later.
   already produce a Timesketch-style CSV/JSONL export (e.g. `log2timeline.py -o dynamic`,
   `psort.py -o dynamic`). Parsed server-side, one row/line at a time.
 - **Parquet** — for large evidence sets or custom log formats. A local converter script
-  (`src/tracesignal/assets/converters/*2tracesignal.py`, downloadable from the web UI) parses
+  (`src/vestigo/assets/converters/*2vestigo.py`, downloadable from the web UI) parses
   the raw evidence file entirely on the analyst's machine and writes one columnar `.parquet`
   file; the server ingests it directly with no re-parsing, no intermediate text file touching
   disk, and no possibility of a lossy round trip through CSV escaping. See
@@ -24,12 +24,12 @@ survive as attributes so an examiner can inspect the original data later.
   bulk conversion.
 
 Format is detected by file extension: `.csv`/`.tsv` → CSV, `.jsonl`/`.ndjson`/`.json` → JSONL,
-`.parquet` → Parquet (`src/tracesignal/ingestion/parser.py::detect_format`).
+`.parquet` → Parquet (`src/vestigo/ingestion/parser.py::detect_format`).
 
 ## The target: `Event`
 
 Every parser — CSV, JSONL, or Parquet — ultimately produces the same fields
-(`src/tracesignal/models/event.py::Event`):
+(`src/vestigo/models/event.py::Event`):
 
 | Field             | Type           | Meaning                                                            |
 |-------------------|----------------|----------------------------------------------------------------------|
@@ -51,7 +51,7 @@ being read; Parquet converters compute them from the original raw evidence file.
 
 ## CSV
 
-Parser: `TimesketchCsvParser` (`src/tracesignal/ingestion/parser.py`). Timesketch-compatible:
+Parser: `TimesketchCsvParser` (`src/vestigo/ingestion/parser.py`). Timesketch-compatible:
 a header row, then one event per data row. Delimiter is auto-detected (comma, semicolon, tab,
 or pipe); quoting follows RFC 4180 with `""` as the escape for embedded quotes.
 
@@ -108,7 +108,7 @@ System started
 
 ## JSONL
 
-Parser: `JsonlParser` (`src/tracesignal/ingestion/parser.py`). One JSON object per line, UTF-8.
+Parser: `JsonlParser` (`src/vestigo/ingestion/parser.py`). One JSON object per line, UTF-8.
 A malformed line is skipped (not fatal to the whole file) — the raw source file is untouched
 so the skipped line is still recoverable by manual inspection.
 
@@ -146,9 +146,9 @@ accepted directly by `_parse_timestamp`.
 
 ---
 
-## Parquet (TraceSignal interchange format, version 1)
+## Parquet (Vestigo interchange format, version 1)
 
-Spec module: `src/tracesignal/ingestion/parquet_format.py`. Unlike CSV/JSONL, Parquet is not
+Spec module: `src/vestigo/ingestion/parquet_format.py`. Unlike CSV/JSONL, Parquet is not
 meant to be hand-written — a local converter script parses raw evidence and writes columnar
 batches with `pyarrow`. The server (`ingestion/parquet_reader.py`) validates the schema and
 footer metadata, then bulk-inserts the columns with **no per-row re-parsing**. This is why the
@@ -194,15 +194,15 @@ rejects the whole file if any row has a null provenance column.
 
 ### Required footer metadata
 
-Parquet supports arbitrary key-value footer metadata; TraceSignal requires these keys
+Parquet supports arbitrary key-value footer metadata; Vestigo requires these keys
 (`schema.with_metadata({...})` in pyarrow):
 
 | Key                                | Value |
 |--------------------------------------|-------|
-| `tracesignal.format_version`         | `"1"` |
-| `tracesignal.converter_name`         | Converter identifier, e.g. `"nginx2tracesignal"`. Becomes the event's `parser_name`. |
-| `tracesignal.converter_version`      | Converter version string, e.g. `"1.0.0"`. Becomes the event's `parser_version`. |
-| `tracesignal.original_files`         | JSON array of `{"name": str, "sha256": str, "size_bytes": int}` — one entry per raw input file (a directory input yields several). |
+| `vestigo.format_version`         | `"1"` |
+| `vestigo.converter_name`         | Converter identifier, e.g. `"nginx2vestigo"`. Becomes the event's `parser_name`. |
+| `vestigo.converter_version`      | Converter version string, e.g. `"1.0.0"`. Becomes the event's `parser_version`. |
+| `vestigo.original_files`         | JSON array of `{"name": str, "sha256": str, "size_bytes": int}` — one entry per raw input file (a directory input yields several). |
 
 ### Minimal example (Python / pyarrow)
 
@@ -226,10 +226,10 @@ schema = pa.schema([
     pa.field("tags", pa.list_(pa.string())),
     pa.field("attributes", pa.map_(pa.string(), pa.string())),
 ]).with_metadata({
-    "tracesignal.format_version": "1",
-    "tracesignal.converter_name": "example2tracesignal",
-    "tracesignal.converter_version": "1.0.0",
-    "tracesignal.original_files": json.dumps(
+    "vestigo.format_version": "1",
+    "vestigo.converter_name": "example2vestigo",
+    "vestigo.converter_version": "1.0.0",
+    "vestigo.original_files": json.dumps(
         [{"name": "auth.log", "sha256": "e3b0c4...", "size_bytes": 128}]
     ),
 })
@@ -255,13 +255,13 @@ with pq.ParquetWriter("example.parquet", schema, compression="zstd") as writer:
 ```
 
 For a real, streaming, forensically-complete implementation see
-`src/tracesignal/assets/converters/nginx2tracesignal.py` — start from it rather than from
+`src/vestigo/assets/converters/nginx2vestigo.py` — start from it rather than from
 scratch when writing a new converter.
 
 ### `timesketch2parquet.py`: converting existing CSV/JSONL
 
 If you already have a Timesketch-compatible CSV or JSONL file, don't hand-write a converter —
-`src/tracesignal/assets/converters/timesketch2parquet.py` reads exactly the CSV/JSONL formats
+`src/vestigo/assets/converters/timesketch2parquet.py` reads exactly the CSV/JSONL formats
 described above and re-emits them as an interchange Parquet file, so a very large existing
 timeline can be uploaded as a single fast columnar file instead of parsed row-by-row server
 side.

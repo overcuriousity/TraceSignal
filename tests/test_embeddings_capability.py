@@ -8,10 +8,10 @@ consumer's import site.
 from __future__ import annotations
 
 from tests.conftest import as_admin
-from tracesignal.api import main as api_main
-from tracesignal.api.routers import cases as cases_router
-from tracesignal.api.routers import events as events_router
-from tracesignal.models.embeddings import embeddings_available
+from vestigo.api import main as api_main
+from vestigo.api.routers import cases as cases_router
+from vestigo.api.routers import events as events_router
+from vestigo.models.embeddings import embeddings_available
 
 
 def test_embeddings_available_true_in_dev_env():
@@ -53,10 +53,10 @@ def test_remote_endpoint_counts_as_available(monkeypatch):
     """Remote embedding mode needs no local torch stack."""
     import importlib.util
 
-    from tracesignal.core.config import get_settings
-    from tracesignal.models import embeddings as embeddings_module
+    from vestigo.core.config import get_settings
+    from vestigo.models import embeddings as embeddings_module
 
-    monkeypatch.setenv("TS_EMBEDDING_API_BASE_URL", "http://embedder.local/v1")
+    monkeypatch.setenv("VESTIGO_EMBEDDING_API_BASE_URL", "http://embedder.local/v1")
     get_settings.cache_clear()
     try:
         real_find_spec = importlib.util.find_spec

@@ -1,12 +1,12 @@
-# TraceSignal Frontend
+# Vestigo Frontend
 
-React 19 + TypeScript + Vite SPA for the TraceSignal forensic log-analysis tool.
+React 19 + TypeScript + Vite SPA for the Vestigo forensic log-analysis tool.
 
 ## Development
 
 ```bash
 # Start backend (from repo root)
-uv run tsig-web                    # FastAPI on :8080
+uv run vestigo-web                    # FastAPI on :8080
 docker compose up -d             # backing services
 
 # Start frontend dev server

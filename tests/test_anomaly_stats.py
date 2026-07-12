@@ -11,8 +11,8 @@ from typing import Any
 
 import numpy as np
 
-from tracesignal.db._offsets import OFFSET_SRC_PARAM, OFFSET_VAL_PARAM
-from tracesignal.db.anomaly_stats import (
+from vestigo.db._offsets import OFFSET_SRC_PARAM, OFFSET_VAL_PARAM
+from vestigo.db.anomaly_stats import (
     AnalysisWindows,
     FreqFinding,
     NoveltyFieldInfo,
@@ -97,7 +97,7 @@ class FakeClickHouseStore:
 
     def __init__(self, client: FakeClient) -> None:
         self.client = client
-        self.database = "tracesignal"
+        self.database = "vestigo"
         # Seedable hydration source for get_events_by_ids; calls are recorded
         # so tests can assert hydration is one batched fetch.
         self.events_by_id: dict[str, dict] = {}
@@ -1307,7 +1307,7 @@ def test_value_novelty_auto_mode_caps_scanned_fields():
     now bounds the batched ARRAY JOIN key set (expansion width / LIMIT BY
     output), not a per-field round-trip count: all plain-attribute fields
     share a single batched scan."""
-    from tracesignal.db.anomaly_stats import _MAX_AUTO_SCAN_FIELDS, NoveltyFieldInfo
+    from vestigo.db.anomaly_stats import _MAX_AUTO_SCAN_FIELDS, NoveltyFieldInfo
 
     total = 1000
     many_fields = [
@@ -1398,7 +1398,7 @@ def test_hydrate_freq_findings_batches_into_a_single_query():
     """
     from datetime import timedelta
 
-    from tracesignal.db.anomaly_stats import FreqFinding
+    from vestigo.db.anomaly_stats import FreqFinding
 
     bucket_a = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
     bucket_b = datetime(2024, 1, 1, 4, 0, 0, tzinfo=UTC)
@@ -1452,7 +1452,7 @@ def test_hydrate_freq_findings_batches_into_a_single_query():
         "c1",
         ["s1"],
         "artifact",
-        "tracesignal",
+        "vestigo",
         {},
         3600,
     )
@@ -1919,7 +1919,7 @@ def test_heavy_detector_scans_carry_memory_settings():
     (external GROUP BY spill + per-query memory cap + thread cap) — a scan
     without it trusts the server-wide limit and can take the box down on a
     300M-row case."""
-    from tracesignal.db._scan import HEAVY_SCAN_SETTINGS
+    from vestigo.db._scan import HEAVY_SCAN_SETTINGS
 
     class _RecordingClient(FakeClient):
         def __init__(self) -> None:
@@ -2033,7 +2033,7 @@ def test_charset_temporal_flags_never_seen_chars_and_guards_sentinel():
     values with never-seen chars flag, with the year-2299 sentinel excluded."""
     import math
 
-    from tracesignal.db._dt import TS_NOT_SENTINEL_SQL
+    from vestigo.db._dt import VESTIGO_NOT_SENTINEL_SQL
 
     windows = _one_suspect(
         datetime(2024, 1, 1, tzinfo=UTC),
@@ -2070,7 +2070,7 @@ def test_charset_temporal_flags_never_seen_chars_and_guards_sentinel():
     # Baseline learns from the baseline window; detect scans the suspect union.
     assert "{b1:String}" in baseline_sql
     assert "{w0s:String}" in detect_sql
-    assert TS_NOT_SENTINEL_SQL in detect_sql
+    assert VESTIGO_NOT_SENTINEL_SQL in detect_sql
 
 
 def test_charset_excludes_normal_marked_events_and_limits():
@@ -2159,7 +2159,7 @@ def test_entropy_temporal_learns_band_from_baseline_and_guards_sentinel():
     values scored with the sentinel excluded; min-length clause applies to
     baseline and detect alike."""
 
-    from tracesignal.db._dt import TS_NOT_SENTINEL_SQL
+    from vestigo.db._dt import VESTIGO_NOT_SENTINEL_SQL
 
     windows = _one_suspect(
         datetime(2024, 1, 1, tzinfo=UTC),
@@ -2192,7 +2192,7 @@ def test_entropy_temporal_learns_band_from_baseline_and_guards_sentinel():
     detect_sql = client.full_queries[2]
     assert "{b1:String}" in baseline_sql
     assert "{w0s:String}" in detect_sql
-    assert TS_NOT_SENTINEL_SQL in detect_sql
+    assert VESTIGO_NOT_SENTINEL_SQL in detect_sql
     assert "lengthUTF8" in baseline_sql
     assert "lengthUTF8" in detect_sql
 
@@ -3986,7 +3986,7 @@ def test_distribution_drift_tiny_window_warning():
 
 def test_distribution_drift_topk_other_bucket():
     """Categories beyond the top-K fold into one exact __other__ bucket."""
-    from tracesignal.db import anomaly_stats
+    from vestigo.db import anomaly_stats
 
     # 52 categories: 50 named + 2 folded. The two tail categories (lowest
     # baseline counts) shift hard into the window.

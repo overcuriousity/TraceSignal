@@ -16,21 +16,21 @@ from typing import Any
 
 import pytest
 
-from tracesignal.db._buckets import (
+from vestigo.db._buckets import (
     aligned_bucket_starts,
     bucket_interval_seconds,
     query_timestamp_range,
 )
-from tracesignal.db._dt import (
+from vestigo.db._dt import (
     NULL_TS_SENTINEL_ISO,
-    TS_NOT_SENTINEL_SQL,
+    VESTIGO_NOT_SENTINEL_SQL,
     ensure_utc,
     ensure_utc_iso,
 )
-from tracesignal.db._offsets import effective_ts_sql
-from tracesignal.db.clickhouse import ClickHouseStore
-from tracesignal.db.queries import EventQuery, EventQueryService, _field_column_expr
-from tracesignal.models.event import Event
+from vestigo.db._offsets import effective_ts_sql
+from vestigo.db.clickhouse import ClickHouseStore
+from vestigo.db.queries import EventQuery, EventQueryService, _field_column_expr
+from vestigo.models.event import Event
 
 CASE_ID = f"tc-fusedts-{uuid.uuid4().hex[:8]}"
 SRC_A = "src-fused-a"
@@ -159,7 +159,7 @@ def _oracle(
                {col_expr} AS val,
                count() AS c
         FROM {database}.events
-        WHERE {where} AND {TS_NOT_SENTINEL_SQL}
+        WHERE {where} AND {VESTIGO_NOT_SENTINEL_SQL}
             AND has({{series_values:Array(String)}}, {col_expr})
         GROUP BY bucket, val
         ORDER BY bucket
