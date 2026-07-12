@@ -1590,9 +1590,10 @@ def test_field_value_timeseries_pivots_series_with_zero_fill() -> None:
     assert result["interval_seconds"] > 0
     series_by_value = {s["value"]: s for s in result["series"]}
     assert set(series_by_value) == {"a", "b"}
-    # "b" has no row for bucket2 — must be zero-filled, not omitted.
+    # "b" has no row for bucket2 — must be zero-filled, not omitted. The grid
+    # also carries the trailing bucket containing max_ts (Jan 2 00:00).
     b_counts = {b["start"]: b["count"] for b in series_by_value["b"]["buckets"]}
-    assert len(b_counts) == 2
+    assert len(b_counts) == 3
     assert sum(b_counts.values()) == 1
 
 
@@ -1620,10 +1621,11 @@ def test_field_value_timeseries_zero_fills_buckets_with_no_top_value_events() ->
     )
     series_a = next(s for s in result["series"] if s["value"] == "a")
     starts = [b["start"] for b in series_a["buckets"]]
-    assert len(starts) == 4
+    # 4 requested buckets plus the trailing one containing max_ts.
+    assert len(starts) == 5
     counts = {b["start"]: b["count"] for b in series_a["buckets"]}
     assert sum(counts.values()) == 2
-    assert sorted(counts.values()) == [0, 0, 1, 1]
+    assert sorted(counts.values()) == [0, 0, 0, 1, 1]
 
 
 def test_field_value_timeseries_empty_range_returns_empty_series() -> None:
@@ -1708,12 +1710,16 @@ def test_compare_time_histogram_shared_grid_zero_fill_and_no_range_query() -> No
     assert result["interval_seconds"] == 3600
     assert result["primary_total"] == 5
     assert result["comparison_total"] == 90
-    assert len(result["buckets"]) == 2
+    # Three grid buckets: the trailing one contains max_ts itself (02:00) —
+    # empty here, but it must exist so events in a partial trailing bucket
+    # are never dropped from the chart.
+    assert len(result["buckets"]) == 3
     # Primary has no row for b1 — zero-filled on the shared grid, not dropped.
     assert result["buckets"][0]["primary"] == 5
     assert result["buckets"][0]["comparison"] == 50
     assert result["buckets"][1]["primary"] == 0
     assert result["buckets"][1]["comparison"] == 40
+    assert result["buckets"][2] == {"start": max_ts.isoformat(), "primary": 0, "comparison": 0}
 
 
 def test_compare_time_histogram_uses_union_of_layer_ranges() -> None:
