@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] — 2026-07-13
+
+### Added
+
+- **Repeating-sequence (motif) mining** — new `sequence_motif` detector
+  (`docs/ANOMALY_DETECTION.md` §12): per source, time-ordered n-grams of one field's
+  values that *recur* are ranked by support × cadence regularity (median gap, CV,
+  Greenwood spacing test). Mode-less — needs no baseline, runs right after ingestion;
+  optional `start`/`end` scope. Tunables: `VESTIGO_STAT_MOTIF_MIN_SUPPORT`,
+  `VESTIGO_STAT_MOTIF_MAX_CANDIDATES`, `VESTIGO_STAT_MOTIF_CADENCE_TOP_K`.
+- **Routine suppression** — new disposition `kind="routine"`: a motif marked routine has
+  its occurrences materialized (ClickHouse `motif_occurrences` table, auto-created) so the
+  event grid, histogram, and export can collapse them via `collapse_routine`. The response
+  always reports `routine_collapsed_count` — collapse is explicit, never silent. Routine is
+  presentation-only: detectors keep scoring and it never enters the reproducibility hash.
+- **Patterns tab** in the Investigate panel: motif list with support, period, regularity
+  bar and per-source cadence; Mark routine / unmark; Explorer collapse toggle with an
+  always-visible collapsed-count banner.
+- **Unified findings feed** — the Anomalies tab now opens with one cross-detector ranked
+  inbox (per-detector rank interleave, raw score with its unit per row, detector chips as
+  filters), built from the detector sweep the count badges already paid for.
+
+### Changed
+
+- The 11 per-detector views moved under a collapsed **Advanced** expander, grouped
+  Values / Volume & timing / Sequences. The dense baseline/suspect-window builder moved
+  from the inline flow into an overlay drawer (FrameBar → *Manage baselines*; histogram
+  mark-mode opens it automatically).
+
 ## [1.0.0] — 2026-07-12
 
 First stable release. Everything below is new in 1.0.0.
