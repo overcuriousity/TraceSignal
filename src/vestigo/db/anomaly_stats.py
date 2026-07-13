@@ -5472,6 +5472,8 @@ class StatisticalAnomalyService:
         values: list[str],
         disposition_id: str,
         max_rows: int = 500_000,
+        start: datetime | None = None,
+        end: datetime | None = None,
         field_mappings: dict[str, list[str]] | None = None,
         source_offsets: dict[str, int] | None = None,
     ) -> tuple[int, list[str]]:
@@ -5479,10 +5481,13 @@ class StatisticalAnomalyService:
 
         Runs once when an analyst marks a motif routine (background job, off
         the request path): per source, re-assembles the n-grams exactly like
-        :meth:`find_sequence_motifs` (same ordering, same partition bounds),
-        keeps occurrences matching *values*, and inserts one row per member
-        event — ``arrayJoin`` over the occurrence's n event ids. The grid's
-        ``collapse_routine`` filter then anti-joins this table; see
+        :meth:`find_sequence_motifs` (same ordering, same partition bounds,
+        and — when the motif was mined with a *start*/*end* scope — the same
+        time predicate at the same query level, so what collapses is exactly
+        what the analyst saw mined, no more), keeps occurrences matching
+        *values*, and inserts one row per member event — ``arrayJoin`` over
+        the occurrence's n event ids. The grid's ``collapse_routine`` filter
+        then anti-joins this table; see
         ``ClickHouseStore.insert_motif_occurrences``.
 
         Returns ``(rows_written, warnings)``. *max_rows* caps the write per
@@ -5500,6 +5505,14 @@ class StatisticalAnomalyService:
         bind_offset_params(source_offsets, params)
         col = _col_expr(series_field, params, field_mappings)
         eff = effective_ts_sql(source_offsets)
+        scope_parts = []
+        if start is not None:
+            params["ms"] = to_clickhouse_utc(start)
+            scope_parts.append(f"{eff} >= {{ms:String}}")
+        if end is not None:
+            params["me"] = to_clickhouse_utc(end)
+            scope_parts.append(f"{eff} < {{me:String}}")
+        scope_pred = " AND ".join(scope_parts) if scope_parts else "1"
         gram_lags = ", ".join(
             [f"lagInFrame(val, {ngram - 1 - j}) OVER w" for j in range(ngram - 1)] + ["val"]
         )
@@ -5529,6 +5542,7 @@ class StatisticalAnomalyService:
                       AND has({{src:Array(String)}}, source_id)
                       AND {col} != ''
                       AND {VESTIGO_NOT_SENTINEL_SQL}
+                      AND ({scope_pred})
                 )
                 WINDOW w AS (
                     PARTITION BY source_id

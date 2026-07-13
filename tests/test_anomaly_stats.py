@@ -3961,6 +3961,34 @@ def test_resolve_motif_occurrences_inserts_member_rows():
     assert params["lim"] == 500_000
 
 
+def test_resolve_motif_occurrences_honors_mining_scope():
+    """A time-scoped mined motif materializes with the same scope predicate,
+    at the same (pre-window) query level — collapse covers exactly what was
+    mined. Unscoped stays the no-op predicate."""
+    client = RecordingClient(
+        [FakeQueryResult(result_rows=[], column_names=["source_id", "first_ts", "member_eid"])]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = _OccurrenceRecordingStore(client)
+    svc.resolve_motif_occurrences(
+        "c1",
+        ["s1"],
+        "artifact",
+        ["a", "b"],
+        "disp-1",
+        start=datetime(2024, 1, 1, tzinfo=UTC),
+        end=datetime(2024, 2, 1, tzinfo=UTC),
+    )
+    sql = client.full_queries[0]
+    assert "{ms:String}" in sql and "{me:String}" in sql
+    # Scope must apply before n-gram assembly (inside the pre-window SELECT),
+    # same as the miner — not as a post-hoc filter on assembled grams.
+    assert sql.index("{ms:String}") < sql.index("WINDOW w AS")
+    params = client._all_parameters[0]
+    assert params["ms"] == "2024-01-01 00:00:00"
+    assert params["me"] == "2024-02-01 00:00:00"
+
+
 def test_resolve_motif_occurrences_cap_warning():
     occ_ts = datetime(2024, 1, 1, tzinfo=UTC)
     client = RecordingClient(

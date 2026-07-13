@@ -143,6 +143,36 @@ def test_routine_disposition_invariants_and_create(client, admin_bootstrap, stor
         ).status_code
         == 422
     )
+    # Non-string / empty elements in details.values rejected.
+    for bad_values in (["a", 2], ["a", ""], ["a", None]):
+        assert (
+            client.post(
+                base,
+                json={
+                    "kind": "routine",
+                    "detector": "sequence_motif",
+                    "field": "artifact",
+                    "value": "a → b",
+                    "details": {"values": bad_values},
+                },
+            ).status_code
+            == 422
+        )
+    # value disagreeing with details.values rejected — the displayed motif
+    # and the materialized occurrences must describe the same pattern.
+    assert (
+        client.post(
+            base,
+            json={
+                "kind": "routine",
+                "detector": "sequence_motif",
+                "field": "artifact",
+                "value": "a → b",
+                "details": {"values": ["a", "c"]},
+            },
+        ).status_code
+        == 422
+    )
 
     # Valid create: row persisted, background materialization scheduled.
     from vestigo.api.routers import dispositions as dispo_module
@@ -168,16 +198,39 @@ def test_routine_disposition_invariants_and_create(client, admin_bootstrap, stor
     assert row["detector"] == "sequence_motif"
     assert resp["materialization_job_id"]
     assert len(materialize_calls) == 1
-    # Job args: (job_id, case_id, source_ids, series_field, values, disposition_id, ...)
+    # Job args: (job_id, case_id, source_ids, series_field, values,
+    # disposition_id, start, end, ...). Unscoped mining → unscoped collapse.
     args = materialize_calls[0]
     assert args[1] == case_id
     assert args[3] == "artifact"
     assert args[4] == ["a", "b", "c"]
     assert args[5] == row["id"]
+    assert args[6] is None and args[7] is None
+
+    # A time-scoped mined motif hands its frame to the materialization job,
+    # so the collapse covers exactly what the analyst saw mined.
+    client.post(
+        base,
+        json={
+            "kind": "routine",
+            "detector": "sequence_motif",
+            "field": "artifact",
+            "value": "x → y",
+            "details": {
+                "values": ["x", "y"],
+                "scope_start": "2026-07-01T00:00:00+00:00",
+                "scope_end": "2026-07-02T00:00:00+00:00",
+            },
+        },
+    )
+    assert len(materialize_calls) == 2
+    args = materialize_calls[1]
+    assert args[6] == datetime.fromisoformat("2026-07-01T00:00:00+00:00")
+    assert args[7] == datetime.fromisoformat("2026-07-02T00:00:00+00:00")
 
     # Listable by kind.
     routine = client.get(base, params={"kind": "routine"}).json()["dispositions"]
-    assert [d["id"] for d in routine] == [row["id"]]
+    assert {d["id"] for d in routine} == {row["id"], materialize_calls[1][5]}
 
 
 def test_dispositions_hash_ignores_routine():

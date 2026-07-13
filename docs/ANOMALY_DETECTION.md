@@ -1311,7 +1311,9 @@ ranking is reproducible arithmetic.
 `details` snapshots the motif). Routine is **presentation-only** — detectors
 keep scoring and it never enters the reproducibility hash — but it has one
 side effect: a background job re-resolves the motif's occurrences (same SQL,
-filtered to the one n-gram) and materializes every member event id into the
+filtered to the one n-gram; if mining was `start`/`end`-scoped, the snapshotted
+`details.scope_start`/`scope_end` re-apply so the collapse covers exactly the
+mined frame) and materializes every member event id into the
 `motif_occurrences` ClickHouse table (capped at 500k rows per disposition,
 partial coverage warned). The Explorer's *Collapse routine* toggle then
 anti-joins that table — and the response always carries

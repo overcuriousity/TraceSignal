@@ -18,7 +18,7 @@ deletable: forensic reproducibility is carried by the DetectorRun snapshot
 
 from __future__ import annotations
 
-from datetime import UTC
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
@@ -95,10 +95,22 @@ def _validate_scope(p: DispositionCreate) -> str:
                 status_code=422, detail="routine requires detector 'sequence_motif'"
             )
         values = (p.details or {}).get("values")
-        if not isinstance(values, list) or not 2 <= len(values) <= 5:
+        if (
+            not isinstance(values, list)
+            or not 2 <= len(values) <= 5
+            or not all(isinstance(v, str) and v for v in values)
+        ):
             raise HTTPException(
                 status_code=422,
-                detail="routine requires details.values (the motif's 2–5 sequence values)",
+                detail="routine requires details.values (the motif's 2–5 non-empty string values)",
+            )
+        # The displayed value and the materialized occurrences must describe
+        # the same motif — an inconsistent pair would collapse events the row
+        # doesn't announce.
+        if p.value != " → ".join(values):
+            raise HTTPException(
+                status_code=422,
+                detail="routine value must equal ' → '.join(details.values)",
             )
     return "value" if has_value else "event"
 
@@ -108,6 +120,27 @@ async def _require_timeline(case_id: str, timeline_id: str) -> None:
         raise HTTPException(status_code=404, detail="Timeline not found")
 
 
+def _details_scope(details: dict[str, Any]) -> tuple[datetime | None, datetime | None]:
+    """Parse the mining frame the motif finding snapshotted into its details.
+
+    ``scope_start``/``scope_end`` are the ISO timestamps ``find_sequence_motifs``
+    records when mining was time-scoped; materialization must honor them so
+    the collapse covers exactly what the analyst saw mined. Unparseable or
+    absent values fall back to None (unscoped).
+    """
+
+    def _parse(key: str) -> datetime | None:
+        raw = details.get(key)
+        if not isinstance(raw, str):
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+
+    return _parse("scope_start"), _parse("scope_end")
+
+
 def _run_motif_materialization_job(
     job_id: str,
     case_id: str,
@@ -115,6 +148,8 @@ def _run_motif_materialization_job(
     series_field: str,
     values: list[str],
     disposition_id: str,
+    start: datetime | None,
+    end: datetime | None,
     field_mappings: dict[str, list[str]] | None,
     source_offsets: dict[str, int] | None,
     job_store: JobStore,
@@ -136,6 +171,8 @@ def _run_motif_materialization_job(
             series_field=series_field,
             values=values,
             disposition_id=disposition_id,
+            start=start,
+            end=end,
             field_mappings=field_mappings,
             source_offsets=source_offsets,
         )
@@ -190,6 +227,7 @@ async def _schedule_routine_materialization(
             created_by=user.id,
             case_id=case_id,
         )
+        start, end = _details_scope(row["details"])
         background_tasks.add_task(
             _run_motif_materialization_job,
             job.id,
@@ -198,6 +236,8 @@ async def _schedule_routine_materialization(
             row["field"],
             list(row["details"]["values"]),
             row["id"],
+            start,
+            end,
             field_mappings,
             source_offsets,
             job_store,
