@@ -13,8 +13,11 @@
 import { useState } from "react";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { Spinner } from "@/components/ui/Spinner";
+import { Tooltip } from "@/components/ui/Tooltip";
 import { DETECTOR_CATEGORIES, DETECTORS, type DetectorId } from "./detector-registry";
 import { useDetectorSweep } from "./detector-hooks";
+import { useTriageCoverage } from "@/hooks/useTriageCoverage";
+import type { DetectorCoverage } from "@/lib/triage-coverage";
 import { ValueNoveltyView } from "./ValueNoveltyView";
 import { ComboNoveltyView } from "./ComboNoveltyView";
 import { FrequencyView } from "./FrequencyView";
@@ -47,6 +50,7 @@ export function DetectorAccordion(props: Props) {
 
   const sweep = useDetectorSweep(caseId, timelineId);
   const needsBaseline = sweep.needsBaseline;
+  const { byDetector } = useTriageCoverage(caseId, timelineId);
 
   return (
     <div className="rounded border border-[var(--color-border)]">
@@ -80,6 +84,7 @@ export function DetectorAccordion(props: Props) {
                       <span className="truncate text-[10px] text-[var(--color-fg-muted)]">{d.hint}</span>
                     )}
                   </span>
+                  {!needsBaseline && <CoverageBadge coverage={byDetector[d.id]} />}
                   <CountBadge
                     count={needsBaseline ? undefined : count}
                     loading={sweep.isFetching && count === undefined}
@@ -96,6 +101,35 @@ export function DetectorAccordion(props: Props) {
         </div>
       ))}
     </div>
+  );
+}
+
+/**
+ * Muted "✓ X/Y reviewed" badge next to the finding count. `≥` marks a
+ * truncated sweep (coverage checked against the fetched slice only) — a
+ * lower bound, so no percentage is ever shown.
+ */
+function CoverageBadge({ coverage }: { coverage: DetectorCoverage | null }) {
+  if (!coverage || coverage.denominator === 0) return null;
+  const { reviewed, denominator, truncated, totalFindings, fetched, verdictsByKind } = coverage;
+  const outstanding = Math.max(0, denominator - reviewed);
+  const lines = [
+    truncated
+      ? `≥${reviewed} of ${denominator} findings reviewed (coverage checked against the top ${fetched} findings by severity; ${totalFindings - fetched} more not fetched)`
+      : `${reviewed} of ${denominator} findings reviewed`,
+    `${outstanding}${truncated ? " or fewer" : ""} outstanding`,
+    `Verdicts: ${verdictsByKind.dismissed} dismissed, ${verdictsByKind.confirmed} confirmed, ${verdictsByKind.routine} routine`,
+    verdictsByKind.normal > 0
+      ? `${verdictsByKind.normal} value${verdictsByKind.normal === 1 ? "" : "s"} marked normal (removed from detection, not counted here)`
+      : null,
+  ].filter(Boolean);
+  return (
+    <Tooltip content={lines.join(". ")}>
+      <span className="shrink-0 font-mono text-[10px] text-[var(--color-fg-muted)]">
+        ✓ {truncated ? "≥" : ""}
+        {reviewed}/{denominator}
+      </span>
+    </Tooltip>
   );
 }
 

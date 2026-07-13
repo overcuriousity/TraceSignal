@@ -659,6 +659,39 @@ export interface DispositionListResponse {
   dispositions: Disposition[];
 }
 
+/** One UTC calendar day of disposition activity (triage burn-down source). */
+export interface DispositionStatsDay {
+  date: string; // "YYYY-MM-DD" (UTC)
+  normal: number;
+  dismissed: number;
+  confirmed: number;
+  routine: number;
+  total: number;
+  cumulative: {
+    normal: number;
+    dismissed: number;
+    confirmed: number;
+    routine: number;
+    total: number;
+  };
+}
+
+/**
+ * Per-day disposition counts by kind (ascending, gaps not filled). Counts
+ * reflect current rows only — deleted verdicts are not shown; the audit
+ * trail records deletions.
+ */
+export interface DispositionStatsResponse {
+  days: DispositionStatsDay[];
+  totals: {
+    normal: number;
+    dismissed: number;
+    confirmed: number;
+    routine: number;
+    total: number;
+  };
+}
+
 /** One active finding fed to the histogram overlay / event grid highlighting. */
 export interface AnomalyMarker {
   ts: string;

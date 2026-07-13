@@ -1318,6 +1318,10 @@ anti-joins that table — and the response always carries
 `routine_collapsed_count`, so **nothing is ever hidden silently**. Deleting
 the disposition reactivates the events immediately (filtering is by active
 disposition id; the leftover rows are inert and swept in the background).
+Because sequence_novelty (detector 9) surfaces the identical
+`(series_field, "a → b → c")` allowlist key, a routine verdict also counts a
+matching sequence_novelty finding as reviewed in the Investigate panel's
+coverage badges — exact key equality, never n-gram containment.
 
 ### Caveats
 

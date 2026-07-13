@@ -27,7 +27,22 @@ export function fmtPct(ratio: number | null | undefined): string {
   return `${(ratio * 100).toFixed(1)}%`;
 }
 
-/** Truncate a long string with an ellipsis. */
+/**
+ * The routine-collapse toolbar stat: "N routine events hidden (X% of
+ * timeline)". Percent omitted when the timeline total is unknown; small (but
+ * real) shares must never display as a flat 0%.
+ */
+export function formatRoutineStat(count: number, timelineTotal: number): string {
+  const events = `${fmtNum(count)} routine event${count === 1 ? "" : "s"} hidden`;
+  if (timelineTotal <= 0) return events;
+  const pct = (count / timelineTotal) * 100;
+  let pctText: string;
+  if (pct > 0 && pct < 0.1) pctText = "<0.1";
+  else if (pct < 1) pctText = pct.toFixed(1);
+  else pctText = Math.round(pct).toString();
+  return `${events} (${pctText}% of timeline)`;
+}
+
 /** Percent with adaptive precision: whole percents from 10% up, one decimal below. */
 export function fmtPctAdaptive(ratio: number): string {
   const v = ratio * 100;

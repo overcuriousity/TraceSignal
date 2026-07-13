@@ -14,7 +14,6 @@ import { Link, useParams, useSearchParams } from "react-router-dom";
 import { useQuery, useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import {
   FlaskConical,
-  RefreshCw,
   PanelLeftClose,
   PanelLeftOpen,
   BarChart2,
@@ -48,7 +47,7 @@ import { ColumnPicker } from "@/components/explorer/ColumnPicker";
 import { TimelineHistogram } from "@/components/explorer/TimelineHistogram";
 import { FieldHistogramModal } from "@/components/viz/FieldHistogramModal";
 import { InvestigatePanel } from "@/components/analysis/InvestigatePanel";
-import { TriageMeter } from "@/components/triage/TriageMeter";
+import { RoutineCollapseStat } from "@/components/explorer/RoutineCollapseStat";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
@@ -468,7 +467,6 @@ export function ExplorerPage() {
     isFetching,
     isError: eventsError,
     error: eventsQueryError,
-    refetch,
     fetchNextPage,
     hasNextPage,
     fetchPreviousPage,
@@ -516,9 +514,9 @@ export function ExplorerPage() {
     refetchInterval: 30_000,
   });
 
-  // Feeds the TriageMeter's reviewed count: an event dispositioned
-  // normal/dismissed/confirmed counts as reviewed even without a user
-  // annotation. The key is invalidated by useDisposition on every verdict.
+  // Feeds the grid's disposition indicator (dispositionMap) and the
+  // collapse-routine toggle. The key is invalidated by useDisposition on
+  // every verdict.
   const { data: dispositionsData } = useQuery({
     queryKey: ["dispositions", caseId, timelineId],
     queryFn: () => dispositionsApi.list(caseId!, timelineId!),
@@ -531,6 +529,15 @@ export function ExplorerPage() {
     [dispositionsData],
   );
   const routineCollapsedCount = eventsData?.pages?.[0]?.routine_collapsed_count ?? 0;
+  // Timeline-wide event total (ready sources only) — denominator for the
+  // routine-collapse stat; matches routine_collapsed_count's timeline-wide scope.
+  const timelineTotal = useMemo(
+    () =>
+      (timelineSources ?? [])
+        .filter((s) => s.status === "ready")
+        .reduce((sum, s) => sum + (s.event_count ?? 0), 0),
+    [timelineSources],
+  );
 
   const { data: views } = useQuery({
     queryKey: ["views", caseId],
@@ -965,7 +972,13 @@ export function ExplorerPage() {
 
           {/* Right-side actions */}
           <div className="flex items-center gap-1.5 shrink-0 ml-auto">
-            <TriageMeter annotations={annotations ?? []} dispositions={dispositionsData?.dispositions ?? []} totalEvents={total} />
+            {collapseRoutine && (
+              <RoutineCollapseStat
+                count={routineCollapsedCount}
+                timelineTotal={timelineTotal}
+                onShow={() => setCollapseRoutine(false)}
+              />
+            )}
 
             {hasRoutineDispositions && (
               <Tooltip
@@ -992,12 +1005,6 @@ export function ExplorerPage() {
                 onClick={() => setHistogramOpen(!histogramOpen)}
               >
                 <BarChart2 size={14} />
-              </Button>
-            </Tooltip>
-
-            <Tooltip content="Refresh events">
-              <Button variant="ghost" size="icon" onClick={() => refetch()}>
-                {isFetching ? <Spinner size={14} /> : <RefreshCw size={14} />}
               </Button>
             </Tooltip>
 
@@ -1049,23 +1056,6 @@ export function ExplorerPage() {
               setInvestigatePanelOpen(true);
             }}
           />
-        )}
-
-        {/* Routine collapse indicator — collapse is explicit, never silent */}
-        {collapseRoutine && (
-          <div className="flex shrink-0 items-center gap-2 bg-[var(--color-accent-dim)] px-3 py-1 text-xs text-[var(--color-fg-primary)]">
-            <Repeat size={11} />
-            <span>
-              {routineCollapsedCount.toLocaleString()} routine event
-              {routineCollapsedCount === 1 ? "" : "s"} collapsed (patterns marked routine).
-            </span>
-            <button
-              className="font-semibold text-[var(--color-accent)] hover:underline"
-              onClick={() => setCollapseRoutine(false)}
-            >
-              Show them
-            </button>
-          </div>
         )}
 
         {/* "Jumped to time" breadcrumb — shown after a jump-to-time cleared filters */}

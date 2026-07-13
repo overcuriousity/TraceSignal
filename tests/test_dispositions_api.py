@@ -4,7 +4,10 @@ db/postgres.py::FindingDisposition)."""
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
+from sqlalchemy import update
 
 from tests.conftest import as_admin
 from vestigo.db.postgres import FindingDisposition, dispositions_hash
@@ -278,6 +281,86 @@ def test_bulk_validates_everything_before_writing(client, admin_bootstrap, store
     )
     assert resp.status_code == 422
     assert client.get(base).json()["dispositions"] == []
+
+
+async def _backdate(store, disposition_id: str, day: str) -> None:
+    """Set a disposition's created_at to noon UTC of *day* (API-created rows
+    all land on "today"; the stats tests need rows spread across days)."""
+    created = datetime.fromisoformat(f"{day}T12:00:00").replace(tzinfo=UTC)
+    async with store.session_factory() as session:
+        await session.execute(
+            update(FindingDisposition)
+            .where(FindingDisposition.id == disposition_id)
+            .values(created_at=created)
+        )
+        await session.commit()
+
+
+async def test_disposition_stats_counts_by_day_and_kind(client, admin_bootstrap, store):
+    as_admin(client, admin_bootstrap)
+    case_id, tl_id = _setup_case(client)
+    base = _base(case_id, tl_id)
+
+    rows = [
+        ("normal", "v1", "2026-07-01"),
+        ("dismissed", "v2", "2026-07-01"),
+        ("dismissed", "v3", "2026-07-03"),
+    ]
+    for kind, value, day in rows:
+        row = client.post(
+            base, json={"kind": kind, "detector": "charset", "field": "f", "value": value}
+        ).json()["disposition"]
+        await _backdate(store, row["id"], day)
+    # One row keeps its real (today's) timestamp.
+    client.post(base, json={"kind": "normal", "detector": "*", "field": "f", "value": "v4"})
+
+    stats = client.get(f"{base}/stats").json()
+    days = stats["days"]
+    assert [d["date"] for d in days[:2]] == ["2026-07-01", "2026-07-03"]
+    assert len(days) == 3
+
+    assert days[0]["normal"] == 1 and days[0]["dismissed"] == 1 and days[0]["total"] == 2
+    assert days[1]["dismissed"] == 1 and days[1]["total"] == 1
+    assert days[1]["cumulative"] == {
+        "normal": 1,
+        "dismissed": 2,
+        "confirmed": 0,
+        "routine": 0,
+        "total": 3,
+    }
+    assert stats["totals"] == {
+        "normal": 2,
+        "dismissed": 2,
+        "confirmed": 0,
+        "routine": 0,
+        "total": 4,
+    }
+    assert days[-1]["cumulative"] == stats["totals"]
+
+
+def test_disposition_stats_scopes_to_timeline_and_404s(client, admin_bootstrap, store):
+    """Event-scoped rows on sources outside the timeline are excluded."""
+    as_admin(client, admin_bootstrap)
+    case_id, tl_id = _setup_case(client)
+    base = _base(case_id, tl_id)
+
+    client.post(
+        base,
+        json={
+            "kind": "dismissed",
+            "detector": "timestamp_order",
+            "source_id": "s-none",
+            "event_id": "e1",
+        },
+    )
+    client.post(base, json={"kind": "normal", "detector": "charset", "field": "f", "value": "v"})
+
+    stats = client.get(f"{base}/stats").json()
+    assert stats["totals"]["total"] == 1
+    assert stats["totals"]["normal"] == 1
+
+    resp = client.get(f"/api/cases/{case_id}/timelines/nope/dispositions/stats")
+    assert resp.status_code == 404
 
 
 def test_dispositions_hash_covers_normal_only_and_event_scope():

@@ -42,6 +42,7 @@ import { FindingsFeed } from "./FindingsFeed";
 import { PatternsView } from "./PatternsView";
 import { BaselineBuilderDrawer } from "./BaselineBuilderDrawer";
 import { NormalValuesList } from "./WindowsNormality";
+import { TriageBurndown } from "./TriageBurndown";
 import { timelinesApi } from "@/api/timelines";
 import { useUiStore } from "@/stores/ui";
 import { useBaselineStore } from "@/stores/baseline";
@@ -264,7 +265,12 @@ export function InvestigatePanel({
                 Dispositions
                 <InfoHint content={GLOSSARY.normalValues} />
               </button>
-              {normalOpen && <NormalValuesList caseId={caseId} timelineId={timelineId} />}
+              {normalOpen && (
+                <div className="space-y-3">
+                  <TriageBurndown caseId={caseId} timelineId={timelineId} />
+                  <NormalValuesList caseId={caseId} timelineId={timelineId} />
+                </div>
+              )}
             </div>
           </>
         )}

@@ -8,7 +8,7 @@ import { shouldInvalidate } from "@/hooks/useCaseStream";
  * Invalidates every annotation/tag-sensitive panel query on success — the
  * same prefix list `useCaseStream` uses for SSE-driven invalidation, so a
  * teammate's live update and the analyst's own edit refresh the same set of
- * panels (EventGrid chips, EventDetailPanel, TriageMeter, ValueNoveltyView,
+ * panels (EventGrid chips, EventDetailPanel, ValueNoveltyView,
  * FrequencyView, histogram, viz modals).
  */
 export function useAnnotationMutations(caseId: string, sourceId: string) {

@@ -1,7 +1,37 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-13 (session 55 — sequence_motif miner, routine grid collapse,
-investigation-UI restructure).
+Last updated: 2026-07-13 (session 56 — triage de-gamification, per-detector coverage,
+disposition burn-down).
+
+## Session 56 — 2026-07-13: triage de-gamification + honest progress surfaces
+
+The Explorer toolbar's gamification widgets measured the wrong thing (annotations-only,
+per-tab-session, blind to value-scoped/routine dispositions — the primary triage path) and
+the Refresh button duplicated the existing auto-refresh (ingest invalidation, SSE case
+stream, 30 s annotation poll). Replaced with forensically honest progress:
+
+- **Removed:** Refresh-events button, `TriageMeter`, `SessionMomentum`, `lib/session.ts`
+  (the `annotations`/`dispositions` queries stay — they feed the grid's annotation and
+  disposition indicators and the collapse toggle).
+- **Routine-collapse stat** (`RoutineCollapseStat`, toolbar): while collapse is on,
+  "N routine events hidden (X% of timeline)" — numerator is the existing timeline-wide
+  `routine_collapsed_count`, denominator the ready sources' `event_count` sum; click turns
+  collapse off. Replaces the full-width banner; still never silent, no new backend.
+- **Per-detector coverage** (`lib/triage-coverage.ts`, `useTriageCoverage`): "✓ X/Y
+  reviewed" badges in the detector accordion + a summary line atop the findings feed.
+  Denominator = current finding population (`total_findings` + `dismissed_count`); numerator
+  = dismissed + fetched findings covered by confirmed/routine rows. `normal` verdicts are
+  disclosed separately (they shrink the population, they don't review it). Truncated sweeps
+  (limit 50) render `≥X/Y` and never a percentage — coverage on the unfetched tail is
+  unknown, so the numerator is an honest lower bound. Routine verdicts (declared on
+  sequence_motif) cover sequence_novelty findings by exact `(field, " → " n-gram)` equality.
+- **Triage burn-down** (`GET …/dispositions/stats` + `TriageBurndown` in the Dispositions
+  section): cumulative verdicts by kind per UTC day, charted with the existing `LineChart`.
+  Deliberately *not* "outstanding remaining" — the denominator moves as detectors re-run —
+  and captioned that deleted verdicts vanish from the chart (the audit trail records
+  deletions). Endpoint aggregates in Python over the `list_dispositions` row set (small
+  counts, dialect-portable, one scoping code path); stats query key sits under the
+  `["dispositions", case, timeline]` prefix so every verdict invalidates it for free.
 
 ## Session 55 — 2026-07-13: motif mining + investigation-UI restructure
 

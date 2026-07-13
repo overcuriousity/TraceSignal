@@ -16,6 +16,7 @@ import { DETECTORS, type DetectorId } from "./detector-registry";
 import { useCappedFindings, useDetectorSweep, useOpenEvent } from "./detector-hooks";
 import { FindingRowActions, FindingShell, NeedsBaselinePrompt, RefreshButton, ResultsBar } from "./detector-shared";
 import { interleaveByRank, normalizeFinding, type FeedItem } from "@/lib/finding-normalize";
+import { useTriageCoverage } from "@/hooks/useTriageCoverage";
 import { cn } from "@/lib/cn";
 import { fmtTimestampCompactUtc as fmtTs } from "@/lib/time";
 import type { Event } from "@/api/types";
@@ -84,6 +85,7 @@ function FeedRow({
 
 export function FindingsFeed({ caseId, timelineId, onSelectEvent, onJumpToTime }: Props) {
   const sweep = useDetectorSweep(caseId, timelineId);
+  const { summary } = useTriageCoverage(caseId, timelineId);
   const [activeChips, setActiveChips] = useState<Set<DetectorId>>(new Set());
 
   const perDetector = useMemo(() => {
@@ -119,6 +121,21 @@ export function FindingsFeed({ caseId, timelineId, onSelectEvent, onJumpToTime }
 
   return (
     <div className="space-y-2">
+      {/* Triage coverage — reviewed vs. the current finding population.
+          "≥" marks truncated sweeps (coverage checked on fetched slices only). */}
+      {summary.denominator > 0 && (
+        <p className="text-[11px] text-[var(--color-fg-muted)]">
+          <span className="font-mono font-semibold text-[var(--color-fg-secondary)]">
+            {summary.anyTruncated ? "≥" : ""}
+            {summary.reviewed}/{summary.denominator}
+          </span>{" "}
+          findings reviewed
+          {summary.anyTruncated && (
+            <span> (coverage checked against the top 50 findings per detector)</span>
+          )}
+        </p>
+      )}
+
       {/* Detector chips — count per detector, toggling filters the feed. */}
       <div className="flex flex-wrap items-center gap-1">
         {perDetector.map(({ meta, items, error }) => {

@@ -18,6 +18,7 @@ deletable: forensic reproducibility is carried by the DetectorRun snapshot
 
 from __future__ import annotations
 
+from datetime import UTC
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
@@ -234,6 +235,58 @@ async def list_dispositions(
         detector=detector,
     )
     return {"dispositions": [d.to_dict() for d in rows]}
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/dispositions/stats")
+async def disposition_stats(
+    case_id: str,
+    timeline_id: str,
+    case: Case = Depends(require_case_read),
+) -> dict[str, Any]:
+    """Per-day disposition counts by kind, plus cumulative totals — the
+    triage burn-down source.
+
+    Aggregated in Python over the same timeline-scoped row set
+    ``list_dispositions`` returns: counts are small, this stays
+    dialect-portable (SQLite runs the same code in tests), and there is one
+    scoping code path. Days are UTC calendar dates of ``created_at``, sorted
+    ascending, gap-free filling left to the client. Counts reflect *current*
+    rows only — deleted verdicts are not shown; the audit trail records
+    deletions.
+    """
+    store = get_store()
+    timeline = await store.get_timeline(case_id, timeline_id)
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="Timeline not found")
+    source_ids = [s.id for s in timeline.sources]
+    rows = await store.list_dispositions(case_id, timeline_id=timeline_id, source_ids=source_ids)
+
+    by_day: dict[str, dict[str, int]] = {}
+    for row in rows:
+        if row.created_at is None:
+            continue
+        # SQLite (tests) returns naive datetimes; they are stored as UTC.
+        created = row.created_at if row.created_at.tzinfo else row.created_at.replace(tzinfo=UTC)
+        day = created.astimezone(UTC).date().isoformat()
+        counts = by_day.setdefault(day, dict.fromkeys(DISPOSITION_KINDS, 0))
+        counts[row.kind] += 1
+
+    days: list[dict[str, Any]] = []
+    cumulative = dict.fromkeys(DISPOSITION_KINDS, 0)
+    for day in sorted(by_day):
+        counts = by_day[day]
+        for kind in DISPOSITION_KINDS:
+            cumulative[kind] += counts[kind]
+        days.append(
+            {
+                "date": day,
+                **counts,
+                "total": sum(counts.values()),
+                "cumulative": {**cumulative, "total": sum(cumulative.values())},
+            }
+        )
+    totals = {**cumulative, "total": sum(cumulative.values())}
+    return {"days": days, "totals": totals}
 
 
 async def _create_one(

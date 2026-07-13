@@ -28,7 +28,9 @@ export interface DispositionTarget {
   details?: Record<string, unknown>;
 }
 
-/** True when the disposition target covers this finding. */
+/** True when the disposition target covers this finding. Sibling of
+ * `dispositionCoversFinding` in lib/triage-coverage.ts, which matches
+ * persisted Disposition rows for the coverage badges. */
 function matchesTarget(f: AnomalyFinding, t: DispositionTarget): boolean {
   if (t.field !== undefined && t.value !== undefined) {
     return (
