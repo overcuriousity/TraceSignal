@@ -158,6 +158,23 @@ def test_routine_disposition_invariants_and_create(client, admin_bootstrap, stor
             ).status_code
             == 422
         )
+    # Present-but-malformed mining scope rejected — a bad snapshot must never
+    # silently degrade to an unscoped (wider) collapse.
+    for bad_scope in ({"scope_start": "not-a-date"}, {"scope_end": 12345}):
+        assert (
+            client.post(
+                base,
+                json={
+                    "kind": "routine",
+                    "detector": "sequence_motif",
+                    "field": "artifact",
+                    "value": "a → b",
+                    "details": {"values": ["a", "b"], **bad_scope},
+                },
+            ).status_code
+            == 422
+        )
+
     # value disagreeing with details.values rejected — the displayed motif
     # and the materialized occurrences must describe the same pattern.
     assert (
@@ -334,6 +351,120 @@ def test_bulk_validates_everything_before_writing(client, admin_bootstrap, store
     )
     assert resp.status_code == 422
     assert client.get(base).json()["dispositions"] == []
+
+
+@pytest.mark.asyncio
+async def test_update_disposition_details_merges_without_clobbering(store):
+    await store.init_schema()
+    row = await store.create_disposition(
+        case_id="c1",
+        kind="routine",
+        detector="sequence_motif",
+        timeline_id="t1",
+        field="artifact",
+        value="a → b",
+        details={"values": ["a", "b"], "scope_start": "2026-07-01T00:00:00+00:00"},
+    )
+    ok = await store.update_disposition_details(
+        "c1", row.id, {"materialization": {"status": "completed", "rows_written": 4}}
+    )
+    assert ok is True
+    rows = await store.list_dispositions("c1", timeline_id="t1")
+    details = rows[0].details
+    # Patch merged; pre-existing keys (the collapse contract) untouched.
+    assert details["materialization"] == {"status": "completed", "rows_written": 4}
+    assert details["values"] == ["a", "b"]
+    assert details["scope_start"] == "2026-07-01T00:00:00+00:00"
+    # Unknown row → False, no error.
+    assert await store.update_disposition_details("c1", "nope", {"x": 1}) is False
+
+
+def test_materialization_outcome_persisted_on_disposition(
+    client, admin_bootstrap, store, monkeypatch
+):
+    """The background job writes its outcome (incl. cap warnings / failure)
+    into details.materialization — durable, unlike the in-memory job result."""
+    from vestigo.api.routers import dispositions as dispo_module
+    from vestigo.core.jobs import get_job_store
+    from vestigo.db.postgres import PostgresStore
+
+    as_admin(client, admin_bootstrap)
+    case_id, tl_id = _setup_case(client)
+    base = _base(case_id, tl_id)
+
+    # The job helper opens a fresh store (thread/loop isolation); point it at
+    # the test database instead of the configured Postgres.
+    test_url = str(store.engine.url)
+    monkeypatch.setattr(
+        "vestigo.db.postgres.PostgresStore",
+        lambda url=None: PostgresStore(url=test_url),
+    )
+
+    class _FakeSvc:
+        def __init__(self, result=None, error=None):
+            self.result, self.error = result, error
+
+        def resolve_motif_occurrences(self, **kwargs):
+            if self.error:
+                raise RuntimeError(self.error)
+            return self.result
+
+    row = client.post(
+        base,
+        json={
+            "kind": "routine",
+            "detector": "sequence_motif",
+            "field": "artifact",
+            "value": "a → b",
+            "details": {"values": ["a", "b"]},
+        },
+    ).json()["disposition"]
+
+    # Completed with a cap warning.
+    monkeypatch.setattr(
+        "vestigo.api.routers.events._get_stat_anomaly_service",
+        lambda: _FakeSvc(result=(4, ["partial collapse"])),
+    )
+    job = get_job_store().create(kind="motif_materialize", case_id=case_id)
+    dispo_module._run_motif_materialization_job(
+        job.id,
+        case_id,
+        ["s1"],
+        "artifact",
+        ["a", "b"],
+        row["id"],
+        None,
+        None,
+        None,
+        None,
+        get_job_store(),
+    )
+    stored = client.get(base, params={"kind": "routine"}).json()["dispositions"][0]
+    mat = stored["details"]["materialization"]
+    assert mat == {"status": "completed", "rows_written": 4, "warnings": ["partial collapse"]}
+
+    # Failure path overwrites with status=failed.
+    monkeypatch.setattr(
+        "vestigo.api.routers.events._get_stat_anomaly_service",
+        lambda: _FakeSvc(error="clickhouse down"),
+    )
+    job2 = get_job_store().create(kind="motif_materialize", case_id=case_id)
+    dispo_module._run_motif_materialization_job(
+        job2.id,
+        case_id,
+        ["s1"],
+        "artifact",
+        ["a", "b"],
+        row["id"],
+        None,
+        None,
+        None,
+        None,
+        get_job_store(),
+    )
+    stored = client.get(base, params={"kind": "routine"}).json()["dispositions"][0]
+    assert stored["details"]["materialization"] == {"status": "failed", "error": "clickhouse down"}
+    assert stored["details"]["values"] == ["a", "b"]
 
 
 async def _backdate(store, disposition_id: str, day: str) -> None:

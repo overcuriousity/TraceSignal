@@ -121,6 +121,26 @@ def test_basic_query_parameterizes_case_id(service: EventQueryService) -> None:
     assert params.get("p0") == "case-1"
 
 
+def test_routine_collapse_anti_join_is_parameterized(service: EventQueryService) -> None:
+    """The routine-collapse anti-join subquery binds case_id and the active
+    disposition ids through the builder (no string interpolation of values),
+    and is absent when no ids are given."""
+    service.query(
+        EventQuery(case_id="case-1", exclude_routine_disposition_ids=["disp-1", "disp-2"])
+    )
+    query, params = _last_query(service)
+    assert "toString(event_id) NOT IN (SELECT event_id FROM" in query
+    assert ".motif_occurrences WHERE case_id = {" in query
+    assert params is not None
+    bound = list(params.values())
+    assert "case-1" in bound
+    assert ["disp-1", "disp-2"] in bound
+
+    service.query(EventQuery(case_id="case-1"))
+    query, _ = _last_query(service)
+    assert "motif_occurrences" not in query
+
+
 def test_source_ids_filter_is_parameterized(service: EventQueryService) -> None:
     """Multiple source_ids use a typed `IN {p:Array(String)}` — source_id is a
     String column, and the bare-column IN form keeps ClickHouse able to use

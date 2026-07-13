@@ -112,6 +112,22 @@ def _validate_scope(p: DispositionCreate) -> str:
                 status_code=422,
                 detail="routine value must equal ' → '.join(details.values)",
             )
+        # A snapshotted mining frame must be parseable — materialization
+        # honors it, and a malformed value must never silently degrade to an
+        # unscoped (wider) collapse.
+        for key in ("scope_start", "scope_end"):
+            raw = (p.details or {}).get(key)
+            if raw is None:
+                continue
+            try:
+                if not isinstance(raw, str):
+                    raise ValueError
+                datetime.fromisoformat(raw)
+            except ValueError:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"routine details.{key} must be an ISO timestamp",
+                ) from None
     return "value" if has_value else "event"
 
 
@@ -125,18 +141,20 @@ def _details_scope(details: dict[str, Any]) -> tuple[datetime | None, datetime |
 
     ``scope_start``/``scope_end`` are the ISO timestamps ``find_sequence_motifs``
     records when mining was time-scoped; materialization must honor them so
-    the collapse covers exactly what the analyst saw mined. Unparseable or
-    absent values fall back to None (unscoped).
+    the collapse covers exactly what the analyst saw mined. Absent values mean
+    unscoped mining; a *present but unparseable* value raises — degrading to
+    unscoped would collapse MORE than the analyst saw, so the job must fail
+    instead (create-time validation makes this unreachable for API-written
+    rows; this guards pre-validation rows and future writers).
     """
 
     def _parse(key: str) -> datetime | None:
         raw = details.get(key)
+        if raw is None:
+            return None
         if not isinstance(raw, str):
-            return None
-        try:
-            return datetime.fromisoformat(raw)
-        except ValueError:
-            return None
+            raise ValueError(f"{key} must be an ISO timestamp string, got {type(raw).__name__}")
+        return datetime.fromisoformat(raw)
 
     return _parse("scope_start"), _parse("scope_end")
 
@@ -160,6 +178,10 @@ def _run_motif_materialization_job(
     blocking ClickHouse scan off the event loop. Failure leaves the grid
     collapse a no-op for this disposition (no occurrence rows), never a wrong
     result; the job error is pollable via the jobs API.
+
+    The outcome (rows written, cap warnings, or the failure) is also persisted
+    to the disposition's ``details.materialization`` — the JobStore is
+    in-memory, and "this collapse is partial/inactive" must survive a restart.
     """
     from vestigo.api.routers.events import _get_stat_anomaly_service
 
@@ -176,13 +198,51 @@ def _run_motif_materialization_job(
             field_mappings=field_mappings,
             source_offsets=source_offsets,
         )
+        _persist_materialization_outcome(
+            case_id,
+            disposition_id,
+            {"status": "completed", "rows_written": written, "warnings": warnings},
+        )
         job_store.update(
             job_id,
             status="completed",
             result={"rows_written": written, "warnings": warnings},
         )
     except Exception as exc:  # noqa: BLE001 — job boundary: report, don't crash the pool
+        _persist_materialization_outcome(
+            case_id, disposition_id, {"status": "failed", "error": str(exc)}
+        )
         job_store.update(job_id, status="failed", error=str(exc))
+
+
+def _persist_materialization_outcome(
+    case_id: str, disposition_id: str, outcome: dict[str, Any]
+) -> None:
+    """Best-effort write of the materialization outcome onto the disposition.
+
+    Runs in the job's threadpool thread. A fresh store + one ``asyncio.run``,
+    engine disposed before the loop closes — the shared ``get_store()`` pool's
+    asyncpg connections are bound to the main loop and must not be used here
+    (same pattern as the embedding job's ``_finalize``). Swallows failures: a
+    Postgres hiccup must not turn a completed ClickHouse materialization into
+    a failed job — the job result still carries the same outcome.
+    """
+    import asyncio
+    import contextlib
+
+    from vestigo.db.postgres import PostgresStore
+
+    async def _write() -> None:
+        store = PostgresStore()
+        try:
+            await store.update_disposition_details(
+                case_id, disposition_id, {"materialization": outcome}
+            )
+        finally:
+            await store.engine.dispose()
+
+    with contextlib.suppress(Exception):
+        asyncio.run(_write())
 
 
 def _cleanup_motif_occurrences(case_id: str, disposition_id: str) -> None:

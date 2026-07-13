@@ -3956,6 +3956,10 @@ def test_resolve_motif_occurrences_inserts_member_rows():
     assert "arrayJoin(eids)" in sql
     assert "gram = {g:Array(String)}" in sql
     assert "PARTITION BY source_id" in sql
+    # Deterministic truncation under the row cap: earliest occurrences first,
+    # ordered before LIMIT — re-marking the same motif collapses the same events.
+    assert "ORDER BY first_ts, member_eid" in sql
+    assert sql.index("ORDER BY first_ts, member_eid") < sql.index("LIMIT {lim:UInt64}")
     params = client._all_parameters[0]
     assert params["g"] == ["a", "b", "c"]
     assert params["lim"] == 500_000

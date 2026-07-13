@@ -2593,6 +2593,32 @@ class PostgresStore:
                 await session.refresh(row)
             return rows
 
+    async def update_disposition_details(
+        self, case_id: str, disposition_id: str, patch: dict[str, Any]
+    ) -> bool:
+        """Shallow-merge *patch* into a disposition's ``details`` JSON.
+
+        Used by the motif-materialization job to persist its outcome
+        (``details.materialization``) durably — the JobStore result is
+        in-memory and lost on restart, but a partial collapse must stay
+        announced. Existing keys outside the patch (``values``, ``scope_*``)
+        are preserved. Returns False when the row is gone (deleted mid-job —
+        the occurrence rows are inert then, nothing to record).
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(FindingDisposition).where(
+                    FindingDisposition.case_id == case_id,
+                    FindingDisposition.id == disposition_id,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return False
+            row.details = {**(row.details or {}), **patch}
+            await session.commit()
+            return True
+
     async def delete_disposition(self, case_id: str, disposition_id: str) -> bool:
         """Delete a disposition row. Returns True if it existed."""
         async with self.session_factory() as session:

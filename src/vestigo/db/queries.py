@@ -429,6 +429,18 @@ class _ParameterizedQueryBuilder:
             self.conditions.append(f"{column} NOT IN {{{name}:Array(String)}}")
         self.parameters[name] = values
 
+    def bind(self, value: Any) -> str:
+        """Register *value* as a query parameter and return its generated name.
+
+        For caller-composed conditions that don't fit an ``add_*`` shape
+        (e.g. an anti-join subquery) — pair with :meth:`add`, embedding the
+        returned name as ``{<name>:<Type>}``. Keeps the name counter and the
+        parameter map encapsulated.
+        """
+        name = self._param_name()
+        self.parameters[name] = value
+        return name
+
     def add_tag_filter(self, filt: TagFilter, negate: bool) -> None:
         """Add a unified tag predicate: ``hasAny(tags, :values) OR has(:ids, toString(event_id))``.
 
@@ -814,15 +826,13 @@ class EventQueryService:
             # Anti-join against the (small) motif_occurrences membership table
             # — routine-motif grid collapse. toString matches the String
             # event_id column the occurrence rows store.
-            cid_name = builder._param_name()
-            did_name = builder._param_name()
-            builder.conditions.append(
+            cid_name = builder.bind(query.case_id)
+            did_name = builder.bind(query.exclude_routine_disposition_ids)
+            builder.add(
                 f"toString(event_id) NOT IN (SELECT event_id FROM "
                 f"{self.store.database}.motif_occurrences WHERE case_id = "
                 f"{{{cid_name}:String}} AND has({{{did_name}:Array(String)}}, disposition_id))"
             )
-            builder.parameters[cid_name] = query.case_id
-            builder.parameters[did_name] = query.exclude_routine_disposition_ids
 
         if query.tags_include is not None:
             builder.add_tag_filter(query.tags_include, negate=False)

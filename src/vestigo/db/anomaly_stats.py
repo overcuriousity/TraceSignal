@@ -5492,8 +5492,12 @@ class StatisticalAnomalyService:
 
         Returns ``(rows_written, warnings)``. *max_rows* caps the write per
         disposition (a very common motif times n member rows can explode);
-        hitting it means the collapse is partial — the warning is surfaced on
-        the disposition's details, never silently.
+        hitting it means the collapse is partial — deterministically so: rows
+        are ordered by occurrence time (``first_ts``, tie-broken by member
+        event id) before the cap, so the *earliest* occurrences survive and
+        re-marking the same motif collapses the same events. The warning is
+        persisted to the disposition's details and the job result, never
+        silent.
         """
         ngram = len(values)
         if not 2 <= ngram <= 5:
@@ -5551,6 +5555,7 @@ class StatisticalAnomalyService:
                 )
             )
             WHERE guard IS NOT NULL AND gram = {{g:Array(String)}}
+            ORDER BY first_ts, member_eid
             LIMIT {{lim:UInt64}}
             {HEAVY_SCAN_SETTINGS}
         """

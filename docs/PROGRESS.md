@@ -1,6 +1,37 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-13 (session 57 — Investigate-panel restructure bugfixes).
+Last updated: 2026-07-13 (session 58 — PR109 review fixes: deterministic capped
+materialization, strict scope validation, durable materialization outcome).
+
+## Session 58 — 2026-07-13: PR109 review fixes
+
+Fixes for the PR109 code-review findings (two deliberate won't-fixes recorded —
+`count_motif_occurrences` caching rejected as stale-number risk, per-detector type
+duplication deferred to an OpenAPI-generation ROADMAP item):
+
+- **Deterministic partial collapse:** `resolve_motif_occurrences` now orders occurrence
+  rows by `first_ts, member_eid` before the 500k cap — truncation keeps the *earliest*
+  occurrences, so re-marking the same motif collapses the same events (was ClickHouse
+  scan-order nondeterministic).
+- **Strict mining-scope validation:** a routine disposition with a present-but-malformed
+  `details.scope_start`/`scope_end` is rejected 422 at create; `_details_scope` raises
+  instead of silently falling back to unscoped — a bad snapshot must fail the
+  materialization job, never widen the collapse beyond what the analyst saw mined.
+- **Durable materialization outcome:** the background job persists
+  `details.materialization` (`status`/`rows_written`/`warnings` or `failed`+error) onto the
+  disposition row via new `PostgresStore.update_disposition_details` (shallow merge, never
+  clobbers `values`/`scope_*`) — the JobStore result is in-memory and a partial/inactive
+  collapse must survive a restart. PatternsView routine rows show a warning triangle when
+  materialization failed or was capped. Fresh-store-per-`asyncio.run` pattern (same as the
+  embedding job's `_finalize`) for the sync-thread Postgres write.
+- **Builder encapsulation:** new public `_ParameterizedQueryBuilder.bind(value) → name`;
+  the routine-collapse anti-join no longer reaches into `_param_name`/`conditions`. First
+  test coverage of the anti-join SQL (`test_queries.py`).
+- **Marker clustering:** fixed-bin clustering (split markers straddling a bin edge)
+  replaced by greedy positional merge in new `lib/markerCluster.ts` (pure, tested);
+  offscreen/onscreen streams never merge.
+- **Burn-down caption:** notes that event-scoped verdicts on a source shared across
+  timelines count in each timeline's chart.
 
 ## Session 57 — 2026-07-13: Investigate-panel restructure bugfixes
 

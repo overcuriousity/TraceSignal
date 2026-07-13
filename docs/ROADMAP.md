@@ -80,6 +80,10 @@ resolved — this file holds only the condensed, still-open action items.
 
 - [ ] Split `api/routers/events.py` (1500+ lines: query parsing, export streaming, anomaly
   orchestration, bulk annotation) opportunistically when next touched — not proactively.
+- [ ] Evaluate OpenAPI-generated frontend API types (`openapi-typescript` over `/openapi.json`)
+  to replace the hand-mirrored finding/response types in `frontend/src/api/types.ts` —
+  eliminates the per-detector backend↔frontend type duplication wholesale instead of
+  special-casing single detectors (PR109 review follow-up).
 
 ## Milestone 4 — anomaly detector expansion (AMiner-inspired, field-agnostic)
 

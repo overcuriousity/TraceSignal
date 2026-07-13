@@ -11,7 +11,7 @@
  */
 import { Fragment, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowRight, EyeOff, Info, Repeat, Undo2 } from "lucide-react";
+import { AlertTriangle, ArrowRight, EyeOff, Info, Repeat, Undo2 } from "lucide-react";
 import { anomaliesApi } from "@/api/anomalies";
 import { dispositionsApi } from "@/api/dispositions";
 import { useDisposition } from "@/hooks/useDisposition";
@@ -45,6 +45,27 @@ const SERIES_FIELD_OPTIONS = [
 ];
 
 const NGRAM_OPTIONS = [2, 3, 4, 5];
+
+/**
+ * Human-readable problem with a routine row's occurrence materialization, or
+ * null when it completed cleanly (or hasn't reported yet). The background job
+ * persists its outcome to details.materialization — a failed or capped
+ * materialization means the grid collapse is inactive or partial, which must
+ * be visible on the row, not just in an ephemeral job result.
+ */
+function materializationIssue(details: Record<string, unknown> | null): string | null {
+  const mat = details?.materialization as
+    | { status?: string; error?: string; warnings?: string[] }
+    | undefined;
+  if (!mat) return null;
+  if (mat.status === "failed") {
+    return `Collapse inactive — materialization failed: ${mat.error ?? "unknown error"}`;
+  }
+  if (Array.isArray(mat.warnings) && mat.warnings.length > 0) {
+    return mat.warnings.join(" ");
+  }
+  return null;
+}
 
 /** Humanize a gap in seconds: 90 → "1.5 min", 300 → "5 min", 7200 → "2 h". */
 function fmtPeriod(seconds: number): string {
@@ -371,6 +392,14 @@ export function PatternsView({ caseId, timelineId, onSelectEvent, onJumpToTime }
                   <span className="min-w-0 flex-1 break-all font-mono text-[var(--color-fg-secondary)]">
                     {fieldLabel(d.field ?? "")}: {d.value}
                   </span>
+                  {materializationIssue(d.details) && (
+                    <span
+                      title={materializationIssue(d.details)!}
+                      className="shrink-0 text-[var(--color-warning)]"
+                    >
+                      <AlertTriangle size={12} />
+                    </span>
+                  )}
                   <button
                     title="Unmark routine — its events reappear in the grid immediately"
                     className="flex shrink-0 items-center gap-1 rounded p-0.5 text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-fg-primary)]"

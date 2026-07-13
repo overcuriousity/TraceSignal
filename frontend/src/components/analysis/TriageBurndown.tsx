@@ -64,7 +64,9 @@ export function TriageBurndown({ caseId, timelineId }: Props) {
         <span>
           Cumulative verdicts recorded per day (by creation date of current
           disposition rows; deleted verdicts are not shown — the audit trail
-          records deletions).
+          records deletions). Counts every verdict visible from this timeline:
+          an event-scoped verdict on a source shared with another timeline
+          counts in both.
         </span>
       </p>
     </div>

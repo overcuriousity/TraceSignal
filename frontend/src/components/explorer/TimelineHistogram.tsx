@@ -23,6 +23,7 @@ import type {
   HistogramBucket,
 } from "@/api/types";
 import { cn } from "@/lib/cn";
+import { clusterMarkers } from "@/lib/markerCluster";
 import { useScrollPositionStore } from "@/stores/scrollPosition";
 
 interface Props {
@@ -208,34 +209,14 @@ export function TimelineHistogram({
   // overplot into one indistinguishable dot (the feed publishes findings for
   // all detectors at once, so hundreds of markers sharing buckets is normal).
   // A cluster renders one flag carrying its count; clicking zooms to its
-  // earliest finding.
+  // earliest finding. Greedy merge, not fixed bins — see lib/markerCluster.
   const markerClusters = useMemo(() => {
     if (!markers || markers.length === 0 || !data || buckets.length === 0) return [];
-    const byPos = new Map<
-      number,
-      { pct: number; offscreen: boolean; ts: string; labels: string[]; count: number }
-    >();
-    for (const m of markers) {
-      const plotted = plotMarker(m.ts, buckets, data.interval_seconds);
-      if (!plotted) continue;
-      // 0.5%-of-width position bins; offscreen markers cluster separately.
-      const key = Math.round(plotted.pct * 2) * 2 + (plotted.offscreen ? 1 : 0);
-      const cluster = byPos.get(key);
-      if (cluster) {
-        cluster.count += 1;
-        if (cluster.labels.length < 5) cluster.labels.push(m.label);
-        if (m.ts < cluster.ts) cluster.ts = m.ts;
-      } else {
-        byPos.set(key, {
-          pct: plotted.pct,
-          offscreen: plotted.offscreen,
-          ts: m.ts,
-          labels: [m.label],
-          count: 1,
-        });
-      }
-    }
-    return [...byPos.values()];
+    const plotted = markers.flatMap((m) => {
+      const p = plotMarker(m.ts, buckets, data.interval_seconds);
+      return p ? [{ pct: p.pct, offscreen: p.offscreen, ts: m.ts, label: m.label }] : [];
+    });
+    return clusterMarkers(plotted);
   }, [markers, buckets, data]);
 
   const handleMouseDown = useCallback(
