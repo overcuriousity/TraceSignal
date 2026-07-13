@@ -153,6 +153,12 @@ class EventQuery:
     # Optional event_id denylist (e.g. resolved from an excluded tag filter).
     # None means "no restriction"; entries here are subtracted from the result.
     exclude_event_ids: list[str] | None = None
+    # Active routine-motif dispositions whose materialized occurrence events
+    # (motif_occurrences table) are collapsed out of the result. The caller
+    # resolves the active disposition ids from Postgres per request, so rows
+    # of a deleted disposition never suppress anything, and must always
+    # surface the collapsed count alongside — nothing hidden silently.
+    exclude_routine_disposition_ids: list[str] | None = None
     # Unified tag include/exclude filters — distinct from event_ids/exclude_event_ids
     # because they carry OR-between-two-systems semantics internally, ANDed
     # alongside every other restriction (see TagFilter).
@@ -422,6 +428,18 @@ class _ParameterizedQueryBuilder:
         else:
             self.conditions.append(f"{column} NOT IN {{{name}:Array(String)}}")
         self.parameters[name] = values
+
+    def bind(self, value: Any) -> str:
+        """Register *value* as a query parameter and return its generated name.
+
+        For caller-composed conditions that don't fit an ``add_*`` shape
+        (e.g. an anti-join subquery) — pair with :meth:`add`, embedding the
+        returned name as ``{<name>:<Type>}``. Keeps the name counter and the
+        parameter map encapsulated.
+        """
+        name = self._param_name()
+        self.parameters[name] = value
+        return name
 
     def add_tag_filter(self, filt: TagFilter, negate: bool) -> None:
         """Add a unified tag predicate: ``hasAny(tags, :values) OR has(:ids, toString(event_id))``.
@@ -803,6 +821,18 @@ class EventQueryService:
 
         if query.exclude_event_ids:
             builder.add_not_in_list("event_id", query.exclude_event_ids, cast_to_string=True)
+
+        if query.exclude_routine_disposition_ids:
+            # Anti-join against the (small) motif_occurrences membership table
+            # — routine-motif grid collapse. toString matches the String
+            # event_id column the occurrence rows store.
+            cid_name = builder.bind(query.case_id)
+            did_name = builder.bind(query.exclude_routine_disposition_ids)
+            builder.add(
+                f"toString(event_id) NOT IN (SELECT event_id FROM "
+                f"{self.store.database}.motif_occurrences WHERE case_id = "
+                f"{{{cid_name}:String}} AND has({{{did_name}:Array(String)}}, disposition_id))"
+            )
 
         if query.tags_include is not None:
             builder.add_tag_filter(query.tags_include, negate=False)

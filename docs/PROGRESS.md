@@ -1,7 +1,157 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-12 (session 54 — release 1.0: rename to Vestigo, brand, changelog,
-release workflow).
+Last updated: 2026-07-13 (session 58 — PR109 review fixes: deterministic capped
+materialization, strict scope validation, durable materialization outcome).
+
+## Session 58 — 2026-07-13: PR109 review fixes
+
+Fixes for the PR109 code-review findings (two deliberate won't-fixes recorded —
+`count_motif_occurrences` caching rejected as stale-number risk, per-detector type
+duplication deferred to an OpenAPI-generation ROADMAP item):
+
+- **Deterministic partial collapse:** `resolve_motif_occurrences` now orders occurrence
+  rows by `first_ts, member_eid` before the 500k cap — truncation keeps the *earliest*
+  occurrences, so re-marking the same motif collapses the same events (was ClickHouse
+  scan-order nondeterministic).
+- **Strict mining-scope validation:** a routine disposition with a present-but-malformed
+  `details.scope_start`/`scope_end` is rejected 422 at create; `_details_scope` raises
+  instead of silently falling back to unscoped — a bad snapshot must fail the
+  materialization job, never widen the collapse beyond what the analyst saw mined.
+- **Durable materialization outcome:** the background job persists
+  `details.materialization` (`status`/`rows_written`/`warnings` or `failed`+error) onto the
+  disposition row via new `PostgresStore.update_disposition_details` (shallow merge, never
+  clobbers `values`/`scope_*`) — the JobStore result is in-memory and a partial/inactive
+  collapse must survive a restart. PatternsView routine rows show a warning triangle when
+  materialization failed or was capped. Fresh-store-per-`asyncio.run` pattern (same as the
+  embedding job's `_finalize`) for the sync-thread Postgres write.
+- **Builder encapsulation:** new public `_ParameterizedQueryBuilder.bind(value) → name`;
+  the routine-collapse anti-join no longer reaches into `_param_name`/`conditions`. First
+  test coverage of the anti-join SQL (`test_queries.py`).
+- **Marker clustering:** fixed-bin clustering (split markers straddling a bin edge)
+  replaced by greedy positional merge in new `lib/markerCluster.ts` (pure, tested);
+  offscreen/onscreen streams never merge.
+- **Burn-down caption:** notes that event-scoped verdicts on a source shared across
+  timelines count in each timeline's chart.
+
+## Session 57 — 2026-07-13: Investigate-panel restructure bugfixes
+
+Four regressions from the session-55 UI restructure, reported from real use:
+
+- **Histogram anomaly markers gone by default.** The old default view (per-detector
+  accordion) published markers via `useAnomalyMarkers`; the new default `FindingsFeed`
+  didn't. The feed now publishes every fetched finding (all detectors, chip filters don't
+  narrow the overlay) as markers; while the Advanced accordion is open the expanded
+  detector view owns the markers instead (`InvestigatePanel` hands the callback to exactly
+  one publisher, and `useAnomalyMarkers` now keys on the handler too so ownership
+  hand-over republishes/clears).
+- **Baseline mark-by-drag broken.** `BaselineBuilderDrawer` (fixed full-screen overlay)
+  opened the moment mark mode armed, covering the histogram. Now: arming no longer opens
+  the drawer; while mark mode is on an open drawer stays *mounted* (draft survives) but
+  hides + drops pointer events, replaced by a floating "drag on the histogram" pill with
+  cancel; the drawer opens/reappears when the brushed range lands. The armed-row target
+  moved into `useBaselineStore` so it survives the hidden drawer, a brush with no armed
+  row defaults to the baseline window, and consuming a brush turns mark mode off.
+- **Counts capped at 50 / inconsistent.** Feed chips and accordion badges showed
+  `results.length` (the sweep's limit-50 slice) next to coverage badges built from real
+  totals. Both now show `total_findings ?? results.length`, and the feed's results bar
+  shows "N of M findings" via its existing `serverTotal` truncation affordance.
+- **Mark-normal dead from the feed.** `useDisposition`'s optimistic removal only touched
+  `["anomalies", …]` caches; the feed reads the `["detector-sweep-v2", …]` cache, so a
+  verdict left the row visibly untouched. The mutation now also filters matching findings
+  out of every sweep cache entry (detector-scoped via the registry mapping), with
+  snapshot/rollback on error. Sweeps never fetch `include_dismissed`, so plain removal
+  matches a refetch.
+
+Follow-up sweep for the same defect classes:
+
+- **Histogram marker clustering** (`TimelineHistogram`): the feed now publishes up to
+  11×50 markers; co-located ones overplotted into one dot. Markers within ~0.5% of chart
+  width cluster into one flag carrying a count (99+ cap), tooltip lists up to 5 labels,
+  click zooms to the cluster's earliest finding.
+- **Disposition buttons no longer silently vanish** (`FindingRowActions`): findings with
+  no value key and no representative event used to render no Normal/Dismiss/Confirm at
+  all; they now render disabled with a tooltip stating the scoping reason.
+- **Duplicate axis ticks** (`Axis.tsx`): small integer domains make d3 emit fractional
+  ticks that rounding formats collapse into duplicate labels ("0 1 1 2 2 3 3", seen on
+  the triage burn-down). `AxisLeft` and numeric `AxisBottom` keep only the last tick of
+  each label run; time ticks untouched (their label runs are intentional).
+- `SWEEP_LIMIT` constant replaces the magic 50 in the sweep fetch + feed coverage copy;
+  removed WindowsNormality's now-unreachable inline mark-mode hint (the drawer hides
+  while mark mode is on; the floating pill carries the guidance).
+
+Left deliberately: `useDisposition`'s detector-at-key-index-3 convention (commented,
+holds for all 11 views) and sweep-total drift after verdicts until the next refetch
+(documented in the hook — invalidating 11 detector scans per verdict isn't worth it).
+
+## Session 56 — 2026-07-13: triage de-gamification + honest progress surfaces
+
+The Explorer toolbar's gamification widgets measured the wrong thing (annotations-only,
+per-tab-session, blind to value-scoped/routine dispositions — the primary triage path) and
+the Refresh button duplicated the existing auto-refresh (ingest invalidation, SSE case
+stream, 30 s annotation poll). Replaced with forensically honest progress:
+
+- **Removed:** Refresh-events button, `TriageMeter`, `SessionMomentum`, `lib/session.ts`
+  (the `annotations`/`dispositions` queries stay — they feed the grid's annotation and
+  disposition indicators and the collapse toggle).
+- **Routine-collapse stat** (`RoutineCollapseStat`, toolbar): while collapse is on,
+  "N routine events hidden (X% of timeline)" — numerator is the existing timeline-wide
+  `routine_collapsed_count`, denominator the ready sources' `event_count` sum; click turns
+  collapse off. Replaces the full-width banner; still never silent, no new backend.
+- **Per-detector coverage** (`lib/triage-coverage.ts`, `useTriageCoverage`): "✓ X/Y
+  reviewed" badges in the detector accordion + a summary line atop the findings feed.
+  Denominator = current finding population (`total_findings` + `dismissed_count`); numerator
+  = dismissed + fetched findings covered by confirmed/routine rows. `normal` verdicts are
+  disclosed separately (they shrink the population, they don't review it). Truncated sweeps
+  (limit 50) render `≥X/Y` and never a percentage — coverage on the unfetched tail is
+  unknown, so the numerator is an honest lower bound. Routine verdicts (declared on
+  sequence_motif) cover sequence_novelty findings by exact `(field, " → " n-gram)` equality.
+- **Triage burn-down** (`GET …/dispositions/stats` + `TriageBurndown` in the Dispositions
+  section): cumulative verdicts by kind per UTC day, charted with the existing `LineChart`.
+  Deliberately *not* "outstanding remaining" — the denominator moves as detectors re-run —
+  and captioned that deleted verdicts vanish from the chart (the audit trail records
+  deletions). Endpoint aggregates in Python over the `list_dispositions` row set (small
+  counts, dialect-portable, one scoping code path); stats query key sits under the
+  `["dispositions", case, timeline]` prefix so every verdict invalidates it for free.
+
+## Session 55 — 2026-07-13: motif mining + investigation-UI restructure
+
+Two coupled deliverables: surface *recurring* event sequences (the mining complement of
+D8's sequence_novelty), and de-clutter the Investigate panel.
+
+- **`sequence_motif` detector** (`method="motif"`, `docs/ANOMALY_DETECTION.md` §12): mines
+  recurring n-grams of one field per source — the shared n-gram CTE was extracted from
+  `find_sequence_novelty` into `_ngram_inner_sql` (byte-identical SQL, existing SQL-shape
+  tests as the gate). Two passes per source: support (HAVING ≥ min_support, capped) and
+  cadence over the top-K candidates (gap aggregates only, no groupArray; CV + Greenwood via
+  the interval detector's `_greenwood_p`). Score = `log10(support) × (1 + max(0, 1−CV))`,
+  every input in `details`. Mode-less (ignores baselines; optional `start`/`end` scope);
+  empty result is `ok`. Config: `VESTIGO_STAT_MOTIF_{MIN_SUPPORT,MAX_CANDIDATES,CADENCE_TOP_K}`.
+  Rides `/anomalies?detector=sequence_motif` (DetectorRun/tagging/dismissals free).
+- **Routine suppression:** new disposition `kind="routine"` (value-scoped,
+  `detector=sequence_motif`, requires `details.values`; presentation-only — never in
+  `dispositions_hash`). Marking routine kicks a background job
+  (`resolve_motif_occurrences`) that materializes member event ids into a new ClickHouse
+  `motif_occurrences` table (500k-row cap, warned). Grid/histogram/export accept
+  `collapse_routine`; the events response then always carries `routine_collapsed_count` —
+  collapse is explicit, never silent. Unmark reactivates instantly (read-time filtering by
+  active disposition id; orphan rows swept best-effort).
+- **UI restructure:** Anomalies tab now = FrameBar → **FindingsFeed** (one cross-detector
+  ranked inbox fed by the existing sweep, per-detector rank interleave — raw scores are
+  incomparable — with detector chips as filters) → collapsed **Advanced** expander holding
+  the 11 per-detector views grouped Values / Volume & timing / Sequences (registry moved to
+  `detector-registry.ts`; sweep lifted to `useDetectorSweep`, key bumped v2, full responses
+  shared between badges and feed). Dense baseline form moved to `BaselineBuilderDrawer`
+  (FrameBar "Manage baselines"; histogram mark-mode opens it). New **Patterns** top tab
+  (`PatternsView`): motif list with support/period/regularity bar/per-source cadence, Mark
+  routine + unmark, routine section; Explorer gets a collapse-routine toggle + always-visible
+  collapsed-count banner.
+- **Verified end-to-end** against real services (isolated DBs): planted alpha→bravo→charlie
+  every 300 s → detected with support 50, period 300 s, CV 0, Greenwood p 2.5e-4; mark
+  routine → grid 350→200 events with `routine_collapsed_count` 150; unmark → 350 restored.
+- Tests: motif + occurrence-resolution blocks in `test_anomaly_stats.py`, router dispatch/
+  serializer in `test_events_router.py`, routine invariants + hash exclusion in
+  `test_dispositions_api.py`, `findingNormalize.test.ts` frontend. ROADMAP: noted as D10
+  stepping stone (mined motifs = candidate rule antecedents).
 
 ## Session 54 — 2026-07-12: release 1.0 — TraceSignal renamed to Vestigo
 

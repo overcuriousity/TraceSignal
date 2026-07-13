@@ -9,7 +9,7 @@ file and the "Method" tab copy in the same commit — see
 [Reality check](#reality-check-2026-07) at the bottom for the audit that
 produced this file and what was fixed as part of it.
 
-There are eleven independent analysis tools in Vestigo:
+There are twelve independent analysis tools in Vestigo:
 
 1. [Value novelty](#1-value-novelty-rare--first-seen-values) — rare/new field values, single field or [combinations](#value-combinations-the-value_combo-variant) (ClickHouse, no ML)
 2. [Frequency anomalies](#2-frequency-anomalies-volume-spikes--silences) — volume spikes/silences (ClickHouse, no ML)
@@ -22,12 +22,14 @@ There are eleven independent analysis tools in Vestigo:
 9. [Event sequences](#9-event-sequences-never-seen-orderings) — time-ordered n-grams of a field's values that occur in a suspect window but never in the baseline (ClickHouse, no ML)
 10. [Value-distribution drift](#10-value-distribution-drift-whole-field-shape-changes-between-windows) — fields whose *whole value distribution* changed between the baseline and a suspect window (ClickHouse + significance tests, no ML)
 11. [Semantic similarity search](#11-semantic-similarity-search) — "find events like this one" (embeddings + Qdrant)
+12. [Repeating sequences](#12-repeating-sequences-motif-mining) — recurring time-ordered n-grams of a field's values, ranked by support and cadence regularity; the discovery/mining complement of detector 9 (ClickHouse, no ML)
 
-The first ten are **statistical detectors**: pure counting and arithmetic over
-already-ingested events, no machine learning, no network calls, work the
-instant ingestion finishes. The eleventh needs an explicit embedding step first.
+All but the eleventh are **statistical detectors**: pure counting and
+arithmetic over already-ingested events, no machine learning, no network
+calls, work the instant ingestion finishes. The eleventh needs an explicit
+embedding step first.
 
-Code: `src/vestigo/db/anomaly_stats.py` (detectors 1–10),
+Code: `src/vestigo/db/anomaly_stats.py` (detectors 1–10, 12),
 `src/vestigo/db/similarity.py` (detector 11). UI: `frontend/src/components/analysis/`.
 
 ### Query-cost discipline (all statistical detectors)
@@ -1233,6 +1235,115 @@ embeddings are never silently mixed.
 *anomaly* signal — it will happily return 50 near-identical "similar" events
 if that's what's in the data. Use it to build context around a suspicious
 event, not as a standalone anomaly detector.
+
+---
+
+## 12. Repeating sequences (motif mining)
+
+**What it answers:** "What *routine structure* does this log have — which
+event orderings repeat, how often, and on what rhythm?" The discovery
+complement of [event sequences](#9-event-sequences-never-seen-orderings):
+detector 9 flags orderings *absent* from a baseline; this one surfaces the
+orderings that *recur* — a backup job's login → sync → logout every 300
+seconds, a health check's request → response pair, a cron chain. Two analyst
+uses: understanding a log's latent skeleton, and **declaring noise** — a
+motif marked *routine* can be collapsed out of the event grid (see the
+disposition note below), shrinking what's left to triage.
+
+**How it works.** Identical n-gram assembly to detector 9 — per source,
+events ordered by (effective) timestamp with record-order tie-breaks, a
+`lagInFrame` chain builds every run of **n consecutive values** of one
+grouping field, once per source (window-function sorts cannot spill; see
+[query-cost discipline](#query-cost-discipline-all-statistical-detectors)) —
+but with **no baseline/suspect split**: the whole scanned range is one
+window. Two passes per source:
+
+1. **Support** — count each complete n-gram, keep those occurring at least
+   `min_support` times, highest support first, capped at the candidate limit
+   (cap hit → warning). Per-source counts are merged case-wide in Python.
+2. **Cadence** — for the top-K merged candidates only (bounds the
+   `PARTITION BY gram` sort), aggregate the gaps between consecutive
+   occurrence start-times: count, mean, standard deviation, median, Σgap².
+   Never `groupArray` — aggregates only, bounded memory.
+
+Per source, regularity is judged two ways: the **coefficient of variation**
+(CV = stddev/mean of the gaps — 0 is a metronome, ≥ 1 is Poisson-or-burstier)
+and, with ≥ 10 gaps, **Greenwood's spacing statistic** — the same
+"too even to be random" test the
+[interval cadence](#8-interval-cadence-arrival-rhythm-changes-between-windows)
+detector uses for beaconing — reported as an auditable z/p in `details`, not
+used as a gate. The **representative cadence** is the source with the lowest
+CV (a motif metronomic in one source and absent elsewhere should read as
+regular); a per-source breakdown (top 5 by gap count) is in `details`.
+
+**Mode-less.** Mining needs no "before" — it runs the instant ingestion
+finishes, ignores baseline definitions entirely, and optionally scopes to a
+`start`/`end` time frame (e.g. the Explorer's current view). An empty result
+is a valid answer (`ok`), not `insufficient_data` — a log can genuinely have
+no repeating structure above the support floor.
+
+**Score = log10(support) × (1 + max(0, 1 − CV))** — volume sets the base,
+regularity up to doubles it, so "47 times, every 300 s ± 5 %" outranks
+"60 times, randomly." Deliberately not a p-value: mining ranks *prominence*,
+not *surprise*. Every input (`support`, `cv`, `period_seconds` = median gap,
+`greenwood_p`, `n_intervals`, `sources_count`) is in `details`, so the
+ranking is reproducible arithmetic.
+
+**Parameters.**
+
+- `ngram_size` (request) / `VESTIGO_STAT_SEQUENCE_NGRAM` (server default 3) —
+  shared with detector 9; validated 2–5, snapshotted into the `DetectorRun`.
+- `series_field` (request, default `artifact`) — the single grouping field,
+  same semantics as detector 9.
+- `min_support` (request) / `VESTIGO_STAT_MOTIF_MIN_SUPPORT` (default 3,
+  floor 2) — occurrences below this are not motifs; snapshotted.
+- `start` / `end` (request, optional) — scope mining to a time frame.
+- `VESTIGO_STAT_MOTIF_MAX_CANDIDATES` (default 1000) — per-source candidate
+  cap, highest support first; hitting it attaches a warning.
+- `VESTIGO_STAT_MOTIF_CADENCE_TOP_K` (default 500) — only the top-K merged
+  candidates by support get the cadence pass; the rest rank on support alone
+  (warned).
+
+**Allowlist key:** `(series_field, "a → b → c")` — same as detector 9.
+
+**Routine disposition & grid collapse.** *Mark routine* writes a
+`kind="routine"` disposition (value-scoped, detector `sequence_motif`,
+`details` snapshots the motif). Routine is **presentation-only** — detectors
+keep scoring and it never enters the reproducibility hash — but it has one
+side effect: a background job re-resolves the motif's occurrences (same SQL,
+filtered to the one n-gram; if mining was `start`/`end`-scoped, the snapshotted
+`details.scope_start`/`scope_end` re-apply so the collapse covers exactly the
+mined frame) and materializes every member event id into the
+`motif_occurrences` ClickHouse table (capped at 500k rows per disposition,
+partial coverage warned). The Explorer's *Collapse routine* toggle then
+anti-joins that table — and the response always carries
+`routine_collapsed_count`, so **nothing is ever hidden silently**. Deleting
+the disposition reactivates the events immediately (filtering is by active
+disposition id; the leftover rows are inert and swept in the background).
+Because sequence_novelty (detector 9) surfaces the identical
+`(series_field, "a → b → c")` allowlist key, a routine verdict also counts a
+matching sequence_novelty finding as reviewed in the Investigate panel's
+coverage badges — exact key equality, never n-gram containment.
+
+### Caveats
+
+- **Occurrences overlap.** Sliding n-grams share n−1 events, so a value
+  repeating back-to-back ("heartbeat heartbeat heartbeat …") yields a motif
+  whose gap is the single-event gap. That is the honest reading of "how often
+  does this pattern start," but don't read `support × n` as distinct events —
+  the collapsed count is computed over *distinct* member events for exactly
+  this reason.
+- **Interleaved multi-writer sources** shuffle independent streams into
+  accidental n-grams, same as detector 9 — a "motif" may be two unrelated
+  periodic streams beating against each other. The per-source cadence
+  breakdown helps: a real routine is usually tight in at least one source.
+- **Routine ≠ irrelevant.** An attacker living inside a scheduled task hides
+  in a routine motif; collapse is a triage lens, not a verdict. The Patterns
+  tab keeps routine motifs listed (dimmed), and the collapsed count keeps the
+  suppression visible.
+- The cadence pass sorts each candidate gram's occurrences; one ultra-common
+  gram still sorts all its occurrences within a source. `CADENCE_TOP_K` and
+  per-source looping bound this — on pathological sources, lower it.
 
 ---
 

@@ -1,5 +1,10 @@
 import { del, get, post } from "./client";
-import type { Disposition, DispositionKind, DispositionListResponse } from "./types";
+import type {
+  Disposition,
+  DispositionKind,
+  DispositionListResponse,
+  DispositionStatsResponse,
+} from "./types";
 
 /**
  * One disposition declaration. Exactly one scope: value (`field` + `value`)
@@ -28,6 +33,11 @@ export const dispositionsApi = {
     get<DispositionListResponse>(
       `/cases/${caseId}/timelines/${timelineId}/dispositions`,
       params,
+    ),
+
+  stats: (caseId: string, timelineId: string) =>
+    get<DispositionStatsResponse>(
+      `/cases/${caseId}/timelines/${timelineId}/dispositions/stats`,
     ),
 
   create: (caseId: string, timelineId: string, body: DispositionInput) =>

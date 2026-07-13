@@ -20,6 +20,10 @@ interface UiState {
   investigatePanelOpen: boolean;
   setInvestigatePanelOpen: (open: boolean) => void;
 
+  /** Whether the baseline-builder drawer (the big window-editor form) is open. */
+  baselineBuilderOpen: boolean;
+  setBaselineBuilderOpen: (open: boolean) => void;
+
   /** Whether the filter rail is collapsed on mobile. */
   filterRailOpen: boolean;
   setFilterRailOpen: (open: boolean) => void;
@@ -89,6 +93,9 @@ export const useUiStore = create<UiState>()(
 
       investigatePanelOpen: false,
       setInvestigatePanelOpen: (open) => set({ investigatePanelOpen: open }),
+
+      baselineBuilderOpen: false,
+      setBaselineBuilderOpen: (open) => set({ baselineBuilderOpen: open }),
 
       filterRailOpen: true,
       setFilterRailOpen: (open) => set({ filterRailOpen: open }),

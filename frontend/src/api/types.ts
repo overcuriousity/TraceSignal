@@ -185,6 +185,12 @@ export interface EventPage {
   has_more_before: boolean;
   next_cursor: [string, string] | null;
   prev_cursor: [string, string] | null;
+  /**
+   * Present only when the request set `collapse_routine`: distinct events
+   * hidden by active routine-motif dispositions (0 when none) — the grid
+   * must surface this so collapse is never silent.
+   */
+  routine_collapsed_count?: number;
 }
 
 /** Keyset pagination cursor: "<iso-timestamp>,<event_id>". */
@@ -510,6 +516,35 @@ export interface DistributionDriftFinding {
   dismissed?: boolean;
 }
 
+/** One recurring event-order n-gram from the sequence_motif miner. */
+export interface SequenceMotifFinding {
+  type: "sequence_motif";
+  /** Field token the sequence was built over (e.g. "artifact"). */
+  field: string;
+  /** The n-gram's values, oldest → newest. */
+  values: string[];
+  /** " → ".join(values) — display form and the allowlist key. */
+  value: string;
+  /** Total occurrences across all scanned sources. */
+  support: number;
+  sources_count: number;
+  /** Median inter-occurrence gap (seconds) of the most regular source. */
+  period_seconds: number | null;
+  /** stddev ÷ mean of that source's gaps; null under 3 occurrences. */
+  cv: number | null;
+  /** max(0, 1 − cv) — 1 is a metronome, 0 is no regularity signal. */
+  regularity_score: number;
+  /** log10(support) × (1 + regularity_score) — used for ranking. */
+  score: number;
+  first_seen: string | null;
+  last_seen: string | null;
+  event_id: string | null;
+  event: Event | null;
+  details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
+}
+
 export type AnomalyFinding =
   | ValueNoveltyFinding
   | ValueComboFinding
@@ -521,6 +556,7 @@ export type AnomalyFinding =
   | ProportionShiftFinding
   | IntervalPeriodicityFinding
   | SequenceNoveltyFinding
+  | SequenceMotifFinding
   | DistributionDriftFinding;
 
 export interface AnomaliesResponse {
@@ -596,7 +632,7 @@ export interface BaselineMutationResponse {
 }
 
 /** Analyst verdict on a finding — the unified disposition taxonomy. */
-export type DispositionKind = "normal" | "dismissed" | "confirmed";
+export type DispositionKind = "normal" | "dismissed" | "confirmed" | "routine";
 
 /**
  * One analyst verdict on an anomaly finding. Scope is exactly one of value
@@ -621,6 +657,39 @@ export interface Disposition {
 
 export interface DispositionListResponse {
   dispositions: Disposition[];
+}
+
+/** One UTC calendar day of disposition activity (triage burn-down source). */
+export interface DispositionStatsDay {
+  date: string; // "YYYY-MM-DD" (UTC)
+  normal: number;
+  dismissed: number;
+  confirmed: number;
+  routine: number;
+  total: number;
+  cumulative: {
+    normal: number;
+    dismissed: number;
+    confirmed: number;
+    routine: number;
+    total: number;
+  };
+}
+
+/**
+ * Per-day disposition counts by kind (ascending, gaps not filled). Counts
+ * reflect current rows only — deleted verdicts are not shown; the audit
+ * trail records deletions.
+ */
+export interface DispositionStatsResponse {
+  days: DispositionStatsDay[];
+  totals: {
+    normal: number;
+    dismissed: number;
+    confirmed: number;
+    routine: number;
+    total: number;
+  };
 }
 
 /** One active finding fed to the histogram overlay / event grid highlighting. */
@@ -831,6 +900,13 @@ export interface EventFilters {
    * grid. Derived from session state, not serialized to the URL/saved views.
    */
   ids?: string[];
+  /**
+   * Collapse events belonging to routine-motif occurrences (dispositions of
+   * kind "routine"). The response then always carries
+   * `routine_collapsed_count` — collapse is explicit, never silent. Session
+   * state, not serialized to the URL/saved views.
+   */
+  collapseRoutine?: boolean;
   limit?: number;
   offset?: number;
   /** Chronological sort direction (default: desc) */

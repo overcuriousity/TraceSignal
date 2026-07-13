@@ -1,10 +1,14 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { anomaliesApi } from "@/api/anomalies";
 import { SHOW_DISMISSED_KEY } from "@/components/analysis/detector-hooks";
+import { DETECTORS, type DetectorId } from "@/components/analysis/detector-registry";
 import { dispositionsApi } from "@/api/dispositions";
 import { shouldInvalidate } from "@/hooks/useCaseStream";
 import { toast } from "@/stores/toasts";
 import type { AnomaliesResponse, AnomalyFinding, DispositionKind } from "@/api/types";
+
+/** Shape of the shared detector-sweep cache (see useDetectorSweep). */
+type SweepData = Record<DetectorId, AnomaliesResponse | null>;
 
 /** What a single disposition action needs to resolve its target finding. */
 export interface DispositionTarget {
@@ -28,7 +32,9 @@ export interface DispositionTarget {
   details?: Record<string, unknown>;
 }
 
-/** True when the disposition target covers this finding. */
+/** True when the disposition target covers this finding. Sibling of
+ * `dispositionCoversFinding` in lib/triage-coverage.ts, which matches
+ * persisted Disposition rows for the coverage badges. */
 function matchesTarget(f: AnomalyFinding, t: DispositionTarget): boolean {
   if (t.field !== undefined && t.value !== undefined) {
     return (
@@ -91,6 +97,10 @@ const TOAST_BY_KIND: Record<DispositionKind, { title: (label: string) => string;
     title: (label) => `Confirmed — ${label}`,
     hint: "Escalated as a durable finding; it survives detector re-runs.",
   },
+  routine: {
+    title: (label) => `Marked routine — ${label}`,
+    hint: "Recurring expected pattern; its occurrences can be collapsed in the event grid.",
+  },
 };
 
 /**
@@ -134,6 +144,9 @@ export function useDisposition(caseId: string, timelineId: string) {
           detector: t.detector,
           field: t.field,
           value: t.value,
+          // routine needs the motif snapshot (details.values drives the
+          // occurrence materialization server-side).
+          details: t.kind === "routine" ? (t.details ?? null) : undefined,
         });
         return;
       }
@@ -150,7 +163,8 @@ export function useDisposition(caseId: string, timelineId: string) {
       });
     },
     onMutate: async (t) => {
-      if (t.kind === "confirmed") return { snapshots: [] };
+      // confirmed and routine leave the finding visible — no optimistic removal.
+      if (t.kind === "confirmed" || t.kind === "routine") return { snapshots: [], sweepSnapshots: [] };
       const prefix = ["anomalies", caseId, timelineId] as const;
       await qc.cancelQueries({ queryKey: prefix });
       const snapshots = qc.getQueriesData<AnomaliesResponse>({ queryKey: prefix });
@@ -180,12 +194,39 @@ export function useDisposition(caseId: string, timelineId: string) {
             : filterFindings(data, t),
         );
       }
-      return { snapshots };
+      // The shared detector sweep (feeding FindingsFeed and the accordion's
+      // badges) lives under its own key, not the ["anomalies", …] prefix —
+      // without filtering it too, a verdict declared from the feed leaves the
+      // row visibly untouched and reads as a dead button. Sweeps are always
+      // fetched without include_dismissed, so plain removal matches a refetch.
+      const sweepPrefix = ["detector-sweep-v2", caseId, timelineId] as const;
+      await qc.cancelQueries({ queryKey: sweepPrefix });
+      const sweepSnapshots = qc.getQueriesData<SweepData>({ queryKey: sweepPrefix });
+      for (const [key, data] of sweepSnapshots) {
+        if (!data) continue;
+        let changed = false;
+        const next = { ...data };
+        for (const meta of DETECTORS) {
+          const response = next[meta.id];
+          if (!response) continue;
+          if (t.detector !== "*" && meta.detector !== t.detector) continue;
+          const filtered = filterFindings(response, t);
+          if (filtered.results.length !== response.results.length) {
+            next[meta.id] = filtered;
+            changed = true;
+          }
+        }
+        if (changed) qc.setQueryData(key, next);
+      }
+      return { snapshots, sweepSnapshots };
     },
     onError: (_err, _t, ctx) => {
       // Roll the optimistically removed rows back; the global mutation error
       // toast (lib/queryClient.ts) reports why.
       for (const [key, data] of ctx?.snapshots ?? []) {
+        if (data) qc.setQueryData(key, data);
+      }
+      for (const [key, data] of ctx?.sweepSnapshots ?? []) {
         if (data) qc.setQueryData(key, data);
       }
     },

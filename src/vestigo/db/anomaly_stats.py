@@ -306,6 +306,11 @@ _MIN_FREQUENCY_STD = 0.5
 # Warning only — findings are never silently suppressed.
 _MIN_WINDOW_EVENTS = 50
 
+# Minimum inter-occurrence deltas before the Greenwood spacing statistic's
+# normal approximation is trusted for a motif's regularity (same floor as the
+# interval detector's beaconing gate).
+_MOTIF_GREENWOOD_MIN_INTERVALS = 10
+
 # Separators used to flatten a value_combo finding's field/value tuples into
 # the single (field, value) key the detector allowlist stores. The fields are
 # comma-joined (tokens never contain commas); the values are joined with the
@@ -900,17 +905,51 @@ class SequenceFinding:
 
 
 @dataclass
+class MotifFinding:
+    """One recurring event-order n-gram surfaced by the sequence-motif miner."""
+
+    # Field token the sequence was built over (e.g. "artifact").
+    field: str
+    # The n-gram's values, oldest → newest.
+    values: list[str]
+    # " → ".join(values) — display form and the allowlist key.
+    value: str
+    # Total occurrences across all scanned sources.
+    support: int
+    # Number of sources the motif occurs in.
+    sources_count: int
+    # Median inter-occurrence gap (seconds) of the most regular source;
+    # None when no source has ≥ 2 occurrences.
+    period_seconds: float | None
+    # Coefficient of variation (stddev/mean) of that source's gaps;
+    # None when fewer than 3 occurrences (needs ≥ 2 deltas).
+    cv: float | None
+    # max(0, 1 - cv) — 1.0 = metronome, 0.0 = no regularity signal.
+    regularity_score: float
+    # log10(support) * (1 + regularity_score); higher = more prominent motif.
+    score: float
+    # Earliest occurrence's first event timestamp (ISO, UTC).
+    first_seen: str | None
+    # Latest occurrence's first event timestamp (ISO, UTC).
+    last_seen: str | None
+    # First event of the earliest occurrence.
+    event_id: str | None
+    event: dict[str, Any] | None
+    details: dict[str, Any]
+
+
+@dataclass
 class StatAnomalyResult:
     """Return value of statistical anomaly detection."""
 
     status: str  # "ok" | "no_data" | "insufficient_data"
     # "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range"
     #  | "charset" | "entropy" | "proportion_shift" | "interval_periodicity"
-    #  | "sequence_novelty" | "value_distribution_drift"
+    #  | "sequence_novelty" | "sequence_motif" | "value_distribution_drift"
     detector: str
     # "self-baseline" | "temporal" | "z-score" | "temporal-z-score" | "sequential"
     #  | "iqr" | "temporal-range" | "rare-chars" | "temporal-charset" | "temporal-iqr"
-    #  | "g-test" | "cadence" | "ngram" | "drift"
+    #  | "g-test" | "cadence" | "ngram" | "motif" | "drift"
     method: str
     baseline_size: int  # total events (value_novelty) or event-count used for z-score
     results: list[
@@ -924,6 +963,7 @@ class StatAnomalyResult:
         | ShiftFinding
         | IntervalFinding
         | SequenceFinding
+        | MotifFinding
         | DistributionDriftFinding
     ] = field(default_factory=list)
     # Effective |z| cutoff used by the frequency detector; None for value_novelty.
@@ -1131,6 +1171,14 @@ def _stub_event(evt_id: str | None, case_id: str, first_seen: str | None) -> dic
     }
 
 
+def _nan_none(v: Any) -> float | None:
+    """Float coercion mapping None and ClickHouse's empty-set NaN to None."""
+    if v is None:
+        return None
+    f = float(v)
+    return None if math.isnan(f) else f
+
+
 def _interval_window_block(row: tuple, w: int) -> dict[str, Any]:
     """Parse one window's aggregate block from an interval-periodicity scan row.
 
@@ -1178,6 +1226,67 @@ def _interval_window_block(row: tuple, w: int) -> dict[str, Any]:
         "cv": cv,
         "span": span,
     }
+
+
+def _ngram_inner_sql(
+    *,
+    db: str,
+    col: str,
+    eff: str,
+    ngram: int,
+    w_idx_expr: str,
+    scope_pred: str,
+) -> str:
+    """Two-level n-gram assembly subquery shared by the sequence detectors.
+
+    Level 1: scope events to *scope_pred* and stamp each with a window index
+    (*w_idx_expr*; ``sequence_novelty`` uses a ``multiIf`` over its analysis
+    windows, ``sequence_motif`` a constant ``0``). Level 2: assemble each
+    row's preceding n-gram via ``lagInFrame`` over per-(source, window)
+    record order — partitioning by ``w_idx`` too keeps an n-gram from
+    spanning a window boundary or the gap between windows. The ``toNullable``
+    guard is NULL exactly on each partition's first ``ngram - 1`` rows
+    (incomplete n-grams), same trick as ``find_order_violations``.
+
+    Callers must run the enclosing query **once per source** (window sorts
+    can't spill — see the query-cost discipline in docs/ANOMALY_DETECTION.md)
+    and filter on ``guard IS NOT NULL`` to keep only complete n-grams.
+    """
+    gram_lags = ", ".join(
+        [f"lagInFrame(val, {ngram - 1 - j}) OVER w" for j in range(ngram - 1)] + ["val"]
+    )
+    return f"""
+            SELECT
+                val,
+                ets,
+                w_idx,
+                [{gram_lags}] AS gram,
+                lagInFrame(toNullable(val), {ngram - 1}) OVER w AS guard,
+                lagInFrame(eid, {ngram - 1}) OVER w AS first_eid,
+                lagInFrame(toNullable(ets), {ngram - 1}) OVER w AS first_ts
+            FROM (
+                SELECT
+                    source_id,
+                    {col} AS val,
+                    toString(event_id) AS eid,
+                    {eff} AS ets,
+                    byte_offset,
+                    line_number,
+                    event_id,
+                    {w_idx_expr} AS w_idx
+                FROM {db}.events
+                WHERE case_id = {{cid:String}}
+                  AND has({{src:Array(String)}}, source_id)
+                  AND {col} != ''
+                  AND {VESTIGO_NOT_SENTINEL_SQL}
+                  AND ({scope_pred})
+            )
+            WINDOW w AS (
+                PARTITION BY source_id, w_idx
+                ORDER BY ets, byte_offset, line_number, event_id
+                ROWS BETWEEN {ngram - 1} PRECEDING AND CURRENT ROW
+            )
+        """
 
 
 def _present_ts(value: Any) -> str | None:
@@ -4882,48 +4991,9 @@ class StatisticalAnomalyService:
         w_branches = ", ".join(f"{sp}, {i}" for i, sp in enumerate(sps))
         w_idx_expr = f"multiIf({bp}, -1, {w_branches}, -2)"
 
-        # Level 1: scope events to the windows and stamp each with its window
-        # index. Level 2: assemble each row's preceding n-gram via lagInFrame
-        # over per-(source, window) record order — partitioning by w_idx too
-        # keeps an n-gram from spanning a window boundary or the gap between
-        # windows. The toNullable guard is NULL exactly on each partition's
-        # first ngram-1 rows (incomplete n-grams), same trick as
-        # find_order_violations.
-        gram_lags = ", ".join(
-            [f"lagInFrame(val, {ngram - 1 - j}) OVER w" for j in range(ngram - 1)] + ["val"]
+        inner = _ngram_inner_sql(
+            db=db, col=col, eff=eff, ngram=ngram, w_idx_expr=w_idx_expr, scope_pred=union_pred
         )
-        inner = f"""
-            SELECT
-                val,
-                ets,
-                w_idx,
-                [{gram_lags}] AS gram,
-                lagInFrame(toNullable(val), {ngram - 1}) OVER w AS guard,
-                lagInFrame(eid, {ngram - 1}) OVER w AS first_eid,
-                lagInFrame(toNullable(ets), {ngram - 1}) OVER w AS first_ts
-            FROM (
-                SELECT
-                    source_id,
-                    {col} AS val,
-                    toString(event_id) AS eid,
-                    {eff} AS ets,
-                    byte_offset,
-                    line_number,
-                    event_id,
-                    {w_idx_expr} AS w_idx
-                FROM {db}.events
-                WHERE case_id = {{cid:String}}
-                  AND has({{src:Array(String)}}, source_id)
-                  AND {col} != ''
-                  AND {VESTIGO_NOT_SENTINEL_SQL}
-                  AND ({union_pred})
-            )
-            WINDOW w AS (
-                PARTITION BY source_id, w_idx
-                ORDER BY ets, byte_offset, line_number, event_id
-                ROWS BETWEEN {ngram - 1} PRECEDING AND CURRENT ROW
-            )
-        """
 
         # Query A (once per source): complete-n-gram totals per window —
         # summed into the surprise denominators and small-window warnings.
@@ -5094,6 +5164,424 @@ class StatisticalAnomalyService:
             warnings=run_warnings,
             windows=windows,
         )
+
+    @_gated_scan
+    def find_sequence_motifs(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        series_field: str = "artifact",
+        ngram: int = 3,
+        limit: int = 50,
+        min_support: int = 3,
+        max_candidates: int = 1000,
+        cadence_top_k: int = 500,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        exclude_event_ids: set[str] | None = None,
+        allowlist: set[tuple[str, str]] | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
+        source_offsets: dict[str, int] | None = None,
+    ) -> StatAnomalyResult:
+        """Return recurring event-order n-grams (motifs), ranked by support and regularity.
+
+        The mining complement of :meth:`find_sequence_novelty`: instead of
+        flagging n-grams absent from a baseline, surface the n-grams that
+        *recur* — the latent routine structure of the log ("these 3 events
+        repeat every ~5 minutes"). Same n-gram assembly (``lagInFrame`` over
+        per-source record order via :func:`_ngram_inner_sql`, one scan per
+        source), but with a single pseudo-window (``w_idx = 0``) — this is
+        discovery, not window comparison, so it is mode-less and needs no
+        baseline. *start*/*end* optionally scope mining to a time frame.
+
+        Two passes per source:
+
+        1. *Support*: count each complete n-gram, keep those occurring at
+           least *min_support* times, highest support first, capped at
+           *max_candidates* (cap hit → warning). Merged across sources in
+           Python (supports summed, earliest occurrence wins).
+        2. *Cadence* (top *cadence_top_k* merged candidates only — bounds the
+           ``PARTITION BY gram`` window sort, which cannot spill): aggregate
+           the deltas between consecutive occurrence start-times per gram —
+           count/mean/stddev/median/Σδ² — never ``groupArray`` (unbounded).
+           Consecutive occurrences of a motif overlap by ``ngram - 1``
+           events by construction (sliding n-grams); for self-repeating
+           values this makes the gap the single-event gap, which is the
+           honest reading of "how often does this pattern start".
+
+        Regularity per source: ``cv = stddev/mean`` of the gaps (≥ 2 deltas)
+        plus Greenwood's spacing statistic via :func:`_greenwood_p` ("too
+        even to be random", ≥ ``_MOTIF_GREENWOOD_MIN_INTERVALS`` deltas). The
+        representative cadence is the source with the lowest CV. Score =
+        ``log10(support) * (1 + max(0, 1 - cv))`` — volume sets the base,
+        regularity up to doubles it; every input is in ``details`` so the
+        ranking is auditable. An empty result is a valid mining answer
+        (``ok``), not ``insufficient_data``.
+        """
+        detector = "sequence_motif"
+        method = "motif"
+        if not 2 <= ngram <= 5:
+            raise ValueError("ngram must be between 2 and 5")
+        if min_support < 2:
+            raise ValueError("min_support must be at least 2")
+
+        self.ch.init_schema()
+        db = self.ch.database
+
+        total_events = self._count_events(case_id, source_ids)
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data", detector=detector, method=method, baseline_size=0
+            )
+
+        params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        bind_offset_params(source_offsets, params)
+        col = _col_expr(series_field, params, field_mappings)
+        eff = effective_ts_sql(source_offsets)
+        scope_parts = []
+        if start is not None:
+            params["ms"] = to_clickhouse_utc(start)
+            scope_parts.append(f"{eff} >= {{ms:String}}")
+        if end is not None:
+            params["me"] = to_clickhouse_utc(end)
+            scope_parts.append(f"{eff} < {{me:String}}")
+        scope_pred = " AND ".join(scope_parts) if scope_parts else "1"
+
+        inner = _ngram_inner_sql(
+            db=db, col=col, eff=eff, ngram=ngram, w_idx_expr="0", scope_pred=scope_pred
+        )
+
+        # Pass 1 (once per source): support per complete n-gram, highest first.
+        params["msup"] = min_support
+        params["cap"] = max_candidates
+        support_sql = f"""
+            SELECT
+                gram,
+                count() AS support,
+                min(first_ts) AS first_occ,
+                max(first_ts) AS last_occ,
+                argMin(first_eid, first_ts) AS evt
+            FROM ({inner})
+            WHERE guard IS NOT NULL
+            GROUP BY gram
+            HAVING support >= {{msup:UInt32}}
+            ORDER BY support DESC, gram ASC
+            LIMIT {{cap:UInt32}}
+            {HEAVY_SCAN_SETTINGS}
+        """
+        run_warnings: list[str] = []
+        # gram -> [support, sources_count, first_occ, first_evt, last_occ]
+        merged: dict[tuple[str, ...], list[Any]] = {}
+        for sid in source_ids:
+            rows = self.ch.client.query(
+                support_sql, parameters={**params, "src": [sid]}
+            ).result_rows
+            if len(rows) >= max_candidates:
+                run_warnings.append(
+                    f"Source {sid}: hit the {max_candidates}-motif candidate cap — "
+                    f"only its {max_candidates} highest-support motifs were fetched; "
+                    f"lower-support motifs may be missing."
+                )
+            for row in rows:
+                gram = tuple(str(v) for v in row[0])
+                slot = merged.get(gram)
+                if slot is None:
+                    merged[gram] = [int(row[1]), 1, row[2], row[4], row[3]]
+                    continue
+                slot[0] += int(row[1])
+                slot[1] += 1
+                if row[2] is not None and (slot[2] is None or row[2] < slot[2]):
+                    slot[2] = row[2]
+                    slot[3] = row[4]
+                if row[3] is not None and (slot[4] is None or row[3] > slot[4]):
+                    slot[4] = row[3]
+
+        if not merged:
+            return self._finalize_findings(
+                [],
+                detector=detector,
+                method=method,
+                total_events=total_events,
+                evaluated_fields=1,
+                exclude_event_ids=exclude_event_ids,
+                limit=limit,
+                case_id=case_id,
+                source_ids=source_ids,
+                allowlist=allowlist,
+                warnings=run_warnings,
+            )
+
+        # Pass 2 (once per source, top-K candidates by merged support only):
+        # inter-occurrence gap aggregates per gram. The 1-PRECEDING-only frame
+        # is the interval detector's lag trick; delta is NULL on each gram's
+        # first occurrence and is filtered before aggregation.
+        top = sorted(merged.items(), key=lambda kv: (-kv[1][0], kv[0]))
+        capped = top[:cadence_top_k]
+        if len(top) > len(capped):
+            run_warnings.append(
+                f"{len(top)} motifs passed min_support but only the top "
+                f"{cadence_top_k} by support were cadence-scored; the rest "
+                f"rank on support alone."
+            )
+        cands = [list(g) for g, _ in capped]
+        params["cands"] = cands
+        cadence_sql = f"""
+            SELECT
+                gram,
+                count() AS k,
+                avg(delta) AS mean,
+                stddevSamp(delta) AS std,
+                quantile(0.5)(delta) AS med,
+                sum(delta * delta) AS sum2,
+                min(occ_ts) AS first,
+                max(occ_ts) AS last
+            FROM (
+                SELECT
+                    gram,
+                    first_ts AS occ_ts,
+                    dateDiff('millisecond', lagInFrame(first_ts, 1) OVER w2, first_ts) / 1000.0 AS delta
+                FROM ({inner})
+                WHERE guard IS NOT NULL AND has({{cands:Array(Array(String))}}, gram)
+                WINDOW w2 AS (
+                    PARTITION BY gram
+                    ORDER BY first_ts, first_eid
+                    ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING
+                )
+            )
+            WHERE delta IS NOT NULL
+            GROUP BY gram
+            {HEAVY_SCAN_SETTINGS}
+        """
+        # gram -> {source_id: cadence block}
+        cadence: dict[tuple[str, ...], dict[str, dict[str, Any]]] = defaultdict(dict)
+        cand_set = {tuple(g) for g in cands}
+        for sid in source_ids:
+            crows = self.ch.client.query(
+                cadence_sql, parameters={**params, "src": [sid]}
+            ).result_rows
+            for row in crows:
+                gram = tuple(str(v) for v in row[0])
+                if gram not in cand_set:
+                    continue
+                k = int(row[1])
+                mean = _nan_none(row[2]) if k >= 1 else None
+                std = _nan_none(row[3]) if k >= 2 else None
+                med = _nan_none(row[4]) if k >= 1 else None
+                sum2 = _nan_none(row[5]) or 0.0
+                first, last = row[6], row[7]
+                cv = (
+                    round(std / mean, 4)
+                    if std is not None and mean is not None and mean > 0
+                    else None
+                )
+                span = None
+                if first is not None and last is not None:
+                    span = (ensure_utc(last) - ensure_utc(first)).total_seconds()
+                greenwood_z = greenwood_p = None
+                if span and span > 0 and k >= _MOTIF_GREENWOOD_MIN_INTERVALS:
+                    z, p = _greenwood_p(sum2 / (span * span), k)
+                    greenwood_z, greenwood_p = round(z, 4), round(p, 6)
+                cadence[gram][sid] = {
+                    "source_id": sid,
+                    "intervals": k,
+                    "median_gap_seconds": round(med, 3) if med is not None else None,
+                    "cv": cv,
+                    "greenwood_z": greenwood_z,
+                    "greenwood_p": greenwood_p,
+                }
+
+        findings: list[MotifFinding] = []
+        for gram, (support, sources_count, first_occ, first_evt, last_occ) in merged.items():
+            values = list(gram)
+            joined = " → ".join(values)
+            blocks = list(cadence.get(gram, {}).values())
+            with_cv = [b for b in blocks if b["cv"] is not None]
+            if with_cv:
+                rep = min(with_cv, key=lambda b: b["cv"])
+            elif blocks:
+                rep = max(blocks, key=lambda b: b["intervals"])
+            else:
+                rep = None
+            cv = rep["cv"] if rep else None
+            period = rep["median_gap_seconds"] if rep else None
+            regularity = round(max(0.0, 1.0 - cv), 4) if cv is not None else 0.0
+            score = round(math.log10(support) * (1.0 + regularity), 4)
+            first_seen = _present_ts(first_occ)
+            evt_id_str = str(first_evt) if first_evt else None
+            findings.append(
+                MotifFinding(
+                    field=series_field,
+                    values=values,
+                    value=joined,
+                    support=support,
+                    sources_count=sources_count,
+                    period_seconds=period,
+                    cv=cv,
+                    regularity_score=regularity,
+                    score=score,
+                    first_seen=first_seen,
+                    last_seen=_present_ts(last_occ),
+                    event_id=evt_id_str,
+                    event=_stub_event(evt_id_str, case_id, first_seen),
+                    details={
+                        "detector": detector,
+                        "method": method,
+                        "field": series_field,
+                        "values": values,
+                        "value": joined,
+                        "n": ngram,
+                        "support": support,
+                        "sources_count": sources_count,
+                        "min_support": min_support,
+                        "period_seconds": period,
+                        "cv": cv,
+                        "regularity_score": regularity,
+                        "greenwood_z": rep["greenwood_z"] if rep else None,
+                        "greenwood_p": rep["greenwood_p"] if rep else None,
+                        "n_intervals": rep["intervals"] if rep else 0,
+                        "representative_source_id": rep["source_id"] if rep else None,
+                        "per_source_cadence": sorted(blocks, key=lambda b: -b["intervals"])[:5],
+                        "scope_start": ensure_utc(start).isoformat() if start else None,
+                        "scope_end": ensure_utc(end).isoformat() if end else None,
+                        "allowlist_field": series_field,
+                        "allowlist_value": joined,
+                    },
+                )
+            )
+
+        return self._finalize_findings(
+            findings,
+            detector=detector,
+            method=method,
+            total_events=total_events,
+            evaluated_fields=1,
+            exclude_event_ids=exclude_event_ids,
+            limit=limit,
+            case_id=case_id,
+            source_ids=source_ids,
+            allowlist=allowlist,
+            warnings=run_warnings,
+        )
+
+    @_gated_scan
+    def resolve_motif_occurrences(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        series_field: str,
+        values: list[str],
+        disposition_id: str,
+        max_rows: int = 500_000,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
+        source_offsets: dict[str, int] | None = None,
+    ) -> tuple[int, list[str]]:
+        """Materialize one routine motif's member events into ``motif_occurrences``.
+
+        Runs once when an analyst marks a motif routine (background job, off
+        the request path): per source, re-assembles the n-grams exactly like
+        :meth:`find_sequence_motifs` (same ordering, same partition bounds,
+        and — when the motif was mined with a *start*/*end* scope — the same
+        time predicate at the same query level, so what collapses is exactly
+        what the analyst saw mined, no more), keeps occurrences matching
+        *values*, and inserts one row per member event — ``arrayJoin`` over
+        the occurrence's n event ids. The grid's ``collapse_routine`` filter
+        then anti-joins this table; see
+        ``ClickHouseStore.insert_motif_occurrences``.
+
+        Returns ``(rows_written, warnings)``. *max_rows* caps the write per
+        disposition (a very common motif times n member rows can explode);
+        hitting it means the collapse is partial — deterministically so: rows
+        are ordered by occurrence time (``first_ts``, tie-broken by member
+        event id) before the cap, so the *earliest* occurrences survive and
+        re-marking the same motif collapses the same events. The warning is
+        persisted to the disposition's details and the job result, never
+        silent.
+        """
+        ngram = len(values)
+        if not 2 <= ngram <= 5:
+            raise ValueError("motif must have between 2 and 5 values")
+        self.ch.init_schema()
+        db = self.ch.database
+
+        params: dict[str, Any] = {"cid": case_id, "src": source_ids, "g": values}
+        bind_offset_params(source_offsets, params)
+        col = _col_expr(series_field, params, field_mappings)
+        eff = effective_ts_sql(source_offsets)
+        scope_parts = []
+        if start is not None:
+            params["ms"] = to_clickhouse_utc(start)
+            scope_parts.append(f"{eff} >= {{ms:String}}")
+        if end is not None:
+            params["me"] = to_clickhouse_utc(end)
+            scope_parts.append(f"{eff} < {{me:String}}")
+        scope_pred = " AND ".join(scope_parts) if scope_parts else "1"
+        gram_lags = ", ".join(
+            [f"lagInFrame(val, {ngram - 1 - j}) OVER w" for j in range(ngram - 1)] + ["val"]
+        )
+        eid_lags = ", ".join(
+            [f"lagInFrame(eid, {ngram - 1 - j}) OVER w" for j in range(ngram - 1)] + ["eid"]
+        )
+        occurrences_sql = f"""
+            SELECT source_id, first_ts, arrayJoin(eids) AS member_eid
+            FROM (
+                SELECT
+                    source_id,
+                    [{gram_lags}] AS gram,
+                    [{eid_lags}] AS eids,
+                    lagInFrame(toNullable(val), {ngram - 1}) OVER w AS guard,
+                    lagInFrame(toNullable(ets), {ngram - 1}) OVER w AS first_ts
+                FROM (
+                    SELECT
+                        source_id,
+                        {col} AS val,
+                        toString(event_id) AS eid,
+                        {eff} AS ets,
+                        byte_offset,
+                        line_number,
+                        event_id
+                    FROM {db}.events
+                    WHERE case_id = {{cid:String}}
+                      AND has({{src:Array(String)}}, source_id)
+                      AND {col} != ''
+                      AND {VESTIGO_NOT_SENTINEL_SQL}
+                      AND ({scope_pred})
+                )
+                WINDOW w AS (
+                    PARTITION BY source_id
+                    ORDER BY ets, byte_offset, line_number, event_id
+                    ROWS BETWEEN {ngram - 1} PRECEDING AND CURRENT ROW
+                )
+            )
+            WHERE guard IS NOT NULL AND gram = {{g:Array(String)}}
+            ORDER BY first_ts, member_eid
+            LIMIT {{lim:UInt64}}
+            {HEAVY_SCAN_SETTINGS}
+        """
+        written = 0
+        warnings: list[str] = []
+        for sid in source_ids:
+            remaining = max_rows - written
+            if remaining <= 0:
+                warnings.append(
+                    f"Hit the {max_rows:,}-row occurrence cap before scanning "
+                    f"source {sid} — its occurrences are not collapsed."
+                )
+                continue
+            rows = self.ch.client.query(
+                occurrences_sql, parameters={**params, "src": [sid], "lim": remaining}
+            ).result_rows
+            if rows:
+                written += self.ch.insert_motif_occurrences(
+                    [(case_id, disposition_id, str(r[0]), str(r[2]), r[1]) for r in rows]
+                )
+            if len(rows) >= remaining:
+                warnings.append(
+                    f"Source {sid}: hit the {max_rows:,}-row occurrence cap — "
+                    f"the routine collapse for this motif is partial."
+                )
+        return written, warnings
 
     @_gated_scan
     def find_order_violations(

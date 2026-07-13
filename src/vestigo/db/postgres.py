@@ -652,6 +652,14 @@ class FindingDisposition(Base):
     - ``confirmed`` — escalated true positive; durable. Event-scoped with a
       concrete detector; bulk re-scans preserve the confirmed
       ``(event, detector)`` pair's system annotation.
+    - ``routine`` — a real, recurring, expected pattern (sequence_motif's
+      "mark routine"). Presentation-only like ``dismissed`` — detectors keep
+      scoring and it never enters the reproducibility hash — but with a
+      distinct meaning and a side effect: its occurrences are materialized to
+      ClickHouse (``motif_occurrences``) so the event grid can *collapse*
+      them behind an explicit, always-visible collapsed-count. Value-scoped
+      (``field`` = the series field, ``value`` = the " → "-joined n-gram);
+      ``details`` snapshots the motif finding (period, support, n).
 
     "Undecided" is the absence of a row. Scope is exactly one of value
     (``field`` + ``value``, timeline-scoped) or event (``source_id`` +
@@ -705,7 +713,7 @@ class FindingDisposition(Base):
         }
 
 
-DISPOSITION_KINDS = ("normal", "dismissed", "confirmed")
+DISPOSITION_KINDS = ("normal", "dismissed", "confirmed", "routine")
 
 
 def dispositions_hash(rows: Iterable[FindingDisposition]) -> str:
@@ -2584,6 +2592,32 @@ class PostgresStore:
             for row in rows:
                 await session.refresh(row)
             return rows
+
+    async def update_disposition_details(
+        self, case_id: str, disposition_id: str, patch: dict[str, Any]
+    ) -> bool:
+        """Shallow-merge *patch* into a disposition's ``details`` JSON.
+
+        Used by the motif-materialization job to persist its outcome
+        (``details.materialization``) durably — the JobStore result is
+        in-memory and lost on restart, but a partial collapse must stay
+        announced. Existing keys outside the patch (``values``, ``scope_*``)
+        are preserved. Returns False when the row is gone (deleted mid-job —
+        the occurrence rows are inert then, nothing to record).
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(FindingDisposition).where(
+                    FindingDisposition.case_id == case_id,
+                    FindingDisposition.id == disposition_id,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return False
+            row.details = {**(row.details or {}), **patch}
+            await session.commit()
+            return True
 
     async def delete_disposition(self, case_id: str, disposition_id: str) -> bool:
         """Delete a disposition row. Returns True if it existed."""

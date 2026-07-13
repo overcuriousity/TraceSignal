@@ -14,11 +14,11 @@ import { Link, useParams, useSearchParams } from "react-router-dom";
 import { useQuery, useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import {
   FlaskConical,
-  RefreshCw,
   PanelLeftClose,
   PanelLeftOpen,
   BarChart2,
   AreaChart,
+  Repeat,
 } from "lucide-react";
 
 import { eventsApi } from "@/api/events";
@@ -47,7 +47,7 @@ import { ColumnPicker } from "@/components/explorer/ColumnPicker";
 import { TimelineHistogram } from "@/components/explorer/TimelineHistogram";
 import { FieldHistogramModal } from "@/components/viz/FieldHistogramModal";
 import { InvestigatePanel } from "@/components/analysis/InvestigatePanel";
-import { TriageMeter } from "@/components/triage/TriageMeter";
+import { RoutineCollapseStat } from "@/components/explorer/RoutineCollapseStat";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
@@ -326,6 +326,10 @@ export function ExplorerPage() {
   const [similarAnchor, setSimilarAnchor] = useState<Event | null>(null);
   const [anomalyMarkers, setAnomalyMarkers] = useState<AnomalyMarker[]>([]);
   const [anomalyRunId, setAnomalyRunId] = useState<string | undefined>(undefined);
+  // Routine-motif collapse (Patterns tab): hide events belonging to
+  // routine-dispositioned motifs. Session state, never serialized — and the
+  // grid always shows the collapsed count, so nothing is hidden silently.
+  const [collapseRoutine, setCollapseRoutine] = useState(false);
   const {
     activeBaselineId,
     markMode: baselineMarkMode,
@@ -436,8 +440,11 @@ export function ExplorerPage() {
     if (semanticSearchIds !== null) {
       f = { ...f, q: undefined, ids: semanticSearchIds };
     }
+    if (collapseRoutine) {
+      f = { ...f, collapseRoutine: true };
+    }
     return f;
-  }, [filters, anomalyRunId, semanticSearchIds]);
+  }, [filters, anomalyRunId, semanticSearchIds, collapseRoutine]);
 
   const eventsQueryKey = ["events", caseId, timelineId, effectiveFilters, sortDir];
 
@@ -460,7 +467,6 @@ export function ExplorerPage() {
     isFetching,
     isError: eventsError,
     error: eventsQueryError,
-    refetch,
     fetchNextPage,
     hasNextPage,
     fetchPreviousPage,
@@ -508,14 +514,30 @@ export function ExplorerPage() {
     refetchInterval: 30_000,
   });
 
-  // Feeds the TriageMeter's reviewed count: an event dispositioned
-  // normal/dismissed/confirmed counts as reviewed even without a user
-  // annotation. The key is invalidated by useDisposition on every verdict.
+  // Feeds the grid's disposition indicator (dispositionMap) and the
+  // collapse-routine toggle. The key is invalidated by useDisposition on
+  // every verdict.
   const { data: dispositionsData } = useQuery({
     queryKey: ["dispositions", caseId, timelineId],
     queryFn: () => dispositionsApi.list(caseId!, timelineId!),
     enabled: !!(caseId && timelineId),
   });
+  // The collapse-routine toggle only renders once at least one routine
+  // disposition exists (Patterns tab → Mark routine).
+  const hasRoutineDispositions = useMemo(
+    () => (dispositionsData?.dispositions ?? []).some((d) => d.kind === "routine"),
+    [dispositionsData],
+  );
+  const routineCollapsedCount = eventsData?.pages?.[0]?.routine_collapsed_count ?? 0;
+  // Timeline-wide event total (ready sources only) — denominator for the
+  // routine-collapse stat; matches routine_collapsed_count's timeline-wide scope.
+  const timelineTotal = useMemo(
+    () =>
+      (timelineSources ?? [])
+        .filter((s) => s.status === "ready")
+        .reduce((sum, s) => sum + (s.event_count ?? 0), 0),
+    [timelineSources],
+  );
 
   const { data: views } = useQuery({
     queryKey: ["views", caseId],
@@ -950,7 +972,31 @@ export function ExplorerPage() {
 
           {/* Right-side actions */}
           <div className="flex items-center gap-1.5 shrink-0 ml-auto">
-            <TriageMeter annotations={annotations ?? []} dispositions={dispositionsData?.dispositions ?? []} totalEvents={total} />
+            {collapseRoutine && (
+              <RoutineCollapseStat
+                count={routineCollapsedCount}
+                timelineTotal={timelineTotal}
+                onShow={() => setCollapseRoutine(false)}
+              />
+            )}
+
+            {hasRoutineDispositions && (
+              <Tooltip
+                content={
+                  collapseRoutine
+                    ? "Show routine events again"
+                    : "Collapse routine events (patterns marked routine in the Patterns tab)"
+                }
+              >
+                <Button
+                  variant={collapseRoutine ? "accent" : "ghost"}
+                  size="icon"
+                  onClick={() => setCollapseRoutine((v) => !v)}
+                >
+                  <Repeat size={14} />
+                </Button>
+              </Tooltip>
+            )}
 
             <Tooltip content={histogramOpen ? "Hide histogram" : "Show histogram"}>
               <Button
@@ -959,12 +1005,6 @@ export function ExplorerPage() {
                 onClick={() => setHistogramOpen(!histogramOpen)}
               >
                 <BarChart2 size={14} />
-              </Button>
-            </Tooltip>
-
-            <Tooltip content="Refresh events">
-              <Button variant="ghost" size="icon" onClick={() => refetch()}>
-                {isFetching ? <Spinner size={14} /> : <RefreshCw size={14} />}
               </Button>
             </Tooltip>
 

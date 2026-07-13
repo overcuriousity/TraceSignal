@@ -3634,6 +3634,388 @@ def test_sequence_multi_source_merges_counts_and_verifies_baselines():
 
 
 # ---------------------------------------------------------------------------
+# sequence_motif — detector
+# ---------------------------------------------------------------------------
+
+# Query order: count, then per source one support query, then per source one
+# cadence query (skipped entirely when no gram survives min_support).
+# Support row layout: gram, support, first_occ, last_occ, evt.
+# Cadence row layout: gram, k, mean, std, med, sum2, first, last.
+
+_MOTIF_SUPPORT_COLS = ["gram", "support", "first_occ", "last_occ", "evt"]
+_MOTIF_CADENCE_COLS = ["gram", "k", "mean", "std", "med", "sum2", "first", "last"]
+
+
+def _motif_responses(
+    total: int,
+    support_rows: list[tuple],
+    cadence_rows: list[tuple] | None = None,
+) -> list[FakeQueryResult]:
+    responses = [
+        FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=support_rows, column_names=_MOTIF_SUPPORT_COLS),
+    ]
+    if cadence_rows is not None:
+        responses.append(
+            FakeQueryResult(result_rows=cadence_rows, column_names=_MOTIF_CADENCE_COLS)
+        )
+    return responses
+
+
+def test_motif_validation():
+    svc = _svc([])
+    for bad in (1, 6):
+        try:
+            svc.find_sequence_motifs("c1", ["s1"], ngram=bad)
+        except ValueError as exc:
+            assert "between 2 and 5" in str(exc)
+        else:
+            raise AssertionError(f"ngram={bad} did not raise")
+    try:
+        svc.find_sequence_motifs("c1", ["s1"], min_support=1)
+    except ValueError as exc:
+        assert "min_support" in str(exc)
+    else:
+        raise AssertionError("min_support=1 did not raise")
+    assert svc.ch.client._calls == []
+
+
+def test_motif_no_data():
+    svc = _svc([FakeQueryResult(result_rows=[(0,)], column_names=["count()"])])
+    result = svc.find_sequence_motifs("c1", ["s1"])
+    assert result.status == "no_data"
+    assert result.detector == "sequence_motif"
+    assert result.method == "motif"
+
+
+def test_motif_empty_mining_is_ok():
+    """No gram over min_support is a valid mining answer — ok, no cadence pass."""
+    svc = _svc(_motif_responses(total=10_000, support_rows=[]))
+    result = svc.find_sequence_motifs("c1", ["s1"])
+    assert result.status == "ok"
+    assert result.results == []
+    assert result.total_findings == 0
+    # count + one support query, no cadence query.
+    assert len(svc.ch.client._calls) == 2
+
+
+def test_motif_recurring_sequence_scored():
+    first_occ = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
+    last_occ = datetime(2024, 1, 1, 4, 0, tzinfo=UTC)
+    responses = _motif_responses(
+        total=10_000,
+        support_rows=[(["login", "sync", "logout"], 47, first_occ, last_occ, "evt-1")],
+        # 46 gaps, tight cadence: mean 300s, std 15s, median 300s.
+        cadence_rows=[
+            (
+                ["login", "sync", "logout"],
+                46,
+                300.0,
+                15.0,
+                300.0,
+                46 * 300.0**2,
+                first_occ,
+                last_occ,
+            )
+        ],
+    )
+    svc = _svc(responses)
+    result = svc.find_sequence_motifs("c1", ["s1"])
+    assert result.status == "ok"
+    assert len(result.results) == 1
+    r = result.results[0]
+    assert r.field == "artifact"
+    assert r.value == "login → sync → logout"
+    assert r.support == 47
+    assert r.sources_count == 1
+    assert r.period_seconds == 300.0
+    assert r.cv == 0.05
+    assert r.regularity_score == 0.95
+    assert abs(r.score - round(np.log10(47) * 1.95, 4)) < 1e-6
+    assert r.first_seen is not None and r.first_seen.startswith("2024-01-01T00:00")
+    assert r.last_seen is not None and r.last_seen.startswith("2024-01-01T04:00")
+    assert r.event_id == "evt-1"
+    # 46 ≥ the Greenwood floor — regularity p-value computed and auditable.
+    assert r.details["greenwood_p"] is not None
+    assert r.details["n_intervals"] == 46
+    assert r.details["representative_source_id"] == "s1"
+    assert r.details["allowlist_field"] == "artifact"
+    assert r.details["allowlist_value"] == "login → sync → logout"
+    assert result.windows is None
+
+
+def test_motif_without_cadence_ranks_on_support_alone():
+    """A motif with < 2 gaps in every source gets regularity 0, score log10(support)."""
+    first_occ = datetime(2024, 1, 1, tzinfo=UTC)
+    responses = _motif_responses(
+        total=1_000,
+        support_rows=[(["a", "b", "c"], 3, first_occ, first_occ, "evt-1")],
+        # One gap only → std is NaN-gated to None, no CV.
+        cadence_rows=[(["a", "b", "c"], 1, 60.0, float("nan"), 60.0, 3600.0, first_occ, first_occ)],
+    )
+    svc = _svc(responses)
+    result = svc.find_sequence_motifs("c1", ["s1"])
+    r = result.results[0]
+    assert r.cv is None
+    assert r.regularity_score == 0.0
+    assert abs(r.score - round(np.log10(3), 4)) < 1e-6
+    # Median gap still reported (k >= 1) via the most-intervals fallback.
+    assert r.period_seconds == 60.0
+    assert r.details["greenwood_p"] is None
+
+
+def test_motif_multi_source_merge_and_representative_cadence():
+    """Supports sum, sources_count counts, earliest occurrence wins the
+    representative event, and the lowest-CV source supplies the cadence."""
+    ts_early = datetime(2024, 1, 1, 8, 0, tzinfo=UTC)
+    ts_late = datetime(2024, 1, 2, 12, 0, tzinfo=UTC)
+    responses = [
+        FakeQueryResult(result_rows=[(10_000,)], column_names=["count()"]),
+        # support per source
+        FakeQueryResult(
+            result_rows=[(["a", "b", "c"], 20, ts_late, ts_late, "evt-s1")],
+            column_names=_MOTIF_SUPPORT_COLS,
+        ),
+        FakeQueryResult(
+            result_rows=[(["a", "b", "c"], 30, ts_early, ts_late, "evt-s2")],
+            column_names=_MOTIF_SUPPORT_COLS,
+        ),
+        # cadence per source: s1 sloppy (cv 0.5), s2 tight (cv 0.1).
+        FakeQueryResult(
+            result_rows=[
+                (["a", "b", "c"], 19, 200.0, 100.0, 180.0, 19 * 200.0**2, ts_late, ts_late)
+            ],
+            column_names=_MOTIF_CADENCE_COLS,
+        ),
+        FakeQueryResult(
+            result_rows=[
+                (["a", "b", "c"], 29, 300.0, 30.0, 290.0, 29 * 300.0**2, ts_early, ts_late)
+            ],
+            column_names=_MOTIF_CADENCE_COLS,
+        ),
+    ]
+    svc = _svc(responses)
+    result = svc.find_sequence_motifs("c1", ["s1", "s2"])
+    assert result.status == "ok"
+    r = result.results[0]
+    assert r.support == 50
+    assert r.sources_count == 2
+    assert r.event_id == "evt-s2"
+    assert r.first_seen is not None and r.first_seen.startswith("2024-01-01T08:00")
+    # Representative cadence = lowest CV (s2).
+    assert r.cv == 0.1
+    assert r.period_seconds == 290.0
+    assert r.details["representative_source_id"] == "s2"
+    assert len(r.details["per_source_cadence"]) == 2
+    # 5 queries: count, 2x support, 2x cadence — each bound to one source.
+    assert len(svc.ch.client._calls) == 5
+    for p in svc.ch.client._all_parameters[1:]:
+        assert p["src"] in (["s1"], ["s2"])
+
+
+def test_motif_candidate_cap_and_top_k_warnings():
+    first_occ = datetime(2024, 1, 1, tzinfo=UTC)
+    support_rows = [
+        ([f"v{i}", "b", "c"], 10 - i, first_occ, first_occ, f"evt-{i}") for i in range(3)
+    ]
+    responses = _motif_responses(total=10_000, support_rows=support_rows, cadence_rows=[])
+    svc = _svc(responses)
+    result = svc.find_sequence_motifs("c1", ["s1"], max_candidates=3, cadence_top_k=2)
+    assert result.status == "ok"
+    assert any("candidate cap" in w for w in result.warnings)
+    assert any("cadence-scored" in w for w in result.warnings)
+    # Only the top-2 grams by support were sent to the cadence pass.
+    cands = svc.ch.client._all_parameters[2]["cands"]
+    assert len(cands) == 2
+    assert cands[0] == ["v0", "b", "c"]
+
+
+def test_motif_allowlist_and_exclude():
+    first_occ = datetime(2024, 1, 1, tzinfo=UTC)
+    responses = _motif_responses(
+        total=10_000,
+        support_rows=[
+            (["a", "b", "c"], 10, first_occ, first_occ, "evt-1"),
+            (["x", "y", "z"], 5, first_occ, first_occ, "evt-routine"),
+        ],
+        cadence_rows=[],
+    )
+    svc = _svc(responses)
+    result = svc.find_sequence_motifs(
+        "c1",
+        ["s1"],
+        allowlist={("artifact", "a → b → c")},
+        exclude_event_ids={"evt-routine"},
+    )
+    assert result.status == "ok"
+    assert result.results == []
+
+
+def test_motif_sql_shape_and_time_scope():
+    """Single pseudo-window lag chain; start/end fold into the scope predicate."""
+    first_occ = datetime(2024, 1, 1, tzinfo=UTC)
+    client = RecordingClient(
+        _motif_responses(
+            total=10_000,
+            support_rows=[(["a", "b", "c"], 10, first_occ, first_occ, "evt-1")],
+            cadence_rows=[],
+        )
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_sequence_motifs(
+        "c1",
+        ["s1"],
+        series_field="attr:proc",
+        min_support=4,
+        start=datetime(2024, 1, 1, tzinfo=UTC),
+        end=datetime(2024, 2, 1, tzinfo=UTC),
+    )
+    assert result.status == "ok"
+    support_sql = client.full_queries[1]
+    cadence_sql = client.full_queries[2]
+    for sql in (support_sql, cadence_sql):
+        assert "PARTITION BY source_id, w_idx" in sql
+        assert "ORDER BY ets, byte_offset, line_number, event_id" in sql
+        assert "ROWS BETWEEN 2 PRECEDING AND CURRENT ROW" in sql
+        assert "lagInFrame(val, 2) OVER w" in sql
+        assert "guard IS NOT NULL" in sql
+        assert "attributes[{fk:String}]" in sql
+        # Time-frame scope instead of analysis windows.
+        assert "{ms:String}" in sql and "{me:String}" in sql
+        assert "multiIf(" not in sql
+    assert "HAVING support >= {msup:UInt32}" in support_sql
+    assert "ORDER BY support DESC, gram ASC" in support_sql
+    assert "has({cands:Array(Array(String))}, gram)" in cadence_sql
+    assert "PARTITION BY gram" in cadence_sql
+    assert "ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING" in cadence_sql
+    params = client._all_parameters[1]
+    assert params["msup"] == 4
+    assert params["ms"] == "2024-01-01 00:00:00"
+    assert params["me"] == "2024-02-01 00:00:00"
+
+
+def test_motif_unscoped_has_no_window_params():
+    first_occ = datetime(2024, 1, 1, tzinfo=UTC)
+    client = RecordingClient(
+        _motif_responses(
+            total=10_000,
+            support_rows=[(["a", "b", "c"], 10, first_occ, first_occ, "evt-1")],
+            cadence_rows=[],
+        )
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_sequence_motifs("c1", ["s1"])
+    support_sql = client.full_queries[1]
+    assert "AND (1)" in support_sql
+    assert "{ms:String}" not in support_sql and "{me:String}" not in support_sql
+
+
+# ---------------------------------------------------------------------------
+# resolve_motif_occurrences
+# ---------------------------------------------------------------------------
+
+
+class _OccurrenceRecordingStore(FakeClickHouseStore):
+    """FakeClickHouseStore that records motif-occurrence inserts."""
+
+    def __init__(self, client: FakeClient) -> None:
+        super().__init__(client)
+        self.inserted: list[list[tuple]] = []
+
+    def insert_motif_occurrences(self, rows: list[tuple]) -> int:
+        self.inserted.append(rows)
+        return len(rows)
+
+
+def test_resolve_motif_occurrences_inserts_member_rows():
+    occ_ts = datetime(2024, 1, 1, tzinfo=UTC)
+    client = RecordingClient(
+        [
+            FakeQueryResult(
+                result_rows=[
+                    ("s1", occ_ts, "evt-1"),
+                    ("s1", occ_ts, "evt-2"),
+                    ("s1", occ_ts, "evt-3"),
+                ],
+                column_names=["source_id", "first_ts", "member_eid"],
+            )
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = _OccurrenceRecordingStore(client)
+    written, warnings = svc.resolve_motif_occurrences(
+        "c1", ["s1"], "artifact", ["a", "b", "c"], "disp-1"
+    )
+    assert written == 3
+    assert warnings == []
+    rows = svc.ch.inserted[0]
+    assert rows[0] == ("c1", "disp-1", "s1", "evt-1", occ_ts)
+    sql = client.full_queries[0]
+    assert "arrayJoin(eids)" in sql
+    assert "gram = {g:Array(String)}" in sql
+    assert "PARTITION BY source_id" in sql
+    # Deterministic truncation under the row cap: earliest occurrences first,
+    # ordered before LIMIT — re-marking the same motif collapses the same events.
+    assert "ORDER BY first_ts, member_eid" in sql
+    assert sql.index("ORDER BY first_ts, member_eid") < sql.index("LIMIT {lim:UInt64}")
+    params = client._all_parameters[0]
+    assert params["g"] == ["a", "b", "c"]
+    assert params["lim"] == 500_000
+
+
+def test_resolve_motif_occurrences_honors_mining_scope():
+    """A time-scoped mined motif materializes with the same scope predicate,
+    at the same (pre-window) query level — collapse covers exactly what was
+    mined. Unscoped stays the no-op predicate."""
+    client = RecordingClient(
+        [FakeQueryResult(result_rows=[], column_names=["source_id", "first_ts", "member_eid"])]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = _OccurrenceRecordingStore(client)
+    svc.resolve_motif_occurrences(
+        "c1",
+        ["s1"],
+        "artifact",
+        ["a", "b"],
+        "disp-1",
+        start=datetime(2024, 1, 1, tzinfo=UTC),
+        end=datetime(2024, 2, 1, tzinfo=UTC),
+    )
+    sql = client.full_queries[0]
+    assert "{ms:String}" in sql and "{me:String}" in sql
+    # Scope must apply before n-gram assembly (inside the pre-window SELECT),
+    # same as the miner — not as a post-hoc filter on assembled grams.
+    assert sql.index("{ms:String}") < sql.index("WINDOW w AS")
+    params = client._all_parameters[0]
+    assert params["ms"] == "2024-01-01 00:00:00"
+    assert params["me"] == "2024-02-01 00:00:00"
+
+
+def test_resolve_motif_occurrences_cap_warning():
+    occ_ts = datetime(2024, 1, 1, tzinfo=UTC)
+    client = RecordingClient(
+        [
+            FakeQueryResult(
+                result_rows=[("s1", occ_ts, f"evt-{i}") for i in range(4)],
+                column_names=["source_id", "first_ts", "member_eid"],
+            )
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = _OccurrenceRecordingStore(client)
+    written, warnings = svc.resolve_motif_occurrences(
+        "c1", ["s1", "s2"], "artifact", ["a", "b"], "disp-1", max_rows=4
+    )
+    assert written == 4
+    # s1 hit the cap; s2 was never scanned — both facts surfaced.
+    assert any("partial" in w for w in warnings)
+    assert any("not collapsed" in w for w in warnings)
+    assert len(client.full_queries) == 1
+
+
+# ---------------------------------------------------------------------------
 # value_distribution_drift detector
 # ---------------------------------------------------------------------------
 
