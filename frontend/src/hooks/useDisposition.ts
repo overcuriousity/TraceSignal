@@ -91,6 +91,10 @@ const TOAST_BY_KIND: Record<DispositionKind, { title: (label: string) => string;
     title: (label) => `Confirmed — ${label}`,
     hint: "Escalated as a durable finding; it survives detector re-runs.",
   },
+  routine: {
+    title: (label) => `Marked routine — ${label}`,
+    hint: "Recurring expected pattern; its occurrences can be collapsed in the event grid.",
+  },
 };
 
 /**
@@ -134,6 +138,9 @@ export function useDisposition(caseId: string, timelineId: string) {
           detector: t.detector,
           field: t.field,
           value: t.value,
+          // routine needs the motif snapshot (details.values drives the
+          // occurrence materialization server-side).
+          details: t.kind === "routine" ? (t.details ?? null) : undefined,
         });
         return;
       }
@@ -150,7 +157,8 @@ export function useDisposition(caseId: string, timelineId: string) {
       });
     },
     onMutate: async (t) => {
-      if (t.kind === "confirmed") return { snapshots: [] };
+      // confirmed and routine leave the finding visible — no optimistic removal.
+      if (t.kind === "confirmed" || t.kind === "routine") return { snapshots: [] };
       const prefix = ["anomalies", caseId, timelineId] as const;
       await qc.cancelQueries({ queryKey: prefix });
       const snapshots = qc.getQueriesData<AnomaliesResponse>({ queryKey: prefix });

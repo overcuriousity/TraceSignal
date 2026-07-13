@@ -123,11 +123,20 @@ for categorical; one BH pool across both branches, `-log10(p)` score, effect flo
 KS D / total-variation distance, field-level `(field, "*")` allowlist key. See
 `docs/ANOMALY_DETECTION.md` §10 (semantic search renumbered §11).
 
+Shipped beyond the AMiner set: **sequence_motif** (`method="motif"`) — the mining complement
+of D8: same per-source `lagInFrame` n-gram assembly (shared `_ngram_inner_sql` helper), but
+mode-less and ranking *recurring* n-grams by support × cadence regularity (CV of
+inter-occurrence gaps + auditable Greenwood z/p, per-source breakdown). Comes with the
+`kind="routine"` disposition (presentation-only, materialized `motif_occurrences` ClickHouse
+table, `collapse_routine` grid filter with an always-visible `routine_collapsed_count`).
+Mined motifs are candidate rule antecedents for D10. See `docs/ANOMALY_DETECTION.md` §12.
+
 Remaining:
 
 - [ ] **D10 — Event correlation rules** (AMiner `EventCorrelationDetector`): mine baseline
   implication rules "value A is followed by value B within Δt", flag violations in the detect
   window. Highest analytical payoff, heaviest lift (rule mining + hypothesis testing) — last.
+  Stepping stone shipped: `sequence_motif`'s recurring n-grams are the natural antecedent set.
 
 Skipped deliberately: `TSAArimaDetector` (ARIMA forecasting — z-score `frequency` detector
 covers most of it and stays explainable).

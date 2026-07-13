@@ -3,9 +3,12 @@
 A **disposition** is one analyst verdict on an anomaly finding — ``normal``
 (expected behavior; extends the baseline and suppresses detection),
 ``dismissed`` (noise for this investigation; presentation-only, detectors
-keep scoring) or ``confirmed`` (escalated true positive; durable across
-re-scans). Undecided is the absence of a row. See
-``db/postgres.py::FindingDisposition`` and ``docs/ANOMALY_DETECTION.md``.
+keep scoring), ``confirmed`` (escalated true positive; durable across
+re-scans) or ``routine`` (a real recurring pattern from the sequence_motif
+miner; presentation-only, but its occurrences are materialized to ClickHouse
+so the event grid can collapse them behind an explicit count). Undecided is
+the absence of a row. See ``db/postgres.py::FindingDisposition`` and
+``docs/ANOMALY_DETECTION.md``.
 
 Every mutation is audited — dispositions are analytical assertions, so who
 declared what, and when, is part of the case record. Rows stay freely
@@ -17,7 +20,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from vestigo.api.deps import (
@@ -26,6 +29,7 @@ from vestigo.api.deps import (
     require_case_read,
     require_password_current,
 )
+from vestigo.core.jobs import JobStore, get_job_store
 from vestigo.db.postgres import DISPOSITION_KINDS, Case, User
 
 router = APIRouter(prefix="/api/cases", tags=["dispositions"])
@@ -41,7 +45,7 @@ class DispositionCreate(BaseModel):
     - event scope: ``source_id`` + ``event_id`` (one concrete event).
     """
 
-    kind: str = Field(pattern="^(normal|dismissed|confirmed)$")
+    kind: str = Field(pattern="^(normal|dismissed|confirmed|routine)$")
     detector: str = Field(default="*", min_length=1, max_length=32)
     field: str | None = Field(default=None, min_length=1, max_length=255)
     value: str | None = Field(default=None, max_length=4096)
@@ -79,12 +83,126 @@ def _validate_scope(p: DispositionCreate) -> str:
             raise HTTPException(status_code=422, detail="confirmed requires event scope")
         if p.detector == "*":
             raise HTTPException(status_code=422, detail="confirmed requires a concrete detector")
+    if p.kind == "routine":
+        # Routine is the sequence_motif miner's verdict: value scope is the
+        # (series_field, " → "-joined n-gram) pair, and the occurrence
+        # materialization needs the motif's values/n from `details`.
+        if not has_value:
+            raise HTTPException(status_code=422, detail="routine requires value scope")
+        if p.detector != "sequence_motif":
+            raise HTTPException(
+                status_code=422, detail="routine requires detector 'sequence_motif'"
+            )
+        values = (p.details or {}).get("values")
+        if not isinstance(values, list) or not 2 <= len(values) <= 5:
+            raise HTTPException(
+                status_code=422,
+                detail="routine requires details.values (the motif's 2–5 sequence values)",
+            )
     return "value" if has_value else "event"
 
 
 async def _require_timeline(case_id: str, timeline_id: str) -> None:
     if await get_store().get_timeline(case_id, timeline_id) is None:
         raise HTTPException(status_code=404, detail="Timeline not found")
+
+
+def _run_motif_materialization_job(
+    job_id: str,
+    case_id: str,
+    source_ids: list[str],
+    series_field: str,
+    values: list[str],
+    disposition_id: str,
+    field_mappings: dict[str, list[str]] | None,
+    source_offsets: dict[str, int] | None,
+    job_store: JobStore,
+) -> None:
+    """Resolve a routine motif's occurrences into ClickHouse (background).
+
+    Sync on purpose — BackgroundTasks runs it in the threadpool, keeping the
+    blocking ClickHouse scan off the event loop. Failure leaves the grid
+    collapse a no-op for this disposition (no occurrence rows), never a wrong
+    result; the job error is pollable via the jobs API.
+    """
+    from vestigo.api.routers.events import _get_stat_anomaly_service
+
+    job_store.update(job_id, status="running")
+    try:
+        written, warnings = _get_stat_anomaly_service().resolve_motif_occurrences(
+            case_id=case_id,
+            source_ids=source_ids,
+            series_field=series_field,
+            values=values,
+            disposition_id=disposition_id,
+            field_mappings=field_mappings,
+            source_offsets=source_offsets,
+        )
+        job_store.update(
+            job_id,
+            status="completed",
+            result={"rows_written": written, "warnings": warnings},
+        )
+    except Exception as exc:  # noqa: BLE001 — job boundary: report, don't crash the pool
+        job_store.update(job_id, status="failed", error=str(exc))
+
+
+def _cleanup_motif_occurrences(case_id: str, disposition_id: str) -> None:
+    """Best-effort background sweep of a deleted disposition's occurrence rows."""
+    import contextlib
+
+    from vestigo.api.routers.events import _get_stat_anomaly_service
+
+    # Suppression is safe: rows are inert either way; this only reclaims space.
+    with contextlib.suppress(Exception):
+        _get_stat_anomaly_service().ch.delete_motif_occurrences(case_id, disposition_id)
+
+
+async def _schedule_routine_materialization(
+    background_tasks: BackgroundTasks,
+    case_id: str,
+    timeline_id: str,
+    rows: list[dict[str, Any]],
+    user: User,
+) -> list[str]:
+    """Queue one occurrence-materialization job per new routine disposition.
+
+    Returns the job ids (surfaced in the create response so the client can
+    poll). Rows that are not routine/sequence_motif are skipped.
+    """
+    routine_rows = [
+        r
+        for r in rows
+        if r["kind"] == "routine" and r["detector"] == "sequence_motif" and r.get("details")
+    ]
+    if not routine_rows:
+        return []
+    from vestigo.api.routers.events import _resolve_timeline_scope
+
+    source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
+    job_store = get_job_store()
+    job_ids: list[str] = []
+    for row in routine_rows:
+        job = job_store.create(
+            kind="motif_materialize",
+            progress={"disposition_id": row["id"], "value": row["value"]},
+            created_by=user.id,
+            case_id=case_id,
+        )
+        background_tasks.add_task(
+            _run_motif_materialization_job,
+            job.id,
+            case_id,
+            source_ids,
+            row["field"],
+            list(row["details"]["values"]),
+            row["id"],
+            field_mappings,
+            source_offsets,
+            job_store,
+        )
+        job_ids.append(job.id)
+    return job_ids
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/dispositions")
@@ -145,12 +263,16 @@ async def create_disposition(
     case_id: str,
     timeline_id: str,
     payload: DispositionCreate,
+    background_tasks: BackgroundTasks,
     case: Case = Depends(require_case_contribute),
     user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
     """Declare one disposition. Idempotent: an identical row is returned, not duplicated."""
     await _require_timeline(case_id, timeline_id)
     row = await _create_one(case_id, timeline_id, payload, user)
+    job_ids = await _schedule_routine_materialization(
+        background_tasks, case_id, timeline_id, [row], user
+    )
     await get_store().record_audit(
         action="disposition.create",
         actor=user,
@@ -164,7 +286,10 @@ async def create_disposition(
             "event_id": payload.event_id,
         },
     )
-    return {"disposition": row}
+    response: dict[str, Any] = {"disposition": row}
+    if job_ids:
+        response["materialization_job_id"] = job_ids[0]
+    return response
 
 
 @router.post("/{case_id}/timelines/{timeline_id}/dispositions/bulk")
@@ -172,6 +297,7 @@ async def bulk_create_dispositions(
     case_id: str,
     timeline_id: str,
     payload: DispositionBulkCreate,
+    background_tasks: BackgroundTasks,
     case: Case = Depends(require_case_contribute),
     user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
@@ -204,6 +330,9 @@ async def bulk_create_dispositions(
             ],
         )
     ]
+    job_ids = await _schedule_routine_materialization(
+        background_tasks, case_id, timeline_id, rows, user
+    )
     await get_store().record_audit(
         action="disposition.bulk_create",
         actor=user,
@@ -212,7 +341,10 @@ async def bulk_create_dispositions(
         target_id=rows[0]["id"] if rows else None,
         detail={"count": len(rows), "kinds": sorted({i.kind for i in payload.items})},
     )
-    return {"dispositions": rows}
+    response: dict[str, Any] = {"dispositions": rows}
+    if job_ids:
+        response["materialization_job_ids"] = job_ids
+    return response
 
 
 @router.delete("/{case_id}/timelines/{timeline_id}/dispositions/{disposition_id}")
@@ -220,6 +352,7 @@ async def delete_disposition(
     case_id: str,
     timeline_id: str,
     disposition_id: str,
+    background_tasks: BackgroundTasks,
     case: Case = Depends(require_case_contribute),
     user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
@@ -228,6 +361,10 @@ async def delete_disposition(
     deleted = await store.delete_disposition(case_id, disposition_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Disposition not found")
+    # Routine rows in motif_occurrences are already inert once the disposition
+    # is gone (the grid filters by *active* disposition ids); this best-effort
+    # sweep just reclaims space. Harmless no-op for non-routine kinds.
+    background_tasks.add_task(_cleanup_motif_occurrences, case_id, disposition_id)
     await store.record_audit(
         action="disposition.delete",
         actor=user,

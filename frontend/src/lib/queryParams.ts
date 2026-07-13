@@ -56,6 +56,7 @@ export interface SerializedEventFilterFields {
   annotated?: string;
   annotation_tag_value?: string;
   run_id?: string;
+  collapse_routine?: boolean;
 }
 
 /**
@@ -102,6 +103,7 @@ export function serializeEventFilterFields(
   }
   if (filters.annotationTagValue) out.annotation_tag_value = filters.annotationTagValue;
   if (filters.anomalyRunId) out.run_id = filters.anomalyRunId;
+  if (filters.collapseRoutine) out.collapse_routine = true;
   return out;
 }
 

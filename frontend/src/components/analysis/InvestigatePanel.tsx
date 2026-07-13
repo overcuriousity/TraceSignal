@@ -3,16 +3,17 @@
  * old sibling AnalysisPanel + BaselineManager. The Anomalies tab reads
  * top-to-bottom as one workflow:
  *
- *   1. Scope     — FrameBar picks the global frame (scan all / compare baseline).
- *                  In the baseline frame the BaselineSection (build/select
- *                  definitions) is inline right here, where the frame needs it.
- *   2. Detectors — DetectorAccordion: every detector with a live count; expand
- *                  one to drill its ranked findings. (No dropdown, no separate
- *                  run-all — the overview is both.)
- *   3. Dispositions — the analyst's verdicts (normal / dismissed / confirmed),
- *                  collapsible at the bottom.
+ *   1. Scope    — FrameBar picks the global frame (scan all / compare baseline);
+ *                 the dense baseline-builder form lives in an overlay drawer
+ *                 ("Manage baselines" / histogram mark-mode opens it).
+ *   2. Findings — FindingsFeed: one cross-detector ranked inbox built from the
+ *                 detector sweep, detector chips as filters.
+ *   3. Advanced — the per-detector accordion (field pickers + tuning knobs),
+ *                 grouped in three categories, collapsed by default.
+ *   4. Dispositions — the analyst's verdicts, collapsible at the bottom.
  *
- * Similarity and Method stay as sibling top tabs.
+ * Patterns (repeating-sequence mining + routine suppression), Similarity and
+ * Method are sibling top tabs.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
@@ -20,8 +21,10 @@ import {
   BookOpen,
   ChevronDown,
   ChevronRight,
+  Repeat,
   Search,
   ShieldCheck,
+  SlidersHorizontal,
   X,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
@@ -35,14 +38,17 @@ import { MethodologyPanel } from "./MethodologyPanel";
 import { FrameBar } from "./FrameBar";
 import { GLOSSARY } from "@/lib/glossary";
 import { DetectorAccordion } from "./DetectorAccordion";
-import { BaselineSection, NormalValuesList } from "./WindowsNormality";
+import { FindingsFeed } from "./FindingsFeed";
+import { PatternsView } from "./PatternsView";
+import { BaselineBuilderDrawer } from "./BaselineBuilderDrawer";
+import { NormalValuesList } from "./WindowsNormality";
 import { timelinesApi } from "@/api/timelines";
 import { useUiStore } from "@/stores/ui";
 import { useBaselineStore } from "@/stores/baseline";
 import { cn } from "@/lib/cn";
 import type { AnomalyMarker, Event } from "@/api/types";
 
-type Tab = "anomalies" | "similar" | "methodology";
+type Tab = "anomalies" | "patterns" | "similar" | "methodology";
 
 interface Props {
   caseId: string;
@@ -77,23 +83,26 @@ export function InvestigatePanel({
 }: Props) {
   const [tab, setTab] = useState<Tab>(similarAnchor ? "similar" : "anomalies");
   const [normalOpen, setNormalOpen] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
-  const frame = useBaselineStore((s) => s.frame);
   const setFrame = useBaselineStore((s) => s.setFrame);
   const markMode = useBaselineStore((s) => s.markMode);
+  const setBaselineBuilderOpen = useUiStore((s) => s.setBaselineBuilderOpen);
 
   useEffect(() => {
     if (similarAnchor) setTab("similar");
   }, [similarAnchor]);
 
   // Marking on the histogram is only meaningful for building a baseline — pull
-  // the user to the Scope area (baseline frame) so the brushed range can land.
+  // the user to the baseline frame and open the builder drawer so the brushed
+  // range can land in the window editor.
   useEffect(() => {
     if (markMode) {
       setTab("anomalies");
       setFrame("baseline");
+      setBaselineBuilderOpen(true);
     }
-  }, [markMode, setFrame]);
+  }, [markMode, setFrame, setBaselineBuilderOpen]);
 
   const { data: timeline } = useQuery({
     queryKey: ["timeline", caseId, timelineId],
@@ -158,6 +167,7 @@ export function InvestigatePanel({
         {(
           [
             ["anomalies", AlertTriangle, "Anomalies"],
+            ["patterns", Repeat, "Patterns"],
             ["similar", Search, "Similarity"],
             ["methodology", BookOpen, "Method"],
           ] as [Tab, React.ElementType, string][]
@@ -188,16 +198,14 @@ export function InvestigatePanel({
                   <li>
                     <strong>Scope</strong> — <em>Scan all events</em> compares every event
                     against the whole corpus; <em>Compare baseline</em> scores suspect
-                    windows against a period you declare normal.
+                    windows against a period you declare normal (build one via{" "}
+                    <em>Manage baselines</em> or by dragging on the histogram).
                   </li>
                   <li>
-                    A <strong>baseline</strong> is a known-good time window; a{" "}
-                    <strong>suspect window</strong> is a period you investigate against it.
-                    Type UTC times or drag on the histogram to set them.
-                  </li>
-                  <li>
-                    <strong>Detectors</strong> each flag one kind of oddity (rare values,
-                    frequency spikes, …). Expand one to see its ranked findings.
+                    <strong>Findings</strong> — every detector's best findings in one
+                    ranked feed. Chips filter by detector;{" "}
+                    <strong>Advanced</strong> opens a detector's full view with field
+                    selection and tuning.
                   </li>
                   <li>
                     Disposition a finding: <strong>Normal</strong> extends the
@@ -211,26 +219,41 @@ export function InvestigatePanel({
 
             {/* 1. Scope */}
             <FrameBar caseId={caseId} timelineId={timelineId} />
-            {frame === "baseline" && (
-              <div className="mb-3">
-                <BaselineSection caseId={caseId} timelineId={timelineId} />
-              </div>
-            )}
 
-            {/* 2. Detectors */}
-            <DetectorAccordion
+            {/* 2. Unified findings feed */}
+            <FindingsFeed
               caseId={caseId}
               timelineId={timelineId}
               onSelectEvent={onSelectEvent}
-              onDrillField={onDrillField}
-              onComboDrill={onComboDrill}
-              onFrequencyDrill={onFrequencyDrill}
-              onAnomalyMarkers={onAnomalyMarkers}
-              onAnomalyRunId={onAnomalyRunId}
               onJumpToTime={onJumpToTime}
             />
 
-            {/* 3. Dispositions */}
+            {/* 3. Advanced: the per-detector accordion, collapsed by default */}
+            <div className="mt-4 border-t border-[var(--color-border)] pt-3">
+              <button
+                onClick={() => setAdvancedOpen((v) => !v)}
+                className="mb-2 flex w-full items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-[var(--color-fg-secondary)] hover:text-[var(--color-fg-primary)]"
+              >
+                {advancedOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                <SlidersHorizontal size={12} />
+                Advanced — per-detector views
+              </button>
+              {advancedOpen && (
+                <DetectorAccordion
+                  caseId={caseId}
+                  timelineId={timelineId}
+                  onSelectEvent={onSelectEvent}
+                  onDrillField={onDrillField}
+                  onComboDrill={onComboDrill}
+                  onFrequencyDrill={onFrequencyDrill}
+                  onAnomalyMarkers={onAnomalyMarkers}
+                  onAnomalyRunId={onAnomalyRunId}
+                  onJumpToTime={onJumpToTime}
+                />
+              )}
+            </div>
+
+            {/* 4. Dispositions */}
             <div className="mt-4 border-t border-[var(--color-border)] pt-3">
               <button
                 onClick={() => setNormalOpen((v) => !v)}
@@ -244,6 +267,16 @@ export function InvestigatePanel({
               {normalOpen && <NormalValuesList caseId={caseId} timelineId={timelineId} />}
             </div>
           </>
+        )}
+
+        {tab === "patterns" && (
+          <PatternsView
+            caseId={caseId}
+            timelineId={timelineId}
+            onSelectEvent={onSelectEvent}
+            onDrillField={onDrillField}
+            onJumpToTime={onJumpToTime}
+          />
         )}
 
         {tab === "similar" && (
@@ -283,6 +316,9 @@ export function InvestigatePanel({
           />
         )}
       </div>
+
+      {/* Baseline builder — overlay drawer, opened from FrameBar / mark-mode. */}
+      <BaselineBuilderDrawer caseId={caseId} timelineId={timelineId} />
     </div>
   );
 }

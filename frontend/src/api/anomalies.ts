@@ -8,7 +8,7 @@ import type {
 } from "./types";
 
 export interface AnomalyParams {
-  detector?: "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range" | "charset" | "entropy" | "proportion_shift" | "interval_periodicity" | "sequence_novelty" | "value_distribution_drift";
+  detector?: "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range" | "charset" | "entropy" | "proportion_shift" | "interval_periodicity" | "sequence_novelty" | "sequence_motif" | "value_distribution_drift";
   /** Comma-separated field tokens for value_novelty, e.g. "artifact,display_name,attr:user_agent" */
   fields?: string;
   /** Field to group frequency series / build event sequences by */
@@ -21,8 +21,14 @@ export interface AnomalyParams {
   fdr_q?: number;
   /** Effect-size floor (rate ratio) for the proportion_shift detector. */
   min_ratio?: number;
-  /** Sequence length (n) for the sequence_novelty detector. Omit to use the server default. */
+  /** Sequence length (n) for the sequence_novelty / sequence_motif detectors. Omit to use the server default. */
   ngram_size?: number;
+  /** sequence_motif only: minimum occurrences before an n-gram counts as a motif. */
+  min_support?: number;
+  /** sequence_motif only: scope mining to events at/after this time (ISO, UTC). */
+  start?: string;
+  /** sequence_motif only: scope mining to events before this time (ISO, UTC). */
+  end?: string;
   /** ID of a saved baseline definition (baseline range + suspect windows). Omit for self-baseline. */
   baseline_id?: string;
   limit?: number;
@@ -72,7 +78,7 @@ export const anomaliesApi = {
     sourceId: string,
     eventId: string,
     body: {
-      detector: "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range" | "charset" | "entropy" | "proportion_shift" | "interval_periodicity" | "sequence_novelty" | "value_distribution_drift";
+      detector: "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range" | "charset" | "entropy" | "proportion_shift" | "interval_periodicity" | "sequence_novelty" | "sequence_motif" | "value_distribution_drift";
       content: string;
       details: Record<string, unknown>;
     },

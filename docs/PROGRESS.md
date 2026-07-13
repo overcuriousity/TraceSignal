@@ -1,7 +1,47 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-12 (session 54 — release 1.0: rename to Vestigo, brand, changelog,
-release workflow).
+Last updated: 2026-07-13 (session 55 — sequence_motif miner, routine grid collapse,
+investigation-UI restructure).
+
+## Session 55 — 2026-07-13: motif mining + investigation-UI restructure
+
+Two coupled deliverables: surface *recurring* event sequences (the mining complement of
+D8's sequence_novelty), and de-clutter the Investigate panel.
+
+- **`sequence_motif` detector** (`method="motif"`, `docs/ANOMALY_DETECTION.md` §12): mines
+  recurring n-grams of one field per source — the shared n-gram CTE was extracted from
+  `find_sequence_novelty` into `_ngram_inner_sql` (byte-identical SQL, existing SQL-shape
+  tests as the gate). Two passes per source: support (HAVING ≥ min_support, capped) and
+  cadence over the top-K candidates (gap aggregates only, no groupArray; CV + Greenwood via
+  the interval detector's `_greenwood_p`). Score = `log10(support) × (1 + max(0, 1−CV))`,
+  every input in `details`. Mode-less (ignores baselines; optional `start`/`end` scope);
+  empty result is `ok`. Config: `VESTIGO_STAT_MOTIF_{MIN_SUPPORT,MAX_CANDIDATES,CADENCE_TOP_K}`.
+  Rides `/anomalies?detector=sequence_motif` (DetectorRun/tagging/dismissals free).
+- **Routine suppression:** new disposition `kind="routine"` (value-scoped,
+  `detector=sequence_motif`, requires `details.values`; presentation-only — never in
+  `dispositions_hash`). Marking routine kicks a background job
+  (`resolve_motif_occurrences`) that materializes member event ids into a new ClickHouse
+  `motif_occurrences` table (500k-row cap, warned). Grid/histogram/export accept
+  `collapse_routine`; the events response then always carries `routine_collapsed_count` —
+  collapse is explicit, never silent. Unmark reactivates instantly (read-time filtering by
+  active disposition id; orphan rows swept best-effort).
+- **UI restructure:** Anomalies tab now = FrameBar → **FindingsFeed** (one cross-detector
+  ranked inbox fed by the existing sweep, per-detector rank interleave — raw scores are
+  incomparable — with detector chips as filters) → collapsed **Advanced** expander holding
+  the 11 per-detector views grouped Values / Volume & timing / Sequences (registry moved to
+  `detector-registry.ts`; sweep lifted to `useDetectorSweep`, key bumped v2, full responses
+  shared between badges and feed). Dense baseline form moved to `BaselineBuilderDrawer`
+  (FrameBar "Manage baselines"; histogram mark-mode opens it). New **Patterns** top tab
+  (`PatternsView`): motif list with support/period/regularity bar/per-source cadence, Mark
+  routine + unmark, routine section; Explorer gets a collapse-routine toggle + always-visible
+  collapsed-count banner.
+- **Verified end-to-end** against real services (isolated DBs): planted alpha→bravo→charlie
+  every 300 s → detected with support 50, period 300 s, CV 0, Greenwood p 2.5e-4; mark
+  routine → grid 350→200 events with `routine_collapsed_count` 150; unmark → 350 restored.
+- Tests: motif + occurrence-resolution blocks in `test_anomaly_stats.py`, router dispatch/
+  serializer in `test_events_router.py`, routine invariants + hash exclusion in
+  `test_dispositions_api.py`, `findingNormalize.test.ts` frontend. ROADMAP: noted as D10
+  stepping stone (mined motifs = candidate rule antecedents).
 
 ## Session 54 — 2026-07-12: release 1.0 — TraceSignal renamed to Vestigo
 

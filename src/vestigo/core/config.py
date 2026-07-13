@@ -131,6 +131,15 @@ class Settings(BaseSettings):
     # Cap on novel n-grams fetched per run (lowest suspect volume first —
     # rarest sequences are the detector's point); hitting it carries a warning.
     stat_sequence_max_candidates: int = 2000
+    # Sequence-motif detector: minimum occurrences before an n-gram counts as
+    # a recurring motif. 2 would surface every coincidental repeat.
+    stat_motif_min_support: int = Field(default=3, ge=2)
+    # Cap on candidate motifs fetched per source (highest support first);
+    # hitting it carries a warning.
+    stat_motif_max_candidates: int = 1000
+    # Only the top-K merged candidates by support get the second cadence
+    # pass — bounds the PARTITION BY gram window sort (can't spill).
+    stat_motif_cadence_top_k: int = 500
     # Guardrails for whole-corpus detector/inventory scans (the shared SETTINGS
     # clause every heavy GROUP BY carries). Defaults sized for the session-27
     # 300M-row incident; tune per ClickHouse host RAM/cores. See db/_scan.py.

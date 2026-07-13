@@ -36,6 +36,7 @@ from vestigo.db.anomaly_stats import (
     EntropyFinding,
     FreqFinding,
     IntervalFinding,
+    MotifFinding,
     NoveltyFieldInfo,
     OrderFinding,
     RangeFinding,
@@ -438,6 +439,31 @@ async def _resolve_annotated_event_ids(
     return list(event_ids)
 
 
+async def _resolve_routine_collapse(
+    case_id: str,
+    timeline_id: str,
+    source_ids: list[str],
+    collapse_routine: bool,
+) -> list[str] | None:
+    """Resolve the active routine-motif disposition ids for grid collapse.
+
+    Returns None unless *collapse_routine* is set and at least one active
+    ``kind="routine"`` disposition exists — the EventQuery anti-join and the
+    collapsed-count both key off exactly this id list, so what is hidden and
+    what is counted can never disagree.
+    """
+    if not collapse_routine:
+        return None
+    rows = await get_store().list_dispositions(
+        case_id,
+        timeline_id=timeline_id,
+        source_ids=source_ids,
+        kinds=["routine"],
+        detector="sequence_motif",
+    )
+    return [d.id for d in rows] or None
+
+
 async def _resolve_event_id_filters(
     case_id: str,
     source_ids: list[str],
@@ -580,6 +606,14 @@ async def list_events(
     limit: int = Query(default=50, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     order: str = Query(default="desc", description="Sort order: asc or desc"),
+    collapse_routine: bool = Query(
+        default=False,
+        description=(
+            "Hide events belonging to routine-motif occurrences (dispositions "
+            "of kind 'routine'). The response then always carries "
+            "`routine_collapsed_count` — collapse is explicit, never silent."
+        ),
+    ),
     case: Case = Depends(require_case_read),
 ) -> dict[str, Any]:
     """List events for a timeline with optional filters."""
@@ -621,6 +655,10 @@ async def list_events(
             ids=ids,
         )
 
+    routine_disposition_ids = await _resolve_routine_collapse(
+        case_id, timeline_id, source_ids, collapse_routine
+    )
+
     service = _get_query_service()
     # EventQueryService is synchronous (blocking ClickHouse scans) — run it in
     # the threadpool so a slow scan doesn't stall the event loop for every
@@ -655,9 +693,10 @@ async def list_events(
             before=before_cursor,
             field_mappings=field_mappings,
             source_offsets=source_offsets,
+            exclude_routine_disposition_ids=routine_disposition_ids,
         ),
     )
-    return {
+    response = {
         "total": page.total,
         "offset": page.offset,
         "limit": page.limit,
@@ -667,6 +706,21 @@ async def list_events(
         "next_cursor": page.next_cursor,
         "prev_cursor": page.prev_cursor,
     }
+    if collapse_routine:
+        # Forensic requirement: a collapse must announce what it hid. Distinct
+        # member events across the active routine dispositions (scoped to this
+        # timeline's sources), regardless of the page's other filters.
+        response["routine_collapsed_count"] = (
+            await run_in_threadpool(
+                service.store.count_motif_occurrences,
+                case_id,
+                routine_disposition_ids,
+                source_ids,
+            )
+            if routine_disposition_ids
+            else 0
+        )
+    return response
 
 
 class BulkAnnotateByFilterRequest(BaseModel):
@@ -960,6 +1014,10 @@ async def get_histogram(
     annotation_tag_value: str | None = Query(default=None),
     run_id: str | None = Query(default=None),
     buckets: int = Query(default=60, ge=10, le=200),
+    collapse_routine: bool = Query(
+        default=False,
+        description="Hide routine-motif occurrence events — same semantics as the events list.",
+    ),
     case: Case = Depends(require_case_read),
 ) -> dict[str, Any]:
     """Return a bucketed event-count histogram for a timeline.
@@ -987,6 +1045,9 @@ async def get_histogram(
         tags_exclude=tags_exclude,
         ids=ids,
     )
+    routine_disposition_ids = await _resolve_routine_collapse(
+        case_id, timeline_id, source_ids, collapse_routine
+    )
     service = _get_query_service()
     # Blocking ClickHouse scan — threadpool, same as list_events.
     return await _run_regex_guarded(
@@ -1013,6 +1074,7 @@ async def get_histogram(
             tags_exclude=tags_exclude_filter,
             field_mappings=field_mappings,
             source_offsets=source_offsets,
+            exclude_routine_disposition_ids=routine_disposition_ids,
         ),
         buckets=buckets,
     )
@@ -1047,6 +1109,10 @@ class ExportFilter(BaseModel):
     annotated: str | None = None
     annotation_tag_value: str | None = None
     run_id: str | None = None
+    # Mirror of the events-list param: exclude routine-motif occurrence
+    # events. The export is a custody artifact, so the audit detail records
+    # this flag (model_dump includes non-default fields).
+    collapse_routine: bool = False
 
     @field_validator("fields", "exclude", mode="before")
     @classmethod
@@ -1205,6 +1271,10 @@ async def export_events(
         ids=body.filter.ids,
     )
 
+    routine_disposition_ids = await _resolve_routine_collapse(
+        case_id, timeline_id, source_ids, body.filter.collapse_routine
+    )
+
     store = get_store()
     annotations_by_event = _index_annotations_by_event(
         await store.list_source_annotations(case_id, source_ids)
@@ -1231,6 +1301,7 @@ async def export_events(
         tags_exclude=tags_exclude_filter,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
+        exclude_routine_disposition_ids=routine_disposition_ids,
     )
 
     if _uses_regex(bool(eq.q_regex and eq.q), eq.filter_modes, eq.exclusion_modes):
@@ -1374,6 +1445,9 @@ async def _run_stat_detector(
     fdr_q: float | None = None,
     min_ratio: float | None = None,
     ngram_size: int | None = None,
+    min_support: int | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
     field_mappings: dict[str, list[str]] | None = None,
     source_offsets: dict[str, int] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
@@ -1473,6 +1547,39 @@ async def _run_stat_detector(
                 limit=limit,
                 windows=windows,
                 max_candidates=cfg.stat_sequence_max_candidates,
+                exclude_event_ids=exclude_ids,
+                allowlist=allowlist,
+                field_mappings=field_mappings,
+            )
+            return result, resolution
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    if detector == "sequence_motif":
+        # Mode-less mining over the single series_field: recurring n-grams,
+        # no baseline needed — `windows` is deliberately ignored. Optional
+        # start/end scope the mining frame. Snapshot the effective knobs so
+        # the persisted run stays self-describing.
+        resolution["sequence_ngram"] = (
+            ngram_size if ngram_size is not None else cfg.stat_sequence_ngram
+        )
+        resolution["motif_min_support"] = (
+            min_support if min_support is not None else cfg.stat_motif_min_support
+        )
+        try:
+            result = await run_in_threadpool(
+                svc.find_sequence_motifs,
+                case_id=case_id,
+                source_ids=source_ids,
+                source_offsets=source_offsets,
+                series_field=series_field,
+                ngram=resolution["sequence_ngram"],
+                limit=limit,
+                min_support=resolution["motif_min_support"],
+                max_candidates=cfg.stat_motif_max_candidates,
+                cadence_top_k=cfg.stat_motif_cadence_top_k,
+                start=start,
+                end=end,
                 exclude_event_ids=exclude_ids,
                 allowlist=allowlist,
                 field_mappings=field_mappings,
@@ -1769,15 +1876,18 @@ def _serialize_finding(
     | ShiftFinding
     | IntervalFinding
     | SequenceFinding
+    | MotifFinding
     | DistributionDriftFinding,
 ) -> dict[str, Any]:
-    """Serialise a Value/Freq/Order/Combo/Range/Charset/Entropy/Shift/Interval/Sequence/Drift finding to a JSON-safe dict."""
-    # Charset/Entropy/Shift/Interval/Sequence/Drift finding dataclass fields
-    # are exactly the wire keys, so asdict() avoids a hand-maintained
+    """Serialise a Value/Freq/Order/Combo/Range/Charset/Entropy/Shift/Interval/Sequence/Motif/Drift finding to a JSON-safe dict."""
+    # Charset/Entropy/Shift/Interval/Sequence/Motif/Drift finding dataclass
+    # fields are exactly the wire keys, so asdict() avoids a hand-maintained
     # field-by-field transcription that would silently drop any newly added
     # field.
     if isinstance(r, DistributionDriftFinding):
         return {"type": "value_distribution_drift", **asdict(r)}
+    if isinstance(r, MotifFinding):
+        return {"type": "sequence_motif", **asdict(r)}
     if isinstance(r, SequenceFinding):
         return {"type": "sequence_novelty", **asdict(r)}
     if isinstance(r, IntervalFinding):
@@ -2095,7 +2205,7 @@ async def list_anomalies(
     timeline_id: str,
     detector: str = Query(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', 'sequence_novelty', or 'value_distribution_drift'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', 'sequence_novelty', 'sequence_motif', or 'value_distribution_drift'.",
     ),
     fields: str | None = Query(
         default=None,
@@ -2147,8 +2257,25 @@ async def list_anomalies(
         ge=2,
         le=5,
         description=(
-            "Sequence length (n) for the sequence_novelty detector. Omit to use the server default."
+            "Sequence length (n) for the sequence_novelty and sequence_motif "
+            "detectors. Omit to use the server default."
         ),
+    ),
+    min_support: int | None = Query(
+        default=None,
+        ge=2,
+        description=(
+            "sequence_motif only: minimum occurrences before an n-gram counts "
+            "as a recurring motif. Omit to use the server default."
+        ),
+    ),
+    start: datetime | None = Query(
+        default=None,
+        description="sequence_motif only: scope mining to events at/after this time (ISO, UTC).",
+    ),
+    end: datetime | None = Query(
+        default=None,
+        description="sequence_motif only: scope mining to events before this time (ISO, UTC).",
     ),
     baseline_id: str | None = Query(
         default=None,
@@ -2223,6 +2350,12 @@ async def list_anomalies(
     but never in the baseline window (AMiner EventSequenceDetector analog).
     Temporal-only; surprise-scored against the window's own n-gram total.
 
+    **sequence_motif**: per source, builds the same time-ordered n-grams of
+    `series_field` values but surfaces the *recurring* ones — the latent
+    routine structure — ranked by support and cadence regularity (median
+    inter-occurrence gap, CV, Greenwood spacing test). Mode-less; optional
+    `start`/`end` scope the mining frame.
+
     **value_distribution_drift**: per *field*, flags fields whose whole value
     distribution changed between the baseline and a suspect window — a
     Kolmogorov-Smirnov test for numeric fields, a k-category G-test (top-50
@@ -2245,6 +2378,9 @@ async def list_anomalies(
         fdr_q=fdr_q,
         min_ratio=min_ratio,
         ngram_size=ngram_size,
+        min_support=min_support,
+        start=start,
+        end=end,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )
@@ -2308,7 +2444,7 @@ class TagAnomaliesRequest(BaseModel):
 
     detector: str = Field(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', 'sequence_novelty', or 'value_distribution_drift'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', 'sequence_novelty', 'sequence_motif', or 'value_distribution_drift'.",
     )
     fields: str | None = Field(
         default=None,
@@ -2343,7 +2479,20 @@ class TagAnomaliesRequest(BaseModel):
         default=None,
         ge=2,
         le=5,
-        description="Sequence length (n) for the sequence_novelty detector.",
+        description="Sequence length (n) for the sequence_novelty and sequence_motif detectors.",
+    )
+    min_support: int | None = Field(
+        default=None,
+        ge=2,
+        description="sequence_motif only: minimum occurrences for a recurring motif.",
+    )
+    start: datetime | None = Field(
+        default=None,
+        description="sequence_motif only: scope mining to events at/after this time.",
+    )
+    end: datetime | None = Field(
+        default=None,
+        description="sequence_motif only: scope mining to events before this time.",
     )
     baseline_id: str | None = Field(
         default=None,
@@ -2398,6 +2547,9 @@ async def tag_anomalies(
         fdr_q=body.fdr_q,
         min_ratio=body.min_ratio,
         ngram_size=body.ngram_size,
+        min_support=body.min_support,
+        start=body.start,
+        end=body.end,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )
@@ -2529,6 +2681,20 @@ async def tag_anomalies(
                 f"first appears in {where} at {r.first_seen} ({r.count} of "
                 f"{r.details.get('window_ngram_total', 0):,} window sequences; "
                 f"surprise {r.score:.2f})"
+            )
+        elif isinstance(r, MotifFinding):
+            event_id = r.event_id or ""
+            src_id = r.event.get("source_id", "") if r.event else ""
+            cadence = (
+                f", repeating every ~{r.period_seconds:g}s (CV {r.cv})"
+                if r.period_seconds is not None and r.cv is not None
+                else ""
+            )
+            content = (
+                f"Recurring sequence — {r.field}: {r.value}: this "
+                f"{r.details.get('n')}-event order occurs {r.support:,} time(s) "
+                f"across {r.sources_count} source(s){cadence} "
+                f"(motif score {r.score:.2f})"
             )
         elif isinstance(r, IntervalFinding):
             event_id = r.event_id or ""

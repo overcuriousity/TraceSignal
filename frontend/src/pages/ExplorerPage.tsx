@@ -19,6 +19,7 @@ import {
   PanelLeftOpen,
   BarChart2,
   AreaChart,
+  Repeat,
 } from "lucide-react";
 
 import { eventsApi } from "@/api/events";
@@ -326,6 +327,10 @@ export function ExplorerPage() {
   const [similarAnchor, setSimilarAnchor] = useState<Event | null>(null);
   const [anomalyMarkers, setAnomalyMarkers] = useState<AnomalyMarker[]>([]);
   const [anomalyRunId, setAnomalyRunId] = useState<string | undefined>(undefined);
+  // Routine-motif collapse (Patterns tab): hide events belonging to
+  // routine-dispositioned motifs. Session state, never serialized — and the
+  // grid always shows the collapsed count, so nothing is hidden silently.
+  const [collapseRoutine, setCollapseRoutine] = useState(false);
   const {
     activeBaselineId,
     markMode: baselineMarkMode,
@@ -436,8 +441,11 @@ export function ExplorerPage() {
     if (semanticSearchIds !== null) {
       f = { ...f, q: undefined, ids: semanticSearchIds };
     }
+    if (collapseRoutine) {
+      f = { ...f, collapseRoutine: true };
+    }
     return f;
-  }, [filters, anomalyRunId, semanticSearchIds]);
+  }, [filters, anomalyRunId, semanticSearchIds, collapseRoutine]);
 
   const eventsQueryKey = ["events", caseId, timelineId, effectiveFilters, sortDir];
 
@@ -516,6 +524,13 @@ export function ExplorerPage() {
     queryFn: () => dispositionsApi.list(caseId!, timelineId!),
     enabled: !!(caseId && timelineId),
   });
+  // The collapse-routine toggle only renders once at least one routine
+  // disposition exists (Patterns tab → Mark routine).
+  const hasRoutineDispositions = useMemo(
+    () => (dispositionsData?.dispositions ?? []).some((d) => d.kind === "routine"),
+    [dispositionsData],
+  );
+  const routineCollapsedCount = eventsData?.pages?.[0]?.routine_collapsed_count ?? 0;
 
   const { data: views } = useQuery({
     queryKey: ["views", caseId],
@@ -952,6 +967,24 @@ export function ExplorerPage() {
           <div className="flex items-center gap-1.5 shrink-0 ml-auto">
             <TriageMeter annotations={annotations ?? []} dispositions={dispositionsData?.dispositions ?? []} totalEvents={total} />
 
+            {hasRoutineDispositions && (
+              <Tooltip
+                content={
+                  collapseRoutine
+                    ? "Show routine events again"
+                    : "Collapse routine events (patterns marked routine in the Patterns tab)"
+                }
+              >
+                <Button
+                  variant={collapseRoutine ? "accent" : "ghost"}
+                  size="icon"
+                  onClick={() => setCollapseRoutine((v) => !v)}
+                >
+                  <Repeat size={14} />
+                </Button>
+              </Tooltip>
+            )}
+
             <Tooltip content={histogramOpen ? "Hide histogram" : "Show histogram"}>
               <Button
                 variant={histogramOpen ? "accent" : "ghost"}
@@ -1016,6 +1049,23 @@ export function ExplorerPage() {
               setInvestigatePanelOpen(true);
             }}
           />
+        )}
+
+        {/* Routine collapse indicator — collapse is explicit, never silent */}
+        {collapseRoutine && (
+          <div className="flex shrink-0 items-center gap-2 bg-[var(--color-accent-dim)] px-3 py-1 text-xs text-[var(--color-fg-primary)]">
+            <Repeat size={11} />
+            <span>
+              {routineCollapsedCount.toLocaleString()} routine event
+              {routineCollapsedCount === 1 ? "" : "s"} collapsed (patterns marked routine).
+            </span>
+            <button
+              className="font-semibold text-[var(--color-accent)] hover:underline"
+              onClick={() => setCollapseRoutine(false)}
+            >
+              Show them
+            </button>
+          </div>
         )}
 
         {/* "Jumped to time" breadcrumb — shown after a jump-to-time cleared filters */}

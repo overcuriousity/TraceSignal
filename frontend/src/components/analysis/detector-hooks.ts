@@ -6,10 +6,12 @@
  * shared row/toolbar chrome components stay there.
  */
 import { useEffect, useState } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { anomaliesApi } from "@/api/anomalies";
 import { eventsApi } from "@/api/events";
 import { useBaselineStore } from "@/stores/baseline";
-import type { AnomalyMarker, Event } from "@/api/types";
+import { DETECTORS, type DetectorId } from "./detector-registry";
+import type { AnomaliesResponse, AnomalyMarker, Event } from "@/api/types";
 
 /**
  * Resolve the request params + queryKey fragment for the current global
@@ -30,6 +32,42 @@ export function useBaselineRequest(): {
   if (activeBaselineId)
     return { params: { baseline_id: activeBaselineId }, key: `bl:${activeBaselineId}`, needsBaseline: false };
   return { params: {}, key: "self", needsBaseline: true };
+}
+
+/**
+ * The detector sweep: one auto-run scan per registered detector under the
+ * active frame (limit 50, unpersisted). Formerly DetectorAccordion's private
+ * count query — lifted here and widened to keep the full responses so the
+ * unified findings feed and the accordion's count badges share ONE fetch.
+ * A detector that errors maps to null (rendered as "err"). Query-key bumped
+ * to v2 for the shape change (counts → full responses).
+ */
+export function useDetectorSweep(caseId: string, timelineId: string) {
+  const frame = useBaselineStore((s) => s.frame);
+  const activeBaselineId = useBaselineStore((s) => s.activeBaselineId);
+  const inBaselineFrame = frame === "baseline";
+  const needsBaseline = inBaselineFrame && !activeBaselineId;
+  const frameKey = inBaselineFrame ? (activeBaselineId ?? "none") : "self";
+
+  const query = useQuery({
+    queryKey: ["detector-sweep-v2", caseId, timelineId, frameKey],
+    enabled: !needsBaseline,
+    staleTime: 60_000,
+    queryFn: async () => {
+      const blParams =
+        inBaselineFrame && activeBaselineId ? { baseline_id: activeBaselineId } : {};
+      const pairs = await Promise.all(
+        DETECTORS.map((d) =>
+          anomaliesApi
+            .list(caseId, timelineId, { detector: d.detector, limit: 50, persist: false, ...blParams })
+            .then((r) => [d.id, r] as const)
+            .catch(() => [d.id, null] as const),
+        ),
+      );
+      return Object.fromEntries(pairs) as Record<DetectorId, AnomaliesResponse | null>;
+    },
+  });
+  return { ...query, needsBaseline, frameKey };
 }
 
 // Auto-scan field selection for the string detectors (charset/entropy). Mirrors

@@ -181,6 +181,24 @@ PARTITION BY (case_id, source_id)
 SETTINGS index_granularity = 8192
 """.strip()
 
+# Membership table for routine-motif grid collapse: one row per member event
+# of each occurrence of a routine-dispositioned motif (see
+# StatisticalAnomalyService.resolve_motif_occurrences). Read-time filtering is
+# by *active* disposition_id resolved from Postgres per request, so rows of a
+# deleted disposition are inert — no mutation needed on unmark.
+_MOTIF_OCCURRENCES_DDL = """
+CREATE TABLE IF NOT EXISTS {database}.motif_occurrences (
+    case_id LowCardinality(String),
+    disposition_id LowCardinality(String),
+    source_id LowCardinality(String),
+    event_id String,
+    occurrence_ts DateTime64(3)
+)
+ENGINE = MergeTree()
+ORDER BY (case_id, disposition_id, event_id)
+PARTITION BY case_id
+""".strip()
+
 # Prefix for the transient tables the enrichment-apply stage/finalize step
 # works through; stale ones (crash mid-apply) are swept at startup by
 # drop_stale_enrichment_scratch_tables.
@@ -282,6 +300,7 @@ class ClickHouseStore:
         )
         self._assert_not_legacy_schema()
         self._ensure_search_blob()
+        self.client.command(_MOTIF_OCCURRENCES_DDL.format(database=self.database))
         self._schema_ready = True
         # Enrichment output moved into events.attributes (stage_enrichment_rows / finalize_enrichment_apply);
         # the former side table is dead. Destructive, but pre-release
@@ -438,6 +457,63 @@ class ClickHouseStore:
             arrow_table=pa.Table.from_batches([batch]),
         )
         return response.written_rows
+
+    def insert_motif_occurrences(self, rows: list[tuple[str, str, str, str, Any]]) -> int:
+        """Insert routine-motif occurrence membership rows.
+
+        Each row is ``(case_id, disposition_id, source_id, event_id,
+        occurrence_ts)`` — one per member event of one motif occurrence.
+        """
+        if not rows:
+            return 0
+        self.init_schema()
+        response = self.client.insert(
+            table=f"{self.database}.motif_occurrences",
+            data=rows,
+            column_names=["case_id", "disposition_id", "source_id", "event_id", "occurrence_ts"],
+        )
+        return response.written_rows
+
+    def count_motif_occurrences(
+        self, case_id: str, disposition_ids: list[str], source_ids: list[str] | None = None
+    ) -> int:
+        """Distinct member events covered by the given routine dispositions.
+
+        The "N routine events collapsed" number: distinct because occurrences
+        of one motif overlap by ``ngram - 1`` events, and two routine motifs
+        can share events.
+        """
+        if not disposition_ids:
+            return 0
+        self.init_schema()
+        params: dict[str, Any] = {"cid": case_id, "dids": disposition_ids}
+        source_pred = ""
+        if source_ids is not None:
+            params["sids"] = source_ids
+            source_pred = " AND has({sids:Array(String)}, source_id)"
+        result = self.client.query(
+            f"SELECT uniqExact(event_id) FROM {self.database}.motif_occurrences "
+            "WHERE case_id = {cid:String} AND has({dids:Array(String)}, disposition_id)"
+            + source_pred,
+            parameters=params,
+        )
+        rows = result.result_rows
+        return int(rows[0][0]) if rows else 0
+
+    def delete_motif_occurrences(self, case_id: str, disposition_id: str) -> None:
+        """Best-effort cleanup of one disposition's occurrence rows.
+
+        Rows are already inert once the disposition is deleted (read-time
+        filtering is by active disposition_id); this just reclaims space.
+        Lightweight delete — asynchronous on the server, fine for a small
+        side table.
+        """
+        self.init_schema()
+        self.client.command(
+            f"DELETE FROM {self.database}.motif_occurrences "
+            "WHERE case_id = {cid:String} AND disposition_id = {did:String}",
+            parameters={"cid": case_id, "did": disposition_id},
+        )
 
     def attribute_keys_present(
         self, case_id: str, source_ids: list[str], keys: list[str]

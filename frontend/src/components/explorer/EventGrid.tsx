@@ -274,10 +274,11 @@ function CommentPopover({
 // Disposition indicator (X3): one icon per verdicted event. When an event
 // carries several kinds, the most consequential wins: a confirmed hit matters
 // more than a dismissal, which matters more than "expected behavior".
-const DISPOSITION_PRIORITY: DispositionKind[] = ["confirmed", "dismissed", "normal"];
+const DISPOSITION_PRIORITY: DispositionKind[] = ["confirmed", "dismissed", "routine", "normal"];
 const DISPOSITION_ICONS = {
   confirmed: { Icon: Flag, color: "var(--color-danger)", label: "Confirmed" },
   dismissed: { Icon: EyeOff, color: "var(--color-fg-muted)", label: "Dismissed" },
+  routine: { Icon: EyeOff, color: "var(--color-fg-muted)", label: "Routine pattern" },
   normal: { Icon: ShieldCheck, color: "var(--color-success)", label: "Marked normal" },
 } as const;
 

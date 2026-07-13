@@ -564,6 +564,7 @@ class _FakeStatAnomalyService:
         self.shift_calls: list[dict] = []
         self.interval_calls: list[dict] = []
         self.sequence_calls: list[dict] = []
+        self.motif_calls: list[dict] = []
 
     def get_timeline_midpoint(self, case_id, source_ids, source_offsets=None):
         return self._midpoint
@@ -610,6 +611,10 @@ class _FakeStatAnomalyService:
     def find_sequence_novelty(self, **kwargs):
         self.sequence_calls.append(kwargs)
         return "sequence-result"
+
+    def find_sequence_motifs(self, **kwargs):
+        self.motif_calls.append(kwargs)
+        return "motif-result"
 
 
 @pytest.fixture()
@@ -1135,6 +1140,95 @@ def test_serialize_finding_sequence_novelty_shape():
     assert out["value"] == "login → priv_esc → wipe"
     assert out["count"] == 2
     assert out["score"] == 6.9068
+    assert out["details"]["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_dispatches_to_sequence_motif(patched_store, monkeypatch):
+    """sequence_motif is mode-less: windows are never passed, config defaults apply."""
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    result, resolution = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="sequence_motif",
+        fields=None,
+        series_field="attr:proc",
+        z_threshold=None,
+        limit=50,
+    )
+    assert result == "motif-result"
+    call = fake_svc.motif_calls[0]
+    assert call["series_field"] == "attr:proc"
+    assert "windows" not in call
+    cfg = events.get_settings()
+    assert call["ngram"] == cfg.stat_sequence_ngram
+    assert call["min_support"] == cfg.stat_motif_min_support
+    assert call["max_candidates"] == cfg.stat_motif_max_candidates
+    assert call["cadence_top_k"] == cfg.stat_motif_cadence_top_k
+    assert call["start"] is None and call["end"] is None
+    assert resolution["sequence_ngram"] == cfg.stat_sequence_ngram
+    assert resolution["motif_min_support"] == cfg.stat_motif_min_support
+    assert not fake_svc.sequence_calls
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_motif_overrides_and_scope(patched_store, monkeypatch):
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    end = datetime(2024, 2, 1, tzinfo=UTC)
+    _result, resolution = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="sequence_motif",
+        fields=None,
+        series_field="artifact",
+        z_threshold=None,
+        limit=50,
+        ngram_size=4,
+        min_support=7,
+        start=start,
+        end=end,
+    )
+    call = fake_svc.motif_calls[0]
+    assert call["ngram"] == 4
+    assert call["min_support"] == 7
+    assert call["start"] == start and call["end"] == end
+    assert resolution["sequence_ngram"] == 4
+    assert resolution["motif_min_support"] == 7
+
+
+def test_serialize_finding_sequence_motif_shape():
+    from vestigo.db.anomaly_stats import MotifFinding
+
+    f = MotifFinding(
+        field="artifact",
+        values=["login", "sync", "logout"],
+        value="login → sync → logout",
+        support=47,
+        sources_count=2,
+        period_seconds=300.0,
+        cv=0.05,
+        regularity_score=0.95,
+        score=3.2571,
+        first_seen="2024-01-01T00:00:00+00:00",
+        last_seen="2024-01-01T04:00:00+00:00",
+        event_id="evt-1",
+        event=None,
+        details={"detector": "sequence_motif", "n": 3, "support": 47},
+    )
+    out = events._serialize_finding(f)
+    assert out["type"] == "sequence_motif"
+    assert out["values"] == ["login", "sync", "logout"]
+    assert out["support"] == 47
+    assert out["sources_count"] == 2
+    assert out["period_seconds"] == 300.0
+    assert out["regularity_score"] == 0.95
     assert out["details"]["n"] == 3
 
 

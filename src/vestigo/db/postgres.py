@@ -652,6 +652,14 @@ class FindingDisposition(Base):
     - ``confirmed`` — escalated true positive; durable. Event-scoped with a
       concrete detector; bulk re-scans preserve the confirmed
       ``(event, detector)`` pair's system annotation.
+    - ``routine`` — a real, recurring, expected pattern (sequence_motif's
+      "mark routine"). Presentation-only like ``dismissed`` — detectors keep
+      scoring and it never enters the reproducibility hash — but with a
+      distinct meaning and a side effect: its occurrences are materialized to
+      ClickHouse (``motif_occurrences``) so the event grid can *collapse*
+      them behind an explicit, always-visible collapsed-count. Value-scoped
+      (``field`` = the series field, ``value`` = the " → "-joined n-gram);
+      ``details`` snapshots the motif finding (period, support, n).
 
     "Undecided" is the absence of a row. Scope is exactly one of value
     (``field`` + ``value``, timeline-scoped) or event (``source_id`` +
@@ -705,7 +713,7 @@ class FindingDisposition(Base):
         }
 
 
-DISPOSITION_KINDS = ("normal", "dismissed", "confirmed")
+DISPOSITION_KINDS = ("normal", "dismissed", "confirmed", "routine")
 
 
 def dispositions_hash(rows: Iterable[FindingDisposition]) -> str:

@@ -348,6 +348,11 @@ const KIND_META: Record<
     hint: "Escalated findings — survive detector re-runs.",
     removeTitle: "Remove — no longer protected across re-runs",
   },
+  routine: {
+    heading: "Routine",
+    hint: "Recurring expected patterns (Patterns tab) — collapsible in the event grid.",
+    removeTitle: "Remove — its events reappear in the grid",
+  },
 };
 
 /** The analyst's dispositions (normal / dismissed / confirmed), grouped by verdict. */

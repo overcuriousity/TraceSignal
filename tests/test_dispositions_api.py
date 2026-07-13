@@ -93,6 +93,106 @@ def test_disposition_scope_invariants(client, admin_bootstrap, store):
     )
 
 
+def test_routine_disposition_invariants_and_create(client, admin_bootstrap, store, monkeypatch):
+    """routine requires value scope, detector=sequence_motif and details.values;
+    a valid create returns the row plus a materialization job id."""
+    as_admin(client, admin_bootstrap)
+    case_id, tl_id = _setup_case(client)
+    base = _base(case_id, tl_id)
+
+    # Event scope rejected.
+    assert (
+        client.post(
+            base,
+            json={
+                "kind": "routine",
+                "detector": "sequence_motif",
+                "source_id": "s1",
+                "event_id": "e1",
+            },
+        ).status_code
+        == 422
+    )
+    # Wrong detector rejected.
+    assert (
+        client.post(
+            base,
+            json={
+                "kind": "routine",
+                "detector": "value_novelty",
+                "field": "artifact",
+                "value": "a → b",
+                "details": {"values": ["a", "b"]},
+            },
+        ).status_code
+        == 422
+    )
+    # Missing details.values rejected.
+    assert (
+        client.post(
+            base,
+            json={
+                "kind": "routine",
+                "detector": "sequence_motif",
+                "field": "artifact",
+                "value": "a → b",
+            },
+        ).status_code
+        == 422
+    )
+
+    # Valid create: row persisted, background materialization scheduled.
+    from vestigo.api.routers import dispositions as dispo_module
+
+    materialize_calls: list[tuple] = []
+    monkeypatch.setattr(
+        dispo_module,
+        "_run_motif_materialization_job",
+        lambda *args: materialize_calls.append(args),
+    )
+    resp = client.post(
+        base,
+        json={
+            "kind": "routine",
+            "detector": "sequence_motif",
+            "field": "artifact",
+            "value": "a → b → c",
+            "details": {"values": ["a", "b", "c"], "n": 3, "support": 47},
+        },
+    ).json()
+    row = resp["disposition"]
+    assert row["kind"] == "routine"
+    assert row["detector"] == "sequence_motif"
+    assert resp["materialization_job_id"]
+    assert len(materialize_calls) == 1
+    # Job args: (job_id, case_id, source_ids, series_field, values, disposition_id, ...)
+    args = materialize_calls[0]
+    assert args[1] == case_id
+    assert args[3] == "artifact"
+    assert args[4] == ["a", "b", "c"]
+    assert args[5] == row["id"]
+
+    # Listable by kind.
+    routine = client.get(base, params={"kind": "routine"}).json()["dispositions"]
+    assert [d["id"] for d in routine] == [row["id"]]
+
+
+def test_dispositions_hash_ignores_routine():
+    """routine is presentation-only — never enters the reproducibility hash."""
+    value_normal = FindingDisposition(
+        id="d1", case_id="c", kind="normal", detector="charset", field="f", value="v"
+    )
+    routine = FindingDisposition(
+        id="d2",
+        case_id="c",
+        kind="routine",
+        detector="sequence_motif",
+        field="artifact",
+        value="a → b → c",
+    )
+    assert dispositions_hash([value_normal, routine]) == dispositions_hash([value_normal])
+
+
 def test_event_scoped_rows_have_no_timeline_and_list_by_source(client, admin_bootstrap, store):
     """Event-scoped rows carry timeline_id=NULL; the list endpoint surfaces
     them for a timeline via its sources."""

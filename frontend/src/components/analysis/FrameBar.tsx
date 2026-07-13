@@ -8,9 +8,10 @@
  * (in the baseline frame), so this bar stays a pure scope switch.
  */
 import { useQuery } from "@tanstack/react-query";
-import { Layers, ScanLine } from "lucide-react";
+import { Layers, ScanLine, SlidersHorizontal } from "lucide-react";
 import { baselinesApi } from "@/api/baselines";
 import { useBaselineStore } from "@/stores/baseline";
+import { useUiStore } from "@/stores/ui";
 import { SegmentedControl } from "@/components/ui/SegmentedControl";
 import { GLOSSARY } from "@/lib/glossary";
 
@@ -21,6 +22,7 @@ interface Props {
 
 export function FrameBar({ caseId, timelineId }: Props) {
   const { frame, setFrame, activeBaselineId } = useBaselineStore();
+  const setBaselineBuilderOpen = useUiStore((s) => s.setBaselineBuilderOpen);
 
   const { data } = useQuery({
     queryKey: ["baselines", caseId, timelineId],
@@ -33,7 +35,7 @@ export function FrameBar({ caseId, timelineId }: Props) {
       ? "Every detector scans all events."
       : active
         ? `Comparing ${active.suspect_windows.length} suspect window${active.suspect_windows.length === 1 ? "" : "s"} against “${active.name}”.`
-        : "Pick or build a baseline below to compare against.";
+        : "No baseline selected — open Manage baselines to pick or build one.";
 
   return (
     <div className="mb-3 space-y-1.5">
@@ -45,7 +47,19 @@ export function FrameBar({ caseId, timelineId }: Props) {
           { id: "baseline", icon: Layers, label: "Compare baseline", hint: GLOSSARY.compareBaseline },
         ]}
       />
-      <p className="text-[11px] text-[var(--color-fg-muted)]">{status}</p>
+      <div className="flex items-center gap-2">
+        <p className="min-w-0 flex-1 text-[11px] text-[var(--color-fg-muted)]">{status}</p>
+        {frame === "baseline" && (
+          <button
+            onClick={() => setBaselineBuilderOpen(true)}
+            className="flex shrink-0 items-center gap-1 rounded border border-[var(--color-border)] px-1.5 py-0.5 text-[11px] text-[var(--color-fg-secondary)] hover:border-[var(--color-border-focus)] hover:text-[var(--color-fg-primary)]"
+            title="Open the baseline builder — pick, edit or create baseline definitions and suspect windows"
+          >
+            <SlidersHorizontal size={11} />
+            Manage baselines
+          </button>
+        )}
+      </div>
     </div>
   );
 }
