@@ -309,6 +309,109 @@ async def test_disposition_dedupe_and_detector_filter(store):
 
 
 @pytest.mark.asyncio
+async def test_create_dispositions_bulk_empty_returns_empty(store):
+    await store.create_case("c1", "Case One")
+    assert await store.create_dispositions_bulk("c1", []) == []
+
+
+@pytest.mark.asyncio
+async def test_create_dispositions_bulk_dedupes_within_batch_and_against_existing(store):
+    await store.create_case("c1", "Case One")
+    existing = await store.create_disposition(
+        "c1",
+        kind="normal",
+        detector="value_novelty",
+        timeline_id="t1",
+        field="attr:user",
+        value="svc",
+    )
+
+    rows = await store.create_dispositions_bulk(
+        "c1",
+        [
+            # Duplicate of the pre-existing row.
+            {
+                "kind": "normal",
+                "detector": "value_novelty",
+                "timeline_id": "t1",
+                "field": "attr:user",
+                "value": "svc",
+            },
+            # New row.
+            {
+                "kind": "normal",
+                "detector": "frequency",
+                "timeline_id": "t1",
+                "field": "artifact",
+                "value": "cron",
+            },
+            # Duplicate of the previous item, within the same batch.
+            {
+                "kind": "normal",
+                "detector": "frequency",
+                "timeline_id": "t1",
+                "field": "artifact",
+                "value": "cron",
+            },
+        ],
+    )
+
+    assert [r.id for r in rows] == [existing.id, rows[1].id, rows[1].id]
+    assert len({r.id for r in rows}) == 2
+    assert len(await store.list_dispositions("c1", timeline_id="t1")) == 2
+
+
+@pytest.mark.asyncio
+async def test_create_dispositions_bulk_scope_narrowing_does_not_cross_timelines(store):
+    """The prefetch narrows candidate rows by (case_id, kind, detector) only,
+    then dedupes exactly in memory on the full scope tuple — same kind and
+    detector in a different timeline must not be treated as a duplicate."""
+    await store.create_case("c1", "Case One")
+    other = await store.create_disposition(
+        "c1",
+        kind="normal",
+        detector="value_novelty",
+        timeline_id="t-other",
+        field="attr:user",
+        value="svc",
+    )
+
+    rows = await store.create_dispositions_bulk(
+        "c1",
+        [
+            {
+                "kind": "normal",
+                "detector": "value_novelty",
+                "timeline_id": "t1",
+                "field": "attr:user",
+                "value": "svc",
+            }
+        ],
+    )
+
+    assert len(rows) == 1
+    assert rows[0].id != other.id
+    assert rows[0].timeline_id == "t1"
+
+
+@pytest.mark.asyncio
+async def test_create_dispositions_bulk_event_scope(store):
+    await store.create_case("c1", "Case One")
+    rows = await store.create_dispositions_bulk(
+        "c1",
+        [
+            {"kind": "dismissed", "source_id": "s1", "event_id": "e1"},
+            {"kind": "dismissed", "source_id": "s1", "event_id": "e1"},
+            {"kind": "dismissed", "source_id": "s1", "event_id": "e2"},
+        ],
+    )
+    assert rows[0].id == rows[1].id
+    assert rows[0].id != rows[2].id
+    assert rows[0].detector == "*"
+    assert rows[0].created_at is not None
+
+
+@pytest.mark.asyncio
 async def test_timeline_and_case_delete_cascade_baseline_rows(store):
     from datetime import UTC, datetime
 
