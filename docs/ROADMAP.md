@@ -185,6 +185,31 @@ Hard, high value:
   investigation. Building blocks (Views, annotations, saved charts, RBAC) all exist; this is
   mostly a new Postgres model + frontend editor. Timesketch's most-loved feature.
 
+## Milestone 6 — streaming ingest ("live forensic" mode, agentless)
+
+Decided 2026-07-14: no bespoke endpoint agent (Velociraptor/osquery-class effort, out of
+scope permanently — see "Explicitly out of scope"). Instead: Vestigo accepts pushed event
+batches from *existing* collectors (Velociraptor post-processing, fluent-bit, winlogbeat,
+custom scripts) over an authenticated ingest endpoint, and the Explorer follows the stream
+via polling. Data-model overhaul explicitly approved by the user.
+
+- [ ] **S1 — Stream-source data model.** New Source kind `stream`: no final file hash;
+  instead an append-only per-batch chunk manifest (SHA-256 per received batch, hash-chained)
+  preserving the forensic attestation story. Touches `docs/CONCEPT.md` /
+  `docs/MODEL_REFINEMENT.md`, Postgres migrations, the `(case_id, file_hash)` dedup
+  uniqueness (`db/postgres.py`), and source UI. Design-first — this is the real cost of the
+  milestone; do it before any endpoint work.
+- [ ] **S2 — Push ingest endpoint.** Machine-client auth (per-source ingest token, not
+  session cookie), rate limiting/backpressure, batch formats: JSONL and Arrow IPC — the
+  Arrow record-batch path into ClickHouse already exists
+  (`ingestion/pipeline.py::_ingest_file_arrow`, `insert_events_arrow`). Arrow Flight
+  optional later; plain HTTP POST batches first.
+- [ ] **S3 — Live Explorer.** TanStack Query `refetchInterval` polling on grid + histogram
+  for stream sources; WebSocket push deliberately skipped.
+- [ ] **S4 — Detectors on open-ended data.** Periodic detector re-runs over stream sources;
+  rethink value-novelty "first seen" and baseline-window semantics for unbounded,
+  ever-growing sources.
+
 ## Explicitly out of scope (decided during the audit)
 
 - Persistent job store — in-memory is a documented deliberate choice for the single-process
@@ -193,3 +218,6 @@ Hard, high value:
 - ~~Alembic adoption~~ — **done**: Postgres schema is now Alembic-managed
   (`db/migrations`), with pre-Alembic databases auto-stamped at `0001` on startup.
 - Proactive router/query-builder splits — churn risk outweighs payoff at current velocity.
+- Bespoke endpoint collection agent (2026-07-14) — building/maintaining a cross-platform
+  collector fleet is a whole product (Velociraptor, osquery); Vestigo stays agentless and
+  accepts pushes from existing collectors instead (Milestone 6).
