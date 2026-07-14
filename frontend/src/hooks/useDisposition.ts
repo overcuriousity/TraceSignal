@@ -91,12 +91,17 @@ function markFindingsDismissed(data: AnomaliesResponse, t: DispositionTarget): A
 }
 
 /** Flag (not drop) the findings a new confirmation covers — the row stays
- * visible with a durable confirmed badge, matching what a refetch returns
- * (the backend stamps `confirmed: true` on covered findings). */
+ * visible with a durable confirmed badge, matching what a refetch returns.
+ * Confirmed dispositions are always event-scoped, and the backend stamps
+ * covered findings by `event_id` alone (`_apply_confirmations`) — so match
+ * only on the event here too, never on the (field, value) key: several
+ * findings can share one value key (e.g. multiple frequency windows of the
+ * same series) and must not all light up from confirming one of them. */
 function markFindingsConfirmed(data: AnomaliesResponse, t: DispositionTarget): AnomaliesResponse {
+  if (!t.eventId) return data;
   let changed = false;
   const results = data.results.map((f) => {
-    if (!matchesTarget(f, t) || f.confirmed) return f;
+    if (f.event_id !== t.eventId || f.confirmed) return f;
     changed = true;
     return { ...f, confirmed: true };
   });

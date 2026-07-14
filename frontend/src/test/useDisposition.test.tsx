@@ -179,6 +179,39 @@ describe("useDisposition optimistic filtering", () => {
     ]);
   });
 
+  it("confirmed flags only the clicked event, not value-key siblings", async () => {
+    // Two findings sharing one (allowlist_field, allowlist_value) key but
+    // owned by different events — e.g. two frequency windows of the same
+    // series. Confirming one must not light up the other: the backend stamps
+    // confirmed findings by event_id alone (_apply_confirmations), so the
+    // optimistic flag must be event-scoped too.
+    const { qc, result } = setup();
+    qc.setQueryData(VIEW_KEYS.frequency, {
+      results: [
+        { event_id: "ev1", details: { allowlist_field: "host", allowlist_value: "evil" } },
+        { event_id: "ev2", details: { allowlist_field: "host", allowlist_value: "evil" } },
+      ],
+      total_findings: 2,
+    } as unknown as AnomaliesResponse);
+
+    result.current.mutate({
+      kind: "confirmed",
+      detector: "frequency",
+      field: "host",
+      value: "evil",
+      sourceId: "s1",
+      eventId: "ev1",
+      content: "confirmed finding",
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    const data = qc.getQueryData<AnomaliesResponse>(VIEW_KEYS.frequency);
+    expect(data?.results.map((f) => [f.event_id, f.confirmed ?? false])).toEqual([
+      ["ev1", true],
+      ["ev2", false],
+    ]);
+  });
+
   it("leaves other detectors' caches untouched for a detector-scoped verdict", async () => {
     const { qc, result } = setup();
     qc.setQueryData(VIEW_KEYS.value_novelty, response("host", "evil"));
