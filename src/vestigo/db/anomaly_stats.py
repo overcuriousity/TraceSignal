@@ -200,7 +200,11 @@ from typing import Any
 
 import numpy as np
 
-from vestigo.db._buckets import bucket_interval_seconds, query_timestamp_range
+from vestigo.db._buckets import (
+    aligned_bucket_starts,
+    bucket_interval_seconds,
+    query_timestamp_range,
+)
 from vestigo.db._columns import resolve_column_token
 from vestigo.db._dt import (
     VESTIGO_NOT_SENTINEL_SQL,
@@ -4436,8 +4440,13 @@ class StatisticalAnomalyService:
         are returned ranked by |z| descending.
 
         *self-baseline* (``method="z-score"``): the whole timeline is bucketed
-        into *bucket_count* buckets and each bucket is scored leave-one-out
-        against the rest of its series.
+        into *bucket_count* buckets, each series is zero-filled over the
+        epoch-aligned grid between its first and last active bucket (so
+        fully-silent interior buckets score as real drops, while buckets
+        outside a series' own coverage span are not treated as silences), and
+        each bucket is scored leave-one-out against the rest of its series.
+        Series with fewer than ``_MIN_FREQUENCY_BUCKETS`` *non-empty* buckets
+        are skipped — no established rhythm to deviate from.
 
         *temporal* (``method="temporal-z-score"``, *windows* provided): the
         bucket interval is derived from the **baseline** window (the reference
@@ -4521,40 +4530,58 @@ class StatisticalAnomalyService:
                 z_threshold=z_threshold,
             )
 
-        series: dict[str, list[tuple[Any, int]]] = defaultdict(list)
+        series: dict[str, dict[str, int]] = defaultdict(dict)
         for brow in brows:
             bucket, sv, cnt = brow
             if sv:
-                series[sv].append((bucket, int(cnt)))
+                series[str(sv)][ensure_utc(bucket).isoformat()] = int(cnt)
+
+        # Epoch-aligned bucket grid covering the whole timeline — the same
+        # alignment `toStartOfInterval` used in the scan above, so every
+        # returned bucket maps onto a grid slot.
+        grid_iso = aligned_bucket_starts(min_ts, max_ts, interval)
+        grid_dt = [datetime.fromisoformat(b) for b in grid_iso]
 
         baseline_size = 0
         findings: list[FreqFinding] = []
         evaluated_series = 0
 
-        for sv, pts in series.items():
-            pts_aware = [(ensure_utc(b), c) for b, c in pts]
-            if len(pts_aware) < _MIN_FREQUENCY_BUCKETS:
+        for sv, cmap in series.items():
+            # A series needs an established rhythm before spikes/silences are
+            # meaningful — gate on *non-empty* buckets, as before zero-fill.
+            if len(cmap) < _MIN_FREQUENCY_BUCKETS:
                 continue
-            baseline_size += sum(c for _, c in pts_aware)
+            # Zero-fill the series between its first and last active bucket —
+            # a covered-but-empty bucket is a real 0 in the distribution, not
+            # a missing sample. Without this, fully-silent buckets never
+            # entered the series at all: silences (z ≪ 0) were undetectable
+            # in self-baseline mode and the dropped zeros inflated mean/std.
+            # The fill is deliberately bounded by the series' own active span,
+            # not the whole timeline grid: on multi-source timelines with
+            # disjoint coverage, buckets outside a series' span are coverage
+            # boundaries, not suspicious silences.
+            lo, hi = min(cmap), max(cmap)
+            span = [(iso, dt) for iso, dt in zip(grid_iso, grid_dt, strict=True) if lo <= iso <= hi]
+            counts = np.array([cmap.get(iso, 0) for iso, _ in span], dtype=np.float64)
+            baseline_size += int(counts.sum())
             # Leave-one-out mean/std: score each bucket against the rest of
             # the series, not against itself. Otherwise a single dominant
             # spike inflates its own baseline and can suppress detection
             # of the very spike being scored.
-            counts = np.array([c for _, c in pts_aware], dtype=np.float64)
             n = len(counts)
             total = float(counts.sum())
             total_sq = float(np.square(counts).sum())
             evaluated_series += 1
-            for (bucket_dt, cnt), c in zip(pts_aware, counts, strict=False):
+            for (_iso, bucket_dt), c in zip(span, counts, strict=True):
                 n_loo = n - 1
                 mean_val = (total - c) / n_loo
                 var_loo = (total_sq - c * c - n_loo * mean_val * mean_val) / (n_loo - 1)
                 std_val = max(math.sqrt(max(var_loo, 0.0)), _MIN_FREQUENCY_STD)
-                z = (cnt - mean_val) / std_val
+                z = (c - mean_val) / std_val
                 if abs(z) >= z_threshold:
                     findings.append(
                         _freq_finding(
-                            series_field, sv, bucket_dt, interval, int(cnt), mean_val, z, method
+                            series_field, sv, bucket_dt, interval, int(c), mean_val, z, method
                         )
                     )
 

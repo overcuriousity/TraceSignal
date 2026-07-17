@@ -410,7 +410,7 @@ temporal variant).
 
 | Mode | Baseline (mean/std source) | When to use |
 |---|---|---|
-| **z-score** (self-baseline) | Every bucket in the series, computed **leave-one-out** | General triage |
+| **z-score** (self-baseline) | Every bucket in the series — zero-filled between the series' first and last active bucket — computed **leave-one-out** | General triage |
 | **temporal-z-score** | The [baseline window's](#baseline-definitions-suspect-windows-and-the-normality-model) full, zero-filled buckets; suspect-window buckets scored against them | Incident response |
 
 **Self-baseline uses leave-one-out scoring.** Each bucket is compared against
@@ -422,6 +422,19 @@ event you're looking for. Leave-one-out avoids that self-suppression. (This
 document and the in-app Methodology panel previously stated the opposite —
 that the self-baseline "includes this window" — which was wrong; fixed as
 part of the audit that produced this file.)
+
+**Self-baseline zero-fills each series between its first and last active
+bucket** (v1.1.3). A covered-but-empty bucket is a real 0 in the series'
+distribution — previously such buckets never entered the series at all, so
+silences were undetectable in self-baseline mode and the dropped zeros
+inflated the mean/std. The fill is deliberately bounded by the series' own
+active span rather than the whole timeline grid: on multi-source timelines
+with disjoint coverage, buckets outside a series' span are coverage
+boundaries, not suspicious silences. (A series that goes silent and *never
+resumes* is indistinguishable from one whose coverage legitimately ends —
+use temporal mode with an explicit suspect window for that question.) Series
+with fewer than 3 non-empty buckets are still skipped: no established rhythm
+to deviate from.
 
 **Temporal mode** computes mean/std from the baseline window's buckets only
 (zero-filled and full-buckets-only — see the [normality model](#baseline-definitions-suspect-windows-and-the-normality-model)

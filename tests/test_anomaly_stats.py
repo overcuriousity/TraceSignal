@@ -740,14 +740,20 @@ def test_frequency_details_shape():
         assert "interval_seconds" in d
 
 
-def test_frequency_constant_series_ignored():
-    """A perfectly flat series (std=0) must not produce any findings."""
+def test_frequency_silence_detected():
+    """A fully-silent bucket inside a series' active span must score as a drop.
+
+    Regression: self-baseline mode built each series only from non-empty
+    GROUP BY buckets, so a bucket with zero events never entered the series —
+    silences were undetectable and the dropped zeros inflated mean/std.
+    """
     from datetime import datetime
 
-    min_dt = datetime(2024, 1, 1, tzinfo=UTC)
-    max_dt = datetime(2024, 1, 2, tzinfo=UTC)
-    # 6 perfectly uniform buckets.
-    bucket_rows = [(min_dt.replace(hour=h * 4), "LOG", 10) for h in range(6)]
+    min_dt = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
+    max_dt = datetime(2024, 1, 1, 6, 0, tzinfo=UTC)
+    # 6h range, 6 buckets → 1h interval; grid covers 7 aligned starts.
+    # Steady 10/bucket with hour 3 completely absent (the silence).
+    bucket_rows = [(min_dt.replace(hour=h), "LOG", 10) for h in (0, 1, 2, 4, 5, 6)]
     svc = _svc(
         [
             FakeQueryResult(result_rows=[(min_dt, max_dt)], column_names=["min", "max"]),
@@ -756,7 +762,55 @@ def test_frequency_constant_series_ignored():
     )
     svc._hydrate_freq_findings = lambda findings, *a, **kw: findings  # type: ignore[method-assign]
 
-    result = svc.find_frequency_anomalies("c1", ["s1"], z_threshold=2.0)
+    result = svc.find_frequency_anomalies("c1", ["s1"], bucket_count=6, z_threshold=2.0)
+    assert result.status == "ok"
+    assert len(result.results) == 1
+    silence = result.results[0]
+    assert silence.observed == 0
+    assert silence.z_score < 0
+    assert silence.window_start == min_dt.replace(hour=3).isoformat()
+
+
+def test_frequency_coverage_boundary_not_silence():
+    """Grid buckets outside a series' own first/last active bucket are coverage
+    boundaries (e.g. disjoint multi-source spans), not silences — no findings."""
+    from datetime import datetime
+
+    min_dt = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
+    max_dt = datetime(2024, 1, 2, 0, 0, tzinfo=UTC)
+    # 24h range, 24 buckets → 1h interval. Series only active hours 0-5,
+    # perfectly flat there; hours 6-24 have no events at all.
+    bucket_rows = [(min_dt.replace(hour=h), "LOG", 10) for h in range(6)]
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(min_dt, max_dt)], column_names=["min", "max"]),
+            FakeQueryResult(result_rows=bucket_rows, column_names=["bucket", "series_val", "cnt"]),
+        ]
+    )
+    svc._hydrate_freq_findings = lambda findings, *a, **kw: findings  # type: ignore[method-assign]
+
+    result = svc.find_frequency_anomalies("c1", ["s1"], bucket_count=24, z_threshold=2.0)
+    assert result.status == "ok"
+    assert result.results == []
+
+
+def test_frequency_constant_series_ignored():
+    """A perfectly flat series (std=0) must not produce any findings."""
+    from datetime import datetime
+
+    min_dt = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
+    max_dt = datetime(2024, 1, 1, 6, 0, tzinfo=UTC)
+    # Perfectly uniform, gap-free series over the whole 1h-bucket grid.
+    bucket_rows = [(min_dt.replace(hour=h), "LOG", 10) for h in range(7)]
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(min_dt, max_dt)], column_names=["min", "max"]),
+            FakeQueryResult(result_rows=bucket_rows, column_names=["bucket", "series_val", "cnt"]),
+        ]
+    )
+    svc._hydrate_freq_findings = lambda findings, *a, **kw: findings  # type: ignore[method-assign]
+
+    result = svc.find_frequency_anomalies("c1", ["s1"], bucket_count=6, z_threshold=2.0)
     assert result.status == "ok"
     assert result.results == []
 
