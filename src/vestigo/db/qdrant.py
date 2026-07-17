@@ -11,6 +11,7 @@ reused across multiple Timelines without duplicating vectors.
 from __future__ import annotations
 
 import contextlib
+import re
 from typing import Any
 
 from qdrant_client import QdrantClient
@@ -151,12 +152,22 @@ class QdrantStore:
 
         A case can have multiple collections (one per distinct embedding
         configuration hash).  All share the prefix
-        ``{collection_prefix}_{safe_case}_``.
+        ``{collection_prefix}_{safe_case}_``, and the remainder must be
+        exactly the 64-hex-char embedding-config hash — a bare prefix match
+        would also sweep in collections of any *other* case whose ID starts
+        with this case's full ID (case IDs are name-derived, so one can be a
+        prefix of another), and every delete/find helper routes through here:
+        a prefix collision would mean cross-case vector deletion.
         """
         safe_case = "".join(c if c.isalnum() else "_" for c in case_id)
         prefix = f"{self.collection_prefix}_{safe_case}_"
         collections = self.client.get_collections()
-        return [c.name for c in collections.collections if c.name.startswith(prefix)]
+        return [
+            c.name
+            for c in collections.collections
+            if c.name.startswith(prefix)
+            and re.fullmatch(r"[0-9a-f]{64}", c.name[len(prefix) :]) is not None
+        ]
 
     def _source_filter(self, source_id: str) -> Filter:
         """Return a Qdrant filter matching a single source_id."""
