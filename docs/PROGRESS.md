@@ -1,7 +1,41 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-14 (session 61 — Investigate panel disposition/pattern
-feedback overhaul, v1.1.2).
+Last updated: 2026-07-17 (session 62 — backend bug-hunt fixes, v1.1.3).
+
+## Session 62 — 2026-07-17: Backend audit bugfixes (v1.1.3)
+
+A code audit of the backend surfaced four real bugs plus three minor issues;
+all fixed in this session. Patch release 1.1.3 (bugfixes only).
+
+- **JSONL parser crashed on valid non-object JSON lines** (`ingestion/parser.py`):
+  `parse()` skipped *malformed* JSON but passed any well-formed line to
+  `_event_from_object`, so an array/string/`null`/number line raised
+  `AttributeError` and failed the entire file's ingest. Non-object lines are now
+  skipped like malformed ones (raw line stays in the immutable source file).
+- **Frequency self-baseline mode couldn't detect silences** (`db/anomaly_stats.py`):
+  series were built only from non-empty `GROUP BY` buckets, so a fully-silent
+  bucket never entered the series — z ≪ 0 drops were undetectable and the
+  dropped zeros inflated mean/std, contradicting `ANOMALY_DETECTION.md`. Each
+  series is now zero-filled over the epoch-aligned grid between its first and
+  last active bucket (span-bounded so disjoint multi-source coverage doesn't
+  read as silence); the ≥3 *non-empty*-buckets gate is unchanged.
+- **Qdrant cross-case collection sweep via ID prefix collision** (`db/qdrant.py`):
+  `case_collections` matched on `startswith(prefix)`; case IDs are name-derived,
+  so case A's full ID could be a prefix of case B's, and A's delete/find helpers
+  (including `delete_case_collections`) would sweep B's vector collections —
+  cross-case evidence deletion. The remainder after the prefix must now be
+  exactly one 64-hex embedding-config hash.
+- **Time-range filters truncated to whole seconds** (`db/queries.py`,
+  `db/anomaly_stats.py` window/motif binds): `to_clickhouse_utc` without
+  `precise=True` dropped the fractional second, so an `end` of `…00.500`
+  excluded events at `…00.001–.500` (and `start` over-included). All range
+  bounds now bind with millisecond precision.
+- Minor: one bad file in a directory ingest (unknown extension) now lands in
+  `result.errors` instead of aborting the run without a summary
+  (`ingestion/pipeline.py`); `_embed_batch` zips events↔vectors strictly so an
+  encoder count mismatch surfaces instead of silently dropping rows; stale
+  `TimesketchCsvParser` docstring (multi-line quoted records *are* handled)
+  rewritten.
 
 ## Session 61 — 2026-07-14: Investigate panel verdict-feedback overhaul
 
