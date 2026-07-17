@@ -188,10 +188,10 @@ class TimesketchCsvParser(Parser):
     Any columns not in the known mapping are preserved in ``attributes``.
 
     Note:
-        This parser reads one physical line at a time.  CSV records with
-        embedded newlines inside quoted fields are not split correctly; for
-        forensic timeline exports this is acceptable because such records are
-        rare and the raw line is preserved verbatim for manual review.
+        Quoted fields containing embedded newlines are handled: lines are
+        streamed through :class:`_RecordTrackingIterator`, which groups the
+        physical lines of each logical CSV record and tracks its exact byte
+        offset, line number, and raw text.
     """
 
     KNOWN_COLUMNS: dict[str, str] = {
@@ -301,7 +301,9 @@ class JsonlParser(Parser):
     """Streaming parser for JSON Lines files.
 
     Each line must contain one JSON object.  Common keys are mapped to event
-    fields; remaining keys are preserved in ``attributes``.
+    fields; remaining keys are preserved in ``attributes``.  Lines that are
+    malformed JSON or well-formed non-object JSON (arrays, strings, numbers,
+    ``null``) are skipped; the raw lines remain in the immutable source file.
     """
 
     KNOWN_KEYS: dict[str, str] = {
@@ -335,6 +337,12 @@ class JsonlParser(Parser):
                 except json.JSONDecodeError:
                     # Forensic rigor: malformed lines are skipped but the raw line
                     # remains in the immutable source file for manual inspection.
+                    continue
+                if not isinstance(obj, dict):
+                    # Well-formed but non-object JSON (array, string, number,
+                    # null) has no key/value fields to map — skipped like a
+                    # malformed line; the raw line stays in the immutable
+                    # source file for manual inspection.
                     continue
                 yield self._event_from_object(
                     source_file, current_offset, line_number, raw_line, obj

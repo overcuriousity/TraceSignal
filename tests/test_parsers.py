@@ -199,6 +199,18 @@ def test_jsonl_parser_skips_malformed_lines(tmp_path: Path) -> None:
     assert events[1].message == "also good"
 
 
+def test_jsonl_parser_skips_non_object_json_lines(tmp_path: Path) -> None:
+    """Well-formed non-object JSON (array/string/null/number) must be skipped,
+    not crash the whole file's ingest with an AttributeError."""
+    path = tmp_path / "mixed.jsonl"
+    path.write_text('{"message":"good"}\n[1,2,3]\n"hello"\nnull\n42\n{"message":"also good"}\n')
+    config = ParserConfig(name="jsonl", version="0.1.0")
+    parser = JsonlParser("case1", "source1", config, file_hash="hash1", source_name="source.jsonl")
+    events = list(parser.parse(path))
+    assert [e.message for e in events] == ["good", "also good"]
+    assert events[1].line_number == 6
+
+
 def test_missing_file_hash_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "x.csv"
     path.write_text("datetime,message\n2024-01-01T00:00:00+00:00,Hello\n")
