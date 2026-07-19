@@ -11,7 +11,9 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
+import pytest
 from fastmcp.client import Client as FastMCPClient
+from fastmcp.exceptions import ToolError
 
 from vestigo.agent.tools import AgentScope, build_tool_server
 from vestigo.db.postgres import User
@@ -243,3 +245,58 @@ async def test_filterspec_collapse_routine(store):
     assert query.exclude_routine_disposition_ids == [row.id]
     plain = await _build_query(scope, FilterSpec())
     assert plain.exclude_routine_disposition_ids is None
+
+
+@pytest.mark.asyncio
+async def test_run_anomaly_detector_passes_tuning_params(store, monkeypatch):
+    import vestigo.api.routers.events as events_router
+
+    captured: dict[str, Any] = {}
+
+    async def fake_run(case_id, timeline_id, source_ids, **kwargs):
+        captured.update(kwargs)
+
+        class R:
+            status = "skipped"
+
+        return R(), {}
+
+    def fake_serialize(result):
+        return {"status": result.status, "results": []}
+
+    monkeypatch.setattr(events_router, "_run_stat_detector", fake_run)
+    monkeypatch.setattr(events_router, "_serialize_stat_result", fake_serialize)
+
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "run_anomaly_detector",
+        {
+            "detector": "proportion_shift",
+            "z_threshold": 4.0,
+            "fdr_q": 0.05,
+            "min_ratio": 2.0,
+            "ngram_size": 3,
+            "min_support": 5,
+            "min_skew_seconds": 1.5,
+            "start": "2026-01-01T00:00:00Z",
+            "end": "2026-02-01T00:00:00Z",
+        },
+    )
+    assert result["status"] == "skipped"
+    assert captured["z_threshold"] == 4.0
+    assert captured["fdr_q"] == 0.05
+    assert captured["min_ratio"] == 2.0
+    assert captured["ngram_size"] == 3
+    assert captured["min_support"] == 5
+    assert captured["min_skew_seconds"] == 1.5
+    assert captured["start"] is not None and captured["end"] is not None
+
+
+@pytest.mark.asyncio
+async def test_run_anomaly_detector_rejects_out_of_bounds(store):
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    with pytest.raises(ToolError):
+        await _call(
+            server, "run_anomaly_detector", {"detector": "sequence_novelty", "ngram_size": 9}
+        )

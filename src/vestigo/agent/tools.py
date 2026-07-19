@@ -352,6 +352,14 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         series_field: str = "artifact",
         baseline_id: str | None = None,
         limit: int = 30,
+        z_threshold: float | None = Field(default=None, gt=0),
+        min_skew_seconds: float | None = Field(default=None, ge=0),
+        fdr_q: float | None = Field(default=None, gt=0, le=1),
+        min_ratio: float | None = Field(default=None, gt=1),
+        ngram_size: int | None = Field(default=None, ge=2, le=5),
+        min_support: int | None = Field(default=None, ge=2),
+        start: datetime | None = None,
+        end: datetime | None = None,
     ) -> dict[str, Any]:
         """Run a statistical anomaly detector over the timeline.
 
@@ -361,6 +369,12 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         sequence_novelty, sequence_motif, value_distribution_drift.
         `fields` is a comma-separated field list for value detectors (omit to
         auto-recommend); `series_field` groups frequency/sequence detectors.
+        Temporal detectors need a `baseline_id` from list_baselines (omit for
+        a self-baseline run). Tuning knobs (all optional, server defaults
+        otherwise): z_threshold (frequency |z| cutoff), min_skew_seconds
+        (timestamp_order), fdr_q (BH false-discovery ceiling), min_ratio
+        (effect-size floor), ngram_size (sequence length, 2-5), min_support
+        (sequence_motif), start/end (sequence_motif mining window).
         Returns findings plus a persisted run_id the analyst can open.
         """
         result, resolution = await _run_stat_detector(
@@ -370,9 +384,16 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             detector=detector,
             fields=fields,
             series_field=series_field,
-            z_threshold=None,
+            z_threshold=z_threshold,
             baseline_id=baseline_id,
             limit=min(limit, 100),
+            min_skew_seconds=min_skew_seconds,
+            fdr_q=fdr_q,
+            min_ratio=min_ratio,
+            ngram_size=ngram_size,
+            min_support=min_support,
+            start=start,
+            end=end,
             field_mappings=scope.field_mappings,
             source_offsets=scope.source_offsets,
         )
@@ -385,7 +406,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 detector=detector,
                 fields=fields,
                 series_field=series_field,
-                z_threshold=None,
+                z_threshold=z_threshold,
                 limit=min(limit, 100),
                 payload=payload,
                 resolution=resolution,
