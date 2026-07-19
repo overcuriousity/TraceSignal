@@ -26,6 +26,28 @@ Point-in-time PR review findings are archived under `docs/archive/PR{N}_REVIEW_F
 (full unrestricted finding set, one file per reviewed PR) once triaged into this backlog or
 resolved — this file holds only the condensed, still-open action items.
 
+## Phase 3 — investigation depth (active, decided 2026-07-19)
+
+Analyst-depth phase; full rationale in
+`docs/superpowers/specs/2026-07-19-phase3-investigation-depth-design.md`. Agent stays an
+analysis companion — agent-authored stories deferred. Ordered:
+
+- [ ] **Step 0 — consolidation preamble**: merge `feat/ai-agent`; A10 via
+  secret-by-env-only mode (no envelope encryption — decision recorded in the spec);
+  CONCEPT.md refresh (stale §7 exclusions, §6.2 Qdrant naming, de-MVP the framing).
+- [ ] **Step 1 — W6 template clustering** (see Milestone 5 entry). First: independent,
+  and template IDs become a facet the later steps consume. Reuse the `routine` collapse
+  machinery for "mute template".
+- [ ] **Step 2 — A9 viz parity** (see Milestone 8 entry). Own design round; before
+  Stories so the chart-spec is exercised once before Stories embeds it.
+- [ ] **Step 3 — W7 Stories, human-first** (see Milestone 5 entry). Own design round;
+  key tension: live embeds in editor vs. point-in-time snapshot on export. Block model
+  leaves room for a later `origin` field (agent authorship later, no migration pain).
+
+Parked: D10 (next phase; W6 feeds it), M6 streaming, M7 examination. Standing rule:
+when M6 or M7 resumes, S1 and E1 are designed **jointly** in one `MODEL_REFINEMENT.md`
+round — the data model migrates once, not twice.
+
 ## Milestone 2 — high-leverage improvements
 
 - [ ] **M15 residue — `list_fields_by_artifact` stays live (deliberate).** The per-source
@@ -267,10 +289,10 @@ exposure of the identical tool server (`VESTIGO_MCP_ENABLED`, default off). See
 `docs/superpowers/specs/2026-07-19-agent-read-parity-mcp-http-design.md` for the full design.
 
 - [ ] **A10 — LLM API key at rest.** `agent_settings.api_key` is stored plaintext in
-  Postgres (admin-only API; masked to a boolean in every response and audit row). Evaluate
-  envelope encryption or a secret-by-env-only mode. Until then: env-pinning
-  `VESTIGO_AGENT_API_KEY` keeps the key out of the DB entirely (env always wins per field,
-  so the DB column stays unused).
+  Postgres (admin-only API; masked to a boolean in every response and audit row).
+  Decision (Phase 3 Step 0): no envelope encryption — ship a secret-by-env-only mode
+  that refuses DB storage; document env-pinning `VESTIGO_AGENT_API_KEY` as the secure
+  path (env always wins per field, so the DB column stays unused).
 - [ ] **A11 — `/api/auth/users` directory scope.** Any signed-in user can list the full
   user directory (id, username, display name — needed to render names on annotations).
   Fine for the small-team threat model; add a config flag or scope the listing to co-case
