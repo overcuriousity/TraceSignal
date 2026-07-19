@@ -44,6 +44,21 @@ delete+rewrite preserving confirmed, logsource stored-not-enforced in v1.
   (272) green. ClickHouse-dependent semantics (`ILIKE` escaping, guarded
   `isIPAddressInRange`, NOT/ILIKE precedence) verified against a live 24.10
   server during development.
+- **PR #133 review fixes** (same session, pre-merge): `delete_case` now also
+  clears `sigma_rules`/`sigma_runs` (was orphaning them); consumer-failure
+  path in the runner aborts the producer thread via a stop flag so a failed
+  annotation write can no longer leave a `HEAVY_SCAN_GATE` slot held forever
+  (deadlock at concurrency 1); confirmed-key preservation is now scoped per
+  rule (`list_confirmed_keys(detector=rule_key)`) so the delete stays on the
+  fast bulk path unless *this* rule has confirmed findings; selected rules
+  that no longer resolve get explicit `error` entries in the run record
+  instead of being silently dropped; global ruleset parse is cached per file
+  (mtime/size — the directory is still re-read every call) with a compile
+  lock because pySigma's `convert` mutates the shared parsed rule;
+  `_string_in_clause` promoted to public `string_in_clause`; run `params`
+  snapshots the annotation batch size; multi-file rule upload surfaces every
+  failure, not just the last. New `tests/test_sigma_runner.py` covers the
+  streaming bridge including the gate-release failure path.
 
 ## Session 62 — 2026-07-17: Backend audit bugfixes (v1.1.3)
 

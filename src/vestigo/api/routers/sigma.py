@@ -220,7 +220,11 @@ async def start_sigma_run(
     run = await store.create_sigma_run(
         case_id=case_id,
         timeline_id=timeline_id,
-        params={"source_ids": source_ids, "selection": selection},
+        params={
+            "source_ids": source_ids,
+            "selection": selection,
+            "annotation_batch_size": get_settings().sigma_annotation_batch_size,
+        },
         created_by=user.id,
     )
     job_store = get_job_store()

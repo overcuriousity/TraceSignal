@@ -65,3 +65,30 @@ def test_malformed_fieldmap_ignored(tmp_path):
     (tmp_path / "r.yml").write_text(VALID_RULE)
     rules = load_global_rules(str(tmp_path))
     assert rules[0].fieldmap == {}
+
+
+def test_unchanged_files_reuse_cached_parse(tmp_path, monkeypatch):
+    """The per-file cache must skip the pySigma parse for unchanged files and
+    re-parse when a file's content (mtime/size) changes."""
+    import vestigo.sigma.rules as rules_mod
+
+    (tmp_path / "a.yml").write_text(VALID_RULE)
+    calls: list[int] = []
+    real_parse = rules_mod.parse_rule_yaml
+
+    def counting_parse(text):
+        calls.append(1)
+        return real_parse(text)
+
+    monkeypatch.setattr(rules_mod, "parse_rule_yaml", counting_parse)
+
+    first = rules_mod.load_global_rules(str(tmp_path))
+    assert len(calls) == 1
+    second = rules_mod.load_global_rules(str(tmp_path))
+    assert len(calls) == 1  # unchanged file: cached parse reused
+    assert second[0].title == first[0].title
+
+    (tmp_path / "a.yml").write_text(VALID_RULE.replace("Valid one", "Changed"))
+    third = rules_mod.load_global_rules(str(tmp_path))
+    assert len(calls) == 2  # changed file: re-parsed
+    assert third[0].title == "Changed"

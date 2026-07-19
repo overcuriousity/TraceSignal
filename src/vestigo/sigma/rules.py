@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -140,10 +141,23 @@ def _load_fieldmap(path: Path) -> dict[str, str]:
     return {str(k): str(v) for k, v in data.items() if isinstance(v, str | int | float)}
 
 
+# Parsed-rule cache for the global directory: pySigma parsing dominates the
+# cost of a listing/run over a large ruleset (a SigmaHQ clone is thousands of
+# files), so re-reading "on every request" — the property that makes a file
+# drop need no restart — is only sustainable if unchanged files skip the
+# parse. Keyed by absolute path; an entry is valid while (mtime_ns, size) and
+# the resolved fieldmap are unchanged, and entries for files that vanish from
+# the walk are pruned. Guarded by a lock: loads run on worker threads.
+_RULE_CACHE: dict[Path, tuple[tuple[int, int], LoadedRule]] = {}
+_RULE_CACHE_LOCK = threading.Lock()
+
+
 def load_global_rules(rules_path: str) -> list[LoadedRule]:
     """Walk the global ruleset directory and load every ``*.yml``/``*.yaml``.
 
-    Malformed files become :class:`LoadedRule` entries with ``error`` set —
+    Re-reads the directory on every call (a rule-file drop needs no restart);
+    files whose mtime/size are unchanged reuse their cached parse. Malformed
+    files become :class:`LoadedRule` entries with ``error`` set —
     reported, never fatal. Fieldmap files: the nearest ``vestigo-fieldmap.yml``
     walking up from the rule file toward the ruleset root wins; maps are not
     merged across levels.
@@ -171,13 +185,23 @@ def load_global_rules(rules_path: str) -> list[LoadedRule]:
         return {}
 
     rules: list[LoadedRule] = []
+    seen: set[Path] = set()
     for path in sorted(root.rglob("*")):
         if not path.is_file() or path.suffix.lower() not in (".yml", ".yaml"):
             continue
         if path.name == FIELDMAP_FILENAME:
             continue
         rel = str(path.relative_to(root))
+        fieldmap = fieldmap_for(path)
         try:
+            stat = path.stat()
+            stamp = (stat.st_mtime_ns, stat.st_size)
+            with _RULE_CACHE_LOCK:
+                cached = _RULE_CACHE.get(path)
+            if cached is not None and cached[0] == stamp and cached[1].fieldmap == fieldmap:
+                rules.append(cached[1])
+                seen.add(path)
+                continue
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             rules.append(
@@ -192,7 +216,14 @@ def load_global_rules(rules_path: str) -> list[LoadedRule]:
                 )
             )
             continue
-        rules.append(load_rule_text("global", rel, text, fieldmap_for(path)))
+        loaded = load_rule_text("global", rel, text, fieldmap)
+        with _RULE_CACHE_LOCK:
+            _RULE_CACHE[path] = (stamp, loaded)
+        rules.append(loaded)
+        seen.add(path)
+    with _RULE_CACHE_LOCK:
+        for stale in set(_RULE_CACHE) - seen:
+            del _RULE_CACHE[stale]
     return rules
 
 

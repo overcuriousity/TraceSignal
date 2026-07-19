@@ -55,7 +55,9 @@ export function SigmaPanel({ caseId, timelineId, onTagFilter }: Props) {
   const qc = useQueryClient();
   const addJob = useJobsStore((s) => s.addJob);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [uploadError, setUploadError] = useState<string | null>(null);
+  // Per-file upload failures from the latest batch (multi-file uploads run
+  // concurrently — collecting keeps every failure visible, not just the last).
+  const [uploadErrors, setUploadErrors] = useState<string[]>([]);
   // Deselected rules (default: everything enabled runs) — keyed origin:ref.
   const [deselected, setDeselected] = useState<Set<string>>(new Set());
   const [expandedRun, setExpandedRun] = useState<string | null>(null);
@@ -82,12 +84,10 @@ export function SigmaPanel({ caseId, timelineId, onTagFilter }: Props) {
   const selectedRules = runnable.filter((r) => !deselected.has(ruleId(r)));
 
   const uploadMutation = useMutation({
-    mutationFn: (yaml: string) => sigmaApi.uploadRule(caseId, yaml),
-    onSuccess: () => {
-      setUploadError(null);
-      qc.invalidateQueries({ queryKey: ["sigma-rules", caseId] });
-    },
-    onError: (err: Error) => setUploadError(err.message),
+    mutationFn: ({ yaml }: { name: string; yaml: string }) => sigmaApi.uploadRule(caseId, yaml),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["sigma-rules", caseId] }),
+    onError: (err: Error, vars) =>
+      setUploadErrors((prev) => [...prev, `${vars.name}: ${err.message}`]),
   });
 
   const toggleEnabled = useMutation({
@@ -123,8 +123,9 @@ export function SigmaPanel({ caseId, timelineId, onTagFilter }: Props) {
 
   const handleFiles = async (files: FileList | null) => {
     if (!files) return;
+    setUploadErrors([]);
     for (const file of Array.from(files)) {
-      uploadMutation.mutate(await file.text());
+      uploadMutation.mutate({ name: file.name, yaml: await file.text() });
     }
   };
 
@@ -173,9 +174,11 @@ export function SigmaPanel({ caseId, timelineId, onTagFilter }: Props) {
             Run {selectedRules.length}
           </Button>
         </div>
-        {uploadError && (
-          <p className="mb-2 text-xs text-[var(--color-danger)]">{uploadError}</p>
-        )}
+        {uploadErrors.map((err) => (
+          <p key={err} className="mb-2 text-xs text-[var(--color-danger)]">
+            {err}
+          </p>
+        ))}
         {runMutation.isError && (
           <p className="mb-2 text-xs text-[var(--color-danger)]">
             {(runMutation.error as Error).message}

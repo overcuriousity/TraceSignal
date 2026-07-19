@@ -1446,6 +1446,16 @@ disposition mechanism.
   `toFloat64OrNull` and treat non-numeric values as no-match.
 - **Unsupported constructs** (correlation rules, aggregations) report the
   rule as `not_applicable` rather than failing the run.
+- **Case-uploaded rules have no ruleset fieldmap.** `vestigo-fieldmap.yml`
+  only applies to rules loaded from the global directory; an uploaded rule
+  resolves fields through the timeline's canonical `field_mappings` and the
+  raw-attribute fallback only. Map fields at the timeline level (or drop the
+  rule into the global directory next to a fieldmap) if an upload needs
+  Sigma-taxonomy field translation.
+- **Global rules are cached per file.** The directory is still re-read on
+  every listing/run (a file drop needs no restart), but a file whose
+  mtime/size are unchanged reuses its parsed form — only changed files pay
+  the YAML/pySigma parse.
 
 ---
 

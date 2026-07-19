@@ -145,6 +145,10 @@ For a lone analyst on one machine, Qdrant can run in **local mode** through the 
 - Docker images can also be pre-bundled, but Docker is not required for airgapped use.
 - Telemetry and cloud APIs are disabled by default and not required.
 - `allow_online`/`VESTIGO_ALLOW_ONLINE` is not yet checked at any network call site.
+- The Sigma runner's `pysigma` dependency transitively installs `requests` (pySigma uses it
+  only for optional rule-collection fetching we never call); no Vestigo Sigma code path
+  touches the network — rules come from the local `VESTIGO_SIGMA_RULES_PATH` drop and
+  Postgres uploads.
 - Exception: optional OIDC SSO (`VESTIGO_OIDC_ENABLED`) is intentionally independent of
   `VESTIGO_ALLOW_ONLINE`. It is operator-opted-in (off by default) and talks to an
   operator-configured IdP the analyst chose to trust — commonly reachable on the same LAN as

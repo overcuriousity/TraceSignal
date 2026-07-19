@@ -2235,7 +2235,8 @@ class PostgresStore:
 
         Returns True if the case existed and was removed, False otherwise.
 
-        ``View``, ``Annotation``, ``DetectorRun``, and the enrichment tables
+        ``View``, ``Annotation``, ``DetectorRun``, the Sigma tables
+        (``SigmaRule``, ``SigmaRun``), and the enrichment tables
         (``SourceEnrichment``, ``EnrichmentResultStaging``,
         ``EnrichmentJobRun``) are case-scoped by a plain ``case_id`` column
         (no FK/cascade — they aren't declared with a ``ForeignKey`` to
@@ -2271,6 +2272,8 @@ class PostgresStore:
             await session.execute(
                 delete(EnrichmentJobRun).where(EnrichmentJobRun.case_id == case_id)
             )
+            await session.execute(delete(SigmaRule).where(SigmaRule.case_id == case_id))
+            await session.execute(delete(SigmaRun).where(SigmaRun.case_id == case_id))
             await session.delete(case)
             await session.commit()
             return True
@@ -3188,8 +3191,6 @@ class PostgresStore:
         they never appear in :meth:`list_distinct_tag_contents` (user tags) —
         this feeds the unified tag filter panel alongside it.
         """
-        from sqlalchemy import select
-
         async with self.session_factory() as session:
             result = await session.execute(
                 select(Annotation.content)

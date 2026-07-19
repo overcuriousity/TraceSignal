@@ -39,13 +39,26 @@ def _resolve_selected_rules(
     global_rules: list[LoadedRule],
     case_rules: list[LoadedRule],
     selection: list[dict[str, str]] | None,
-) -> list[LoadedRule]:
-    """Apply the run request's rule selection; ``None``/empty = all loadable rules."""
+) -> tuple[list[LoadedRule], list[tuple[str, str]]]:
+    """Apply the run request's rule selection; ``None``/empty = all loadable rules.
+
+    Returns ``(rules, missing)`` where *missing* is every selected
+    ``(origin, ref)`` that resolved to nothing (deleted or disabled since the
+    request was built) — reported per-rule in the run record rather than
+    silently dropped, so the record always accounts for the full selection.
+    """
     pool = global_rules + case_rules
     if not selection:
-        return pool
-    wanted = {(s["origin"], s["ref"]) for s in selection}
-    return [r for r in pool if (r.origin, r.ref) in wanted]
+        return pool, []
+    wanted = [(s["origin"], s["ref"]) for s in selection]
+    wanted_set = set(wanted)
+    rules = [r for r in pool if (r.origin, r.ref) in wanted_set]
+    found = {(r.origin, r.ref) for r in rules}
+    return rules, [w for w in wanted if w not in found]
+
+
+class _ProducerAbort(Exception):
+    """Raised inside the producer thread when the consumer signalled stop."""
 
 
 def _stream_rule_hits(
@@ -56,20 +69,31 @@ def _stream_rule_hits(
     batch_size: int,
     loop: asyncio.AbstractEventLoop,
     queue: asyncio.Queue,
+    stop: threading.Event,
 ) -> None:
     """Producer thread: stream matching rows into *queue* in batches.
 
-    ``run_coroutine_threadsafe(...).result()`` blocks the producer until the
-    consumer drains — the bounded queue is the backpressure that keeps a
-    multi-million-hit rule from buffering unboundedly. Exceptions are shipped
+    The blocking put is the backpressure that keeps a multi-million-hit rule
+    from buffering unboundedly; it polls *stop* so a failed consumer (which
+    can no longer drain the queue) unwinds the producer instead of leaving it
+    parked forever holding a ``HEAVY_SCAN_GATE`` slot. Exceptions are shipped
     through the queue so the consumer re-raises them in the event loop.
     """
 
     def _put(item: Any) -> None:
-        asyncio.run_coroutine_threadsafe(queue.put(item), loop).result()
+        future = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+        while True:
+            if stop.is_set():
+                future.cancel()
+                raise _ProducerAbort
+            try:
+                future.result(timeout=0.5)
+                return
+            except TimeoutError:
+                continue
 
     try:
-        in_clause, params = ClickHouseStore._string_in_clause("src", source_ids)
+        in_clause, params = ClickHouseStore.string_in_clause("src", source_ids)
         params["case_id"] = case_id
         query = (
             f"SELECT event_id, source_id FROM {ch.database}.events "  # noqa: S608
@@ -86,10 +110,12 @@ def _stream_rule_hits(
             if batch:
                 _put(batch)
         _put(_STREAM_END)
+    except _ProducerAbort:
+        logger.debug("Sigma scan producer aborted: consumer stopped draining")
     except BaseException as exc:  # noqa: BLE001 — shipped to the consumer, re-raised there
         try:
             _put(exc)
-        except Exception:  # loop already gone — nothing left to notify
+        except (_ProducerAbort, Exception):  # consumer/loop gone — nothing left to notify
             logger.exception("Sigma scan producer failed after consumer went away")
 
 
@@ -108,9 +134,10 @@ async def _scan_and_annotate(
     """Stream one rule's hits and persist them as system annotations. Returns match count."""
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue(maxsize=_QUEUE_DEPTH)
+    stop = threading.Event()
     producer = threading.Thread(
         target=_stream_rule_hits,
-        args=(ch, case_id, source_ids, condition_sql, batch_size, loop, queue),
+        args=(ch, case_id, source_ids, condition_sql, batch_size, loop, queue, stop),
         name=f"sigma-scan-{rule.rule_key[:8]}",
         daemon=True,
     )
@@ -151,7 +178,13 @@ async def _scan_and_annotate(
             await store.bulk_create_annotations(annotation_rows)
             on_progress(matched)
     finally:
-        producer.join(timeout=30)
+        # Unwind the producer even when this consumer failed mid-stream: the
+        # stop flag aborts its blocking put so it exits the HEAVY_SCAN_GATE
+        # context instead of holding a slot forever.
+        stop.set()
+        await asyncio.to_thread(producer.join, 30)
+        if producer.is_alive():
+            logger.warning("Sigma scan producer for rule %s did not exit in time", rule.rule_key)
     return matched
 
 
@@ -181,8 +214,7 @@ def run_sigma_job(
         case_rules = [
             load_case_rule(row.id, row.yaml_content, {}) for row in case_rows if row.enabled
         ]
-        rules = _resolve_selected_rules(global_rules, case_rules, selection)
-        confirmed_keys = await store.list_confirmed_keys(case_id, source_ids)
+        rules, missing = _resolve_selected_rules(global_rules, case_rules, selection)
 
         await store.update_sigma_run(run_id, status="running")
         job_store.update(
@@ -192,6 +224,26 @@ def run_sigma_job(
         )
 
         results: list[dict[str, Any]] = []
+        # Selected rules that no longer resolve (deleted/disabled between
+        # building the request and running it) get an explicit error entry —
+        # the run record must account for the full selection.
+        for origin, ref in missing:
+            results.append(
+                {
+                    "rule_key": f"{origin}:{ref}",
+                    "origin": origin,
+                    "ref": ref,
+                    "title": ref,
+                    "level": None,
+                    "logsource": {},
+                    "content_hash": "",
+                    "sql": None,
+                    "match_count": 0,
+                    "status": "error",
+                    "error": "selected rule not found (deleted or disabled since selection)",
+                    "fallback_fields": [],
+                }
+            )
         total_hits = 0
         for done, rule in enumerate(rules):
             entry: dict[str, Any] = {
@@ -226,6 +278,12 @@ def run_sigma_job(
             entry["sql"] = compiled.sql
             entry["fallback_fields"] = compiled.fallback_fields
             try:
+                # Scoped per rule: an empty set keeps delete_system_annotations
+                # on its fast bulk-DELETE path — the preserve path loads every
+                # matching row into memory, unacceptable for a no-cap rule.
+                confirmed_keys = await store.list_confirmed_keys(
+                    case_id, source_ids, detector=rule.rule_key
+                )
                 await store.delete_system_annotations(
                     case_id,
                     source_ids,

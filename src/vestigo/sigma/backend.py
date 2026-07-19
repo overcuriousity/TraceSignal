@@ -29,6 +29,7 @@ Keyword (field-less) values search the lowercased ``search_blob`` column.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 
@@ -256,6 +257,9 @@ class VestigoClickHouseBackend(TextQueryBackend):
         return f"match(search_blob, {quote_ch_string('(?i)' + cond.value.regexp)})"
 
 
+_COMPILE_LOCK = threading.Lock()
+
+
 @dataclass
 class CompiledRule:
     """The compilation outcome for one rule: SQL or a reason there is none."""
@@ -280,7 +284,12 @@ def compile_rule(
     resolver = FieldResolver(field_mappings=field_mappings, fieldmap=dict(fieldmap))
     backend = VestigoClickHouseBackend(resolver)
     try:
-        queries = backend.convert(SigmaCollection([rule]))
+        # pySigma's convert mutates the rule (set_conversion_result/states);
+        # parsed rules are shared via the global-ruleset cache, so concurrent
+        # jobs must not convert the same object at once. Compilation is
+        # milliseconds per rule — serializing it is cheap.
+        with _COMPILE_LOCK:
+            queries = backend.convert(SigmaCollection([rule]))
     except SigmaError as exc:
         return CompiledRule(sql=None, error=str(exc))
     queries = [q for q in queries if isinstance(q, str) and q.strip()]
