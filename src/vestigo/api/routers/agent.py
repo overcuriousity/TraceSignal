@@ -25,7 +25,12 @@ from pydantic import BaseModel, Field
 from vestigo.agent.availability import agent_available
 from vestigo.agent.runtime import dump_history, load_history, stream_turn
 from vestigo.agent.tools import build_scope
-from vestigo.api.deps import get_current_user, get_store, require_case_read
+from vestigo.api.deps import (
+    get_current_user,
+    get_store,
+    require_case_contribute,
+    require_case_read,
+)
 from vestigo.core.config import get_settings
 from vestigo.db.postgres import (
     ANNOTATION_ORIGIN_AGENT,
@@ -289,7 +294,7 @@ async def confirm_proposal(
     case_id: str,
     conversation_id: str,
     proposal_id: str,
-    case: Case = Depends(require_case_read),
+    case: Case = Depends(require_case_contribute),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Confirm an agent proposal, writing its annotations with origin agentic-analysis.
@@ -353,7 +358,7 @@ async def reject_proposal(
     case_id: str,
     conversation_id: str,
     proposal_id: str,
-    case: Case = Depends(require_case_read),
+    case: Case = Depends(require_case_contribute),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Reject an agent proposal — no annotations are written."""

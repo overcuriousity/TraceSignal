@@ -263,6 +263,50 @@ def test_confirm_proposal_writes_annotations(client, admin_bootstrap, agent_on, 
     assert any(a.action == "agent.annotation_confirm" for a in audit_rows)
 
 
+def test_confirm_reports_skipped_events(client, admin_bootstrap, agent_on, store, monkeypatch):
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    async def _seed():
+        return await _seed_proposal(store, case_id, timeline_id, owner["id"])
+
+    conv, proposal = asyncio.run(_seed())
+    # Only e1 still resolves against the current scope; e2's source left the
+    # timeline (or the event was otherwise removed) since propose time.
+    _patch_proposal_resolver(monkeypatch, {"e1": "s1"}, unknown=["e2"])
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/confirm"
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["written"] == 1
+    assert body["skipped_event_ids"] == ["e2"]
+    assert body["proposal"]["status"] == "confirmed"
+
+    async def _check(event_id):
+        return await store.list_annotations(case_id, "s1", event_id)
+
+    e1_rows = asyncio.run(_check("e1"))
+    assert any(
+        r.origin == "agentic-analysis"
+        and r.annotation_type == "tag"
+        and r.content == "suspicious"
+        and r.created_by == "admin"
+        for r in e1_rows
+    )
+    e2_rows = asyncio.run(_check("e2"))
+    assert e2_rows == []
+
+    async def _audit():
+        return await store.query_audit(case_id=case_id)
+
+    audit_rows = asyncio.run(_audit())
+    confirm_row = next(a for a in audit_rows if a.action == "agent.annotation_confirm")
+    assert confirm_row.detail["skipped_event_ids"] == ["e2"]
+    assert confirm_row.detail["written"] == 1
+
+
 def test_confirm_is_idempotent(client, admin_bootstrap, agent_on, store, monkeypatch):
     owner = as_admin(client, admin_bootstrap)
     case_id, timeline_id = _make_case_and_timeline(client)
