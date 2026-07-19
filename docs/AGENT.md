@@ -48,7 +48,11 @@ alongside any agent change, like `ANOMALY_DETECTION.md` for detectors.
 - **Invisible unless configured.** `/api/health` reports `agent_available`
   only when `VESTIGO_AGENT_*` is set **and** the endpoint answered a cached
   probe (`agent/availability.py`, TTL `VESTIGO_AGENT_PROBE_TTL_SECONDS`).
-  The frontend renders zero agent UI otherwise; API endpoints 503.
+  The frontend renders zero agent UI otherwise; API endpoints 503. The
+  cache is stale-while-revalidate: a merely-expired entry answers
+  immediately with the last value and re-probes in the background, so
+  `/api/health` never blocks on a hung LLM endpoint; only a cold cache or
+  a config-fingerprint change probes synchronously.
 - **Forensic reproducibility.** Conversations persist in Postgres
   (`agent_conversations` / `agent_messages`, migration 0007): every tool
   call with exact arguments and a result summary, plus the runtime's
@@ -91,6 +95,9 @@ frontend AgentPanel ──POST /messages (SSE)──► api/routers/agent.py
 - Streaming is SSE over the POST response (`text_delta`, `tool_call`,
   `tool_result`, `done`, `error`); the frontend reads it via fetch +
   ReadableStream (`frontend/src/api/agent.ts`).
+- One turn at a time per conversation: a POST while another turn is
+  streaming gets a 409 (`_active_turns` in `api/routers/agent.py`) —
+  concurrent turns would race on the conversation's replayable `history`.
 - The analyst's current Explorer filters ride along with each message and are
   injected as context, so "filter what I'm looking at further" works.
 
@@ -125,7 +132,10 @@ in-app agent has. One tool code path, two transports.
 - **Audit.** Each `tools/call` request writes an `agent.tool_call` audit
   row (same action as the built-in loop) carrying the token id and
   `transport: "mcp_http"` in the detail, sniffed from the request body
-  before it's replayed into the MCP session (`_audit_tool_call`).
+  before it's replayed into the MCP session (`_audit_tool_call`). JSON-RPC
+  batch arrays audit one row per `tools/call` member — the transport
+  rejects batches (2025-06-18 spec), but the custody trail doesn't depend
+  on that. Request bodies are capped at 10 MiB (413 above).
 - FastMCP's DNS-rebinding host-validation transport security is disabled
   for this endpoint — safe because a universal Bearer-auth check precedes
   all dispatch, unlike the browser-ambient-credential threat that

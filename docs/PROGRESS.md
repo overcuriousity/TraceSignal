@@ -1,6 +1,32 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-19 (session 67 — agent A3/A6/A1/A7 sweep).
+Last updated: 2026-07-19 (session 68 — PR137 review fix batch).
+
+## Session 68 — 2026-07-19: PR137 pre-merge review fixes (feat/ai-agent)
+
+Full pre-merge review of PR #137; every fixable finding fixed on the branch. Full
+finding set: `docs/archive/PR137_REVIEW_FINDINGS.md`.
+
+- **Backend**: `stream_turn` now owns and closes the per-turn `httpx.AsyncClient`
+  (was leaked per message); one turn at a time per conversation (in-memory
+  `_active_turns` reservation, concurrent POST → 409 — protects the replayable
+  `history` from a last-writer-wins race); conversation delete cascades to
+  proposals; `/mcp` request bodies capped at 10 MiB (413) and audit sniffing now
+  handles JSON-RPC batch arrays (roadmap A4 closed, defense in depth); agent-tool
+  limit/offset clamped against negative values; the probe's Bearer-header key
+  duplicate now goes only to Kimi's `/coding` endpoint
+  (`is_kimi_coding_endpoint` moved to `agent/config.py`); availability probe is
+  stale-while-revalidate so `/api/health` never blocks on a hung LLM endpoint.
+- **Frontend**: `AgentPanel.send()` handles create-conversation failure inside the
+  stream error path (input restored); the live transcript is cleared only after
+  the persisted refetch lands (no flash); stream rendering refactored to an
+  incremental `foldStreamEvent` reducer (was O(n²) per token over a turn);
+  `ProposalCard` surfaces non-409 decision failures as an error toast.
+- **Triage**: plaintext `agent_settings.api_key` at rest and the authenticated
+  full user directory (`/api/auth/users`) became roadmap items A10/A11; the
+  confirm-proposal crash gap stays a documented deliberate tradeoff.
+- 8 new backend tests (409 guard, client close, proposal cascade, body cap,
+  batch audit, clamps, stale-while-revalidate, Kimi-only Bearer).
 
 ## Session 67 — 2026-07-19: agent A3 scoping fix, A6 token metering, A1 propose→confirm annotations, A7 DB-backed settings (feat/ai-agent)
 

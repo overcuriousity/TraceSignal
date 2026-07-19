@@ -99,6 +99,63 @@ async def test_mcp_rejects_revoked_and_expired_rows(store):
     assert _token_auth_error(expired) == "token expired"
 
 
+def test_mcp_body_cap_413(mcp_client, admin_bootstrap, monkeypatch):
+    """The buffered request body is capped — oversized requests get a 413."""
+    from vestigo.agent import mcp_http
+
+    monkeypatch.setattr(mcp_http, "_MAX_BODY_BYTES", 64)
+    as_admin(mcp_client, admin_bootstrap)
+    case_id, tl_id, token = _setup_token(mcp_client)
+    resp = mcp_client.post(
+        "/mcp",
+        content=b"x" * 1024,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 413
+
+
+def test_mcp_batch_tools_call_still_audited(mcp_client, admin_bootstrap, store):
+    """A JSON-RPC batch array writes one agent.tool_call audit row per member.
+
+    The SDK transport rejects batches (2025-06-18 spec removed them) — the
+    audit sniffing must not depend on that, so the rows exist regardless of
+    the transport's response.
+    """
+    import asyncio
+
+    as_admin(mcp_client, admin_bootstrap)
+    case_id, tl_id, token = _setup_token(mcp_client)
+    mcp_client.post(
+        "/mcp",
+        json=[
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "list_baselines", "arguments": {}},
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "list_saved_views", "arguments": {}},
+            },
+        ],
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "Authorization": f"Bearer {token}",
+        },
+    )
+
+    async def _rows():
+        return await store.query_audit(case_id=case_id, action="agent.tool_call")
+
+    rows = asyncio.run(_rows())
+    audited_tools = {r.detail["tool"] for r in rows}
+    assert {"list_baselines", "list_saved_views"} <= audited_tools
+
+
 def test_mcp_end_to_end_tool_call(mcp_client, admin_bootstrap):
     """Full streamable-HTTP round trip: initialize, list tools, call one."""
     as_admin(mcp_client, admin_bootstrap)

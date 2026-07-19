@@ -27,6 +27,10 @@ from vestigo.db._dt import ensure_utc
 
 logger = logging.getLogger(__name__)
 
+# Hard cap on the buffered MCP request body (JSON-RPC messages are small;
+# 10 MiB is generous headroom for large tool arguments).
+_MAX_BODY_BYTES = 10 * 1024 * 1024
+
 
 def _token_auth_error(row: Any | None) -> str | None:
     """Return the auth-failure reason for a token row, or None when usable."""
@@ -62,32 +66,41 @@ async def _authenticate(headers: dict[bytes, bytes]) -> tuple[Any, Any] | JSONRe
 
 
 async def _audit_tool_call(body: bytes, token_row: Any, user: Any) -> None:
-    """Best-effort agent.tool_call audit row for tools/call requests."""
+    """Best-effort agent.tool_call audit row(s) for tools/call requests.
+
+    Handles both a single JSON-RPC object and a batch array (one audit row
+    per ``tools/call`` member). The MCP SDK's streamable-HTTP transport
+    currently rejects batches (removed in the 2025-06-18 spec), so the array
+    branch is defense in depth: the custody trail must not depend on a
+    transport implementation detail.
+    """
     from vestigo.api.deps import get_store
 
     try:
-        message = json.loads(body)
+        parsed = json.loads(body)
     except (ValueError, UnicodeDecodeError):
         return
-    if not isinstance(message, dict) or message.get("method") != "tools/call":
-        return
-    params = message.get("params") or {}
-    try:
-        await get_store().record_audit(
-            action="agent.tool_call",
-            actor=user,
-            case_id=token_row.case_id,
-            target_type="agent_token",
-            target_id=token_row.id,
-            detail={
-                "tool": params.get("name"),
-                "args": params.get("arguments"),
-                "transport": "mcp_http",
-            },
-        )
-    except Exception:
-        # Audit is best-effort — a logging hiccup must never fail the tool call.
-        logger.exception("Failed to write agent.tool_call audit row for MCP request")
+    messages = parsed if isinstance(parsed, list) else [parsed]
+    for message in messages:
+        if not isinstance(message, dict) or message.get("method") != "tools/call":
+            continue
+        params = message.get("params") or {}
+        try:
+            await get_store().record_audit(
+                action="agent.tool_call",
+                actor=user,
+                case_id=token_row.case_id,
+                target_type="agent_token",
+                target_id=token_row.id,
+                detail={
+                    "tool": params.get("name"),
+                    "args": params.get("arguments"),
+                    "transport": "mcp_http",
+                },
+            )
+        except Exception:
+            # Audit is best-effort — a logging hiccup must never fail the tool call.
+            logger.exception("Failed to write agent.tool_call audit row for MCP request")
 
 
 class MCPEndpoint:
@@ -113,12 +126,18 @@ class MCPEndpoint:
         token_row, user = auth
 
         # Buffer the request body once: audit sniffs it, then the inner app
-        # re-reads it through a replaying receive.
+        # re-reads it through a replaying receive. Capped — an authenticated
+        # client must not be able to balloon server memory with one request.
         body = b""
         more = True
         while more:
             message = await receive()
             body += message.get("body", b"")
+            if len(body) > _MAX_BODY_BYTES:
+                await JSONResponse(status_code=413, content={"detail": "Request body too large"})(
+                    scope, receive, send
+                )
+                return
             more = message.get("more_body", False)
         await _audit_tool_call(body, token_row, user)
 

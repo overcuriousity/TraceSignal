@@ -22,7 +22,12 @@ import time
 
 import httpx
 
-from vestigo.agent.config import AgentConfig, config_fingerprint, resolve_agent_config
+from vestigo.agent.config import (
+    AgentConfig,
+    config_fingerprint,
+    is_kimi_coding_endpoint,
+    resolve_agent_config,
+)
 from vestigo.core.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -34,6 +39,8 @@ _PROBE_TIMEOUT = 5.0
 # endpoint. A fingerprint mismatch bypasses the TTL (see module docstring).
 _cache: tuple[bool, float, str] | None = None
 _probe_lock = asyncio.Lock()
+# In-flight stale-while-revalidate refresh; at most one at a time.
+_refresh_task: asyncio.Task[None] | None = None
 
 
 def agent_configured(config: AgentConfig) -> bool:
@@ -82,8 +89,11 @@ async def _probe(config: AgentConfig) -> bool:
             headers.setdefault("x-api-key", config.api_key)
             headers.setdefault("anthropic-version", "2023-06-01")
             # Kimi's coding endpoint (Anthropic protocol) authenticates the
-            # OpenAI-compatible /v1/models surface with Bearer auth.
-            headers.setdefault("Authorization", f"Bearer {config.api_key}")
+            # OpenAI-compatible /v1/models surface with Bearer auth. Only Kimi
+            # gets the duplicate — never send the key in a second header to
+            # arbitrary anthropic-protocol endpoints.
+            if is_kimi_coding_endpoint(config.api_base_url):
+                headers.setdefault("Authorization", f"Bearer {config.api_key}")
         else:
             headers.setdefault("Authorization", f"Bearer {config.api_key}")
     url = _models_probe_url(config)
@@ -99,6 +109,27 @@ async def _probe(config: AgentConfig) -> bool:
     return True
 
 
+async def _refresh_cache(config: AgentConfig, fingerprint: str) -> None:
+    """Background re-probe: refresh the cache unless someone beat us to it."""
+    global _cache
+    async with _probe_lock:
+        if (
+            _cache is not None
+            and _cache[2] == fingerprint
+            and time.monotonic() - _cache[1] < get_settings().agent_probe_ttl_seconds
+        ):
+            return
+        result = await _probe(config)
+        _cache = (result, time.monotonic(), fingerprint)
+
+
+def _schedule_refresh(config: AgentConfig, fingerprint: str) -> None:
+    global _refresh_task
+    if _refresh_task is not None and not _refresh_task.done():
+        return
+    _refresh_task = asyncio.create_task(_refresh_cache(config, fingerprint))
+
+
 async def agent_available(*, force: bool = False) -> bool:
     """Whether the agent is configured AND its endpoint answers.
 
@@ -106,6 +137,13 @@ async def agent_available(*, force: bool = False) -> bool:
     bypasses the cache (used after config changes in tests). A change in the
     resolved config's fingerprint also bypasses the TTL — see module
     docstring.
+
+    Stale-while-revalidate: when a same-fingerprint entry has merely outlived
+    its TTL, the stale value is returned immediately and a background task
+    re-probes — so ``/api/health`` never blocks up to the probe timeout on a
+    hung LLM endpoint. Only a cold cache or a fingerprint change (config
+    edit) probes synchronously, keeping availability gating correct right
+    after an admin changes settings.
     """
     global _cache
     settings = get_settings()
@@ -113,13 +151,18 @@ async def agent_available(*, force: bool = False) -> bool:
     if not agent_configured(config):
         return False
     fingerprint = config_fingerprint(config)
+    if not force and _cache is not None and _cache[2] == fingerprint:
+        if time.monotonic() - _cache[1] < settings.agent_probe_ttl_seconds:
+            return _cache[0]
+        _schedule_refresh(config, fingerprint)
+        return _cache[0]
     async with _probe_lock:
-        now = time.monotonic()
+        # Re-check under the lock — a concurrent caller may have probed.
         if (
             not force
             and _cache is not None
             and _cache[2] == fingerprint
-            and now - _cache[1] < settings.agent_probe_ttl_seconds
+            and time.monotonic() - _cache[1] < settings.agent_probe_ttl_seconds
         ):
             return _cache[0]
         result = await _probe(config)

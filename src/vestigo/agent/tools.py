@@ -239,8 +239,10 @@ async def _build_query(
         tags_exclude=tags_exclude,
         event_ids=event_ids,
         exclude_routine_disposition_ids=routine_ids,
-        limit=min(limit, MAX_EVENTS_PER_SEARCH),
-        offset=offset,
+        # Clamp both ends — the model can pass anything, and a negative
+        # LIMIT/OFFSET would surface as a ClickHouse error.
+        limit=max(1, min(limit, MAX_EVENTS_PER_SEARCH)),
+        offset=max(0, offset),
         order=order if order in ("asc", "desc") else "desc",  # type: ignore[arg-type]
         field_mappings=scope.field_mappings,
         source_offsets=scope.source_offsets,
@@ -350,7 +352,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         """
         spec = _validated(filters)
         query = await _build_query(scope, spec)
-        return await run_in_threadpool(service.field_terms, query, field, min(limit, 100))
+        return await run_in_threadpool(service.field_terms, query, field, max(1, min(limit, 100)))
 
     @server.tool()
     async def field_numeric_stats(field: str, filters: FilterSpec | None = None) -> dict[str, Any]:
@@ -407,7 +409,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             series_field=series_field,
             z_threshold=z_threshold,
             baseline_id=baseline_id,
-            limit=min(limit, 100),
+            limit=max(1, min(limit, 100)),
             min_skew_seconds=min_skew_seconds,
             fdr_q=fdr_q,
             min_ratio=min_ratio,
@@ -428,7 +430,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 fields=fields,
                 series_field=series_field,
                 z_threshold=z_threshold,
-                limit=min(limit, 100),
+                limit=max(1, min(limit, 100)),
                 payload=payload,
                 resolution=resolution,
                 source_offsets=scope.source_offsets,
@@ -506,7 +508,11 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             return {"error": "embeddings are not available in this installation"}
         svc = _get_similarity_service()
         result = await run_in_threadpool(
-            svc.find_similar_by_text, scope.case_id, scope.source_ids, q, limit=min(limit, 50)
+            svc.find_similar_by_text,
+            scope.case_id,
+            scope.source_ids,
+            q,
+            limit=max(1, min(limit, 50)),
         )
         return {
             "status": result.status,
@@ -521,7 +527,11 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         """Find events semantically similar to an existing event (needs embeddings)."""
         svc = _get_similarity_service()
         result = await run_in_threadpool(
-            svc.find_similar, scope.case_id, scope.source_ids, event_id, limit=min(limit, 50)
+            svc.find_similar,
+            scope.case_id,
+            scope.source_ids,
+            event_id,
+            limit=max(1, min(limit, 50)),
         )
         return {
             "status": result.status,

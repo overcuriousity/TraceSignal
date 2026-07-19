@@ -266,11 +266,15 @@ params on `run_anomaly_detector`, `AgentToken` scoped PATs, and `/mcp` streamabl
 exposure of the identical tool server (`VESTIGO_MCP_ENABLED`, default off). See
 `docs/superpowers/specs/2026-07-19-agent-read-parity-mcp-http-design.md` for the full design.
 
-- [ ] **A4 — `/mcp` audit sniffing depends on no JSON-RPC batching.** `_audit_tool_call`
-  (`agent/mcp_http.py`) only recognizes a single JSON-RPC object; a batched `tools/call`
-  array would silently skip the audit row. Currently safe because the MCP SDK's streamable
-  HTTP transport rejects JSON-RPC batch arrays outright (removed in the 2025-06-18 MCP
-  spec) — revisit if the SDK ever reintroduces batching support.
+- [ ] **A10 — LLM API key at rest.** `agent_settings.api_key` is stored plaintext in
+  Postgres (admin-only API; masked to a boolean in every response and audit row). Evaluate
+  envelope encryption or a secret-by-env-only mode. Until then: env-pinning
+  `VESTIGO_AGENT_API_KEY` keeps the key out of the DB entirely (env always wins per field,
+  so the DB column stays unused).
+- [ ] **A11 — `/api/auth/users` directory scope.** Any signed-in user can list the full
+  user directory (id, username, display name — needed to render names on annotations).
+  Fine for the small-team threat model; add a config flag or scope the listing to co-case
+  members if multi-tenant / large-org deployments emerge (PR137 review follow-up).
 - [ ] **A8 — External MCP toolsets (web research / user-pluggable tools).** Do NOT build
   bespoke whois/web tools or a custom plugin API: the runtime is pydantic-ai with MCP
   toolsets, so let the agent consume operator-configured **external MCP servers**

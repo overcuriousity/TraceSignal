@@ -152,7 +152,27 @@ def _sse(event: dict[str, Any]) -> str:
     return f"data: {json.dumps(event, default=str)}\n\n"
 
 
+# Conversations with a turn currently streaming. Two concurrent turns on one
+# conversation would race on `history` (last writer wins, the other turn's
+# messages vanish from the replayable record), so send_message 409s instead.
+# In-memory on purpose — same single-process deployment premise as JobStore.
+_active_turns: set[str] = set()
+
+
 async def _message_stream(
+    case_id: str,
+    conversation: AgentConversation,
+    payload: SendMessageRequest,
+    user: User,
+) -> AsyncGenerator[str]:
+    try:
+        async for chunk in _message_stream_inner(case_id, conversation, payload, user):
+            yield chunk
+    finally:
+        _active_turns.discard(conversation.id)
+
+
+async def _message_stream_inner(
     case_id: str,
     conversation: AgentConversation,
     payload: SendMessageRequest,
@@ -244,9 +264,19 @@ async def send_message(
     case: Case = Depends(require_case_read),
     user: User = Depends(get_current_user),
 ) -> StreamingResponse:
-    """Send a user message and stream the agent's turn as SSE."""
+    """Send a user message and stream the agent's turn as SSE.
+
+    One turn at a time per conversation: a second POST while a turn is
+    streaming gets a 409 (see ``_active_turns``).
+    """
     await _require_agent()
     conversation = await _require_conversation(case_id, conversation_id, user)
+    if conversation_id in _active_turns:
+        raise HTTPException(
+            status_code=409, detail="A turn is already running for this conversation"
+        )
+    # Reserve before returning the response — the generator's finally releases.
+    _active_turns.add(conversation_id)
     return StreamingResponse(
         _message_stream(case_id, conversation, payload, user),
         media_type="text/event-stream",

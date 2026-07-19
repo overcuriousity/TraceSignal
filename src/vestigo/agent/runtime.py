@@ -25,7 +25,6 @@ import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlparse
 
 import httpx
 from fastmcp.client import Client as FastMCPClient
@@ -50,7 +49,7 @@ from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import UsageLimits
 
 from vestigo.agent.availability import probe_headers
-from vestigo.agent.config import AgentConfig, resolve_agent_config
+from vestigo.agent.config import AgentConfig, is_kimi_coding_endpoint, resolve_agent_config
 from vestigo.agent.tools import AgentScope, build_tool_server
 
 _LLM_TIMEOUT = 300.0
@@ -73,18 +72,6 @@ button. Propose only filters you have actually run. Cite event_ids and
 counts in your prose. Never invent data; if the tools return nothing
 conclusive, say so.
 """
-
-
-def _is_kimi_coding_endpoint(base_url: str | None) -> bool:
-    """True for Kimi's coding-plan endpoint (Anthropic protocol, UA-gated)."""
-    if not base_url:
-        return False
-    try:
-        parsed = urlparse(base_url)
-    except ValueError:
-        return False
-    host = (parsed.hostname or "").lower()
-    return host == "api.kimi.com" and parsed.path.rstrip("/").startswith("/coding")
 
 
 class KimiAnthropicModel(AnthropicModel):
@@ -156,7 +143,7 @@ def effort_model_settings(config: AgentConfig) -> ModelSettings | None:
     effort = config.reasoning_effort
     if effort == "off":
         return None
-    if _is_kimi_coding_endpoint(config.api_base_url):
+    if is_kimi_coding_endpoint(config.api_base_url):
         return ModelSettings(extra_body={"reasoning_effort": _KIMI_EFFORT[effort]})
     if config.provider == "anthropic":
         return AnthropicModelSettings(
@@ -168,11 +155,15 @@ def effort_model_settings(config: AgentConfig) -> ModelSettings | None:
     return OpenAIChatModelSettings(openai_reasoning_effort=effort)
 
 
-def build_model(config: AgentConfig) -> Model:
-    """Build the pydantic-ai model from a resolved :class:`AgentConfig`."""
+def build_model(config: AgentConfig, http_client: httpx.AsyncClient) -> Model:
+    """Build the pydantic-ai model from a resolved :class:`AgentConfig`.
+
+    The caller owns ``http_client`` and must close it when the turn is done
+    (``stream_turn`` does) — building it here and never closing leaked a
+    connection pool per turn.
+    """
     if not config.model:
         raise RuntimeError("VESTIGO_AGENT_MODEL is not configured")
-    http_client = httpx.AsyncClient(headers=probe_headers(config), timeout=_LLM_TIMEOUT)
     if config.provider == "anthropic":
         provider = AnthropicProvider(
             api_key=config.api_key,
@@ -180,7 +171,7 @@ def build_model(config: AgentConfig) -> Model:
             http_client=http_client,
         )
         model_cls = (
-            KimiAnthropicModel if _is_kimi_coding_endpoint(config.api_base_url) else AnthropicModel
+            KimiAnthropicModel if is_kimi_coding_endpoint(config.api_base_url) else AnthropicModel
         )
         return model_cls(config.model, provider=provider)
     provider = OpenAIProvider(
@@ -239,63 +230,72 @@ async def stream_turn(
     forwarded to the client).
     """
     config = await resolve_agent_config()
-    model = model or build_model(config)
-    server = build_tool_server(scope)
-    toolset = MCPToolset(FastMCPClient(server), id="vestigo")
-    agent = Agent(
-        model,
-        system_prompt=SYSTEM_PROMPT,
-        toolsets=[toolset],
-        model_settings=effort_model_settings(config),
-    )
-    limits = UsageLimits(request_limit=config.max_turns)
+    # When no model is injected (tests), the turn owns an HTTP client that
+    # must be closed when the stream ends — see build_model's docstring.
+    http_client: httpx.AsyncClient | None = None
+    if model is None:
+        http_client = httpx.AsyncClient(headers=probe_headers(config), timeout=_LLM_TIMEOUT)
+        model = build_model(config, http_client)
+    try:
+        server = build_tool_server(scope)
+        toolset = MCPToolset(FastMCPClient(server), id="vestigo")
+        agent = Agent(
+            model,
+            system_prompt=SYSTEM_PROMPT,
+            toolsets=[toolset],
+            model_settings=effort_model_settings(config),
+        )
+        limits = UsageLimits(request_limit=config.max_turns)
 
-    context = (
-        f"Case: {scope.case_id}. Timeline: {scope.timeline_id} "
-        f"({len(scope.source_ids)} sources). {_view_context(view_filters)}\n\n{user_text}"
-    )
+        context = (
+            f"Case: {scope.case_id}. Timeline: {scope.timeline_id} "
+            f"({len(scope.source_ids)} sources). {_view_context(view_filters)}\n\n{user_text}"
+        )
 
-    async with agent.run_stream_events(
-        context, message_history=history or None, usage_limits=limits
-    ) as stream:
-        async for event in stream:
-            if isinstance(event, PartStartEvent) and isinstance(event.part, TextPart):
-                # A text part's first chunk arrives in the start event, not as
-                # a delta — dropping it clips the opening of every segment.
-                if event.part.content:
-                    yield {"type": "text_delta", "text": event.part.content}
-            elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
-                if event.delta.content_delta:
-                    yield {"type": "text_delta", "text": event.delta.content_delta}
-            elif isinstance(event, FunctionToolCallEvent):
-                yield {
-                    "type": "tool_call",
-                    "tool_call_id": event.part.tool_call_id,
-                    "tool": event.part.tool_name,
-                    "args": event.part.args_as_dict(),
-                }
-            elif isinstance(event, FunctionToolResultEvent):
-                content = event.part.content
-                summary = content if isinstance(content, (dict, list)) else str(content)
-                yield {
-                    "type": "tool_result",
-                    "tool_call_id": event.part.tool_call_id,
-                    "tool": event.part.tool_name,
-                    "result": summary,
-                }
-            elif isinstance(event, AgentRunResultEvent):
-                result = event.result
-                # `AgentRunResult.usage` is a property in pydantic-ai 2.13.0
-                # (not the callable `.usage()` some older docs/snippets show).
-                usage = result.usage
-                yield {
-                    "type": "result",
-                    "turn": TurnResult(
-                        output_text=str(result.output),
-                        new_messages=result.new_messages(),
-                        # 0 means the endpoint reported nothing — store NULL,
-                        # never a fake count.
-                        prompt_tokens=usage.input_tokens or None,
-                        completion_tokens=usage.output_tokens or None,
-                    ),
-                }
+        async with agent.run_stream_events(
+            context, message_history=history or None, usage_limits=limits
+        ) as stream:
+            async for event in stream:
+                if isinstance(event, PartStartEvent) and isinstance(event.part, TextPart):
+                    # A text part's first chunk arrives in the start event, not as
+                    # a delta — dropping it clips the opening of every segment.
+                    if event.part.content:
+                        yield {"type": "text_delta", "text": event.part.content}
+                elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
+                    if event.delta.content_delta:
+                        yield {"type": "text_delta", "text": event.delta.content_delta}
+                elif isinstance(event, FunctionToolCallEvent):
+                    yield {
+                        "type": "tool_call",
+                        "tool_call_id": event.part.tool_call_id,
+                        "tool": event.part.tool_name,
+                        "args": event.part.args_as_dict(),
+                    }
+                elif isinstance(event, FunctionToolResultEvent):
+                    content = event.part.content
+                    summary = content if isinstance(content, (dict, list)) else str(content)
+                    yield {
+                        "type": "tool_result",
+                        "tool_call_id": event.part.tool_call_id,
+                        "tool": event.part.tool_name,
+                        "result": summary,
+                    }
+                elif isinstance(event, AgentRunResultEvent):
+                    result = event.result
+                    # `AgentRunResult.usage` is a property in pydantic-ai 2.13.0
+                    # (not the callable `.usage()` some older docs/snippets show).
+                    usage = result.usage
+                    yield {
+                        "type": "result",
+                        "turn": TurnResult(
+                            output_text=str(result.output),
+                            new_messages=result.new_messages(),
+                            # 0 means the endpoint reported nothing — store NULL,
+                            # never a fake count.
+                            prompt_tokens=usage.input_tokens or None,
+                            completion_tokens=usage.output_tokens or None,
+                        ),
+                    }
+    finally:
+        if http_client is not None:
+            await http_client.aclose()

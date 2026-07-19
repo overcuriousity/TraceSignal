@@ -105,69 +105,77 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
   return items;
 }
 
-function itemsFromStream(events: AgentStreamEvent[]): ChatItem[] {
-  const items: ChatItem[] = [];
-  let text = "";
-  let promptTokens: number | null | undefined;
-  let completionTokens: number | null | undefined;
-  for (const e of events) {
-    if (e.type === "text_delta") {
-      text += e.text;
-    } else if (e.type === "done") {
-      promptTokens = e.prompt_tokens;
-      completionTokens = e.completion_tokens;
-    } else if (e.type === "tool_call") {
-      if (text) {
-        items.push({ kind: "assistant", content: text });
-        text = "";
-      }
-      if (e.tool === "propose_finding") {
-        const args = e.args as {
-          title?: string;
-          description?: string;
-          filters?: AgentFilterSpec;
-        };
-        items.push({
-          kind: "finding",
-          title: args.title ?? "Finding",
-          description: args.description ?? "",
-          spec: args.filters ?? {},
-        });
-      } else if (e.tool === "propose_annotation") {
-        // Rendered from the paired tool_result below, once proposal_id is
-        // known — the call event only carries the proposed tag/comment.
-      } else {
-        items.push({ kind: "tool", tool: e.tool, args: e.args });
-      }
-    } else if (e.type === "tool_result") {
-      // Most tool_result rows stay invisible (results feed the model, not
-      // the analyst) — propose_annotation is the one exception, since its
-      // proposal_id is only known once the result lands.
-      if (e.tool === "propose_annotation") {
-        if (text) {
-          items.push({ kind: "assistant", content: text });
-          text = "";
-        }
-        const result = e.result as { proposal_id?: string } | null;
-        if (result?.proposal_id) {
-          items.push({ kind: "proposal", proposalId: result.proposal_id });
-        }
-      }
-    } else if (e.type === "error") {
-      items.push({ kind: "error", detail: e.detail });
+/**
+ * Live-stream render state, folded incrementally: one `foldStreamEvent` call
+ * per SSE event instead of re-deriving the whole item list from an
+ * ever-growing event array on every delta (which was O(n²) over a turn).
+ */
+interface StreamState {
+  items: ChatItem[];
+  liveText: string;
+}
+
+const EMPTY_STREAM: StreamState = { items: [], liveText: "" };
+
+function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
+  if (e.type === "text_delta") {
+    return { ...s, liveText: s.liveText + e.text };
+  }
+  const flushed: ChatItem[] = s.liveText
+    ? [...s.items, { kind: "assistant", content: s.liveText }]
+    : s.items;
+  if (e.type === "tool_call") {
+    if (e.tool === "propose_finding") {
+      const args = e.args as {
+        title?: string;
+        description?: string;
+        filters?: AgentFilterSpec;
+      };
+      return {
+        items: [
+          ...flushed,
+          {
+            kind: "finding",
+            title: args.title ?? "Finding",
+            description: args.description ?? "",
+            spec: args.filters ?? {},
+          },
+        ],
+        liveText: "",
+      };
     }
-    // "done" is handled by the caller via query invalidation.
+    if (e.tool === "propose_annotation") {
+      // Rendered from the paired tool_result below, once proposal_id is
+      // known — the call event only carries the proposed tag/comment.
+      return { items: flushed, liveText: "" };
+    }
+    return { items: [...flushed, { kind: "tool", tool: e.tool, args: e.args }], liveText: "" };
   }
-  if (text) {
-    items.push({
-      kind: "assistant",
-      content: text,
-      streaming: true,
-      promptTokens,
-      completionTokens,
-    });
+  if (e.type === "tool_result") {
+    // Most tool_result rows stay invisible (results feed the model, not
+    // the analyst) — propose_annotation is the one exception, since its
+    // proposal_id is only known once the result lands.
+    if (e.tool === "propose_annotation") {
+      const result = e.result as { proposal_id?: string } | null;
+      return {
+        items: result?.proposal_id
+          ? [...flushed, { kind: "proposal", proposalId: result.proposal_id }]
+          : flushed,
+        liveText: "",
+      };
+    }
+    return s;
   }
-  return items;
+  if (e.type === "error") {
+    return { items: [...flushed, { kind: "error", detail: e.detail }], liveText: "" };
+  }
+  // "done" is handled by the caller via query invalidation.
+  return s;
+}
+
+function itemsFromStream(s: StreamState): ChatItem[] {
+  if (!s.liveText) return s.items;
+  return [...s.items, { kind: "assistant", content: s.liveText, streaming: true }];
 }
 
 function ToolRow({ tool, args }: { tool: string; args?: Record<string, unknown> | null }) {
@@ -191,7 +199,7 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
   const setActiveConversation = useAgentStore((s) => s.setActiveConversation);
 
   const [input, setInput] = useState("");
-  const [streamEvents, setStreamEvents] = useState<AgentStreamEvent[]>([]);
+  const [stream, setStream] = useState<StreamState>(EMPTY_STREAM);
   const [streaming, setStreaming] = useState(false);
   const [pendingUserText, setPendingUserText] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -240,34 +248,38 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
   const persistedItems = conversationQuery.data
     ? itemsFromMessages(conversationQuery.data.messages)
     : [];
-  const liveItems = itemsFromStream(streamEvents);
+  const liveItems = itemsFromStream(stream);
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
-  }, [persistedItems.length, liveItems.length, streamEvents.length]);
+  }, [persistedItems.length, liveItems.length, stream.liveText.length]);
 
   const send = useCallback(async () => {
     const content = input.trim();
     if (!content || streaming) return;
-    let conversationId = activeId;
-    if (!conversationId) {
-      const conversation = await agentApi.createConversation(caseId, timelineId);
-      queryClient.invalidateQueries({ queryKey: ["agent-conversations", caseId, timelineId] });
-      setActiveConversation(storeKey, conversation.id);
-      conversationId = conversation.id;
-    }
     setInput("");
     setPendingUserText(content);
-    setStreamEvents([]);
+    setStream(EMPTY_STREAM);
     setStreaming(true);
     const abort = new AbortController();
     abortRef.current = abort;
+    let conversationId = activeId;
+    // Keep failed turns on screen: the finally block only clears the live
+    // transcript when the turn ended cleanly, so an error item stays visible.
+    let failed = false;
     try {
+      if (!conversationId) {
+        const conversation = await agentApi.createConversation(caseId, timelineId);
+        queryClient.invalidateQueries({ queryKey: ["agent-conversations", caseId, timelineId] });
+        setActiveConversation(storeKey, conversation.id);
+        conversationId = conversation.id;
+      }
       await agentApi.streamMessage(
         caseId,
         conversationId,
         { content, view_filters: currentFilters },
         (event) => {
-          setStreamEvents((prev) => [...prev, event]);
+          if (event.type === "error") failed = true;
+          setStream((prev) => foldStreamEvent(prev, event));
           if (event.type === "tool_result" && event.tool === "propose_annotation") {
             queryClient.invalidateQueries({ queryKey: ["agent-proposals", caseId, conversationId] });
           }
@@ -276,16 +288,35 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
       );
     } catch (err) {
       if (!abort.signal.aborted) {
+        failed = true;
         const detail = err instanceof Error ? err.message : "Request failed";
-        setStreamEvents((prev) => [...prev, { type: "error", detail }]);
+        setStream((prev) => foldStreamEvent(prev, { type: "error", detail }));
       }
     } finally {
       setStreaming(false);
       abortRef.current = null;
+      if (conversationId) {
+        // Await the transcript refetch before dropping the live items —
+        // clearing first flashed the finished turn empty until data landed.
+        await queryClient.invalidateQueries({
+          queryKey: ["agent-conversation", caseId, conversationId],
+        });
+        queryClient.invalidateQueries({ queryKey: ["agent-conversations", caseId, timelineId] });
+      }
       setPendingUserText(null);
-      setStreamEvents([]);
-      queryClient.invalidateQueries({ queryKey: ["agent-conversation", caseId, conversationId] });
-      queryClient.invalidateQueries({ queryKey: ["agent-conversations", caseId, timelineId] });
+      if (failed) {
+        // The persisted refetch already carries the user message and any
+        // partial assistant text ("[interrupted]") — keep only the error
+        // item(s) live so nothing renders twice. If the conversation never
+        // got created, restore the input so the message isn't lost.
+        setStream((prev) => ({
+          items: prev.items.filter((i) => i.kind === "error"),
+          liveText: "",
+        }));
+        if (!conversationId) setInput(content);
+      } else {
+        setStream(EMPTY_STREAM);
+      }
     }
   }, [
     input,

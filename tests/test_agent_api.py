@@ -87,6 +87,78 @@ async def test_probe_result_is_cached(store, monkeypatch):
     assert calls["n"] == 1
 
 
+@pytest.mark.asyncio
+async def test_probe_is_stale_while_revalidate(store, monkeypatch):
+    """An expired same-fingerprint cache entry serves stale and refreshes in background."""
+    import time as _time
+
+    _configure_agent(monkeypatch)
+    results = {"value": True}
+    calls = {"n": 0}
+
+    async def probe(config):
+        calls["n"] += 1
+        return results["value"]
+
+    monkeypatch.setattr(availability, "_probe", probe)
+    availability.reset_probe_cache()
+    assert await availability.agent_available() is True
+    assert calls["n"] == 1
+
+    # Age the cache past the TTL and flip the endpoint to down: the next call
+    # must still answer immediately with the stale True (never block /api/health
+    # on a hung endpoint), while a background refresh picks up the new state.
+    results["value"] = False
+    cached = availability._cache
+    availability._cache = (cached[0], _time.monotonic() - 10_000, cached[2])
+    assert await availability.agent_available() is True
+    assert availability._refresh_task is not None
+    await availability._refresh_task
+    assert calls["n"] == 2
+    assert await availability.agent_available() is False
+
+
+@pytest.mark.asyncio
+async def test_probe_bearer_header_only_for_kimi(store, monkeypatch):
+    """The anthropic-protocol probe never duplicates the key into a Bearer header
+    for non-Kimi endpoints."""
+    captured: dict[str, dict] = {}
+
+    class SpyClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, headers=None):
+            captured["headers"] = headers or {}
+
+            class _Resp:
+                status_code = 200
+
+            return _Resp()
+
+    monkeypatch.setattr(availability.httpx, "AsyncClient", SpyClient)
+
+    monkeypatch.setenv("VESTIGO_AGENT_MODEL", "m")
+    monkeypatch.setenv("VESTIGO_AGENT_PROVIDER", "anthropic")
+    monkeypatch.setenv("VESTIGO_AGENT_API_KEY", "sk-secret")
+    monkeypatch.setenv("VESTIGO_AGENT_API_BASE_URL", "https://api.anthropic.com")
+    get_settings.cache_clear()
+    assert await availability._probe(await resolve_agent_config()) is True
+    assert captured["headers"]["x-api-key"] == "sk-secret"
+    assert "Authorization" not in captured["headers"]
+
+    monkeypatch.setenv("VESTIGO_AGENT_API_BASE_URL", "https://api.kimi.com/coding")
+    get_settings.cache_clear()
+    assert await availability._probe(await resolve_agent_config()) is True
+    assert captured["headers"]["Authorization"] == "Bearer sk-secret"
+
+
 def test_health_reports_agent_available(client):
     resp = client.get("/api/health")
     assert resp.status_code == 200
@@ -627,7 +699,9 @@ def test_send_message_persists_and_streams_token_usage(
         yield "the answer is 42"
 
     monkeypatch.setattr(
-        runtime, "build_model", lambda settings=None: FunctionModel(stream_function=model_stream)
+        runtime,
+        "build_model",
+        lambda config=None, http_client=None: FunctionModel(stream_function=model_stream),
     )
 
     as_admin(client, admin_bootstrap)
@@ -659,19 +733,107 @@ def test_send_message_persists_and_streams_token_usage(
     assert assistant.completion_tokens and assistant.completion_tokens > 0
 
 
+def test_send_message_409_while_turn_active(client, admin_bootstrap, agent_on, monkeypatch):
+    """One turn at a time per conversation — a concurrent POST gets a 409."""
+    from vestigo.api.routers import agent as agent_router
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+
+    url = f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages"
+
+    # Simulate an in-flight turn: the reservation is what send_message checks.
+    agent_router._active_turns.add(conversation["id"])
+    try:
+        resp = client.post(url, json={"content": "hello"})
+        assert resp.status_code == 409
+    finally:
+        agent_router._active_turns.discard(conversation["id"])
+
+    # After the reservation is released a turn runs — and releases itself.
+    from mcp.server.fastmcp import FastMCP
+    from pydantic_ai.models.function import FunctionModel
+
+    from vestigo.agent import runtime
+
+    monkeypatch.setattr(runtime, "build_tool_server", lambda scope: FastMCP("stub"))
+
+    async def model_stream(messages, info):
+        yield "ok"
+
+    monkeypatch.setattr(
+        runtime,
+        "build_model",
+        lambda config=None, http_client=None: FunctionModel(stream_function=model_stream),
+    )
+    resp = client.post(url, json={"content": "hello again"})
+    assert resp.status_code == 200
+    assert conversation["id"] not in agent_router._active_turns
+
+
+@pytest.mark.asyncio
+async def test_stream_turn_closes_its_http_client(monkeypatch):
+    """A turn that builds its own model must close the HTTP client it opened."""
+    from mcp.server.fastmcp import FastMCP
+    from pydantic_ai.models.function import FunctionModel
+
+    from vestigo.agent import runtime
+
+    closed = {"n": 0}
+
+    class SpyClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def aclose(self):
+            closed["n"] += 1
+
+    monkeypatch.setattr(runtime.httpx, "AsyncClient", SpyClient)
+    monkeypatch.setattr(runtime, "build_tool_server", lambda scope: FastMCP("stub"))
+
+    async def model_stream(messages, info):
+        yield "done"
+
+    monkeypatch.setattr(
+        runtime,
+        "build_model",
+        lambda config=None, http_client=None: FunctionModel(stream_function=model_stream),
+    )
+    monkeypatch.setenv("VESTIGO_AGENT_MODEL", "m")
+    monkeypatch.setenv("VESTIGO_AGENT_API_BASE_URL", "http://localhost:9/v1")
+    get_settings.cache_clear()
+    try:
+        scope = AgentScope(
+            case_id="c1",
+            timeline_id="t1",
+            user=None,
+            source_ids=["s1"],
+            field_mappings=None,
+            source_offsets=None,
+        )
+        async for _ in runtime.stream_turn(scope, user_text="hi", history=[]):
+            pass
+    finally:
+        get_settings.cache_clear()
+    assert closed["n"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Kimi coding-plan shim
 # ---------------------------------------------------------------------------
 
 
 def test_is_kimi_coding_endpoint():
-    from vestigo.agent.runtime import _is_kimi_coding_endpoint
+    from vestigo.agent.config import is_kimi_coding_endpoint
 
-    assert _is_kimi_coding_endpoint("https://api.kimi.com/coding")
-    assert _is_kimi_coding_endpoint("https://api.kimi.com/coding/v1")
-    assert not _is_kimi_coding_endpoint("https://api.moonshot.ai/v1")
-    assert not _is_kimi_coding_endpoint("https://evil.example/coding")
-    assert not _is_kimi_coding_endpoint(None)
+    assert is_kimi_coding_endpoint("https://api.kimi.com/coding")
+    assert is_kimi_coding_endpoint("https://api.kimi.com/coding/v1")
+    assert not is_kimi_coding_endpoint("https://api.moonshot.ai/v1")
+    assert not is_kimi_coding_endpoint("https://evil.example/coding")
+    assert not is_kimi_coding_endpoint(None)
 
 
 @pytest.mark.asyncio
@@ -826,3 +988,22 @@ async def test_agent_proposal_lifecycle(store):
     # second decision must not go through
     assert await store.decide_agent_proposal(p.id, status="rejected", decided_by="bob") is None
     assert (await store.get_agent_proposal(conv.id, p.id)).status == "confirmed"
+
+
+async def test_delete_conversation_removes_proposals(store):
+    """Conversation delete cascades to its proposals, not just its messages."""
+    await store.init_schema()
+    conv = await store.create_agent_conversation("c1", "t1", "u1", model_id="m")
+    await store.add_agent_message(conv.id, "user", "q")
+    await store.create_agent_proposal(
+        case_id="c1",
+        timeline_id="t1",
+        conversation_id=conv.id,
+        tag="t",
+        comment=None,
+        rationale="",
+        events=[{"source_id": "s1", "event_id": "e1"}],
+    )
+    assert await store.delete_agent_conversation("c1", conv.id) is True
+    assert await store.list_agent_messages(conv.id) == []
+    assert await store.list_agent_proposals(conv.id) == []

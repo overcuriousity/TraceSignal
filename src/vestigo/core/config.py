@@ -262,9 +262,7 @@ class Settings(BaseSettings):
     agent_max_turns: int = Field(default=15, ge=1, le=100)
     # Reasoning effort passed to the model, when the provider supports it.
     # Keep in sync with agent/config.py::EFFORT_VALUES.
-    agent_reasoning_effort: str | None = Field(
-        default=None, pattern="^(off|low|medium|high|max)$"
-    )
+    agent_reasoning_effort: str | None = Field(default=None, pattern="^(off|low|medium|high|max)$")
     # Seconds an availability probe result is cached before re-probing.
     agent_probe_ttl_seconds: float = Field(default=60.0, gt=0)
 

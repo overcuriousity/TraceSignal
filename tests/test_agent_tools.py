@@ -219,6 +219,20 @@ async def test_filterspec_event_ids_intersect_annotated(store):
     assert query.event_ids == ["e2"]
 
 
+async def test_build_query_clamps_limit_and_offset(store):
+    """Model-supplied paging is clamped — a negative LIMIT/OFFSET would be a
+    ClickHouse error."""
+    from vestigo.agent.tools import MAX_EVENTS_PER_SEARCH, FilterSpec, _build_query
+
+    await store.init_schema()
+    scope = _scope("c1", "t1", source_ids=["s1"])
+    query = await _build_query(scope, FilterSpec(), limit=-5, offset=-10)
+    assert query.limit == 1
+    assert query.offset == 0
+    query = await _build_query(scope, FilterSpec(), limit=10_000)
+    assert query.limit == MAX_EVENTS_PER_SEARCH
+
+
 async def test_filterspec_event_ids_alone(store):
     from vestigo.agent.tools import FilterSpec, _build_query
 

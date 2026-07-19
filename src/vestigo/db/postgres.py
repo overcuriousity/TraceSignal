@@ -3187,7 +3187,7 @@ class PostgresStore:
             await session.commit()
 
     async def delete_agent_conversation(self, case_id: str, conversation_id: str) -> bool:
-        """Delete a conversation and its messages. Returns False when not found."""
+        """Delete a conversation, its messages and its proposals. Returns False when not found."""
         async with self.session_factory() as session:
             result = await session.execute(
                 delete(AgentConversation).where(
@@ -3197,6 +3197,9 @@ class PostgresStore:
             )
             await session.execute(
                 delete(AgentMessage).where(AgentMessage.conversation_id == conversation_id)
+            )
+            await session.execute(
+                delete(AgentProposal).where(AgentProposal.conversation_id == conversation_id)
             )
             await session.commit()
             return bool(result.rowcount)

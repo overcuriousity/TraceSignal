@@ -12,6 +12,7 @@ import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { agentApi, specToEventFilters, type AgentProposal } from "@/api/agent";
 import { ApiError } from "@/api/client";
+import { toast } from "@/stores/toasts";
 import type { EventFilters } from "@/api/types";
 import { useUserNames } from "@/hooks/useUserNames";
 
@@ -26,22 +27,25 @@ export function ProposalCard({ caseId, conversationId, proposal, onApply }: Prop
   const queryClient = useQueryClient();
   const queryKey = ["agent-proposals", caseId, conversationId];
 
+  // A 409 means another tab/analyst already decided this proposal — refetch
+  // (onSettled) and render the decided state instead of surfacing an error.
+  // Anything else must be visible: rethrowing from onError just vanishes
+  // into an unhandled rejection, so toast instead.
+  const onDecideError = (err: Error) => {
+    if (err instanceof ApiError && err.status === 409) return;
+    toast.error("Proposal update failed", err.message);
+  };
+
   const confirmMutation = useMutation({
     mutationFn: () => agentApi.confirmProposal(caseId, conversationId, proposal.id),
     onSettled: () => queryClient.invalidateQueries({ queryKey }),
-    // A 409 means another tab/analyst already decided this proposal — refetch
-    // and render the decided state instead of surfacing an error toast.
-    onError: (err) => {
-      if (!(err instanceof ApiError) || err.status !== 409) throw err;
-    },
+    onError: onDecideError,
   });
 
   const rejectMutation = useMutation({
     mutationFn: () => agentApi.rejectProposal(caseId, conversationId, proposal.id),
     onSettled: () => queryClient.invalidateQueries({ queryKey }),
-    onError: (err) => {
-      if (!(err instanceof ApiError) || err.status !== 409) throw err;
-    },
+    onError: onDecideError,
   });
 
   const deciding = confirmMutation.isPending || rejectMutation.isPending;

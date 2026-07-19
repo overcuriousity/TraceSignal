@@ -31,12 +31,30 @@ import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
 from vestigo.core.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
 EFFORT_VALUES = ("off", "low", "medium", "high", "max")
+
+
+def is_kimi_coding_endpoint(base_url: str | None) -> bool:
+    """True for Kimi's coding-plan endpoint (Anthropic protocol, UA-gated).
+
+    Lives here (not runtime.py) so both the availability probe and the model
+    builder can use it without importing pydantic-ai machinery.
+    """
+    if not base_url:
+        return False
+    try:
+        parsed = urlparse(base_url)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    return host == "api.kimi.com" and parsed.path.rstrip("/").startswith("/coding")
+
 
 _DEFAULT_PROVIDER = "openai"
 _DEFAULT_MAX_TURNS = 15
