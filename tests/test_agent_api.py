@@ -311,3 +311,15 @@ async def test_kimi_shim_injects_unsigned_thinking_on_tool_call_replay():
         first = m["content"][0]
         assert first["type"] == "thinking"
         assert first["signature"] == ""
+
+
+async def test_agent_message_token_columns(store):
+    await store.init_schema()
+    conv = await store.create_agent_conversation("c1", "t1", "u1", model_id="openai:m")
+    msg = await store.add_agent_message(
+        conv.id, "assistant", "hi", prompt_tokens=1200, completion_tokens=80
+    )
+    assert msg.to_dict()["prompt_tokens"] == 1200
+    assert msg.to_dict()["completion_tokens"] == 80
+    bare = await store.add_agent_message(conv.id, "user", "q")
+    assert bare.to_dict()["prompt_tokens"] is None
