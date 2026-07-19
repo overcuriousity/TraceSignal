@@ -151,9 +151,11 @@ export function AdminAgentPage() {
     mutationFn: async () => {
       const { patch, error } = buildPatch(form, baseline, apiKeyInput, clearApiKey);
       if (error) throw new Error(error);
-      if (Object.keys(patch).length > 0) {
-        await adminApi.putAgentSettings(patch);
-      }
+      // Always PUT, even with an empty patch: the backend resets the probe
+      // cache on any PUT, and "Test connection" must force a fresh probe
+      // rather than risk returning a stale (up to agent_probe_ttl_seconds
+      // old) cached result when the form is unchanged.
+      await adminApi.putAgentSettings(patch);
       return healthApi.check();
     },
     onSuccess: (health) => {

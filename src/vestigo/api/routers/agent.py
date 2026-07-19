@@ -331,7 +331,7 @@ async def confirm_proposal(
                         "event_id": event["event_id"],
                         "annotation_type": ann_type,
                         "content": content,
-                        "created_by": user.username,
+                        "created_by": user.id,
                         "origin": ANNOTATION_ORIGIN_AGENT,
                     }
                 )

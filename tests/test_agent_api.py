@@ -133,6 +133,38 @@ async def test_resolver_env_wins_per_field(store, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_resolver_picks_up_reasoning_effort_env(store, monkeypatch):
+    """VESTIGO_AGENT_REASONING_EFFORT is a real Settings field, not silently dropped."""
+    monkeypatch.setenv("VESTIGO_AGENT_REASONING_EFFORT", "high")
+    get_settings.cache_clear()
+    try:
+        config = await resolve_agent_config()
+        assert config.reasoning_effort == "high"
+        assert config.sources["reasoning_effort"] == "env"
+    finally:
+        get_settings.cache_clear()
+
+
+def test_admin_agent_settings_shows_reasoning_effort_env_pinned(
+    client, admin_bootstrap, store, monkeypatch
+):
+    from tests.conftest import as_admin
+
+    as_admin(client, admin_bootstrap)
+    monkeypatch.setenv("VESTIGO_AGENT_REASONING_EFFORT", "high")
+    get_settings.cache_clear()
+    try:
+        resp = client.get("/api/admin/agent-settings")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["effective"]["reasoning_effort"] == "high"
+        assert body["sources"]["reasoning_effort"] == "env"
+        assert body["env_vars"]["reasoning_effort"] == "VESTIGO_AGENT_REASONING_EFFORT"
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
 async def test_probe_cache_invalidates_on_config_change(store, monkeypatch):
     """A DB-side settings edit changes the fingerprint and bypasses the TTL."""
     await store.init_schema()
@@ -331,7 +363,7 @@ def test_confirm_proposal_writes_annotations(client, admin_bootstrap, agent_on, 
         r.origin == "agentic-analysis"
         and r.annotation_type == "tag"
         and r.content == "suspicious"
-        and r.created_by == "admin"
+        and r.created_by == owner["id"]
         for r in rows
     )
 
@@ -371,7 +403,7 @@ def test_confirm_reports_skipped_events(client, admin_bootstrap, agent_on, store
         r.origin == "agentic-analysis"
         and r.annotation_type == "tag"
         and r.content == "suspicious"
-        and r.created_by == "admin"
+        and r.created_by == owner["id"]
         for r in e1_rows
     )
     e2_rows = asyncio.run(_check("e2"))
