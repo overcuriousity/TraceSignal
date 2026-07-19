@@ -348,3 +348,32 @@ def test_agent_settings_put_triggers_reprobe(client, admin_bootstrap, store, mon
 
     assert asyncio.run(availability.agent_available()) is True
     assert calls["n"] == 2
+
+
+def test_agent_settings_put_strips_whitespace(client, admin_bootstrap, store):
+    """Pasted values carry stray whitespace (trailing spaces on a URL, a newline
+    after an API key) — the PUT must normalize them, and a whitespace-only
+    string must clear the field like an explicit null."""
+    as_admin(client, admin_bootstrap)
+    resp = client.put(
+        "/api/admin/agent-settings",
+        json={
+            "model": " k3 ",
+            "api_base_url": "https://api.kimi.com/coding     ",
+            "api_key": "sk-kimi-x\n",
+            "user_agent": "  claude-code/0.1.0",
+        },
+    )
+    assert resp.status_code == 200
+    effective = resp.json()["effective"]
+    assert effective["model"] == "k3"
+    assert effective["api_base_url"] == "https://api.kimi.com/coding"
+    assert effective["user_agent"] == "claude-code/0.1.0"
+    assert effective["api_key_set"] is True
+
+    resp = client.put("/api/admin/agent-settings", json={"model": "   ", "api_key": " \n"})
+    assert resp.status_code == 200
+    effective = resp.json()["effective"]
+    # Whitespace-only degrades to an explicit clear.
+    assert effective["model"] is None
+    assert effective["api_key_set"] is False

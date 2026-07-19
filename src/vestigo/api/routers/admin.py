@@ -521,6 +521,24 @@ class AgentSettingsUpdate(BaseModel):
     max_turns: int | None = Field(default=None, ge=1, le=100)
     reasoning_effort: str | None = None
 
+    @field_validator(
+        "model",
+        "provider",
+        "api_base_url",
+        "api_key",
+        "user_agent",
+        "reasoning_effort",
+        mode="before",
+    )
+    @classmethod
+    def _strip_strings(cls, value: Any) -> Any:
+        # Pasted values routinely carry stray whitespace (trailing spaces on a
+        # URL, a newline after an API key) that silently breaks the endpoint
+        # probe. Whitespace-only degrades to an explicit clear.
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
     @field_validator("reasoning_effort")
     @classmethod
     def _validate_reasoning_effort(cls, value: str | None) -> str | None:
