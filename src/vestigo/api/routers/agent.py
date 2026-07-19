@@ -165,11 +165,24 @@ async def _message_stream(
         ):
             if event["type"] == "result":
                 turn = event["turn"]
-                await store.add_agent_message(conversation_id, "assistant", turn.output_text)
+                await store.add_agent_message(
+                    conversation_id,
+                    "assistant",
+                    turn.output_text,
+                    prompt_tokens=turn.prompt_tokens,
+                    completion_tokens=turn.completion_tokens,
+                )
                 await store.update_agent_conversation(
                     conversation_id, history=dump_history(history + turn.new_messages)
                 )
-                yield _sse({"type": "done", "content": turn.output_text})
+                yield _sse(
+                    {
+                        "type": "done",
+                        "content": turn.output_text,
+                        "prompt_tokens": turn.prompt_tokens,
+                        "completion_tokens": turn.completion_tokens,
+                    }
+                )
                 continue
             if event["type"] == "text_delta":
                 text_parts.append(event["text"])

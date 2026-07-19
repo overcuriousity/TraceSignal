@@ -135,10 +135,12 @@ def build_model(settings: Settings | None = None) -> Model:
 
 @dataclass
 class TurnResult:
-    """Outcome of one streamed turn: the model's final text + full new history."""
+    """Outcome of one streamed turn: final text, new history, measured usage."""
 
     output_text: str
     new_messages: list[ModelMessage]
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
 
 
 def dump_history(messages: list[ModelMessage]) -> list[Any]:
@@ -217,10 +219,17 @@ async def stream_turn(
                 }
             elif isinstance(event, AgentRunResultEvent):
                 result = event.result
+                # `AgentRunResult.usage` is a property in pydantic-ai 2.13.0
+                # (not the callable `.usage()` some older docs/snippets show).
+                usage = result.usage
                 yield {
                     "type": "result",
                     "turn": TurnResult(
                         output_text=str(result.output),
                         new_messages=result.new_messages(),
+                        # 0 means the endpoint reported nothing — store NULL,
+                        # never a fake count.
+                        prompt_tokens=usage.input_tokens or None,
+                        completion_tokens=usage.output_tokens or None,
                     ),
                 }

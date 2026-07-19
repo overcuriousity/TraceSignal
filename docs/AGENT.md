@@ -33,6 +33,15 @@ alongside any agent change, like `ANOMALY_DETECTION.md` for detectors.
   case/timeline; the external `/mcp` endpoint derives it from the Bearer
   token (`AgentToken.case_id`/`timeline_id`), never from anything the model
   or client sends.
+- **Token metering: measured, or null.** Each streamed turn reads
+  `AgentRunResult.usage` (a `RunUsage` with `input_tokens`/`output_tokens`)
+  once the run completes and stamps `agent_messages.prompt_tokens` /
+  `completion_tokens` on the persisted assistant row (`agent/runtime.py`'s
+  `TurnResult`, `api/routers/agent.py::_message_stream`). If the endpoint
+  reports `0` (nothing measured), the column is left `NULL` — Vestigo never
+  fabricates or estimates a token count. The same two fields ride along on
+  the terminal `done` SSE event so the live UI can show a usage chip without
+  a refetch.
 
 ## Architecture
 

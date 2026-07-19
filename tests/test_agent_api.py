@@ -8,6 +8,9 @@ and the Kimi coding-plan replay shim.
 
 from __future__ import annotations
 
+import asyncio
+import json
+
 import pytest
 
 from tests.conftest import as_admin, login
@@ -253,6 +256,92 @@ async def test_stream_turn_maps_events(monkeypatch):
     # History round-trips through JSON for Postgres persistence.
     dumped = runtime.dump_history(turn.new_messages)
     assert runtime.load_history(dumped)
+
+
+@pytest.mark.asyncio
+async def test_stream_turn_result_carries_measured_token_usage(monkeypatch):
+    """FunctionModel reports non-zero fake usage; TurnResult must surface it."""
+    from mcp.server.fastmcp import FastMCP
+    from pydantic_ai.messages import ModelMessage
+    from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+    from vestigo.agent import runtime
+
+    stub = FastMCP("stub")
+    monkeypatch.setattr(runtime, "build_tool_server", lambda scope: stub)
+
+    async def model_stream(messages: list[ModelMessage], info: AgentInfo):
+        yield "a plain answer, no tools needed"
+
+    scope = AgentScope(
+        case_id="c1",
+        timeline_id="t1",
+        user=None,
+        source_ids=["s1"],
+        field_mappings=None,
+        source_offsets=None,
+    )
+    events = []
+    async for event in runtime.stream_turn(
+        scope,
+        user_text="what happened",
+        history=[],
+        model=FunctionModel(stream_function=model_stream),
+    ):
+        events.append(event)
+
+    turn = events[-1]["turn"]
+    assert turn.prompt_tokens is not None and turn.prompt_tokens > 0
+    assert turn.completion_tokens is not None and turn.completion_tokens > 0
+
+
+def test_send_message_persists_and_streams_token_usage(
+    client, admin_bootstrap, agent_on, store, monkeypatch
+):
+    """A streamed turn stamps the persisted assistant row and the done SSE event."""
+    from mcp.server.fastmcp import FastMCP
+    from pydantic_ai.messages import ModelMessage
+    from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+    from vestigo.agent import runtime
+
+    stub = FastMCP("stub")
+    monkeypatch.setattr(runtime, "build_tool_server", lambda scope: stub)
+
+    async def model_stream(messages: list[ModelMessage], info: AgentInfo):
+        yield "the answer is 42"
+
+    monkeypatch.setattr(
+        runtime, "build_model", lambda settings=None: FunctionModel(stream_function=model_stream)
+    )
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
+        json={"content": "hello agent"},
+    )
+    assert resp.status_code == 200
+    done_events = [
+        json.loads(line[len("data: ") :])
+        for line in resp.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    done = next(e for e in done_events if e["type"] == "done")
+    assert done["prompt_tokens"] and done["prompt_tokens"] > 0
+    assert done["completion_tokens"] and done["completion_tokens"] > 0
+
+    async def _fetch_messages():
+        return await store.list_agent_messages(conversation["id"])
+
+    messages = asyncio.run(_fetch_messages())
+    assistant = [m for m in messages if m.role == "assistant"][-1]
+    assert assistant.prompt_tokens and assistant.prompt_tokens > 0
+    assert assistant.completion_tokens and assistant.completion_tokens > 0
 
 
 # ---------------------------------------------------------------------------
