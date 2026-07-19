@@ -217,3 +217,13 @@ describe("formatTokenCount", () => {
     expect(formatTokenCount(1200000)).toBe("1.2M");
   });
 });
+
+describe("isAnalystAnnotation", () => {
+  it("treats user and agentic-analysis as analyst-visible, system not", async () => {
+    const { isAnalystAnnotation } = await import("../api/types");
+    const base = { annotation_type: "tag" };
+    expect(isAnalystAnnotation({ ...base, origin: "user" } as never)).toBe(true);
+    expect(isAnalystAnnotation({ ...base, origin: "agentic-analysis" } as never)).toBe(true);
+    expect(isAnalystAnnotation({ ...base, origin: "system" } as never)).toBe(false);
+  });
+});

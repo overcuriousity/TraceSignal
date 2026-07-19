@@ -20,6 +20,7 @@ import { useDisposition } from "@/hooks/useDisposition";
 import { useUiStore } from "@/stores/ui";
 import { TagInput } from "@/components/explorer/TagInput";
 import type { AnomalyMarker, Event, Annotation, DispositionKind } from "@/api/types";
+import { isAnalystAnnotation } from "@/api/types";
 
 interface Props {
   event: Event;
@@ -363,7 +364,7 @@ export function EventDetailPanel({
     };
   }, [setDetailPanelWidth]);
 
-  const userAnnotations = annotations.filter((a) => a.origin === "user");
+  const userAnnotations = annotations.filter(isAnalystAnnotation);
   const systemAnnotations = annotations.filter((a) => a.origin === "system");
   const persistedAnomalies = systemAnnotations.filter((a) => a.annotation_type === "anomaly");
   const persistedDetectors = new Set(persistedAnomalies.map((a) => a.detector));

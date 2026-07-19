@@ -20,6 +20,7 @@ import {
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { ChevronRight, AlertTriangle, Tag, MessageSquare, Trash2, ArrowUp, ArrowDown, ShieldCheck, EyeOff, Flag } from "lucide-react";
 import type { AnomalyMarker, Disposition, DispositionKind, Event, Annotation } from "@/api/types";
+import { isAnalystAnnotation } from "@/api/types";
 import { fmtTimestamp, fmtRelative, fmtTimestampFull } from "@/lib/time";
 import { truncate } from "@/lib/format";
 import { Badge } from "@/components/ui/Badge";
@@ -98,7 +99,7 @@ function TagPopover({
   const [open, setOpen] = useState(false);
   const [value, setValue] = useState("");
   const { add, remove } = useAnnotationMutations(caseId, sourceId);
-  const userTags = anns.filter((a) => a.annotation_type === "tag" && a.origin === "user");
+  const userTags = anns.filter((a) => a.annotation_type === "tag" && isAnalystAnnotation(a));
 
   function submit() {
     const tag = value.trim();
@@ -189,7 +190,9 @@ function CommentPopover({
   const [open, setOpen] = useState(false);
   const [value, setValue] = useState("");
   const { add, remove } = useAnnotationMutations(caseId, sourceId);
-  const userComments = anns.filter((a) => a.annotation_type === "comment" && a.origin === "user");
+  const userComments = anns.filter(
+    (a) => a.annotation_type === "comment" && isAnalystAnnotation(a),
+  );
 
   function submit() {
     if (!value.trim()) return;
@@ -517,7 +520,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
           const anns = annotations.get(row.original.event_id) ?? [];
           const parserTags = row.original.tags;
           const userTags = anns.filter(
-            (a) => a.annotation_type === "tag" && a.origin === "user",
+            (a) => a.annotation_type === "tag" && isAnalystAnnotation(a),
           );
           return (
             <div className="flex items-center gap-1 min-w-0">

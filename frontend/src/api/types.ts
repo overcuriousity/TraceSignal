@@ -214,7 +214,7 @@ export interface View {
  * deleted the old rows.
  */
 export type AnnotationType = "comment" | "tag" | "anomaly";
-export type AnnotationOrigin = "user" | "system";
+export type AnnotationOrigin = "user" | "system" | "agentic-analysis";
 
 export interface Annotation {
   id: string;
@@ -229,6 +229,16 @@ export interface Annotation {
   created_at: string;
   /** Which detector produced this system annotation ("value_novelty" | "frequency"); null for human annotations. */
   detector: string | null;
+}
+
+/**
+ * Analyst-visible annotations: written by a human, or by the agent and
+ * confirmed by a human (origin "agentic-analysis"). Mirrors the backend's
+ * USER_VISIBLE_ANNOTATION_ORIGINS — origin is provenance, not a visibility
+ * class, so both render wherever user annotations do.
+ */
+export function isAnalystAnnotation(a: Pick<Annotation, "origin">): boolean {
+  return a.origin === "user" || a.origin === "agentic-analysis";
 }
 
 export interface Job {
