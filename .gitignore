@@ -24,6 +24,14 @@ frontend/.vite/
 .claude/settings.local.json
 .claude/settings.local.json.tmp.*
 
+# AI agent rule files (local caveman mode)
+.cursor/
+.windsurf/
+.clinerules/
+.opencode/
+.github/copilot-instructions.md
+AGENTS.md
+
 # IDE
 .vscode/
 .idea/
