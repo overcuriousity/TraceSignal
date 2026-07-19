@@ -681,6 +681,85 @@ async def test_kimi_shim_injects_unsigned_thinking_on_tool_call_replay():
         assert first["signature"] == ""
 
 
+# ---------------------------------------------------------------------------
+# Reasoning-effort translation (A7)
+# ---------------------------------------------------------------------------
+
+
+def _agent_config(**overrides):
+    from vestigo.agent.config import AgentConfig
+
+    fields = {
+        "model": "m",
+        "provider": "openai",
+        "api_base_url": None,
+        "api_key": None,
+        "user_agent": None,
+        "extra_headers": None,
+        "max_turns": 15,
+        "reasoning_effort": "off",
+        "sources": {},
+    }
+    fields.update(overrides)
+    return AgentConfig(**fields)
+
+
+def test_effort_settings_off_is_none():
+    from vestigo.agent.runtime import effort_model_settings
+
+    for provider in ("openai", "anthropic"):
+        config = _agent_config(provider=provider, reasoning_effort="off")
+        assert effort_model_settings(config) is None
+
+    kimi_config = _agent_config(
+        provider="anthropic",
+        api_base_url="https://api.kimi.com/coding",
+        reasoning_effort="off",
+    )
+    assert effort_model_settings(kimi_config) is None
+
+
+def test_effort_settings_openai_verbatim():
+    from pydantic_ai.models.openai import OpenAIChatModelSettings
+
+    from vestigo.agent.runtime import effort_model_settings
+
+    config = _agent_config(provider="openai", reasoning_effort="high")
+    settings = effort_model_settings(config)
+    assert isinstance(settings, dict)
+    assert settings == OpenAIChatModelSettings(openai_reasoning_effort="high")
+    assert settings["openai_reasoning_effort"] == "high"
+
+
+def test_effort_settings_anthropic_budget():
+    from vestigo.agent.runtime import effort_model_settings
+
+    config = _agent_config(provider="anthropic", reasoning_effort="medium")
+    settings = effort_model_settings(config)
+    assert settings["anthropic_thinking"] == {"type": "enabled", "budget_tokens": 8192}
+
+
+def test_effort_settings_kimi_mapping():
+    from vestigo.agent.runtime import effort_model_settings
+
+    expected = {"low": "low", "medium": "high", "high": "high", "max": "max"}
+    for effort, kimi_effort in expected.items():
+        config = _agent_config(
+            provider="anthropic",
+            api_base_url="https://api.kimi.com/coding",
+            reasoning_effort=effort,
+        )
+        settings = effort_model_settings(config)
+        assert settings["extra_body"] == {"reasoning_effort": kimi_effort}
+
+    off_config = _agent_config(
+        provider="anthropic",
+        api_base_url="https://api.kimi.com/coding",
+        reasoning_effort="off",
+    )
+    assert effort_model_settings(off_config) is None
+
+
 async def test_agent_message_token_columns(store):
     await store.init_schema()
     conv = await store.create_agent_conversation("c1", "t1", "u1", model_id="openai:m")

@@ -12,9 +12,11 @@ whose User-Agent doesn't identify a coding agent — handled via
 replayed assistant tool-call messages to carry a thinking block, unsigned
 (``reasoning_content`` semantics, hermes-agent#13848). Stock pydantic-ai only
 replays *signed* thinking blocks, so :class:`KimiAnthropicModel` re-injects
-unsigned ones. The Anthropic ``thinking`` request parameter is never sent
-(pydantic-ai omits it unless explicitly configured), matching hermes'
-behavior for this endpoint.
+unsigned ones. The Anthropic ``thinking`` request parameter itself is still
+never sent by pydantic-ai for this endpoint; when reasoning effort is
+configured (``reasoning_effort`` != ``"off"``), :func:`effort_model_settings`
+instead sends a top-level ``reasoning_effort`` field via ``extra_body`` (see
+that function's docstring for the wire-field verification).
 """
 
 from __future__ import annotations
@@ -38,10 +40,11 @@ from pydantic_ai.messages import (
     TextPartDelta,
 )
 from pydantic_ai.models import Model
-from pydantic_ai.models.anthropic import AnthropicModel
-from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
+from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import UsageLimits
 
 from vestigo.agent.availability import probe_headers
@@ -103,6 +106,64 @@ class KimiAnthropicModel(AnthropicModel):
                 # unsigned thinking block; it must precede text/tool_use.
                 content.insert(0, {"type": "thinking", "thinking": "", "signature": ""})
         return system_prompt, anthropic_messages
+
+
+_ANTHROPIC_THINKING_BUDGETS = {"low": 2048, "medium": 8192, "high": 24576, "max": 32768}
+
+# Kimi's own effort vocabulary is coarser (low/high/max) than Vestigo's
+# closed enum (off/low/medium/high/max); "medium" and "high" both collapse
+# to Kimi's "high" tier. See effort_model_settings() docstring for sourcing.
+_KIMI_EFFORT = {"low": "low", "medium": "high", "high": "high", "max": "max"}
+
+
+def effort_model_settings(config: AgentConfig) -> ModelSettings | None:
+    """Translate the closed reasoning-effort enum into provider model settings.
+
+    ``config.reasoning_effort`` is one of ``EFFORT_VALUES``
+    (``vestigo.agent.config``): ``"off"`` (no reasoning-effort setting is
+    sent — current/default behavior), ``"low"``, ``"medium"``, ``"high"``,
+    ``"max"``. See the effort table in docs/AGENT.md for the full per-provider
+    mapping.
+
+    - OpenAI-protocol endpoints: passed verbatim as
+      ``OpenAIChatModelSettings(openai_reasoning_effort=effort)`` (pydantic-ai
+      forwards it as the OpenAI ``reasoning_effort`` request field).
+    - Anthropic-protocol endpoints (non-Kimi): translated to an explicit
+      thinking-token budget via ``AnthropicModelSettings(anthropic_thinking=...)``
+      since stock Anthropic has no discrete effort enum, only a token budget.
+    - Kimi's ``https://api.kimi.com/coding`` endpoint (also Anthropic-protocol
+      on the wire): Kimi's own K3 API takes a coarser, discrete
+      ``low``/``high``/``max`` effort tier via a **top-level `reasoning_effort`
+      field in the JSON request body** (not the Anthropic `thinking` object).
+      Verified against: platform.kimi.ai's "Thinking Effort" guide
+      (https://platform.kimi.ai/docs/guide/use-thinking-effort), which shows
+      `reasoning_effort` as a top-level request field for kimi-k3 on Kimi's
+      chat-completions API and calls out explicit OpenAI `reasoning_effort`
+      compatibility; and Kimi Code's "Using in Third-Party Coding Agents" docs
+      (https://www.kimi.com/code/docs/en/third-party-tools/other-coding-agents.html),
+      which give the exact effort-tier mapping used here for the `/coding`
+      agent-facing endpoint: low->low, medium->high, high->high, xhigh->max,
+      max->max (Vestigo has no "xhigh" tier, so "max" covers it). Neither
+      source shows a raw HTTP request body captured specifically against
+      `/coding`'s Anthropic-protocol (`/v1/messages`) path, so the field name
+      is corroborated rather than directly observed on that exact route --
+      pydantic-ai's ``ModelSettings.extra_body`` merges it into the JSON body
+      regardless of protocol, which is the safe construction either way.
+      Treat as experimental pending a direct request/response capture.
+    """
+    effort = config.reasoning_effort
+    if effort == "off":
+        return None
+    if _is_kimi_coding_endpoint(config.api_base_url):
+        return ModelSettings(extra_body={"reasoning_effort": _KIMI_EFFORT[effort]})
+    if config.provider == "anthropic":
+        return AnthropicModelSettings(
+            anthropic_thinking={
+                "type": "enabled",
+                "budget_tokens": _ANTHROPIC_THINKING_BUDGETS[effort],
+            }
+        )
+    return OpenAIChatModelSettings(openai_reasoning_effort=effort)
 
 
 def build_model(config: AgentConfig) -> Model:
@@ -183,6 +244,7 @@ async def stream_turn(
         model,
         system_prompt=SYSTEM_PROMPT,
         toolsets=[toolset],
+        model_settings=effort_model_settings(config),
     )
     limits = UsageLimits(request_limit=config.max_turns)
 

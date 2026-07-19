@@ -184,8 +184,55 @@ to server behavior.
 | `VESTIGO_AGENT_USER_AGENT` | UA header for endpoints that gate on client identity. |
 | `VESTIGO_AGENT_EXTRA_HEADERS` | JSON object of extra HTTP headers. |
 | `VESTIGO_AGENT_MAX_TURNS` | Model round-trip cap per user message (default 15). |
+| `VESTIGO_AGENT_REASONING_EFFORT` | Reasoning-effort enum: `off` (default), `low`, `medium`, `high`, `max`. Admin-editable; see **Reasoning effort** below. |
 | `VESTIGO_AGENT_PROBE_TTL_SECONDS` | Availability probe cache (default 60). |
 | `VESTIGO_MCP_ENABLED` | Serve the external `/mcp` streamable-HTTP endpoint (default `false`). Independent of `VESTIGO_AGENT_*`. |
+
+### Reasoning effort
+
+`AgentConfig.reasoning_effort` (`agent/config.py`, `EFFORT_VALUES`) is a closed
+five-value enum — `off`/`low`/`medium`/`high`/`max` — resolved through the same
+env-wins-per-field layering as every other agent setting. `off` is the default
+and reproduces pre-A7 behavior exactly: no reasoning-effort field is sent at
+all. `runtime.py::effort_model_settings(config)` translates a non-`off` value
+into the wire shape the configured endpoint expects and is passed as
+`Agent(..., model_settings=...)` in `stream_turn`:
+
+| `reasoning_effort` | OpenAI-protocol | Anthropic-protocol (non-Kimi) | Kimi `/coding` |
+|---|---|---|---|
+| `off` | nothing sent | nothing sent | nothing sent |
+| `low` | `openai_reasoning_effort="low"` | `anthropic_thinking={"type":"enabled","budget_tokens":2048}` | `reasoning_effort="low"` |
+| `medium` | `openai_reasoning_effort="medium"` | `budget_tokens=8192` | `reasoning_effort="high"` |
+| `high` | `openai_reasoning_effort="high"` | `budget_tokens=24576` | `reasoning_effort="high"` |
+| `max` | `openai_reasoning_effort="max"` | `budget_tokens=32768` | `reasoning_effort="max"` |
+
+- **OpenAI-protocol** endpoints get the value passed straight through as
+  `OpenAIChatModelSettings(openai_reasoning_effort=effort)`.
+- **Anthropic-protocol, non-Kimi** endpoints have no discrete effort enum on
+  the wire, only a thinking-token budget, so effort is translated to
+  `AnthropicModelSettings(anthropic_thinking={"type": "enabled",
+  "budget_tokens": ...})` using a fixed budget table
+  (`_ANTHROPIC_THINKING_BUDGETS` in `runtime.py`).
+- **Kimi's `https://api.kimi.com/coding` endpoint** (Anthropic protocol on
+  the wire, see below) uses its own coarser `low`/`high`/`max` tiers via a
+  **top-level `reasoning_effort` field in the JSON request body**
+  (`ModelSettings(extra_body={"reasoning_effort": ...})`), not the Anthropic
+  `thinking` object — Vestigo's `medium` and `high` both collapse to Kimi's
+  `high` tier (`_KIMI_EFFORT` in `runtime.py`).
+  - **Verified against:** platform.kimi.ai's "Thinking Effort" guide
+    (`https://platform.kimi.ai/docs/guide/use-thinking-effort`), which shows
+    `reasoning_effort` as a top-level field on Kimi's chat-completions API
+    for `kimi-k3` and documents it as OpenAI-`reasoning_effort`-compatible;
+    and Kimi Code's "Using in Third-Party Coding Agents" docs
+    (`https://www.kimi.com/code/docs/en/third-party-tools/other-coding-agents.html`),
+    which give the exact effort-tier mapping (Claude-Code-level -> K3 level:
+    `low`->`low`, `medium`->`high`, `high`->`high`, `xhigh`->`max`,
+    `max`->`max`) used by `_KIMI_EFFORT` (Vestigo has no `xhigh` tier). Neither
+    source shows a captured raw request against `/coding`'s specific
+    Anthropic-protocol (`/v1/messages`) route, so treat the Kimi branch as
+    **experimental** pending a direct request/response capture; `extra_body`
+    is the safe construction regardless of exact route, since pydantic-ai
+    merges it into the JSON body unconditionally.
 
 Works with any OpenAI-compatible endpoint (ollama, vllm, LocalAI,
 OpenRouter, `api.moonshot.ai/v1`) or Anthropic-compatible endpoint. Like the
@@ -211,15 +258,19 @@ Verified against the hermes-agent source (`agent/anthropic_adapter.py`,
   tool-call messages to carry an (unsigned) thinking block
   (hermes-agent#13848). Stock pydantic-ai replays only *signed* thinking
   blocks, so `runtime.KimiAnthropicModel` injects unsigned ones for
-  `api.kimi.com/coding` base URLs; the Anthropic `thinking` request
-  parameter is never sent for this endpoint.
+  `api.kimi.com/coding` base URLs. The Anthropic `thinking` request
+  parameter itself is still never sent for this endpoint; reasoning effort
+  (when `VESTIGO_AGENT_REASONING_EFFORT` != `off`) instead rides a top-level
+  `reasoning_effort` field via `extra_body` — see **Reasoning effort** above.
 
 ## Testing
 
 `tests/test_agent_api.py`: availability gate (probe + cache), health flag,
 router 503 gating, conversation CRUD + per-user privacy, the full streamed
 loop over a stubbed MCP tool server with pydantic-ai's `FunctionModel` (no
-real LLM), the Kimi replay shim, and the proposal lifecycle over HTTP
+real LLM), the Kimi replay shim, `effort_model_settings` (off/openai/
+anthropic-budget/Kimi-mapping, pure function, no network), and the proposal
+lifecycle over HTTP
 (confirm writes annotations + audits, confirm is idempotent/409s on
 redecide, reject writes nothing, only the conversation's owner can decide).
 `tests/test_agent_tools.py`: the read-parity tools, the extended
