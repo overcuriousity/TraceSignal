@@ -1025,6 +1025,47 @@ class AgentMessage(Base):
         }
 
 
+class AgentToken(Base):
+    """A scoped personal access token for the external MCP endpoint (docs/AGENT.md).
+
+    Bound to exactly one case + timeline at creation — presenting the token
+    yields precisely that scope, so the external client (like the built-in
+    agent) never supplies IDs. Only the SHA-256 of the token is stored; the
+    plaintext is shown once at creation. Access is re-checked against the
+    creating user's current case RBAC on every connect, so revoking the user
+    or their team membership also cuts off their tokens.
+    """
+
+    __tablename__ = "agent_tokens"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    timeline_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serializable dict for the token-management API — never the hash."""
+        return {
+            "id": self.id,
+            "case_id": self.case_id,
+            "timeline_id": self.timeline_id,
+            "user_id": self.user_id,
+            "name": self.name,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "revoked_at": self.revoked_at.isoformat() if self.revoked_at else None,
+        }
+
+
 class User(Base):
     """An analyst or administrator account.
 
@@ -3047,6 +3088,68 @@ class PostgresStore:
                 .order_by(AgentMessage.created_at.asc(), AgentMessage.id.asc())
             )
             return list(result.scalars().all())
+
+    # ------------------------------------------------------------------
+    # Agent MCP tokens
+    # ------------------------------------------------------------------
+
+    async def create_agent_token(
+        self,
+        case_id: str,
+        timeline_id: str,
+        user_id: str,
+        name: str,
+        token_hash: str,
+        expires_at: datetime | None = None,
+    ) -> AgentToken:
+        """Persist a new MCP access token row (hash only, never plaintext)."""
+        row = AgentToken(
+            id=generate_id(f"agent_token_{name}"),
+            token_hash=token_hash,
+            case_id=case_id,
+            timeline_id=timeline_id,
+            user_id=user_id,
+            name=name,
+            expires_at=expires_at,
+        )
+        async with self.session_factory() as session:
+            session.add(row)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def list_agent_tokens(self, case_id: str, timeline_id: str) -> list[AgentToken]:
+        """Return a timeline's MCP tokens, newest first (revoked ones included)."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(AgentToken)
+                .where(AgentToken.case_id == case_id, AgentToken.timeline_id == timeline_id)
+                .order_by(AgentToken.created_at.desc())
+            )
+            return list(result.scalars().all())
+
+    async def get_agent_token_by_hash(self, token_hash: str) -> AgentToken | None:
+        """Resolve a presented token's SHA-256 to its row (revoked/expired rows included —
+        the caller decides how to respond so auth failures stay distinguishable)."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(AgentToken).where(AgentToken.token_hash == token_hash)
+            )
+            return result.scalar_one_or_none()
+
+    async def revoke_agent_token(self, case_id: str, token_id: str) -> bool:
+        """Stamp revoked_at on a token row. Returns True when the row existed."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(AgentToken).where(AgentToken.case_id == case_id, AgentToken.id == token_id)
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return False
+            if row.revoked_at is None:
+                row.revoked_at = datetime.now(UTC)
+                await session.commit()
+            return True
 
     # ------------------------------------------------------------------
     # Sigma rules + runs
