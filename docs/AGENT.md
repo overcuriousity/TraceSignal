@@ -188,6 +188,30 @@ to server behavior.
 | `VESTIGO_AGENT_PROBE_TTL_SECONDS` | Availability probe cache (default 60). |
 | `VESTIGO_MCP_ENABLED` | Serve the external `/mcp` streamable-HTTP endpoint (default `false`). Independent of `VESTIGO_AGENT_*`. |
 
+### DB-backed settings and env-wins precedence (A7)
+
+Every field above except `VESTIGO_AGENT_PROBE_TTL_SECONDS` and `VESTIGO_MCP_ENABLED`
+can also be set from the admin UI (`Admin -> Agent`, `frontend/src/pages/admin/AdminAgentPage.tsx`),
+backed by a singleton `agent_settings` row (migration `0011`, `db/postgres.py`).
+`resolve_agent_config()` (`agent/config.py`) resolves each field independently,
+**per field**, in this order:
+
+1. `VESTIGO_AGENT_<FIELD>` env var, if set — wins unconditionally.
+2. The DB-stored value, if set.
+3. The hardcoded default (e.g. `provider=openai`, `max_turns=15`, `reasoning_effort=off`).
+
+This is deliberately per-field, not per-config: an operator can pin `VESTIGO_AGENT_API_KEY`
+while leaving `model` and `reasoning_effort` admin-editable in the DB. The resolved
+`AgentConfig.sources` dict records which layer won each field (`"env"|"db"|"default"`),
+which the admin API (`GET/PUT /api/admin/agent-settings`) surfaces so the UI can render
+env-pinned fields as disabled with a `pinned by VESTIGO_AGENT_<FIELD>` badge instead of
+silently accepting edits that would never take effect. `api_key` is never round-tripped
+in plaintext through this API — only an `api_key_set` boolean; the UI's password field
+treats an empty submit as "unchanged" and requires an explicit clear action to null it out.
+Resolved configs are cached per-fingerprint (hash of the resolved values) so admin edits
+take effect on the next call without a process restart, and `PUT` resets the availability
+probe cache so a following health check re-probes immediately.
+
 ### Reasoning effort
 
 `AgentConfig.reasoning_effort` (`agent/config.py`, `EFFORT_VALUES`) is a closed

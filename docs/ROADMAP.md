@@ -271,14 +271,6 @@ exposure of the identical tool server (`VESTIGO_MCP_ENABLED`, default off). See
   array would silently skip the audit row. Currently safe because the MCP SDK's streamable
   HTTP transport rejects JSON-RPC batch arrays outright (removed in the 2025-06-18 MCP
   spec) — revisit if the SDK ever reintroduces batching support.
-- [ ] **A7 — Agent config in the admin interface.** Move `VESTIGO_AGENT_*` runtime
-  selection (model, provider, base URL, API key, user agent, extra headers, max turns)
-  into a DB-backed settings page under the existing admin UI, with **env always winning**
-  over DB values (operator pins beat admin toggles — preserves the explicit-operator
-  stance on network endpoints). API key write-only/masked; availability-probe cache must
-  invalidate on change. Add a "reasoning effort" field with per-provider translation in
-  `runtime.build_model` (Anthropic `thinking` budget vs. OpenAI `reasoning_effort`) —
-  the concept doesn't exist yet.
 - [ ] **A8 — External MCP toolsets (web research / user-pluggable tools).** Do NOT build
   bespoke whois/web tools or a custom plugin API: the runtime is pydantic-ai with MCP
   toolsets, so let the agent consume operator-configured **external MCP servers**
