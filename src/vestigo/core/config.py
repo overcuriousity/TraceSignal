@@ -263,6 +263,13 @@ class Settings(BaseSettings):
     # Seconds an availability probe result is cached before re-probing.
     agent_probe_ttl_seconds: float = Field(default=60.0, gt=0)
 
+    # External MCP endpoint (/mcp): serves the same scoped tool server the
+    # built-in agent uses over streamable HTTP, authenticated by scoped
+    # per-timeline tokens (agent_tokens table). Off by default — invisible
+    # unless the operator enables it. Independent of VESTIGO_AGENT_* (serving
+    # MCP needs no LLM endpoint).
+    mcp_enabled: bool = False
+
 
 @lru_cache
 def get_settings() -> Settings:

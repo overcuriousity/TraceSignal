@@ -409,6 +409,8 @@ async def test_init_schema_drops_legacy_staging_table(tmp_path):
         # 0007 adds the AI-agent conversation tables.
         await conn.execute(text("DROP TABLE agent_conversations"))
         await conn.execute(text("DROP TABLE agent_messages"))
+        # 0008 adds the scoped MCP token table.
+        await conn.execute(text("DROP TABLE agent_tokens"))
         await conn.execute(text("ALTER TABLE sources DROP COLUMN time_offset_seconds"))
         # 0005 adds completed_source_ids to the job-run marker.
         await conn.execute(text("ALTER TABLE enrichment_job_runs DROP COLUMN completed_source_ids"))

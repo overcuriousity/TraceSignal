@@ -451,6 +451,9 @@ def create_app() -> FastAPI:
             # answered the cached probe — the frontend renders no agent UI
             # at all in that state.
             "agent_available": await agent_available(),
+            # True only when VESTIGO_MCP_ENABLED — the external streamable-HTTP
+            # MCP endpoint at /mcp. Off by default (Bearer-token-gated when on).
+            "mcp_enabled": get_settings().mcp_enabled,
         }
 
     app.include_router(auth.router)
@@ -467,6 +470,21 @@ def create_app() -> FastAPI:
     app.include_router(converters.router)
     app.include_router(agent.router)
     app.include_router(agent_tokens.router)
+
+    # External streamable-HTTP MCP endpoint (Bearer-token-gated), off by default.
+    # Registered outside /api/, so AuthAuditMiddleware's session gate does not
+    # apply — the endpoint's own Bearer auth is the sole gate. Registered
+    # unconditionally (the endpoint itself 404s when VESTIGO_MCP_ENABLED is off)
+    # so a disabled deployment answers a clean 404 instead of the SPA catch-all's
+    # 405. A bare Mount("/mcp") only matches "/mcp/…"; clients POST to "/mcp", so
+    # the exact path is routed explicitly too (both dispatch to the same app).
+    from starlette.routing import Mount, Route
+
+    from vestigo.agent.mcp_http import MCPEndpoint
+
+    mcp_endpoint = MCPEndpoint()
+    app.router.routes.append(Route("/mcp", mcp_endpoint, methods=["GET", "POST", "DELETE"]))
+    app.router.routes.append(Mount("/mcp", app=mcp_endpoint))
 
     # Serve the built frontend when frontend/dist exists.
     # Run `npm run build` inside frontend/ once; vestigo-web then serves everything.
