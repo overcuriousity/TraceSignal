@@ -280,11 +280,6 @@ exposure of the identical tool server (`VESTIGO_MCP_ENABLED`, default off). See
   array would silently skip the audit row. Currently safe because the MCP SDK's streamable
   HTTP transport rejects JSON-RPC batch arrays outright (removed in the 2025-06-18 MCP
   spec) — revisit if the SDK ever reintroduces batching support.
-- [ ] **A5 — Markdown rendering of agent responses.** `AgentPanel`/`FindingCard` render
-  plain `whitespace-pre-wrap` text; models emit markdown regardless. Add
-  `react-markdown` + `remark-gfm` for assistant messages and finding descriptions —
-  **no raw HTML** (agent output is untrusted; do not add `rehype-raw`), styled code
-  blocks/lists/tables. Small, self-contained.
 - [ ] **A6 — Token-usage metering.** No usage data is captured today; local-LLM sizing
   advice is estimated, not measured. pydantic-ai exposes per-run token counts — stamp
   prompt/completion tokens per turn into `agent_messages` (or the conversation row) and

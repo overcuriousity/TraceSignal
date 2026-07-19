@@ -9,6 +9,7 @@ import { ArrowRight, Lightbulb } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { specToEventFilters, type AgentFilterSpec } from "@/api/agent";
 import type { EventFilters } from "@/api/types";
+import { Markdown } from "./Markdown";
 
 interface Props {
   title: string;
@@ -50,7 +51,9 @@ export function FindingCard({ title, description, spec, total, onApply }: Props)
         <span className="min-w-0 break-words">{title}</span>
       </div>
       {description && (
-        <p className="mt-1 whitespace-pre-wrap text-[var(--color-fg-secondary)]">{description}</p>
+        <div className="mt-1 text-[var(--color-fg-secondary)]">
+          <Markdown content={description} />
+        </div>
       )}
       <div className="mt-1.5 flex flex-wrap gap-1">
         {specChips(spec).map((chip, i) => (

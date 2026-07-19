@@ -23,6 +23,7 @@ import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { FindingCard } from "./FindingCard";
+import { Markdown } from "./Markdown";
 import type { EventFilters } from "@/api/types";
 
 interface Props {
@@ -308,9 +309,9 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
             return (
               <div
                 key={i}
-                className="whitespace-pre-wrap px-1 text-xs leading-relaxed text-[var(--color-fg-primary)]"
+                className="px-1 text-xs leading-relaxed text-[var(--color-fg-primary)]"
               >
-                {item.content}
+                <Markdown content={item.content} />
                 {item.streaming && <span className="animate-pulse">▌</span>}
               </div>
             );
