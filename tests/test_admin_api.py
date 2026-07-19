@@ -186,3 +186,44 @@ def test_default_pool_listing(client, admin_bootstrap, store):
     usernames = {u["username"] for u in resp.json()["users"]}
     assert "unassigned1" in usernames
     assert "teamed" not in usernames
+
+
+def test_agent_settings_upsert_and_mask(client, admin_bootstrap, store):
+    """update_agent_settings upserts the single 'global' row; only keys present
+    in `values` change; a key present with value None clears that column; and
+    to_dict(mask_key=True) never exposes the plaintext api_key."""
+    import asyncio
+
+    async def _exercise() -> None:
+        assert await store.get_agent_settings() is None
+
+        row = await store.update_agent_settings({"model": "qwen3:32b"}, "root")
+        assert row.id == "global"
+        assert row.model == "qwen3:32b"
+        assert row.api_key is None
+        assert row.updated_by == "root"
+
+        row = await store.update_agent_settings({"api_key": "sk-x"}, "root")
+        assert row.model == "qwen3:32b"  # preserved
+        assert row.api_key == "sk-x"
+
+        d = row.to_dict()
+        assert d["api_key_set"] is True
+        assert "api_key" not in d
+
+        d_unmasked = row.to_dict(mask_key=False)
+        assert d_unmasked["api_key"] == "sk-x"
+
+        row = await store.update_agent_settings({"api_key": None}, "root")
+        assert row.api_key is None
+        assert row.model == "qwen3:32b"  # still preserved
+
+        d = row.to_dict()
+        assert d["api_key_set"] is False
+        assert "api_key" not in d
+
+        fetched = await store.get_agent_settings()
+        assert fetched is not None
+        assert fetched.id == "global"
+
+    asyncio.run(_exercise())
