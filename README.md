@@ -79,6 +79,20 @@ embeddings surface the needles in the haystack, without needing a cluster to run
 - See [Anomaly Detection](docs/ANOMALY_DETECTION.md) for a plain-language explanation of every
   detector — what it catches, how it scores, and its knobs.
 
+### AI investigation agent (optional)
+- An off-by-default AI assistant embedded in the Explorer: it searches, aggregates, runs
+  detectors, and reads prior analyst work (annotations, dispositions, saved views, Sigma
+  results) through **read-only, case-scoped tools**, then hands results back as findings —
+  filter sets you apply to the Explorer with one click. It never mutates your view or your data.
+- Works with any OpenAI- or Anthropic-compatible endpoint the operator points it at (ollama,
+  vllm, llama.cpp server, LocalAI, OpenRouter, Anthropic, Kimi) — fully local operation is a
+  first-class path, consistent with the airgapped design goal.
+- The same tool set is exposable as a standard **MCP endpoint** (`/mcp`, off by default):
+  scoped per-timeline access tokens let external agents (e.g. Claude Code) investigate a
+  timeline with identical capabilities, every tool call audited.
+- Every conversation and tool call is persisted and audit-trailed — an agent-assisted finding
+  stays explainable from the case record alone. See [AI Agent](docs/AGENT.md).
+
 ### Authentication, access control, and audit
 - Session-cookie authentication for local accounts, with a seeded one-time bootstrap admin and
   optional OIDC SSO for teams that already run an identity provider.
@@ -247,6 +261,7 @@ analysis system for a small, self-hosted team.
 - [Concept](docs/CONCEPT.md)
 - [Input Formats](docs/INPUT_FORMATS.md) — CSV/JSONL/Parquet field-level normalization spec
 - [Anomaly Detection](docs/ANOMALY_DETECTION.md) — every statistical detector explained, plain language
+- [AI Agent](docs/AGENT.md) — the optional investigation agent and the external MCP endpoint
 - [Tech Stack](docs/TECH_STACK.md)
 - [Model Refinement](docs/MODEL_REFINEMENT.md) — approved Case / Source / Timeline / Artifact redesign
 - [Roadmap](docs/ROADMAP.md)
