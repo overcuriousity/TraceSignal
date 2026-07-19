@@ -1,5 +1,14 @@
-import { del, get, patch, post } from "./client";
+import { del, get, patch, post, put } from "./client";
 import type { AuditEntry, Team, TeamMember, TeamRole, User } from "./types";
+
+/** GET/PUT `/admin/agent-settings` response shape: the effective (env/db/default-merged)
+ * AI agent config, the source each field was resolved from, and the env var name for any
+ * field currently pinned by the environment (see `resolve_agent_config` in the backend). */
+export interface AgentSettingsResponse {
+  effective: Record<string, unknown> & { api_key_set: boolean };
+  sources: Record<string, "env" | "db" | "default">;
+  env_vars: Record<string, string>;
+}
 
 export const adminApi = {
   // --- Users -----------------------------------------------------------
@@ -60,4 +69,10 @@ export const adminApi = {
   // --- Audit ---------------------------------------------------------------
   queryAudit: (filters?: { user_id?: string; case_id?: string; action?: string; limit?: number }) =>
     get<{ audit: AuditEntry[] }>("/admin/audit", filters).then((r) => r.audit),
+
+  // --- AI agent settings (A7) ----------------------------------------------
+  getAgentSettings: () => get<AgentSettingsResponse>("/admin/agent-settings"),
+
+  putAgentSettings: (patch: Record<string, unknown>) =>
+    put<AgentSettingsResponse>("/admin/agent-settings", patch),
 };

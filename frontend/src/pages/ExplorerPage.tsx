@@ -19,6 +19,7 @@ import {
   BarChart2,
   AreaChart,
   Repeat,
+  Sparkles,
 } from "lucide-react";
 
 import { eventsApi } from "@/api/events";
@@ -33,6 +34,7 @@ import { useScrollPositionStore } from "@/stores/scrollPosition";
 import { useBaselineStore } from "@/stores/baseline";
 import { baselinesApi } from "@/api/baselines";
 import { paramsToFilters, filtersToParams } from "@/lib/queryParams";
+import { computeEffectiveFilters, overlaysFromApplied } from "@/lib/effectiveFilters";
 import { contextWindow } from "@/lib/time";
 import { useCaseStream } from "@/hooks/useCaseStream";
 
@@ -47,6 +49,9 @@ import { ColumnPicker } from "@/components/explorer/ColumnPicker";
 import { TimelineHistogram } from "@/components/explorer/TimelineHistogram";
 import { FieldHistogramModal } from "@/components/viz/FieldHistogramModal";
 import { InvestigatePanel } from "@/components/analysis/InvestigatePanel";
+import { AgentPanel } from "@/components/agent/AgentPanel";
+import { useAgentStore } from "@/stores/agent";
+import { useHealth } from "@/api/health";
 import { RoutineCollapseStat } from "@/components/explorer/RoutineCollapseStat";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
@@ -112,6 +117,12 @@ export function ExplorerPage() {
       // scroll — otherwise it can fire against an unrelated later `events`
       // update (e.g. a subsequent range change or jump-to-time).
       pendingSoftAnchorRef.current = null;
+      // Any manual filter change clears an agent-applied event_id allowlist —
+      // the overlay auto-clears like semanticSearchIds does, so a finding's
+      // `ids` can never get stranded on the grid with no chip to remove it.
+      // handleApplyAgentFilters re-sets it after this call (same React batch),
+      // so an actual finding-apply survives.
+      setAppliedIds(null);
       const rangeUnchanged = f.start === filters.start && f.end === filters.end;
       const anchorTs = useScrollPositionStore.getState().currentPositionTs;
       // A bare `{}` is handleJumpToTime's own clear-and-seek call — it seeds
@@ -320,11 +331,40 @@ export function ExplorerPage() {
     [filters, setFilters],
   );
 
+  /**
+   * Wired to the Agent panel's "Apply to Explorer". A finding's filter set may
+   * carry the three session-overlay fields (`anomalyRunId`, `ids`,
+   * `collapseRoutine`) that are deliberately *not* URL-serialized — so plain
+   * `setFilters` (URL only) would silently drop them and the grid would show a
+   * broader set than the agent actually ran, breaking the "apply must match
+   * exactly what the agent saw" invariant (src/vestigo/agent/tools.py). We
+   * drive the overlay setters alongside setFilters rather than URL-encoding the
+   * fields, keeping saved-view/shared-URL semantics unchanged for every
+   * non-agent flow. Each apply fully (re)sets all three overlays so applying a
+   * second finding never inherits the first's run/ids/collapse.
+   */
+  const handleApplyAgentFilters = useCallback(
+    (f: EventFilters) => {
+      const overlays = overlaysFromApplied(f);
+      setAnomalyRunId(overlays.anomalyRunId);
+      setCollapseRoutine(overlays.collapseRoutine);
+      // setFilters clears appliedIds; re-set it after (same React batch → wins).
+      setFilters(f);
+      setAppliedIds(overlays.ids);
+    },
+    [setFilters],
+  );
+
   // ── Panel visibility state ────────────────────────────────────────────
   const filterRailOpen = useUiStore((s) => s.filterRailOpen);
   const setFilterRailOpen = useUiStore((s) => s.setFilterRailOpen);
   const investigatePanelOpen = useUiStore((s) => s.investigatePanelOpen);
   const setInvestigatePanelOpen = useUiStore((s) => s.setInvestigatePanelOpen);
+  // Agent panel: only offered when the backend probe says the agent exists —
+  // an unconfigured install renders zero agent UI.
+  const agentAvailable = useHealth().data?.agent_available ?? false;
+  const agentPanelOpen = useAgentStore((s) => s.panelOpen);
+  const setAgentPanelOpen = useAgentStore((s) => s.setPanelOpen);
   const [expandedEvent, setExpandedEvent] = useState<Event | null>(null);
   const handleExpandEvent = useCallback((event: Event | null) => {
     if (event) tourEvent("event-expanded");
@@ -334,6 +374,11 @@ export function ExplorerPage() {
   const [similarAnchor, setSimilarAnchor] = useState<Event | null>(null);
   const [anomalyMarkers, setAnomalyMarkers] = useState<AnomalyMarker[]>([]);
   const [anomalyRunId, setAnomalyRunId] = useState<string | undefined>(undefined);
+  // Agent-applied event_id allowlist (a finding's `event_ids`). Session
+  // overlay, never URL-serialized — same category as anomalyRunId/semantic
+  // ids. Cleared by any manual filter change (see setFilters); re-set by
+  // handleApplyAgentFilters. `null` = no allowlist active.
+  const [appliedIds, setAppliedIds] = useState<string[] | null>(null);
   // Routine-motif collapse (Patterns tab): hide events belonging to
   // routine-dispositioned motifs. Session state, never serialized — and the
   // grid always shows the collapsed count, so nothing is hidden silently.
@@ -437,22 +482,19 @@ export function ExplorerPage() {
   // with the active Analysis tab's persisted run_id and semantic search
   // candidates only while relevant, so switching detector tabs or field
   // selections correctly refetches the filtered view.
-  const effectiveFilters = useMemo<EventFilters>(() => {
-    let f = filters;
-    if (filters.annotated?.includes("anomaly") && anomalyRunId) {
-      f = { ...f, anomalyRunId };
-    }
-    // Semantic candidates replace the broadened keyword search server-side
-    // (rather than ANDing with it) — a semantically relevant event may not
-    // literally contain the typed words, so intersecting would wrongly drop it.
-    if (semanticSearchIds !== null) {
-      f = { ...f, q: undefined, ids: semanticSearchIds };
-    }
-    if (collapseRoutine) {
-      f = { ...f, collapseRoutine: true };
-    }
-    return f;
-  }, [filters, anomalyRunId, semanticSearchIds, collapseRoutine]);
+  const effectiveFilters = useMemo<EventFilters>(
+    () =>
+      computeEffectiveFilters(filters, {
+        anomalyRunId,
+        appliedIds,
+        // Semantic candidates replace the broadened keyword search server-side
+        // (rather than ANDing with it) — a semantically relevant event may not
+        // literally contain the typed words, so intersecting would wrongly drop it.
+        semanticSearchIds,
+        collapseRoutine,
+      }),
+    [filters, anomalyRunId, appliedIds, semanticSearchIds, collapseRoutine],
+  );
 
   const eventsQueryKey = ["events", caseId, timelineId, effectiveFilters, sortDir];
 
@@ -1044,6 +1086,19 @@ export function ExplorerPage() {
                 Investigate
               </Button>
             </Tooltip>
+
+            {agentAvailable && (
+              <Tooltip content={agentPanelOpen ? "Close Agent panel" : "Ask the AI agent to investigate"}>
+                <Button
+                  variant={agentPanelOpen ? "accent" : "outline"}
+                  size="sm"
+                  onClick={() => setAgentPanelOpen(!agentPanelOpen)}
+                >
+                  <Sparkles size={13} />
+                  Agent
+                </Button>
+              </Tooltip>
+            )}
           </div>
         </div>
 
@@ -1204,6 +1259,17 @@ export function ExplorerPage() {
                     onAnomalyRunId={setAnomalyRunId}
                     onJumpToTime={handleJumpToTime}
                     onTagFilter={handleTagDrill}
+                  />
+                )}
+
+                {/* AI agent panel (sandbox + apply; only when configured) */}
+                {agentAvailable && agentPanelOpen && (
+                  <AgentPanel
+                    caseId={caseId!}
+                    timelineId={timelineId!}
+                    currentFilters={filters}
+                    onApplyFilters={handleApplyAgentFilters}
+                    onClose={() => setAgentPanelOpen(false)}
                   />
                 )}
               </div>

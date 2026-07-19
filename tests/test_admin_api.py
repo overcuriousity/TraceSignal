@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import pytest
+
 from tests.conftest import as_admin, login
+from vestigo.agent import availability
+from vestigo.core.config import get_settings
 
 
 def test_non_admin_cannot_reach_admin_routes(client, admin_bootstrap, store):
@@ -186,3 +190,190 @@ def test_default_pool_listing(client, admin_bootstrap, store):
     usernames = {u["username"] for u in resp.json()["users"]}
     assert "unassigned1" in usernames
     assert "teamed" not in usernames
+
+
+def test_agent_settings_upsert_and_mask(client, admin_bootstrap, store):
+    """update_agent_settings upserts the single 'global' row; only keys present
+    in `values` change; a key present with value None clears that column; and
+    to_dict(mask_key=True) never exposes the plaintext api_key."""
+    import asyncio
+
+    async def _exercise() -> None:
+        assert await store.get_agent_settings() is None
+
+        row = await store.update_agent_settings({"model": "qwen3:32b"}, "root")
+        assert row.id == "global"
+        assert row.model == "qwen3:32b"
+        assert row.api_key is None
+        assert row.updated_by == "root"
+
+        row = await store.update_agent_settings({"api_key": "sk-x"}, "root")
+        assert row.model == "qwen3:32b"  # preserved
+        assert row.api_key == "sk-x"
+
+        d = row.to_dict()
+        assert d["api_key_set"] is True
+        assert "api_key" not in d
+
+        d_unmasked = row.to_dict(mask_key=False)
+        assert d_unmasked["api_key"] == "sk-x"
+
+        row = await store.update_agent_settings({"api_key": None}, "root")
+        assert row.api_key is None
+        assert row.model == "qwen3:32b"  # still preserved
+
+        d = row.to_dict()
+        assert d["api_key_set"] is False
+        assert "api_key" not in d
+
+        fetched = await store.get_agent_settings()
+        assert fetched is not None
+        assert fetched.id == "global"
+
+    asyncio.run(_exercise())
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Agent settings API (A7)
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.fixture(autouse=True)
+def _reset_agent_probe_cache():
+    availability.reset_probe_cache()
+    yield
+    availability.reset_probe_cache()
+
+
+def test_agent_settings_requires_admin(client, admin_bootstrap, store):
+    as_admin(client, admin_bootstrap)
+    client.post("/api/admin/users", json={"username": "plainagent", "password": "abcdefgh12"})
+
+    plain_client = client.__class__(client.app)
+    login(plain_client, "plainagent", "abcdefgh12")
+    assert plain_client.get("/api/admin/agent-settings").status_code == 403
+    assert plain_client.put("/api/admin/agent-settings", json={"model": "x"}).status_code == 403
+
+
+def test_agent_settings_get_masks_key(client, admin_bootstrap, store):
+    as_admin(client, admin_bootstrap)
+    resp = client.get("/api/admin/agent-settings")
+    assert resp.status_code == 200
+    body = resp.json()
+    effective = body["effective"]
+    assert "api_key" not in effective
+    assert effective["api_key_set"] is False
+    assert "sources" in body
+    assert "env_vars" in body
+
+    resp = client.put("/api/admin/agent-settings", json={"api_key": "sk-secret"})
+    assert resp.status_code == 200
+    effective = resp.json()["effective"]
+    assert "api_key" not in effective
+    assert effective["api_key_set"] is True
+
+
+def test_agent_settings_put_persists_and_audits_names_only(client, admin_bootstrap, store):
+    admin = as_admin(client, admin_bootstrap)
+    resp = client.put(
+        "/api/admin/agent-settings",
+        json={"model": "qwen3:32b", "max_turns": 10, "api_key": "sk-secret-value"},
+    )
+    assert resp.status_code == 200
+    effective = resp.json()["effective"]
+    assert effective["model"] == "qwen3:32b"
+    assert effective["max_turns"] == 10
+    assert effective["api_key_set"] is True
+
+    resp = client.get("/api/admin/agent-settings")
+    assert resp.json()["effective"]["model"] == "qwen3:32b"
+
+    resp = client.get("/api/admin/audit", params={"action": "admin.agent_settings_update"})
+    rows = resp.json()["audit"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["user_id"] == admin["id"]
+    assert set(row["detail"]["fields"]) == {"model", "max_turns", "api_key"}
+    # Values, including the API key, must never land in the audit trail.
+    assert "sk-secret-value" not in str(row["detail"])
+    assert "qwen3:32b" not in str(row["detail"])
+
+
+def test_agent_settings_put_null_clears_field(client, admin_bootstrap, store):
+    as_admin(client, admin_bootstrap)
+    client.put("/api/admin/agent-settings", json={"model": "qwen3:32b"})
+    resp = client.put("/api/admin/agent-settings", json={"model": None})
+    assert resp.status_code == 200
+    assert resp.json()["effective"]["model"] is None
+
+
+def test_agent_settings_put_rejects_invalid_values(client, admin_bootstrap, store):
+    as_admin(client, admin_bootstrap)
+    assert client.put("/api/admin/agent-settings", json={"provider": "bogus"}).status_code == 422
+    assert (
+        client.put("/api/admin/agent-settings", json={"reasoning_effort": "extreme"}).status_code
+        == 422
+    )
+    assert client.put("/api/admin/agent-settings", json={"max_turns": 0}).status_code == 422
+    assert client.put("/api/admin/agent-settings", json={"max_turns": 101}).status_code == 422
+
+
+def test_agent_settings_put_triggers_reprobe(client, admin_bootstrap, store, monkeypatch):
+    """A PUT resets the probe cache so the next health check re-probes immediately,
+    reusing the counting-monkeypatch pattern from
+    tests/test_agent_api.py::test_probe_cache_invalidates_on_config_change."""
+    monkeypatch.setenv("VESTIGO_AGENT_MODEL", "test-model")
+    monkeypatch.setenv("VESTIGO_AGENT_PROVIDER", "openai")
+    monkeypatch.setenv("VESTIGO_AGENT_API_BASE_URL", "http://localhost:9/v1")
+    get_settings.cache_clear()
+
+    calls = {"n": 0}
+
+    async def probe(config):
+        calls["n"] += 1
+        return True
+
+    monkeypatch.setattr(availability, "_probe", probe)
+    availability.reset_probe_cache()
+
+    import asyncio
+
+    assert asyncio.run(availability.agent_available()) is True
+    assert asyncio.run(availability.agent_available()) is True
+    assert calls["n"] == 1
+
+    as_admin(client, admin_bootstrap)
+    resp = client.put("/api/admin/agent-settings", json={"max_turns": 42})
+    assert resp.status_code == 200
+
+    assert asyncio.run(availability.agent_available()) is True
+    assert calls["n"] == 2
+
+
+def test_agent_settings_put_strips_whitespace(client, admin_bootstrap, store):
+    """Pasted values carry stray whitespace (trailing spaces on a URL, a newline
+    after an API key) — the PUT must normalize them, and a whitespace-only
+    string must clear the field like an explicit null."""
+    as_admin(client, admin_bootstrap)
+    resp = client.put(
+        "/api/admin/agent-settings",
+        json={
+            "model": " k3 ",
+            "api_base_url": "https://api.kimi.com/coding     ",
+            "api_key": "sk-kimi-x\n",
+            "user_agent": "  claude-code/0.1.0",
+        },
+    )
+    assert resp.status_code == 200
+    effective = resp.json()["effective"]
+    assert effective["model"] == "k3"
+    assert effective["api_base_url"] == "https://api.kimi.com/coding"
+    assert effective["user_agent"] == "claude-code/0.1.0"
+    assert effective["api_key_set"] is True
+
+    resp = client.put("/api/admin/agent-settings", json={"model": "   ", "api_key": " \n"})
+    assert resp.status_code == 200
+    effective = resp.json()["effective"]
+    # Whitespace-only degrades to an explicit clear.
+    assert effective["model"] is None
+    assert effective["api_key_set"] is False

@@ -26,6 +26,28 @@ Point-in-time PR review findings are archived under `docs/archive/PR{N}_REVIEW_F
 (full unrestricted finding set, one file per reviewed PR) once triaged into this backlog or
 resolved — this file holds only the condensed, still-open action items.
 
+## Phase 3 — investigation depth (active, decided 2026-07-19)
+
+Analyst-depth phase; full rationale in
+`docs/superpowers/specs/2026-07-19-phase3-investigation-depth-design.md`. Agent stays an
+analysis companion — agent-authored stories deferred. Ordered:
+
+- [ ] **Step 0 — consolidation preamble**: merge `feat/ai-agent`; A10 via
+  secret-by-env-only mode (no envelope encryption — decision recorded in the spec);
+  CONCEPT.md refresh (stale §7 exclusions, §6.2 Qdrant naming, de-MVP the framing).
+- [ ] **Step 1 — W6 template clustering** (see Milestone 5 entry). First: independent,
+  and template IDs become a facet the later steps consume. Reuse the `routine` collapse
+  machinery for "mute template".
+- [ ] **Step 2 — A9 viz parity** (see Milestone 8 entry). Own design round; before
+  Stories so the chart-spec is exercised once before Stories embeds it.
+- [ ] **Step 3 — W7 Stories, human-first** (see Milestone 5 entry). Own design round;
+  key tension: live embeds in editor vs. point-in-time snapshot on export. Block model
+  leaves room for a later `origin` field (agent authorship later, no migration pain).
+
+Parked: D10 (next phase; W6 feeds it), M6 streaming, M7 examination. Standing rule:
+when M6 or M7 resumes, S1 and E1 are designed **jointly** in one `MODEL_REFINEMENT.md`
+round — the data model migrates once, not twice.
+
 ## Milestone 2 — high-leverage improvements
 
 - [ ] **M15 residue — `list_fields_by_artifact` stays live (deliberate).** The per-source
@@ -256,6 +278,54 @@ Carries over unchanged: provenance chain (Source `file_hash`, per-event
 `content_hash`/`byte_offset`, UUIDv5 identity), detectors/embeddings/Sigma (W5) and
 schema-on-read (W8) gain the new domain for free, auth/RBAC/audit as chain-of-custody
 baseline. In-memory JobStore stays — heavy work lives in converters.
+
+## Milestone 8 — AI investigation agent expansion (v1 shipped 2026-07-19, see docs/AGENT.md)
+
+Read parity + external MCP endpoint shipped 2026-07-19 (session 66): nine new read tools
+(baselines, dispositions, saved views, annotations, Sigma rules/runs), FilterSpec gained
+`annotated`/`annotation_tag_value`/`run_id`/`event_ids`/`collapse_routine`, detector tuning
+params on `run_anomaly_detector`, `AgentToken` scoped PATs, and `/mcp` streamable-HTTP
+exposure of the identical tool server (`VESTIGO_MCP_ENABLED`, default off). See
+`docs/superpowers/specs/2026-07-19-agent-read-parity-mcp-http-design.md` for the full design.
+
+- [ ] **A10 — LLM API key at rest.** `agent_settings.api_key` is stored plaintext in
+  Postgres (admin-only API; masked to a boolean in every response and audit row).
+  Decision (Phase 3 Step 0): no envelope encryption — ship a secret-by-env-only mode
+  that refuses DB storage; document env-pinning `VESTIGO_AGENT_API_KEY` as the secure
+  path (env always wins per field, so the DB column stays unused).
+- [ ] **A11 — `/api/auth/users` directory scope.** Any signed-in user can list the full
+  user directory (id, username, display name — needed to render names on annotations).
+  Fine for the small-team threat model; add a config flag or scope the listing to co-case
+  members if multi-tenant / large-org deployments emerge (PR137 review follow-up).
+- [ ] **A8 — External MCP toolsets (web research / user-pluggable tools).** Do NOT build
+  bespoke whois/web tools or a custom plugin API: the runtime is pydantic-ai with MCP
+  toolsets, so let the agent consume operator-configured **external MCP servers**
+  (users write a whois/VT/web-search tool as a tiny MCP server in any language; zero
+  Vestigo code per tool; symmetric with our own `/mcp` exposure). Hard requirements:
+  (a) OPSEC gate — outbound lookups leak case indicators to third parties; gate behind
+  `VESTIGO_ALLOW_ONLINE` **and** per-case opt-in, default off; (b) forensic capture —
+  audit every external call and persist/hash the raw response (external evidence must
+  stay replayable), mark results `origin: external` in the conversation record. Needs
+  its own design round before implementation.
+- [ ] **A9 — Agent-created visualizations (viz parity).** Give the agent the same charting
+  a human has on the Visualize page, in two symmetric halves: (a) **read tools** wrapping
+  the existing viz queries (`field_timeseries`, `time_punchcard`, `field_pivot`,
+  `field_scatter`, `compare_layers` — field-terms/numeric/histogram already exist)
+  returning budget-capped compact series so the model can *find* a pattern before showing
+  it; (b) a **`propose_chart` tool** carrying the exact chart spec (chart type + the same
+  validated params the viz endpoints take + FilterSpec); the backend validates by
+  executing the query and echoing summary stats, the panel renders a **live chart card**
+  reusing the Visualize page's chart components, with "Open in Visualize" (applies the
+  spec through the normal URL path) and "Save" (the analyst's click writes a saved chart
+  via the existing endpoint, credited to the analyst — no proposal lifecycle needed since
+  the analyst executes the write). Sandbox+apply invariant holds: the agent never mutates
+  the analyst's view or writes anything itself. Result caps matter: viz series are dense —
+  per-tool row/bucket budgets like `search_events`. Needs its own design round
+  (chart-spec schema shared backend↔frontend, card rendering reuse vs. simplified
+  renderer) before implementation.
+- [ ] **Confirm-proposal crash-gap.** A crash between the atomic proposal-decide and the
+  annotation bulk-write leaves a confirmed proposal with no annotations and no retry path.
+  Single-process tradeoff, deliberate; revisit if it bites.
 
 ## Explicitly out of scope (decided during the audit)
 

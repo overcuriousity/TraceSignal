@@ -214,7 +214,7 @@ export interface View {
  * deleted the old rows.
  */
 export type AnnotationType = "comment" | "tag" | "anomaly";
-export type AnnotationOrigin = "user" | "system";
+export type AnnotationOrigin = "user" | "system" | "agentic-analysis";
 
 export interface Annotation {
   id: string;
@@ -229,6 +229,16 @@ export interface Annotation {
   created_at: string;
   /** Which detector produced this system annotation ("value_novelty" | "frequency"); null for human annotations. */
   detector: string | null;
+}
+
+/**
+ * Analyst-visible annotations: written by a human, or by the agent and
+ * confirmed by a human (origin "agentic-analysis"). Mirrors the backend's
+ * USER_VISIBLE_ANNOTATION_ORIGINS — origin is provenance, not a visibility
+ * class, so both render wherever user annotations do.
+ */
+export function isAnalystAnnotation(a: Pick<Annotation, "origin">): boolean {
+  return a.origin === "user" || a.origin === "agentic-analysis";
 }
 
 export interface Job {
@@ -862,6 +872,13 @@ export interface HealthResponse {
   oidc_enabled: boolean;
   /** False when neither local embedding deps nor a remote endpoint are configured. */
   embeddings_available: boolean;
+  /**
+   * True only when VESTIGO_AGENT_* is configured and the LLM endpoint
+   * answered the backend's probe — the agent UI renders nothing otherwise.
+   */
+  agent_available: boolean;
+  /** True when the MCP server endpoint (/mcp) is enabled and token issuance is available. */
+  mcp_enabled: boolean;
 }
 
 /** Non-default field-filter match modes; "exact" is implied by absence. */

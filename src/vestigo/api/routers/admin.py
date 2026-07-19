@@ -11,13 +11,28 @@ import asyncio
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
+from vestigo.agent.availability import reset_probe_cache
+from vestigo.agent.config import EFFORT_VALUES, resolve_agent_config
 from vestigo.api.deps import get_store, require_admin
 from vestigo.api.uploads import receive_upload_to_tmp
 from vestigo.core.config import get_settings
 from vestigo.core.security import hash_password
 from vestigo.db.postgres import User, generate_id
+
+# Fields resolved by resolve_agent_config / persisted by update_agent_settings,
+# in the order the AgentConfig dataclass declares them (excluding `sources`).
+_AGENT_SETTINGS_FIELDS: tuple[str, ...] = (
+    "model",
+    "provider",
+    "api_base_url",
+    "api_key",
+    "user_agent",
+    "extra_headers",
+    "max_turns",
+    "reasoning_effort",
+)
 
 router = APIRouter(prefix="/api/admin", tags=["admin"], dependencies=[Depends(require_admin)])
 
@@ -480,3 +495,106 @@ async def upload_enricher_asset(
         "reason": availability.reason if availability else None,
         "detail": install_detail,
     }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# AI agent configuration (A7)
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class AgentSettingsUpdate(BaseModel):
+    """Payload to edit the DB-backed layer of the agent config (see agent/config.py).
+
+    Every field is optional so a PUT can touch only what changed. An
+    explicit ``null`` clears that field's DB override (falling back to env,
+    then the hardcoded default); a field simply absent from the request body
+    leaves its stored value untouched — the two are distinguished via
+    ``model_fields_set``, not by inspecting the resolved values.
+    """
+
+    model: str | None = None
+    provider: str | None = Field(default=None, pattern="^(openai|anthropic)$")
+    api_base_url: str | None = None
+    api_key: str | None = None
+    user_agent: str | None = None
+    extra_headers: dict[str, str] | None = None
+    max_turns: int | None = Field(default=None, ge=1, le=100)
+    reasoning_effort: str | None = None
+
+    @field_validator(
+        "model",
+        "provider",
+        "api_base_url",
+        "api_key",
+        "user_agent",
+        "reasoning_effort",
+        mode="before",
+    )
+    @classmethod
+    def _strip_strings(cls, value: Any) -> Any:
+        # Pasted values routinely carry stray whitespace (trailing spaces on a
+        # URL, a newline after an API key) that silently breaks the endpoint
+        # probe. Whitespace-only degrades to an explicit clear.
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    @field_validator("reasoning_effort")
+    @classmethod
+    def _validate_reasoning_effort(cls, value: str | None) -> str | None:
+        if value is not None and value not in EFFORT_VALUES:
+            raise ValueError(f"reasoning_effort must be one of {EFFORT_VALUES}")
+        return value
+
+
+async def _agent_settings_response() -> dict[str, Any]:
+    """Build the GET/PUT response shape: effective config, sources, env pins.
+
+    ``api_key`` is never included in ``effective`` — only ``api_key_set``, a
+    boolean — so the plaintext key never leaves this module via this route.
+    """
+    config = await resolve_agent_config()
+    effective: dict[str, Any] = {
+        f: getattr(config, f) for f in _AGENT_SETTINGS_FIELDS if f != "api_key"
+    }
+    effective["api_key_set"] = bool(config.api_key)
+    env_vars = {
+        field_name: f"VESTIGO_AGENT_{field_name.upper()}"
+        for field_name, source in config.sources.items()
+        if source == "env"
+    }
+    return {"effective": effective, "sources": dict(config.sources), "env_vars": env_vars}
+
+
+@router.get("/agent-settings")
+async def get_agent_settings(admin: User = Depends(require_admin)) -> dict[str, Any]:
+    """Return the effective AI agent configuration, its per-field source, and env pins."""
+    return await _agent_settings_response()
+
+
+@router.put("/agent-settings")
+async def set_agent_settings(
+    payload: AgentSettingsUpdate, admin: User = Depends(require_admin)
+) -> dict[str, Any]:
+    """Update the DB-backed layer of the AI agent configuration.
+
+    Only fields present in the request body change (``model_fields_set``);
+    a field set to ``null`` explicitly clears it. Resets the availability
+    probe cache so the next health check re-probes immediately instead of
+    waiting out the TTL. Audited with field *names* only — values (which may
+    include the API key) never enter the audit trail.
+    """
+    store = get_store()
+    changed_fields = sorted(payload.model_fields_set)
+    if changed_fields:
+        values = {f: getattr(payload, f) for f in payload.model_fields_set}
+        await store.update_agent_settings(values, admin.id)
+    reset_probe_cache()
+    await store.record_audit(
+        action="admin.agent_settings_update",
+        actor=admin,
+        target_type="agent_settings",
+        target_id="global",
+        detail={"fields": changed_fields},
+    )
+    return await _agent_settings_response()

@@ -20,6 +20,8 @@ import {
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { ChevronRight, AlertTriangle, Tag, MessageSquare, Trash2, ArrowUp, ArrowDown, ShieldCheck, EyeOff, Flag } from "lucide-react";
 import type { AnomalyMarker, Disposition, DispositionKind, Event, Annotation } from "@/api/types";
+import { isAnalystAnnotation } from "@/api/types";
+import { useUserNames } from "@/hooks/useUserNames";
 import { fmtTimestamp, fmtRelative, fmtTimestampFull } from "@/lib/time";
 import { truncate } from "@/lib/format";
 import { Badge } from "@/components/ui/Badge";
@@ -98,7 +100,8 @@ function TagPopover({
   const [open, setOpen] = useState(false);
   const [value, setValue] = useState("");
   const { add, remove } = useAnnotationMutations(caseId, sourceId);
-  const userTags = anns.filter((a) => a.annotation_type === "tag" && a.origin === "user");
+  const userName = useUserNames();
+  const userTags = anns.filter((a) => a.annotation_type === "tag" && isAnalystAnnotation(a));
 
   function submit() {
     const tag = value.trim();
@@ -138,7 +141,7 @@ function TagPopover({
                   className="group/tag flex items-center gap-1 min-w-0 rounded bg-[var(--color-accent-dim)] px-2 py-1"
                 >
                   <Tag size={9} className="shrink-0 text-[var(--color-accent)]" />
-                  <Tooltip content={`${t.created_by ? t.created_by + " · " : ""}${fmtRelative(t.created_at)} — ${fmtTimestampFull(t.created_at)}`} side="top">
+                  <Tooltip content={`${t.created_by ? userName(t.created_by) + " · " : ""}${fmtRelative(t.created_at)} — ${fmtTimestampFull(t.created_at)}`} side="top">
                     <span className="flex-1 min-w-0 truncate text-xs text-[var(--color-accent)] font-medium cursor-default">
                       {t.content}
                     </span>
@@ -189,7 +192,10 @@ function CommentPopover({
   const [open, setOpen] = useState(false);
   const [value, setValue] = useState("");
   const { add, remove } = useAnnotationMutations(caseId, sourceId);
-  const userComments = anns.filter((a) => a.annotation_type === "comment" && a.origin === "user");
+  const userName = useUserNames();
+  const userComments = anns.filter(
+    (a) => a.annotation_type === "comment" && isAnalystAnnotation(a),
+  );
 
   function submit() {
     if (!value.trim()) return;
@@ -237,7 +243,7 @@ function CommentPopover({
                   </div>
                   <Tooltip content={fmtTimestampFull(c.created_at)} side="bottom">
                     <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
-                      {c.created_by ?? "anonymous"} · {fmtRelative(c.created_at)}
+                      {userName(c.created_by)} · {fmtRelative(c.created_at)}
                     </p>
                   </Tooltip>
                 </div>
@@ -517,7 +523,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
           const anns = annotations.get(row.original.event_id) ?? [];
           const parserTags = row.original.tags;
           const userTags = anns.filter(
-            (a) => a.annotation_type === "tag" && a.origin === "user",
+            (a) => a.annotation_type === "tag" && isAnalystAnnotation(a),
           );
           return (
             <div className="flex items-center gap-1 min-w-0">

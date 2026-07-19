@@ -20,6 +20,8 @@ import { useDisposition } from "@/hooks/useDisposition";
 import { useUiStore } from "@/stores/ui";
 import { TagInput } from "@/components/explorer/TagInput";
 import type { AnomalyMarker, Event, Annotation, DispositionKind } from "@/api/types";
+import { isAnalystAnnotation } from "@/api/types";
+import { useUserNames } from "@/hooks/useUserNames";
 
 interface Props {
   event: Event;
@@ -363,7 +365,8 @@ export function EventDetailPanel({
     };
   }, [setDetailPanelWidth]);
 
-  const userAnnotations = annotations.filter((a) => a.origin === "user");
+  const userName = useUserNames();
+  const userAnnotations = annotations.filter(isAnalystAnnotation);
   const systemAnnotations = annotations.filter((a) => a.origin === "system");
   const persistedAnomalies = systemAnnotations.filter((a) => a.annotation_type === "anomaly");
   const persistedDetectors = new Set(persistedAnomalies.map((a) => a.detector));
@@ -639,6 +642,13 @@ export function EventDetailPanel({
                   <MessageSquare size={11} className="shrink-0 mt-0.5 text-[var(--color-info)]" />
                 )}
                 <span className="flex-1 text-[var(--color-fg-primary)] break-all leading-snug">{a.content}</span>
+                {a.origin === "agentic-analysis" && (
+                  <Tooltip content="Proposed by the AI agent, confirmed by the analyst" side="top">
+                    <span className="shrink-0 rounded bg-[var(--color-accent-dim)] px-1 py-px text-[10px] font-medium text-[var(--color-accent)]">
+                      agent
+                    </span>
+                  </Tooltip>
+                )}
                 <Tooltip content="Delete annotation" side="top">
                   <button
                     onClick={() =>
@@ -654,7 +664,7 @@ export function EventDetailPanel({
               <Tooltip content={fmtTimestampFull(a.created_at)} side="bottom">
                 <p className="mt-1 flex items-center gap-1 text-xs text-[var(--color-fg-muted)]">
                   <Clock size={8} />
-                  {a.created_by ?? "anonymous"} · {fmtRelative(a.created_at)}
+                  {userName(a.created_by)} · {fmtRelative(a.created_at)}
                 </p>
               </Tooltip>
             </div>

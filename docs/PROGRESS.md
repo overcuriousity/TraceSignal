@@ -1,6 +1,163 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-19 (session 64 — v1.2.0 release, dependency roundup, v1.2.1).
+Last updated: 2026-07-19 (session 68 — PR137 review fix batch).
+
+## Session 68 — 2026-07-19: PR137 pre-merge review fixes (feat/ai-agent)
+
+Full pre-merge review of PR #137; every fixable finding fixed on the branch. Full
+finding set: `docs/archive/PR137_REVIEW_FINDINGS.md`.
+
+- **Backend**: `stream_turn` now owns and closes the per-turn `httpx.AsyncClient`
+  (was leaked per message); one turn at a time per conversation (in-memory
+  `_active_turns` reservation, concurrent POST → 409 — protects the replayable
+  `history` from a last-writer-wins race); conversation delete cascades to
+  proposals; `/mcp` request bodies capped at 10 MiB (413) and audit sniffing now
+  handles JSON-RPC batch arrays (roadmap A4 closed, defense in depth); agent-tool
+  limit/offset clamped against negative values; the probe's Bearer-header key
+  duplicate now goes only to Kimi's `/coding` endpoint
+  (`is_kimi_coding_endpoint` moved to `agent/config.py`); availability probe is
+  stale-while-revalidate so `/api/health` never blocks on a hung LLM endpoint.
+- **Frontend**: `AgentPanel.send()` handles create-conversation failure inside the
+  stream error path (input restored); the live transcript is cleared only after
+  the persisted refetch lands (no flash); stream rendering refactored to an
+  incremental `foldStreamEvent` reducer (was O(n²) per token over a turn);
+  `ProposalCard` surfaces non-409 decision failures as an error toast.
+- **Triage**: plaintext `agent_settings.api_key` at rest and the authenticated
+  full user directory (`/api/auth/users`) became roadmap items A10/A11; the
+  confirm-proposal crash gap stays a documented deliberate tradeoff.
+- 8 new backend tests (409 guard, client close, proposal cascade, body cap,
+  batch audit, clamps, stale-while-revalidate, Kimi-only Bearer).
+
+## Session 67 — 2026-07-19: agent A3 scoping fix, A6 token metering, A1 propose→confirm annotations, A7 DB-backed settings (feat/ai-agent)
+
+Closes the four remaining Milestone 8 watch items from session 66's audit.
+Design: `docs/superpowers/specs/2026-07-19-agent-a1-a6-a7-design.md`; plan
+`docs/superpowers/plans/2026-07-19-agent-a3-a6-a1-a7.md`.
+
+- **A3 — `list_sigma_runs` timeline scoping fix**: the store's `limit=50`
+  case-wide cap was applied before filtering to the current timeline,
+  letting a busy case starve the tool's results for the timeline actually
+  in scope; the timeline filter now runs in-query ahead of the limit.
+- **A6 — token-usage metering**: `agent_messages` gained per-turn
+  input/output token columns (migration 0009), measured from pydantic-ai's
+  `RunUsage` on every turn; the panel shows per-message usage chips and a
+  running conversation total.
+- **A1 — propose→confirm agent annotations**: new `AgentProposal` model +
+  lifecycle store (migration 0010), a `propose_annotation` tool
+  (in-app loop only, excluded from `/mcp`), and proposal cards in the
+  panel with confirm/reject. Confirming writes real annotations with
+  `origin: agentic-analysis` — treated as analyst-approved content, so it
+  behaves like a user annotation in tag autocomplete, annotated-filters,
+  and deletion (`USER_VISIBLE_ANNOTATION_ORIGINS`); `origin` stays as
+  provenance for display/audit only. Proposal decisions are gated at
+  contribute-level RBAC, with a test for the partial-miss case (some
+  proposed events no longer match).
+- **A7 — DB-backed agent settings**: `agent_settings` singleton table
+  (migration 0011), an `AgentConfig` resolver with env-wins-per-field
+  precedence over DB values and a fingerprint-keyed probe cache, an admin
+  API for reading/writing settings with env-pinning badges and a masked
+  API key, an admin settings page, and per-provider reasoning-effort
+  translation including an experimental Kimi wire-field mapping. The Kimi
+  mapping is the one unverified external claim in this batch — it wasn't
+  confirmed against upstream API docs/source before shipping and should
+  be treated as unverified until checked against a live Kimi endpoint or
+  its published API reference.
+- New/extended tests across `tests/test_agent_api.py`,
+  `tests/test_agent_tokens.py`, `tests/test_agent_tools.py`,
+  `tests/test_admin_api.py`, and `tests/test_postgres_store.py` for all
+  four items; full backend
+  (`uv run pytest`, 1065 passed) and frontend (`npm run test`, 286 passed)
+  suites green, `npm run typecheck`/`npm run lint` and
+  `uv run ruff check .`/`ruff format --check .` clean.
+- Roadmap: Milestone 8 A1/A3/A6/A7 closed; A4 and A8 remain open. Added a
+  new watch item — a crash between the atomic proposal-decide and the
+  annotation bulk-write (A1) leaves a confirmed proposal with no
+  annotations and no retry path; deliberate single-process tradeoff,
+  revisit if it bites.
+
+## Session 66 — 2026-07-19: agent read parity + external MCP endpoint (feat/ai-agent)
+
+Closes the gap between the v1 agent (session 65) and full analyst read
+visibility, and adds a second transport so external MCP clients can reuse
+the same tool server — motivated by agent-analyst parity (the agent
+couldn't see baselines, prior annotations, saved views, or Sigma
+rules/runs, making the temporal detectors effectively unusable to it) and
+by wanting agent-agnostic external access (Claude Code, hermes-agent, nib)
+without duplicating the tool implementation. Design:
+`docs/superpowers/specs/2026-07-19-agent-read-parity-mcp-http-design.md`.
+
+- **9 new read tools** (`src/vestigo/agent/tools.py`): `list_baselines`,
+  `list_dispositions`, `list_saved_views`, `list_annotations`,
+  `get_event_annotations`, `list_sigma_rules`, `get_sigma_rule`,
+  `list_sigma_runs`, `get_sigma_run` — 20 tools total, same scope-bound
+  closure pattern as the original 11.
+- **FilterSpec extension**: `annotated` (`tag`/`anomaly`),
+  `annotation_tag_value`, `run_id` (detector-run finding membership),
+  `event_ids`, `collapse_routine`. Deliberately no `exclude_event_ids` —
+  the frontend `EventFilters` shape has no exclude-ids field, so such a
+  finding could never be applied via `propose_finding`'s one-click path.
+  Frontend maps `run_id` onto `EventFilters.anomalyRunId`
+  (`frontend/src/api/agent.ts`).
+- **Detector tuning parity**: `run_anomaly_detector` gained `z_threshold`,
+  `min_skew_seconds`, `fdr_q`, `min_ratio`, `ngram_size`, `min_support`,
+  `start`, `end`, with Pydantic bounds identical to the HTTP endpoint's
+  `Query` validation.
+- **`AgentToken` + scoped PAT management**: new Postgres model + Alembic
+  migration 0008, store CRUD methods, and
+  `/api/cases/{case_id}/timelines/{timeline_id}/agent-tokens`
+  (`api/routers/agent_tokens.py`) for create/list/revoke, RBAC-checked so a
+  token grants no more than its creator's own case access. Token UI dialog
+  in the timeline list (`AgentTokensDialog.tsx`), gated on the
+  `mcp_enabled` health flag.
+- **External `/mcp` endpoint** (`agent/mcp_http.py`): MCP Streamable HTTP,
+  Bearer `vgo_*` token auth, per-connect re-check that the token's creator
+  still has case access, scope derived from the token
+  (`build_scope(case, timeline, user)`) never from the model — builds the
+  *identical* tool server the built-in agent uses
+  (`build_tool_server(scope)`), one code path for both transports.
+  `agent.tool_call` audit rows carry the token id and `transport:
+  "mcp_http"`. Gated by `VESTIGO_MCP_ENABLED` (default off, independent of
+  `VESTIGO_AGENT_*`); off means a clean 404. FastMCP's DNS-rebinding host
+  validation disabled here — safe because Bearer auth precedes all
+  dispatch, unlike the browser-ambient-credential threat that protection
+  targets.
+- New tests: `tests/test_agent_tools.py`, `tests/test_agent_tokens.py`,
+  `tests/test_mcp_http.py`.
+- Two reviewer minors noted, not yet fixed (`docs/ROADMAP.md` Milestone 8
+  A3/A4): `list_sigma_runs` applies the store's `limit=50` case-wide before
+  filtering to the current timeline; `/mcp` audit sniffing only recognizes
+  a single JSON-RPC object and relies on the MCP SDK rejecting batch
+  arrays (true today — batching was removed from the 2025-06-18 MCP spec).
+- Roadmap: Milestone 8 A2 (external MCP endpoint) closed; A1 (agent
+  annotations) still open.
+
+## Session 65 — 2026-07-19: AI investigation agent (feat/ai-agent)
+
+- **Optional AI agent embedded in the Explorer** (docs/AGENT.md): chat panel
+  that drives the iterative analysis loop (search → aggregate → detect →
+  refine) and returns findings as one-click-applyable filter sets
+  (sandbox + apply — the agent never mutates the analyst's view).
+- Backend: `src/vestigo/agent/` — read-only tools on a standard MCP server
+  (`tools.py`, scope-bound per conversation, wrapping EventQueryService /
+  StatisticalAnomalyService / SimilarityService), pydantic-ai runtime with
+  streaming (`runtime.py`), availability probe + `/api/health`
+  `agent_available` flag (`availability.py`), SSE router
+  (`api/routers/agent.py`), Postgres persistence (migration 0007:
+  `agent_conversations`/`agent_messages`) with tool calls mirrored into the
+  audit trail (`agent.tool_call`).
+- Feature is invisible unless `VESTIGO_AGENT_*` is configured **and** the
+  endpoint answers a probe. Providers: OpenAI-compatible (ollama/vllm/
+  LocalAI/OpenRouter) and Anthropic-compatible; Kimi coding plan supported
+  out of the box (UA gate via `VESTIGO_AGENT_USER_AGENT`, unsigned-thinking
+  replay shim `KimiAnthropicModel` — endpoint quirks verified against
+  hermes-agent source, see docs/AGENT.md).
+- Frontend: `components/agent/` (AgentPanel, FindingCard), `api/agent.ts`
+  (POST-SSE reader), `stores/agent.ts`; Explorer toolbar gains an "Agent"
+  button gated on the health flag.
+- New deps: `pydantic-ai-slim[openai,anthropic,mcp]`, `mcp`. Tests:
+  `tests/test_agent_api.py` (13), `frontend/src/test/agent.test.ts`.
+- Roadmap: Milestone 8 (agent annotations with `origin: agentic-analysis`,
+  external MCP endpoint with PAT auth).
 
 ## Session 64 — 2026-07-19: v1.2.0 release + dependency roundup (v1.2.1)
 

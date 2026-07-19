@@ -16,6 +16,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     String,
     Text,
     delete,
@@ -331,6 +332,62 @@ class EnricherGlobalConfig(Base):
             "updated_by": self.updated_by,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+class AgentSettingsRow(Base):
+    """Instance-wide AI agent configuration, set by admins (A7, docs/AGENT.md).
+
+    A single row pinned at ``id="global"`` — there is exactly one agent
+    configuration per instance. Any field left ``None`` here falls back to
+    the corresponding ``VESTIGO_AGENT_*`` environment variable at resolution
+    time (see the env-always-wins resolver that consumes this row); this
+    model only owns storage, not precedence. ``api_key`` is masked to a
+    boolean by default in ``to_dict`` so the plaintext key never leaves this
+    module unless explicitly requested.
+    """
+
+    __tablename__ = "agent_settings"
+
+    id: Mapped[str] = mapped_column(String(16), primary_key=True, default="global")
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    api_base_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    api_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    extra_headers: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    max_turns: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reasoning_effort: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    updated_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self, *, mask_key: bool = True) -> dict[str, Any]:
+        """Return a serializable dictionary.
+
+        When ``mask_key`` is True (the default), ``api_key`` is replaced by
+        ``api_key_set`` (a bool) so the plaintext key is never included.
+        """
+        d: dict[str, Any] = {
+            "id": self.id,
+            "model": self.model,
+            "provider": self.provider,
+            "api_base_url": self.api_base_url,
+            "user_agent": self.user_agent,
+            "extra_headers": self.extra_headers,
+            "max_turns": self.max_turns,
+            "reasoning_effort": self.reasoning_effort,
+            "updated_by": self.updated_by,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+        if mask_key:
+            d["api_key_set"] = bool(self.api_key)
+        else:
+            d["api_key"] = self.api_key
+        return d
 
 
 class EnrichmentResultStaging(Base):
@@ -787,6 +844,15 @@ class DetectorRun(Base):
         }
 
 
+# Origin of an agent-confirmed annotation (A1): distinguishes it from
+# manually-typed ``"user"`` annotations for provenance/audit purposes only.
+# Confirmed agent annotations are analyst-approved content — they behave
+# like user annotations in filters, autocomplete and deletion; ``origin`` is
+# provenance, not a visibility class.
+ANNOTATION_ORIGIN_AGENT = "agentic-analysis"
+USER_VISIBLE_ANNOTATION_ORIGINS: tuple[str, ...] = ("user", ANNOTATION_ORIGIN_AGENT)
+
+
 class Annotation(Base):
     """A tag or comment annotation attached to a single event.
 
@@ -937,6 +1003,186 @@ class SigmaRun(Base):
             "created_by": self.created_by,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+        }
+
+
+class AgentConversation(Base):
+    """A persisted AI-agent chat, scoped to one case timeline and one user.
+
+    Forensic reproducibility: the conversation plus its ``AgentMessage`` rows
+    (including every tool call with exact arguments) let an analyst show
+    later how an agent-assisted finding was reached. ``history`` holds the
+    runtime's own serialized message history (pydantic-ai wire format) so
+    follow-up turns replay byte-identical context — including provider
+    quirks like Kimi's reasoning blocks — while the message rows stay the
+    human-readable record.
+    """
+
+    __tablename__ = "agent_conversations"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    timeline_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    # Model identity snapshot (provider + model name) at creation time.
+    model_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    history: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary for the AgentConversation API response."""
+        return {
+            "id": self.id,
+            "case_id": self.case_id,
+            "timeline_id": self.timeline_id,
+            "user_id": self.user_id,
+            "title": self.title,
+            "model_id": self.model_id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class AgentMessage(Base):
+    """One human-readable step of an agent conversation.
+
+    ``role`` is ``user`` | ``assistant`` | ``tool``. Tool rows carry the tool
+    name, its exact arguments and a result summary — the auditable record of
+    what the agent actually queried. Append-only, like ``AuditLog``.
+    """
+
+    __tablename__ = "agent_messages"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    tool_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    tool_args: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    tool_result: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)
+    # Measured LLM usage for this turn (assistant rows only). NULL = not
+    # measured (pre-metering rows, or the endpoint reported no usage) —
+    # never an estimate.
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary for the AgentMessage API response."""
+        return {
+            "id": self.id,
+            "conversation_id": self.conversation_id,
+            "role": self.role,
+            "content": self.content,
+            "tool_name": self.tool_name,
+            "tool_args": self.tool_args,
+            "tool_result": self.tool_result,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class AgentProposal(Base):
+    """An agent-proposed annotation, pending analyst confirmation (A1).
+
+    The agent resolves the target events at propose time (``events``) and
+    states its reasoning (``rationale``); an analyst then confirms or
+    rejects it. ``status`` starts at ``proposed`` and transitions exactly
+    once via the atomic ``decide_agent_proposal`` update, which is the
+    idempotency backbone for the API's 409-on-redecide behavior.
+    """
+
+    __tablename__ = "agent_proposals"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    timeline_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="proposed")
+    tag: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    rationale: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    events: Mapped[list] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    decided_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a serializable dictionary for the AgentProposal API response."""
+        return {
+            "id": self.id,
+            "conversation_id": self.conversation_id,
+            "case_id": self.case_id,
+            "timeline_id": self.timeline_id,
+            "status": self.status,
+            "tag": self.tag,
+            "comment": self.comment,
+            "rationale": self.rationale,
+            "events": self.events,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "decided_by": self.decided_by,
+            "decided_at": self.decided_at.isoformat() if self.decided_at else None,
+        }
+
+
+class AgentToken(Base):
+    """A scoped personal access token for the external MCP endpoint (docs/AGENT.md).
+
+    Bound to exactly one case + timeline at creation — presenting the token
+    yields precisely that scope, so the external client (like the built-in
+    agent) never supplies IDs. Only the SHA-256 of the token is stored; the
+    plaintext is shown once at creation. Access is re-checked against the
+    creating user's current case RBAC on every connect, so revoking the user
+    or their team membership also cuts off their tokens.
+    """
+
+    __tablename__ = "agent_tokens"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    case_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    timeline_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serializable dict for the token-management API — never the hash."""
+        return {
+            "id": self.id,
+            "case_id": self.case_id,
+            "timeline_id": self.timeline_id,
+            "user_id": self.user_id,
+            "name": self.name,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "revoked_at": self.revoked_at.isoformat() if self.revoked_at else None,
         }
 
 
@@ -1607,6 +1853,33 @@ class PostgresStore:
                 row.auto_run_default = auto_run_default
                 row.updated_by = updated_by
                 row.updated_at = datetime.now(UTC)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def get_agent_settings(self) -> AgentSettingsRow | None:
+        """Return the single instance-wide agent settings row, if it exists."""
+        async with self.session_factory() as session:
+            return await session.get(AgentSettingsRow, "global")
+
+    async def update_agent_settings(
+        self, values: dict[str, Any], updated_by: str | None
+    ) -> AgentSettingsRow:
+        """Create or update the single "global" agent settings row.
+
+        Only keys present in ``values`` are changed; a key present with
+        value ``None`` clears that column (distinct from a key simply being
+        absent from ``values``, which leaves the existing value untouched).
+        """
+        async with self.session_factory() as session:
+            row = await session.get(AgentSettingsRow, "global")
+            if row is None:
+                row = AgentSettingsRow(id="global")
+                session.add(row)
+            for key, value in values.items():
+                setattr(row, key, value)
+            row.updated_by = updated_by
+            row.updated_at = datetime.now(UTC)
             await session.commit()
             await session.refresh(row)
             return row
@@ -2839,6 +3112,279 @@ class PostgresStore:
             return result.scalar_one_or_none()
 
     # ------------------------------------------------------------------
+    # Agent conversations
+    # ------------------------------------------------------------------
+
+    async def create_agent_conversation(
+        self,
+        case_id: str,
+        timeline_id: str,
+        user_id: str,
+        title: str = "",
+        model_id: str | None = None,
+    ) -> AgentConversation:
+        """Create a new agent conversation."""
+        conversation = AgentConversation(
+            id=generate_id("agentconv"),
+            case_id=case_id,
+            timeline_id=timeline_id,
+            user_id=user_id,
+            title=title,
+            model_id=model_id,
+        )
+        async with self.session_factory() as session:
+            session.add(conversation)
+            await session.commit()
+            await session.refresh(conversation)
+            return conversation
+
+    async def get_agent_conversation(
+        self, case_id: str, conversation_id: str
+    ) -> AgentConversation | None:
+        """Return one agent conversation by case and conversation IDs."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(AgentConversation).where(
+                    AgentConversation.case_id == case_id,
+                    AgentConversation.id == conversation_id,
+                )
+            )
+            return result.scalar_one_or_none()
+
+    async def list_agent_conversations(
+        self, case_id: str, timeline_id: str | None = None, user_id: str | None = None
+    ) -> list[AgentConversation]:
+        """List agent conversations, newest first."""
+        stmt = select(AgentConversation).where(AgentConversation.case_id == case_id)
+        if timeline_id is not None:
+            stmt = stmt.where(AgentConversation.timeline_id == timeline_id)
+        if user_id is not None:
+            stmt = stmt.where(AgentConversation.user_id == user_id)
+        stmt = stmt.order_by(AgentConversation.updated_at.desc())
+        async with self.session_factory() as session:
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
+
+    async def update_agent_conversation(
+        self,
+        conversation_id: str,
+        *,
+        title: str | None = None,
+        history: list | None = None,
+    ) -> None:
+        """Update a conversation's title and/or replayable history snapshot."""
+        values: dict[str, Any] = {"updated_at": datetime.now(UTC)}
+        if title is not None:
+            values["title"] = title
+        if history is not None:
+            values["history"] = history
+        async with self.session_factory() as session:
+            await session.execute(
+                update(AgentConversation)
+                .where(AgentConversation.id == conversation_id)
+                .values(**values)
+            )
+            await session.commit()
+
+    async def delete_agent_conversation(self, case_id: str, conversation_id: str) -> bool:
+        """Delete a conversation, its messages and its proposals. Returns False when not found."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                delete(AgentConversation).where(
+                    AgentConversation.case_id == case_id,
+                    AgentConversation.id == conversation_id,
+                )
+            )
+            await session.execute(
+                delete(AgentMessage).where(AgentMessage.conversation_id == conversation_id)
+            )
+            await session.execute(
+                delete(AgentProposal).where(AgentProposal.conversation_id == conversation_id)
+            )
+            await session.commit()
+            return bool(result.rowcount)
+
+    async def add_agent_message(
+        self,
+        conversation_id: str,
+        role: str,
+        content: str = "",
+        tool_name: str | None = None,
+        tool_args: dict | None = None,
+        tool_result: dict | list | None = None,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+    ) -> AgentMessage:
+        """Append one message row to a conversation."""
+        message = AgentMessage(
+            id=generate_id("agentmsg"),
+            conversation_id=conversation_id,
+            role=role,
+            content=content,
+            tool_name=tool_name,
+            tool_args=tool_args,
+            tool_result=tool_result,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+        async with self.session_factory() as session:
+            session.add(message)
+            await session.commit()
+            await session.refresh(message)
+            return message
+
+    async def list_agent_messages(self, conversation_id: str) -> list[AgentMessage]:
+        """Return a conversation's messages in chronological order."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(AgentMessage)
+                .where(AgentMessage.conversation_id == conversation_id)
+                .order_by(AgentMessage.created_at.asc(), AgentMessage.id.asc())
+            )
+            return list(result.scalars().all())
+
+    # ------------------------------------------------------------------
+    # Agent proposals (A1)
+    # ------------------------------------------------------------------
+
+    async def create_agent_proposal(
+        self,
+        *,
+        case_id: str,
+        timeline_id: str,
+        conversation_id: str,
+        tag: str | None,
+        comment: str | None,
+        rationale: str,
+        events: list,
+    ) -> AgentProposal:
+        """Create a new proposed annotation awaiting analyst decision."""
+        proposal = AgentProposal(
+            id=generate_id("agentprop"),
+            conversation_id=conversation_id,
+            case_id=case_id,
+            timeline_id=timeline_id,
+            status="proposed",
+            tag=tag,
+            comment=comment,
+            rationale=rationale,
+            events=events,
+        )
+        async with self.session_factory() as session:
+            session.add(proposal)
+            await session.commit()
+            await session.refresh(proposal)
+            return proposal
+
+    async def get_agent_proposal(
+        self, conversation_id: str, proposal_id: str
+    ) -> AgentProposal | None:
+        """Return one agent proposal by conversation and proposal IDs."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(AgentProposal).where(
+                    AgentProposal.conversation_id == conversation_id,
+                    AgentProposal.id == proposal_id,
+                )
+            )
+            return result.scalar_one_or_none()
+
+    async def list_agent_proposals(self, conversation_id: str) -> list[AgentProposal]:
+        """Return a conversation's proposals in chronological order."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(AgentProposal)
+                .where(AgentProposal.conversation_id == conversation_id)
+                .order_by(AgentProposal.created_at.asc(), AgentProposal.id.asc())
+            )
+            return list(result.scalars().all())
+
+    async def decide_agent_proposal(
+        self, proposal_id: str, *, status: str, decided_by: str
+    ) -> AgentProposal | None:
+        """Atomically confirm or reject a proposal that is still ``proposed``.
+
+        Returns the updated row, or ``None`` when the proposal was not in
+        ``proposed`` state (already decided) — callers turn that into a 409.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                update(AgentProposal)
+                .where(AgentProposal.id == proposal_id, AgentProposal.status == "proposed")
+                .values(status=status, decided_by=decided_by, decided_at=datetime.now(UTC))
+            )
+            if result.rowcount == 0:
+                await session.commit()
+                return None
+            await session.commit()
+            row = await session.execute(
+                select(AgentProposal).where(AgentProposal.id == proposal_id)
+            )
+            return row.scalar_one_or_none()
+
+    # ------------------------------------------------------------------
+    # Agent MCP tokens
+    # ------------------------------------------------------------------
+
+    async def create_agent_token(
+        self,
+        case_id: str,
+        timeline_id: str,
+        user_id: str,
+        name: str,
+        token_hash: str,
+        expires_at: datetime | None = None,
+    ) -> AgentToken:
+        """Persist a new MCP access token row (hash only, never plaintext)."""
+        row = AgentToken(
+            id=generate_id(f"agent_token_{name}"),
+            token_hash=token_hash,
+            case_id=case_id,
+            timeline_id=timeline_id,
+            user_id=user_id,
+            name=name,
+            expires_at=expires_at,
+        )
+        async with self.session_factory() as session:
+            session.add(row)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def list_agent_tokens(self, case_id: str, timeline_id: str) -> list[AgentToken]:
+        """Return a timeline's MCP tokens, newest first (revoked ones included)."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(AgentToken)
+                .where(AgentToken.case_id == case_id, AgentToken.timeline_id == timeline_id)
+                .order_by(AgentToken.created_at.desc())
+            )
+            return list(result.scalars().all())
+
+    async def get_agent_token_by_hash(self, token_hash: str) -> AgentToken | None:
+        """Resolve a presented token's SHA-256 to its row (revoked/expired rows included —
+        the caller decides how to respond so auth failures stay distinguishable)."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(AgentToken).where(AgentToken.token_hash == token_hash)
+            )
+            return result.scalar_one_or_none()
+
+    async def revoke_agent_token(self, case_id: str, token_id: str) -> bool:
+        """Stamp revoked_at on a token row. Returns True when the row existed."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(AgentToken).where(AgentToken.case_id == case_id, AgentToken.id == token_id)
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return False
+            if row.revoked_at is None:
+                row.revoked_at = datetime.now(UTC)
+                await session.commit()
+            return True
+
+    # ------------------------------------------------------------------
     # Sigma rules + runs
     # ------------------------------------------------------------------
 
@@ -2956,15 +3502,15 @@ class PostgresStore:
             await session.execute(update(SigmaRun).where(SigmaRun.id == run_id).values(**values))
             await session.commit()
 
-    async def list_sigma_runs(self, case_id: str, limit: int = 50) -> list[SigmaRun]:
-        """Return the case's Sigma runs, newest first."""
+    async def list_sigma_runs(
+        self, case_id: str, timeline_id: str | None = None, limit: int = 50
+    ) -> list[SigmaRun]:
+        """Return the case's Sigma runs, newest first, optionally scoped to one timeline."""
+        stmt = select(SigmaRun).where(SigmaRun.case_id == case_id)
+        if timeline_id is not None:
+            stmt = stmt.where(SigmaRun.timeline_id == timeline_id)
         async with self.session_factory() as session:
-            result = await session.execute(
-                select(SigmaRun)
-                .where(SigmaRun.case_id == case_id)
-                .order_by(SigmaRun.created_at.desc())
-                .limit(limit)
-            )
+            result = await session.execute(stmt.order_by(SigmaRun.created_at.desc()).limit(limit))
             return list(result.scalars().all())
 
     async def get_sigma_run(self, case_id: str, run_id: str) -> SigmaRun | None:
@@ -3145,7 +3691,7 @@ class PostgresStore:
                     Annotation.case_id == case_id,
                     Annotation.event_id == event_id,
                     Annotation.id == annotation_id,
-                    Annotation.origin == "user",
+                    Annotation.origin.in_(USER_VISIBLE_ANNOTATION_ORIGINS),
                 )
             )
             annotation = result.scalar_one_or_none()
@@ -3173,7 +3719,7 @@ class PostgresStore:
                     Annotation.case_id == case_id,
                     Annotation.source_id.in_(source_ids),
                     Annotation.annotation_type == "tag",
-                    Annotation.origin == "user",
+                    Annotation.origin.in_(USER_VISIBLE_ANNOTATION_ORIGINS),
                 )
                 .distinct()
                 .order_by(Annotation.content)
@@ -3210,7 +3756,7 @@ class PostgresStore:
         case_id: str,
         source_ids: list[str],
         annotation_type: str,
-        origin: str = "user",
+        origins: tuple[str, ...] = USER_VISIBLE_ANNOTATION_ORIGINS,
         content: str | None = None,
         content_in: list[str] | None = None,
     ) -> list[str]:
@@ -3220,7 +3766,10 @@ class PostgresStore:
         and by the events API to filter to tagged/anomaly-flagged events.
         ``content`` optionally narrows to a specific annotation value (e.g. a
         specific tag label); ``content_in`` narrows to any of several values
-        (OR semantics) — the two are mutually exclusive.
+        (OR semantics) — the two are mutually exclusive. ``origins`` defaults
+        to the user-visible set (human + analyst-confirmed agent
+        annotations); pass ``origins=("system",)`` for machine-generated
+        findings.
         """
         from sqlalchemy import select
 
@@ -3229,7 +3778,7 @@ class PostgresStore:
                 Annotation.case_id == case_id,
                 Annotation.source_id.in_(source_ids),
                 Annotation.annotation_type == annotation_type,
-                Annotation.origin == origin,
+                Annotation.origin.in_(origins),
             ]
             if content is not None:
                 conditions.append(Annotation.content == content)
