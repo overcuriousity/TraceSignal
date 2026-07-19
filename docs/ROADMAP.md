@@ -280,6 +280,37 @@ exposure of the identical tool server (`VESTIGO_MCP_ENABLED`, default off). See
   array would silently skip the audit row. Currently safe because the MCP SDK's streamable
   HTTP transport rejects JSON-RPC batch arrays outright (removed in the 2025-06-18 MCP
   spec) — revisit if the SDK ever reintroduces batching support.
+- [ ] **A5 — Markdown rendering of agent responses.** `AgentPanel`/`FindingCard` render
+  plain `whitespace-pre-wrap` text; models emit markdown regardless. Add
+  `react-markdown` + `remark-gfm` for assistant messages and finding descriptions —
+  **no raw HTML** (agent output is untrusted; do not add `rehype-raw`), styled code
+  blocks/lists/tables. Small, self-contained.
+- [ ] **A6 — Token-usage metering.** No usage data is captured today; local-LLM sizing
+  advice is estimated, not measured. pydantic-ai exposes per-run token counts — stamp
+  prompt/completion tokens per turn into `agent_messages` (or the conversation row) and
+  surface them in the panel. Estimated shape today (from `tools.py` result budgets):
+  3–5k fixed prompt (system + 20 tool schemas), 3–8k per `search_events` result, up to
+  15 round-trips replaying full history — heavy turns plausibly 30–100k prompt tokens.
+  llama.cpp-class local endpoints are viable (ollama already the documented example) but
+  need a tool-calling-capable ≥14B model, ≥32k context, and prompt caching for latency.
+- [ ] **A7 — Agent config in the admin interface.** Move `VESTIGO_AGENT_*` runtime
+  selection (model, provider, base URL, API key, user agent, extra headers, max turns)
+  into a DB-backed settings page under the existing admin UI, with **env always winning**
+  over DB values (operator pins beat admin toggles — preserves the explicit-operator
+  stance on network endpoints). API key write-only/masked; availability-probe cache must
+  invalidate on change. Add a "reasoning effort" field with per-provider translation in
+  `runtime.build_model` (Anthropic `thinking` budget vs. OpenAI `reasoning_effort`) —
+  the concept doesn't exist yet.
+- [ ] **A8 — External MCP toolsets (web research / user-pluggable tools).** Do NOT build
+  bespoke whois/web tools or a custom plugin API: the runtime is pydantic-ai with MCP
+  toolsets, so let the agent consume operator-configured **external MCP servers**
+  (users write a whois/VT/web-search tool as a tiny MCP server in any language; zero
+  Vestigo code per tool; symmetric with our own `/mcp` exposure). Hard requirements:
+  (a) OPSEC gate — outbound lookups leak case indicators to third parties; gate behind
+  `VESTIGO_ALLOW_ONLINE` **and** per-case opt-in, default off; (b) forensic capture —
+  audit every external call and persist/hash the raw response (external evidence must
+  stay replayable), mark results `origin: external` in the conversation record. Needs
+  its own design round before implementation.
 
 ## Explicitly out of scope (decided during the audit)
 
