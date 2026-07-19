@@ -270,11 +270,6 @@ exposure of the identical tool server (`VESTIGO_MCP_ENABLED`, default off). See
   events (today it is read-only). Requires an explicit analyst confirmation step in the
   chat UI (propose → confirm → write), a new `Annotation.origin` value alongside
   `user`/`system`, and audit rows crediting both the analyst and the conversation.
-- [ ] **A3 — `list_sigma_runs` case-wide limit.** The tool applies the store's `limit=50`
-  case-wide (`PostgresStore.list_sigma_runs`) before filtering to the current timeline
-  (`agent/tools.py::list_sigma_runs`) — a case with many Sigma runs on other timelines can
-  starve this timeline's run list before the Python-side filter ever sees it. Push the
-  timeline filter into the query, or paginate.
 - [ ] **A4 — `/mcp` audit sniffing depends on no JSON-RPC batching.** `_audit_tool_call`
   (`agent/mcp_http.py`) only recognizes a single JSON-RPC object; a batched `tools/call`
   array would silently skip the audit row. Currently safe because the MCP SDK's streamable

@@ -300,3 +300,15 @@ async def test_run_anomaly_detector_rejects_out_of_bounds(store):
         await _call(
             server, "run_anomaly_detector", {"detector": "sequence_novelty", "ngram_size": 9}
         )
+
+
+async def test_list_sigma_runs_not_starved_by_other_timelines(store):
+    await store.init_schema()
+    # Create t1 run first (oldest)
+    await store.create_sigma_run("c1", "t1", params={}, created_by="alice")
+    # Then create 55 OTHER timeline runs (newer)
+    for _ in range(55):
+        await store.create_sigma_run("c1", "OTHER", params={}, created_by="alice")
+    server = build_tool_server(_scope("c1", "t1"))
+    result = await _call(server, "list_sigma_runs")
+    assert result["total"] == 1

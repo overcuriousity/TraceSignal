@@ -609,8 +609,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         """List past Sigma evaluations over this timeline (newest first, no per-rule detail)."""
         from vestigo.api.deps import get_store
 
-        rows = await get_store().list_sigma_runs(scope.case_id)
-        rows = [r for r in rows if r.timeline_id == scope.timeline_id]
+        rows = await get_store().list_sigma_runs(scope.case_id, timeline_id=scope.timeline_id)
         return {
             "total": len(rows),
             "runs": [

@@ -3269,15 +3269,15 @@ class PostgresStore:
             await session.execute(update(SigmaRun).where(SigmaRun.id == run_id).values(**values))
             await session.commit()
 
-    async def list_sigma_runs(self, case_id: str, limit: int = 50) -> list[SigmaRun]:
-        """Return the case's Sigma runs, newest first."""
+    async def list_sigma_runs(
+        self, case_id: str, timeline_id: str | None = None, limit: int = 50
+    ) -> list[SigmaRun]:
+        """Return the case's Sigma runs, newest first, optionally scoped to one timeline."""
+        stmt = select(SigmaRun).where(SigmaRun.case_id == case_id)
+        if timeline_id is not None:
+            stmt = stmt.where(SigmaRun.timeline_id == timeline_id)
         async with self.session_factory() as session:
-            result = await session.execute(
-                select(SigmaRun)
-                .where(SigmaRun.case_id == case_id)
-                .order_by(SigmaRun.created_at.desc())
-                .limit(limit)
-            )
+            result = await session.execute(stmt.order_by(SigmaRun.created_at.desc()).limit(limit))
             return list(result.scalars().all())
 
     async def get_sigma_run(self, case_id: str, run_id: str) -> SigmaRun | None:
