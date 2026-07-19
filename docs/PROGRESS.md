@@ -1,6 +1,53 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-19 (session 66 — agent read parity + external MCP endpoint).
+Last updated: 2026-07-19 (session 67 — agent A3/A6/A1/A7 sweep).
+
+## Session 67 — 2026-07-19: agent A3 scoping fix, A6 token metering, A1 propose→confirm annotations, A7 DB-backed settings (feat/ai-agent)
+
+Closes the four remaining Milestone 8 watch items from session 66's audit.
+Design: `docs/superpowers/specs/2026-07-19-agent-a1-a6-a7-design.md`; plan
+`docs/superpowers/plans/2026-07-19-agent-a3-a6-a1-a7.md`.
+
+- **A3 — `list_sigma_runs` timeline scoping fix**: the store's `limit=50`
+  case-wide cap was applied before filtering to the current timeline,
+  letting a busy case starve the tool's results for the timeline actually
+  in scope; the timeline filter now runs in-query ahead of the limit.
+- **A6 — token-usage metering**: `agent_messages` gained per-turn
+  input/output token columns (migration 0009), measured from pydantic-ai's
+  `RunUsage` on every turn; the panel shows per-message usage chips and a
+  running conversation total.
+- **A1 — propose→confirm agent annotations**: new `AgentProposal` model +
+  lifecycle store (migration 0010), a `propose_annotation` tool
+  (in-app loop only, excluded from `/mcp`), and proposal cards in the
+  panel with confirm/reject. Confirming writes real annotations with
+  `origin: agentic-analysis` — treated as analyst-approved content, so it
+  behaves like a user annotation in tag autocomplete, annotated-filters,
+  and deletion (`USER_VISIBLE_ANNOTATION_ORIGINS`); `origin` stays as
+  provenance for display/audit only. Proposal decisions are gated at
+  contribute-level RBAC, with a test for the partial-miss case (some
+  proposed events no longer match).
+- **A7 — DB-backed agent settings**: `agent_settings` singleton table
+  (migration 0011), an `AgentConfig` resolver with env-wins-per-field
+  precedence over DB values and a fingerprint-keyed probe cache, an admin
+  API for reading/writing settings with env-pinning badges and a masked
+  API key, an admin settings page, and per-provider reasoning-effort
+  translation including an experimental Kimi wire-field mapping. The Kimi
+  mapping is the one unverified external claim in this batch — it wasn't
+  confirmed against upstream API docs/source before shipping and should
+  be treated as unverified until checked against a live Kimi endpoint or
+  its published API reference.
+- New/extended tests across `tests/test_agent_api.py`,
+  `tests/test_agent_tokens.py`, `tests/test_agent_tools.py`,
+  `tests/test_admin_api.py`, and `tests/test_postgres_store.py` for all
+  four items; full backend
+  (`uv run pytest`, 1065 passed) and frontend (`npm run test`, 286 passed)
+  suites green, `npm run typecheck`/`npm run lint` and
+  `uv run ruff check .`/`ruff format --check .` clean.
+- Roadmap: Milestone 8 A1/A3/A6/A7 closed; A4 and A8 remain open. Added a
+  new watch item — a crash between the atomic proposal-decide and the
+  annotation bulk-write (A1) leaves a confirmed proposal with no
+  annotations and no retry path; deliberate single-process tradeoff,
+  revisit if it bites.
 
 ## Session 66 — 2026-07-19: agent read parity + external MCP endpoint (feat/ai-agent)
 

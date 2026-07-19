@@ -281,6 +281,9 @@ exposure of the identical tool server (`VESTIGO_MCP_ENABLED`, default off). See
   audit every external call and persist/hash the raw response (external evidence must
   stay replayable), mark results `origin: external` in the conversation record. Needs
   its own design round before implementation.
+- [ ] **Confirm-proposal crash-gap.** A crash between the atomic proposal-decide and the
+  annotation bulk-write leaves a confirmed proposal with no annotations and no retry path.
+  Single-process tradeoff, deliberate; revisit if it bites.
 
 ## Explicitly out of scope (decided during the audit)
 
