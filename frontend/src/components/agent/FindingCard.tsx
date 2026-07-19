@@ -34,6 +34,11 @@ function specChips(spec: AgentFilterSpec): string[] {
   }
   if (spec.tags_include?.length) chips.push(`tag: ${spec.tags_include.join(", ")}`);
   if (spec.tags_exclude?.length) chips.push(`-tag: ${spec.tags_exclude.join(", ")}`);
+  if (spec.annotated?.length) chips.push(`annotated: ${spec.annotated.join(", ")}`);
+  if (spec.annotation_tag_value) chips.push(`tag value: ${spec.annotation_tag_value}`);
+  if (spec.run_id) chips.push(`run: ${spec.run_id}`);
+  if (spec.event_ids?.length) chips.push(`${spec.event_ids.length} event id${spec.event_ids.length === 1 ? "" : "s"}`);
+  if (spec.collapse_routine) chips.push("collapse routine");
   return chips;
 }
 

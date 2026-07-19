@@ -6,6 +6,9 @@
  */
 import { describe, expect, it } from "vitest";
 import { specToEventFilters, type AgentFilterSpec } from "@/api/agent";
+import { filtersToParams, paramsToFilters } from "@/lib/queryParams";
+import { computeEffectiveFilters, overlaysFromApplied } from "@/lib/effectiveFilters";
+import type { EventFilters } from "@/api/types";
 
 describe("specToEventFilters", () => {
   it("maps every FilterSpec field onto EventFilters", () => {
@@ -84,5 +87,90 @@ describe("specToEventFilters", () => {
     expect(f.anomalyRunId).toBeUndefined();
     expect(f.ids).toBeUndefined();
     expect(f.collapseRoutine).toBeUndefined();
+  });
+});
+
+/**
+ * End-to-end apply seam: FindingCard → onApply(specToEventFilters(spec)) →
+ * ExplorerPage.handleApplyAgentFilters, which splits the applied filters into
+ * the URL layer (setFilters → filtersToParams → paramsToFilters) and the
+ * session overlays (overlaysFromApplied), then re-merges via
+ * computeEffectiveFilters into the filter set actually queried. The whole
+ * point of the fix: `anomalyRunId`, `ids`, `collapseRoutine` survive even
+ * though they are never URL-serialized.
+ */
+describe("agent finding apply → effective filters", () => {
+  /** Reproduce exactly what ExplorerPage does on "Apply to Explorer". */
+  function applyToEffective(applied: EventFilters): EventFilters {
+    const urlLayer = paramsToFilters(filtersToParams(applied)); // setFilters round-trip
+    const overlays = overlaysFromApplied(applied);
+    return computeEffectiveFilters(urlLayer, {
+      anomalyRunId: overlays.anomalyRunId,
+      appliedIds: overlays.ids,
+      semanticSearchIds: null,
+      collapseRoutine: overlays.collapseRoutine,
+    });
+  }
+
+  it("carries all five new FilterSpec fields (plus base fields) into the applied view", () => {
+    const spec: AgentFilterSpec = {
+      q: "ssh",
+      q_regex: true,
+      artifacts: ["syslog"],
+      source_id: "s1",
+      start: "2026-01-01T00:00:00Z",
+      end: "2026-01-02T00:00:00Z",
+      filters: { username: ["root"] },
+      exclusions: { status: ["200"] },
+      filter_modes: { username: "wildcard" },
+      exclusion_modes: { status: "regex" },
+      tags_include: ["suspicious"],
+      tags_exclude: ["benign"],
+      // The five fields the apply path previously dropped or ignored:
+      annotated: ["tag", "anomaly"],
+      annotation_tag_value: "bad",
+      run_id: "run-1",
+      event_ids: ["e1", "e2"],
+      collapse_routine: true,
+    };
+    const applied = specToEventFilters(spec);
+    const effective = applyToEffective(applied);
+    // Nothing is lost: the applied view equals the agent's own filter set.
+    expect(effective).toEqual(applied);
+    // Explicit checks on the three previously-dropped overlay fields.
+    expect(effective.anomalyRunId).toBe("run-1");
+    expect(effective.ids).toEqual(["e1", "e2"]);
+    expect(effective.collapseRoutine).toBe(true);
+  });
+
+  it("documents the regression: the URL layer alone drops the three overlay fields", () => {
+    const applied = specToEventFilters({
+      run_id: "run-1",
+      event_ids: ["e1", "e2"],
+      collapse_routine: true,
+      annotated: ["anomaly"],
+    });
+    // The old apply path (setFilters only, no overlays) silently loses them.
+    const urlOnly = paramsToFilters(filtersToParams(applied));
+    expect(urlOnly.anomalyRunId).toBeUndefined();
+    expect(urlOnly.ids).toBeUndefined();
+    expect(urlOnly.collapseRoutine).toBeUndefined();
+    // The fixed path restores them.
+    const effective = applyToEffective(applied);
+    expect(effective.anomalyRunId).toBe("run-1");
+    expect(effective.ids).toEqual(["e1", "e2"]);
+    expect(effective.collapseRoutine).toBe(true);
+  });
+
+  it("an agent event_id allowlist wins over an active semantic search", () => {
+    const applied = specToEventFilters({ event_ids: ["a", "b"] });
+    const overlays = overlaysFromApplied(applied);
+    const effective = computeEffectiveFilters(paramsToFilters(filtersToParams(applied)), {
+      anomalyRunId: undefined,
+      appliedIds: overlays.ids,
+      semanticSearchIds: ["x", "y", "z"],
+      collapseRoutine: false,
+    });
+    expect(effective.ids).toEqual(["a", "b"]);
   });
 });
