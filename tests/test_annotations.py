@@ -388,3 +388,24 @@ async def test_list_confirmed_keys(store: PostgresStore):
 
     keys = await store.list_confirmed_keys("c10", ["s10"], detector="value_novelty")
     assert keys == {("confirmed-evt", "value_novelty")}
+
+
+@pytest.mark.asyncio
+async def test_agentic_annotations_are_user_visible(store: PostgresStore):
+    """Analyst-confirmed agent annotations (origin=agentic-analysis) behave
+    like user annotations in tag autocomplete, the annotated-event filter,
+    and deletion — origin is provenance, not a visibility class (A1)."""
+    await store.create_annotation(
+        "c1",
+        "s1",
+        "e1",
+        "a1",
+        "tag",
+        "agent-tag",
+        created_by="alice",
+        origin="agentic-analysis",
+    )
+    assert "agent-tag" in await store.list_distinct_tag_contents("c1", ["s1"])
+    ids = await store.list_event_ids_by_annotation_type("c1", ["s1"], "tag")
+    assert ids == ["e1"]
+    assert await store.delete_annotation("c1", "e1", "a1") is True  # analyst-owned

@@ -788,6 +788,15 @@ class DetectorRun(Base):
         }
 
 
+# Origin of an agent-confirmed annotation (A1): distinguishes it from
+# manually-typed ``"user"`` annotations for provenance/audit purposes only.
+# Confirmed agent annotations are analyst-approved content — they behave
+# like user annotations in filters, autocomplete and deletion; ``origin`` is
+# provenance, not a visibility class.
+ANNOTATION_ORIGIN_AGENT = "agentic-analysis"
+USER_VISIBLE_ANNOTATION_ORIGINS: tuple[str, ...] = ("user", ANNOTATION_ORIGIN_AGENT)
+
+
 class Annotation(Base):
     """A tag or comment annotation attached to a single event.
 
@@ -3596,7 +3605,7 @@ class PostgresStore:
                     Annotation.case_id == case_id,
                     Annotation.event_id == event_id,
                     Annotation.id == annotation_id,
-                    Annotation.origin == "user",
+                    Annotation.origin.in_(USER_VISIBLE_ANNOTATION_ORIGINS),
                 )
             )
             annotation = result.scalar_one_or_none()
@@ -3624,7 +3633,7 @@ class PostgresStore:
                     Annotation.case_id == case_id,
                     Annotation.source_id.in_(source_ids),
                     Annotation.annotation_type == "tag",
-                    Annotation.origin == "user",
+                    Annotation.origin.in_(USER_VISIBLE_ANNOTATION_ORIGINS),
                 )
                 .distinct()
                 .order_by(Annotation.content)
@@ -3661,7 +3670,7 @@ class PostgresStore:
         case_id: str,
         source_ids: list[str],
         annotation_type: str,
-        origin: str = "user",
+        origins: tuple[str, ...] = USER_VISIBLE_ANNOTATION_ORIGINS,
         content: str | None = None,
         content_in: list[str] | None = None,
     ) -> list[str]:
@@ -3671,7 +3680,10 @@ class PostgresStore:
         and by the events API to filter to tagged/anomaly-flagged events.
         ``content`` optionally narrows to a specific annotation value (e.g. a
         specific tag label); ``content_in`` narrows to any of several values
-        (OR semantics) — the two are mutually exclusive.
+        (OR semantics) — the two are mutually exclusive. ``origins`` defaults
+        to the user-visible set (human + analyst-confirmed agent
+        annotations); pass ``origins=("system",)`` for machine-generated
+        findings.
         """
         from sqlalchemy import select
 
@@ -3680,7 +3692,7 @@ class PostgresStore:
                 Annotation.case_id == case_id,
                 Annotation.source_id.in_(source_ids),
                 Annotation.annotation_type == annotation_type,
-                Annotation.origin == origin,
+                Annotation.origin.in_(origins),
             ]
             if content is not None:
                 conditions.append(Annotation.content == content)

@@ -353,12 +353,12 @@ async def _resolve_tags_filter(
         return None
     store = get_store()
     ann_ids = await store.list_event_ids_by_annotation_type(
-        case_id, source_ids, "tag", origin="user", content_in=tag_values
+        case_id, source_ids, "tag", content_in=tag_values
     )
     # Sigma hits are a third tag population: system annotations whose content
     # is the "sigma: <title>" label shown in the unified tag panel.
     sigma_ids = await store.list_event_ids_by_annotation_type(
-        case_id, source_ids, "sigma", origin="system", content_in=tag_values
+        case_id, source_ids, "sigma", origins=("system",), content_in=tag_values
     )
     return TagFilter(tag_values=tag_values, postgres_event_ids=list({*ann_ids, *sigma_ids}))
 
@@ -432,12 +432,12 @@ async def _resolve_annotated_event_ids(
     event_ids: set[str] = set()
     if "tag" in types:
         ids = await store.list_event_ids_by_annotation_type(
-            case_id, source_ids, "tag", origin="user", content=tag_value or None
+            case_id, source_ids, "tag", content=tag_value or None
         )
         event_ids.update(ids)
     if "anomaly" in types:
         ids = await store.list_event_ids_by_annotation_type(
-            case_id, source_ids, "anomaly", origin="system"
+            case_id, source_ids, "anomaly", origins=("system",)
         )
         event_ids.update(ids)
         event_ids.update(await _resolve_run_event_ids(case_id, run_id))

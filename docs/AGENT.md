@@ -12,10 +12,39 @@ alongside any agent change, like `ANOMALY_DETECTION.md` for detectors.
   never mutates the analyst's view. Findings render as cards; only an
   explicit analyst click applies filters (through the normal URL-driven
   filter path, `frontend/src/lib/queryParams.ts`).
-- **Read-only v1.** Tools cannot annotate, tag, or change anything (the one
-  nuance: `run_anomaly_detector` persists a `DetectorRun`, same as an
-  analyst-triggered preview scan). Agent-written annotations
-  (`origin: agentic-analysis`) are a roadmap item.
+- **Propose→confirm writes (A1).** The agent itself never writes an
+  annotation. `propose_annotation` (available once a conversation is bound,
+  `agent/tools.py`) resolves the target events and records an
+  `AgentProposal` row (`status="proposed"`) — it does not touch
+  `annotations`. An analyst reviews the proposal in the UI and calls
+  `POST .../proposals/{id}/confirm` or `.../reject`
+  (`api/routers/agent.py`). Confirm re-resolves the events against the
+  *current* scope (a source may have left the timeline since propose time),
+  writes one `tag`/`comment` annotation per still-resolving event with
+  `origin="agentic-analysis"` and `created_by` set to the confirming
+  analyst, and reports `skipped_event_ids` for anything that no longer
+  resolves. `decide_agent_proposal` is an atomic `UPDATE … WHERE
+  status='proposed'`, so a proposal can only ever be decided once — a
+  second confirm/reject 409s. Rejecting writes nothing. `run_anomaly_detector`
+  remains the other write-shaped tool (it persists a `DetectorRun`, same as
+  an analyst-triggered preview scan).
+  - **Origin is provenance, not a visibility class.** Once confirmed, an
+    `agentic-analysis` annotation is indistinguishable from a manually-typed
+    one everywhere that matters: tag autocomplete
+    (`list_distinct_tag_contents`), the `annotated`/tag Explorer filter
+    (`list_event_ids_by_annotation_type`, which defaults to
+    `USER_VISIBLE_ANNOTATION_ORIGINS = ("user", "agentic-analysis")`), and
+    manual deletion (`delete_annotation`). Only `origin="system"` (the
+    outlier-detection pipeline) stays outside that set — those calls pass
+    `origins=("system",)` explicitly.
+  - **Audit.** Every decision writes a row: `agent.annotation_confirm`
+    (detail: `written`, `skipped_event_ids`, `tag`, `comment_present`) or
+    `agent.annotation_reject`, both keyed to `target_type="agent_proposal"`.
+  - `propose_annotation`/the confirm/reject endpoints are **not** exposed on
+    the external `/mcp` transport — only the in-app agent's tool server
+    binds a `conversation_id` (`AgentScope.conversation_id`), which is what
+    gates `propose_annotation`'s registration; a bare `/mcp` token scope has
+    none, so the tool is simply absent from that server's tool list.
 - **Invisible unless configured.** `/api/health` reports `agent_available`
   only when `VESTIGO_AGENT_*` is set **and** the endpoint answered a cached
   probe (`agent/availability.py`, TTL `VESTIGO_AGENT_PROBE_TTL_SECONDS`).
@@ -103,12 +132,13 @@ in-app agent has. One tool code path, two transports.
   protection targets; Host handling is left to the deployment's reverse
   proxy.
 
-## Tools (read-only, 20 total)
+## Tools (21 total; all read-only except the propose→confirm annotation path)
 
 Core: `search_events`, `get_event`, `list_fields`, `list_artifacts`,
 `field_terms`, `field_numeric_stats`, `histogram`, `run_anomaly_detector`,
-`propose_finding`, and — when embeddings are available — `semantic_search`,
-`similar_events`.
+`propose_finding`, `propose_annotation` (conversation-bound only — see
+**Propose→confirm writes** above), and — when embeddings are available —
+`semantic_search`, `similar_events`.
 
 Read-parity tools (analyst-visible state the agent previously couldn't see):
 `list_baselines` (saved baseline definitions — unlocks the temporal-only
@@ -189,12 +219,20 @@ Verified against the hermes-agent source (`agent/anthropic_adapter.py`,
 `tests/test_agent_api.py`: availability gate (probe + cache), health flag,
 router 503 gating, conversation CRUD + per-user privacy, the full streamed
 loop over a stubbed MCP tool server with pydantic-ai's `FunctionModel` (no
-real LLM), and the Kimi replay shim. `tests/test_agent_tools.py`: the nine
-read-parity tools and the extended `FilterSpec`/detector-tuning surface
-against a stubbed store. `tests/test_agent_tokens.py`: `AgentToken` model +
-store methods + the token-management API (create/list/revoke, RBAC).
+real LLM), the Kimi replay shim, and the proposal lifecycle over HTTP
+(confirm writes annotations + audits, confirm is idempotent/409s on
+redecide, reject writes nothing, only the conversation's owner can decide).
+`tests/test_agent_tools.py`: the read-parity tools, the extended
+`FilterSpec`/detector-tuning surface, and `propose_annotation` (records the
+proposal, requires tag or comment, rejects unknown event ids) against a
+stubbed store. `tests/test_agent_tokens.py`: `AgentToken` model + store
+methods + the token-management API (create/list/revoke, RBAC).
 `tests/test_mcp_http.py`: token lifecycle (valid/expired/revoked/
 creator-lost-access), scope binding, an end-to-end tool call over the HTTP
-transport, and 404/off behavior when `VESTIGO_MCP_ENABLED` is unset.
-Frontend: `frontend/src/test/agent.test.ts` (FilterSpec → EventFilters
-mapping, including the new fields).
+transport, 404/off behavior when `VESTIGO_MCP_ENABLED` is unset, and that
+`propose_annotation` is absent from the `/mcp` tool list (no
+`conversation_id` in that scope). `tests/test_annotations.py`:
+`agentic-analysis`-origin annotations are user-visible in tag autocomplete,
+the annotated-event filter, and deletion. Frontend:
+`frontend/src/test/agent.test.ts` (FilterSpec → EventFilters mapping,
+including the new fields).

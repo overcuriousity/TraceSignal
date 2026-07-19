@@ -266,10 +266,6 @@ params on `run_anomaly_detector`, `AgentToken` scoped PATs, and `/mcp` streamabl
 exposure of the identical tool server (`VESTIGO_MCP_ENABLED`, default off). See
 `docs/superpowers/specs/2026-07-19-agent-read-parity-mcp-http-design.md` for the full design.
 
-- [ ] **A1 — Agent annotations with `origin: agentic-analysis`.** Let the agent tag/annotate
-  events (today it is read-only). Requires an explicit analyst confirmation step in the
-  chat UI (propose → confirm → write), a new `Annotation.origin` value alongside
-  `user`/`system`, and audit rows crediting both the analyst and the conversation.
 - [ ] **A4 — `/mcp` audit sniffing depends on no JSON-RPC batching.** `_audit_tool_call`
   (`agent/mcp_http.py`) only recognizes a single JSON-RPC object; a batched `tools/call`
   array would silently skip the audit row. Currently safe because the MCP SDK's streamable

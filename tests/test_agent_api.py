@@ -194,6 +194,162 @@ def test_conversations_are_private_to_their_creator(client, admin_bootstrap, age
 
 
 # ---------------------------------------------------------------------------
+# Proposals: confirm/reject (A1)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_proposal(store, case_id, timeline_id, user_id, *, tag="suspicious", comment=None):
+    conv = await store.create_agent_conversation(case_id, timeline_id, user_id, model_id="m")
+    proposal = await store.create_agent_proposal(
+        case_id=case_id,
+        timeline_id=timeline_id,
+        conversation_id=conv.id,
+        tag=tag,
+        comment=comment,
+        rationale="clustered failed logins",
+        events=[
+            {"source_id": "s1", "event_id": "e1"},
+            {"source_id": "s1", "event_id": "e2"},
+        ],
+    )
+    return conv, proposal
+
+
+def _patch_proposal_resolver(monkeypatch, found: dict[str, str], unknown: list[str] | None = None):
+    from vestigo.api.routers import agent as agent_router
+
+    async def fake_resolve(scope, event_ids):
+        return found, unknown or []
+
+    monkeypatch.setattr(agent_router, "_proposal_resolver", lambda: fake_resolve)
+
+
+def test_confirm_proposal_writes_annotations(client, admin_bootstrap, agent_on, store, monkeypatch):
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    async def _seed():
+        return await _seed_proposal(store, case_id, timeline_id, owner["id"])
+
+    conv, proposal = asyncio.run(_seed())
+    _patch_proposal_resolver(monkeypatch, {"e1": "s1", "e2": "s1"})
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/confirm"
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["written"] == 2
+    assert body["skipped_event_ids"] == []
+    assert body["proposal"]["status"] == "confirmed"
+
+    async def _check():
+        rows = await store.list_annotations(case_id, "s1", "e1")
+        return rows
+
+    rows = asyncio.run(_check())
+    assert any(
+        r.origin == "agentic-analysis"
+        and r.annotation_type == "tag"
+        and r.content == "suspicious"
+        and r.created_by == "admin"
+        for r in rows
+    )
+
+    async def _audit():
+        return await store.query_audit(case_id=case_id)
+
+    audit_rows = asyncio.run(_audit())
+    assert any(a.action == "agent.annotation_confirm" for a in audit_rows)
+
+
+def test_confirm_is_idempotent(client, admin_bootstrap, agent_on, store, monkeypatch):
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    async def _seed():
+        return await _seed_proposal(store, case_id, timeline_id, owner["id"])
+
+    conv, proposal = asyncio.run(_seed())
+    _patch_proposal_resolver(monkeypatch, {"e1": "s1", "e2": "s1"})
+
+    url = f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/confirm"
+    first = client.post(url)
+    assert first.status_code == 200, first.text
+    second = client.post(url)
+    assert second.status_code == 409
+
+
+def test_reject_proposal(client, admin_bootstrap, agent_on, store, monkeypatch):
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    async def _seed():
+        return await _seed_proposal(store, case_id, timeline_id, owner["id"])
+
+    conv, proposal = asyncio.run(_seed())
+    _patch_proposal_resolver(monkeypatch, {"e1": "s1", "e2": "s1"})
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/reject"
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["proposal"]["status"] == "rejected"
+
+    async def _check():
+        return await store.list_annotations(case_id, "s1", "e1")
+
+    assert asyncio.run(_check()) == []
+
+    async def _audit():
+        return await store.query_audit(case_id=case_id)
+
+    audit_rows = asyncio.run(_audit())
+    assert any(a.action == "agent.annotation_reject" for a in audit_rows)
+
+
+def test_list_proposals(client, admin_bootstrap, agent_on, store):
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    async def _seed():
+        return await _seed_proposal(store, case_id, timeline_id, owner["id"])
+
+    conv, proposal = asyncio.run(_seed())
+    resp = client.get(f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals")
+    assert resp.status_code == 200, resp.text
+    ids = [p["id"] for p in resp.json()["proposals"]]
+    assert ids == [proposal.id]
+
+
+def test_only_owner_can_decide(client, admin_bootstrap, agent_on, store, monkeypatch):
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    async def _seed():
+        return await _seed_proposal(store, case_id, timeline_id, owner["id"])
+
+    conv, proposal = asyncio.run(_seed())
+    _patch_proposal_resolver(monkeypatch, {"e1": "s1", "e2": "s1"})
+
+    # There is no per-case member grant for personal cases (only team roles);
+    # give the second analyst admin-level case access (MANAGE on every case)
+    # so the only thing standing between them and the proposal is
+    # conversation ownership, which is what this test exercises.
+    client.post(
+        "/api/admin/users",
+        json={"username": "analyst2", "password": "abcdefgh12", "is_admin": True},
+    )
+    other = client.__class__(client.app)
+    login(other, "analyst2", "abcdefgh12")
+
+    resp = other.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/confirm"
+    )
+    assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
 # Runtime: SSE event mapping over a stubbed tool server + FunctionModel
 # ---------------------------------------------------------------------------
 

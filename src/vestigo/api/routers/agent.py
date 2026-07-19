@@ -27,7 +27,13 @@ from vestigo.agent.runtime import dump_history, load_history, stream_turn
 from vestigo.agent.tools import build_scope
 from vestigo.api.deps import get_current_user, get_store, require_case_read
 from vestigo.core.config import get_settings
-from vestigo.db.postgres import AgentConversation, Case, User
+from vestigo.db.postgres import (
+    ANNOTATION_ORIGIN_AGENT,
+    AgentConversation,
+    Case,
+    User,
+    generate_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -245,3 +251,128 @@ async def send_message(
             "Connection": "keep-alive",
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Proposals: propose->confirm annotation writes (A1)
+# ---------------------------------------------------------------------------
+
+
+def _proposal_resolver():
+    """Confirm-time event re-resolution, patchable in tests.
+
+    A thin indirection over :func:`vestigo.agent.tools._resolve_event_sources`
+    so tests can substitute a fake resolver without needing a real
+    ClickHouse-backed scope (the same seam used at propose time in
+    ``propose_annotation``).
+    """
+    from vestigo.agent.tools import _resolve_event_sources
+
+    return _resolve_event_sources
+
+
+@router.get("/{case_id}/agent/conversations/{conversation_id}/proposals")
+async def list_proposals(
+    case_id: str,
+    conversation_id: str,
+    case: Case = Depends(require_case_read),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """List a conversation's agent-proposed annotations, oldest first."""
+    await _require_conversation(case_id, conversation_id, user)
+    rows = await get_store().list_agent_proposals(conversation_id)
+    return {"proposals": [p.to_dict() for p in rows]}
+
+
+@router.post("/{case_id}/agent/conversations/{conversation_id}/proposals/{proposal_id}/confirm")
+async def confirm_proposal(
+    case_id: str,
+    conversation_id: str,
+    proposal_id: str,
+    case: Case = Depends(require_case_read),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Confirm an agent proposal, writing its annotations with origin agentic-analysis.
+
+    Events are re-resolved against the current scope rather than trusted from
+    propose time — a source may have left the timeline since the agent
+    proposed the annotation. Whatever still resolves is written; the rest is
+    reported back as ``skipped_event_ids`` so the record stays truthful.
+    """
+    conversation = await _require_conversation(case_id, conversation_id, user)
+    store = get_store()
+    proposal = await store.get_agent_proposal(conversation_id, proposal_id)
+    if proposal is None:
+        raise HTTPException(status_code=404, detail="Proposal not found")
+    decided = await store.decide_agent_proposal(
+        proposal_id, status="confirmed", decided_by=user.username
+    )
+    if decided is None:
+        raise HTTPException(status_code=409, detail=f"Proposal already {proposal.status}")
+
+    scope = await build_scope(case_id, conversation.timeline_id, user)
+    found, unknown = await _proposal_resolver()(scope, [e["event_id"] for e in decided.events])
+    rows = []
+    for event in decided.events:
+        if event["event_id"] not in found:
+            continue
+        for ann_type, content in (("tag", decided.tag), ("comment", decided.comment)):
+            if content:
+                rows.append(
+                    {
+                        "annotation_id": generate_id("ann"),
+                        "case_id": case_id,
+                        "source_id": event["source_id"],
+                        "event_id": event["event_id"],
+                        "annotation_type": ann_type,
+                        "content": content,
+                        "created_by": user.username,
+                        "origin": ANNOTATION_ORIGIN_AGENT,
+                    }
+                )
+    written = await store.bulk_create_annotations(rows)
+    await store.record_audit(
+        action="agent.annotation_confirm",
+        actor=user,
+        case_id=case_id,
+        target_type="agent_proposal",
+        target_id=proposal_id,
+        detail={
+            "conversation_id": conversation_id,
+            "written": written,
+            "skipped_event_ids": unknown,
+            "tag": decided.tag,
+            "comment_present": bool(decided.comment),
+        },
+    )
+    return {"proposal": decided.to_dict(), "written": written, "skipped_event_ids": unknown}
+
+
+@router.post("/{case_id}/agent/conversations/{conversation_id}/proposals/{proposal_id}/reject")
+async def reject_proposal(
+    case_id: str,
+    conversation_id: str,
+    proposal_id: str,
+    case: Case = Depends(require_case_read),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Reject an agent proposal — no annotations are written."""
+    await _require_conversation(case_id, conversation_id, user)
+    store = get_store()
+    proposal = await store.get_agent_proposal(conversation_id, proposal_id)
+    if proposal is None:
+        raise HTTPException(status_code=404, detail="Proposal not found")
+    decided = await store.decide_agent_proposal(
+        proposal_id, status="rejected", decided_by=user.username
+    )
+    if decided is None:
+        raise HTTPException(status_code=409, detail=f"Proposal already {proposal.status}")
+    await store.record_audit(
+        action="agent.annotation_reject",
+        actor=user,
+        case_id=case_id,
+        target_type="agent_proposal",
+        target_id=proposal_id,
+        detail={"conversation_id": conversation_id},
+    )
+    return {"proposal": decided.to_dict()}
