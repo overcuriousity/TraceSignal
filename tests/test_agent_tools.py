@@ -193,3 +193,53 @@ async def test_sigma_runs_tools(store):
 
     full = await _call(server, "get_sigma_run", {"run_id": run.id})
     assert full["results"][0]["match_count"] == 3
+
+
+async def test_filterspec_annotated_resolves_to_event_ids(store, monkeypatch):
+    """annotated=['tag'] resolves tagged event ids into EventQuery.event_ids."""
+    from vestigo.agent.tools import FilterSpec, _build_query
+
+    await store.init_schema()
+    await store.create_annotation("c1", "s1", "e-tagged", "a1", "tag", "bad", origin="user")
+    scope = _scope("c1", "t1", source_ids=["s1"])
+    query = await _build_query(scope, FilterSpec(annotated=["tag"]))
+    assert query.event_ids == ["e-tagged"]
+
+
+async def test_filterspec_event_ids_intersect_annotated(store):
+    from vestigo.agent.tools import FilterSpec, _build_query
+
+    await store.init_schema()
+    await store.create_annotation("c1", "s1", "e1", "a1", "tag", "bad", origin="user")
+    await store.create_annotation("c1", "s1", "e2", "a2", "tag", "bad", origin="user")
+    scope = _scope("c1", "t1", source_ids=["s1"])
+    query = await _build_query(scope, FilterSpec(annotated=["tag"], event_ids=["e2", "e3"]))
+    assert query.event_ids == ["e2"]
+
+
+async def test_filterspec_event_ids_alone(store):
+    from vestigo.agent.tools import FilterSpec, _build_query
+
+    await store.init_schema()
+    scope = _scope("c1", "t1", source_ids=["s1"])
+    query = await _build_query(scope, FilterSpec(event_ids=["e9"]))
+    assert query.event_ids == ["e9"]
+
+
+async def test_filterspec_collapse_routine(store):
+    from vestigo.agent.tools import FilterSpec, _build_query
+
+    await store.init_schema()
+    row = await store.create_disposition(
+        "c1",
+        "routine",
+        detector="sequence_motif",
+        timeline_id="t1",
+        field="artifact",
+        value="a → b",
+    )
+    scope = _scope("c1", "t1", source_ids=["s1"])
+    query = await _build_query(scope, FilterSpec(collapse_routine=True))
+    assert query.exclude_routine_disposition_ids == [row.id]
+    plain = await _build_query(scope, FilterSpec())
+    assert plain.exclude_routine_disposition_ids is None

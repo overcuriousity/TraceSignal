@@ -79,6 +79,33 @@ class FilterSpec(BaseModel):
     tags_exclude: list[str] | None = Field(
         default=None, description="Drop events carrying any of these tags."
     )
+    annotated: list[str] | None = Field(
+        default=None,
+        description=(
+            'Restrict to annotated events: any of "tag" (user tags, optionally '
+            'narrowed by annotation_tag_value) and "anomaly" (system anomaly '
+            "marks; unioned with run_id findings when set)."
+        ),
+    )
+    annotation_tag_value: str | None = Field(
+        default=None, description='Narrow annotated=["tag"] to one exact tag value.'
+    )
+    run_id: str | None = Field(
+        default=None,
+        description=(
+            "A persisted detector run id (from run_anomaly_detector) — its "
+            'finding event ids are unioned into the "anomaly" branch of '
+            '`annotated`. Only effective when annotated includes "anomaly".'
+        ),
+    )
+    event_ids: list[str] | None = Field(
+        default=None,
+        description="Explicit event_id allowlist, intersected with the other id-based filters.",
+    )
+    collapse_routine: bool = Field(
+        default=False,
+        description="Hide events belonging to analyst-marked routine motifs (kind='routine' dispositions).",
+    )
 
 
 @dataclass
@@ -158,7 +185,12 @@ async def _build_query(
     offset: int = 0,
     order: str = "desc",
 ) -> EventQuery:
-    from vestigo.api.routers.events import _resolve_tags_filter
+    from vestigo.api.routers.events import (
+        _intersect_optional,
+        _resolve_annotated_event_ids,
+        _resolve_routine_collapse,
+        _resolve_tags_filter,
+    )
 
     spec = spec or FilterSpec()
     tags_include: TagFilter | None = None
@@ -171,6 +203,17 @@ async def _build_query(
         tags_exclude = await _resolve_tags_filter(
             scope.case_id, scope.source_ids, spec.tags_exclude
         )
+    annotated_ids = await _resolve_annotated_event_ids(
+        scope.case_id,
+        scope.source_ids,
+        ",".join(spec.annotated) if spec.annotated else None,
+        spec.annotation_tag_value,
+        spec.run_id,
+    )
+    event_ids = _intersect_optional(annotated_ids, spec.event_ids)
+    routine_ids = await _resolve_routine_collapse(
+        scope.case_id, scope.timeline_id, scope.source_ids, spec.collapse_routine
+    )
     return EventQuery(
         case_id=scope.case_id,
         source_ids=scope.source_ids,
@@ -186,6 +229,8 @@ async def _build_query(
         exclusion_modes=spec.exclusion_modes,
         tags_include=tags_include,
         tags_exclude=tags_exclude,
+        event_ids=event_ids,
+        exclude_routine_disposition_ids=routine_ids,
         limit=min(limit, MAX_EVENTS_PER_SEARCH),
         offset=offset,
         order=order if order in ("asc", "desc") else "desc",  # type: ignore[arg-type]
