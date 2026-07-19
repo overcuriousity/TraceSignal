@@ -281,6 +281,22 @@ exposure of the identical tool server (`VESTIGO_MCP_ENABLED`, default off). See
   audit every external call and persist/hash the raw response (external evidence must
   stay replayable), mark results `origin: external` in the conversation record. Needs
   its own design round before implementation.
+- [ ] **A9 — Agent-created visualizations (viz parity).** Give the agent the same charting
+  a human has on the Visualize page, in two symmetric halves: (a) **read tools** wrapping
+  the existing viz queries (`field_timeseries`, `time_punchcard`, `field_pivot`,
+  `field_scatter`, `compare_layers` — field-terms/numeric/histogram already exist)
+  returning budget-capped compact series so the model can *find* a pattern before showing
+  it; (b) a **`propose_chart` tool** carrying the exact chart spec (chart type + the same
+  validated params the viz endpoints take + FilterSpec); the backend validates by
+  executing the query and echoing summary stats, the panel renders a **live chart card**
+  reusing the Visualize page's chart components, with "Open in Visualize" (applies the
+  spec through the normal URL path) and "Save" (the analyst's click writes a saved chart
+  via the existing endpoint, credited to the analyst — no proposal lifecycle needed since
+  the analyst executes the write). Sandbox+apply invariant holds: the agent never mutates
+  the analyst's view or writes anything itself. Result caps matter: viz series are dense —
+  per-tool row/bucket budgets like `search_events`. Needs its own design round
+  (chart-spec schema shared backend↔frontend, card rendering reuse vs. simplified
+  renderer) before implementation.
 - [ ] **Confirm-proposal crash-gap.** A crash between the atomic proposal-decide and the
   annotation bulk-write leaves a confirmed proposal with no annotations and no retry path.
   Single-process tradeoff, deliberate; revisit if it bites.
