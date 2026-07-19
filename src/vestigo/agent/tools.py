@@ -113,6 +113,20 @@ def _truncate(value: Any, limit: int) -> Any:
     return value
 
 
+def _slim_annotation(row: Any) -> dict[str, Any]:
+    """Compact an Annotation row for model consumption."""
+    return {
+        "event_id": row.event_id,
+        "source_id": row.source_id,
+        "type": row.annotation_type,
+        "content": _truncate(row.content, MESSAGE_TRUNCATE),
+        "origin": row.origin,
+        "detector": row.detector,
+        "created_by": row.created_by,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
 def _slim_event(event: dict[str, Any]) -> dict[str, Any]:
     """Compact an event row for model consumption."""
     slim: dict[str, Any] = {}
@@ -380,5 +394,109 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 for r in result.results
             ],
         }
+
+    @server.tool()
+    async def list_baselines() -> dict[str, Any]:
+        """List saved baseline definitions (baseline range + suspect windows).
+
+        Pass a baseline's id as `baseline_id` to run_anomaly_detector to run
+        temporal detection (proportion_shift, interval_periodicity,
+        sequence_novelty, frequency, value_distribution_drift) against it.
+        """
+        from vestigo.api.deps import get_store
+
+        rows = await get_store().list_baseline_definitions(scope.case_id, scope.timeline_id)
+        return {
+            "total": len(rows),
+            "baselines": [
+                {
+                    "id": r.id,
+                    "name": r.name,
+                    **r.windows_payload(),
+                    "created_by": r.created_by,
+                }
+                for r in rows
+            ],
+        }
+
+    @server.tool()
+    async def list_dispositions(
+        kind: str | None = None, detector: str | None = None
+    ) -> dict[str, Any]:
+        """List analyst verdicts on anomaly findings visible from this timeline.
+
+        Kinds: 'normal' (expected behavior, suppresses detection), 'dismissed'
+        (noise), 'confirmed' (escalated true positive), 'routine' (recurring
+        expected motif). Use these to avoid re-reporting what the analyst has
+        already judged.
+        """
+        from vestigo.api.deps import get_store
+
+        rows = await get_store().list_dispositions(
+            scope.case_id,
+            timeline_id=scope.timeline_id,
+            source_ids=scope.source_ids,
+            kinds=[kind] if kind else None,
+            detector=detector,
+        )
+        return {
+            "total": len(rows),
+            "dispositions": [
+                {
+                    "id": r.id,
+                    "kind": r.kind,
+                    "detector": r.detector,
+                    "field": r.field,
+                    "value": _truncate(r.value, ATTR_VALUE_TRUNCATE),
+                    "source_id": r.source_id,
+                    "event_id": r.event_id,
+                    "note": _truncate(r.note, MESSAGE_TRUNCATE),
+                    "created_by": r.created_by,
+                }
+                for r in rows
+            ],
+        }
+
+    @server.tool()
+    async def list_saved_views() -> dict[str, Any]:
+        """List the analyst's saved filter views for this case (name, query, filter payload)."""
+        from vestigo.api.deps import get_store
+
+        rows = await get_store().list_views(scope.case_id)
+        return {
+            "total": len(rows),
+            "views": [
+                {"id": r.id, "name": r.name, "query": r.query, "filter": r.view_filter or {}}
+                for r in rows
+            ],
+        }
+
+    @server.tool()
+    async def list_annotations(annotation_type: str | None = None) -> dict[str, Any]:
+        """List annotations (tags/comments/system anomaly marks) across this timeline's sources.
+
+        `annotation_type` filters to 'tag', 'comment', or 'anomaly'. Results
+        are capped at 200 rows, oldest first — use get_event_annotations for
+        one event's full detail.
+        """
+        from vestigo.api.deps import get_store
+
+        rows = await get_store().list_source_annotations(scope.case_id, scope.source_ids)
+        if annotation_type:
+            rows = [r for r in rows if r.annotation_type == annotation_type]
+        return {
+            "total": len(rows),
+            "annotations": [_slim_annotation(r) for r in rows[:200]],
+        }
+
+    @server.tool()
+    async def get_event_annotations(source_id: str, event_id: str) -> dict[str, Any]:
+        """List all annotations attached to one event (full content, oldest first)."""
+        from vestigo.api.deps import get_store
+
+        if source_id not in scope.source_ids:
+            return {"error": f"source {source_id} is not part of this timeline"}
+        rows = await get_store().list_annotations(scope.case_id, source_id, event_id)
+        return {"total": len(rows), "annotations": [_slim_annotation(r) for r in rows]}
 
     return server
