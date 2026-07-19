@@ -53,14 +53,28 @@ export interface AgentMessage {
   tool_args: Record<string, unknown> | null;
   tool_result: unknown;
   created_at: string | null;
+  prompt_tokens?: number | null;
+  completion_tokens?: number | null;
 }
 
 export type AgentStreamEvent =
   | { type: "text_delta"; text: string }
   | { type: "tool_call"; tool_call_id: string; tool: string; args: Record<string, unknown> }
   | { type: "tool_result"; tool_call_id: string; tool: string; result: unknown }
-  | { type: "done"; content: string }
+  | {
+      type: "done";
+      content: string;
+      prompt_tokens?: number | null;
+      completion_tokens?: number | null;
+    }
   | { type: "error"; detail: string };
+
+/** Compact token count: 890, 12.4k, 1.2M. */
+export function formatTokenCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
+  return String(n);
+}
 
 /** Map a backend FilterSpec onto the Explorer's EventFilters (camelCase). */
 export function specToEventFilters(spec: AgentFilterSpec): EventFilters {

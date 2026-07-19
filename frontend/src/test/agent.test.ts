@@ -5,7 +5,7 @@
  * the filter set the agent ran.
  */
 import { describe, expect, it } from "vitest";
-import { specToEventFilters, type AgentFilterSpec } from "@/api/agent";
+import { specToEventFilters, formatTokenCount, type AgentFilterSpec } from "@/api/agent";
 import { filtersToParams, paramsToFilters } from "@/lib/queryParams";
 import { computeEffectiveFilters, overlaysFromApplied } from "@/lib/effectiveFilters";
 import type { EventFilters } from "@/api/types";
@@ -172,5 +172,13 @@ describe("agent finding apply → effective filters", () => {
       collapseRoutine: false,
     });
     expect(effective.ids).toEqual(["a", "b"]);
+  });
+});
+
+describe("formatTokenCount", () => {
+  it("formats plain, k and M", () => {
+    expect(formatTokenCount(890)).toBe("890");
+    expect(formatTokenCount(12400)).toBe("12.4k");
+    expect(formatTokenCount(1200000)).toBe("1.2M");
   });
 });

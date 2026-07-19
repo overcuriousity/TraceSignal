@@ -14,6 +14,7 @@ import { Plus, Send, Sparkles, Square, Trash2, Wrench, X } from "lucide-react";
 
 import {
   agentApi,
+  formatTokenCount,
   type AgentFilterSpec,
   type AgentMessage,
   type AgentStreamEvent,
@@ -38,7 +39,13 @@ interface Props {
 /** One renderable chat item, unified over persisted rows and live stream events. */
 type ChatItem =
   | { kind: "user"; content: string }
-  | { kind: "assistant"; content: string; streaming?: boolean }
+  | {
+      kind: "assistant";
+      content: string;
+      streaming?: boolean;
+      promptTokens?: number | null;
+      completionTokens?: number | null;
+    }
   | { kind: "tool"; tool: string; args?: Record<string, unknown> | null }
   | {
       kind: "finding";
@@ -55,7 +62,14 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
     if (m.role === "user") {
       items.push({ kind: "user", content: m.content });
     } else if (m.role === "assistant") {
-      if (m.content) items.push({ kind: "assistant", content: m.content });
+      if (m.content) {
+        items.push({
+          kind: "assistant",
+          content: m.content,
+          promptTokens: m.prompt_tokens,
+          completionTokens: m.completion_tokens,
+        });
+      }
     } else if (m.role === "tool" && m.tool_args) {
       // Tool rows come in pairs (call with args, then result); render on the
       // call row and let the result row pass silently.
@@ -82,9 +96,14 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
 function itemsFromStream(events: AgentStreamEvent[]): ChatItem[] {
   const items: ChatItem[] = [];
   let text = "";
+  let promptTokens: number | null | undefined;
+  let completionTokens: number | null | undefined;
   for (const e of events) {
     if (e.type === "text_delta") {
       text += e.text;
+    } else if (e.type === "done") {
+      promptTokens = e.prompt_tokens;
+      completionTokens = e.completion_tokens;
     } else if (e.type === "tool_call") {
       if (text) {
         items.push({ kind: "assistant", content: text });
@@ -111,7 +130,15 @@ function itemsFromStream(events: AgentStreamEvent[]): ChatItem[] {
     // "tool_result" rows stay invisible (results feed the model, not the
     // analyst); "done" is handled by the caller via query invalidation.
   }
-  if (text) items.push({ kind: "assistant", content: text, streaming: true });
+  if (text) {
+    items.push({
+      kind: "assistant",
+      content: text,
+      streaming: true,
+      promptTokens,
+      completionTokens,
+    });
+  }
   return items;
 }
 
@@ -236,6 +263,16 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
     ...liveItems,
   ];
 
+  // Conversation-wide token total, summed across persisted (loaded) messages.
+  const loadedMessages = conversationQuery.data?.messages ?? [];
+  let totalPromptTokens = 0;
+  let totalCompletionTokens = 0;
+  for (const m of loadedMessages) {
+    if (m.prompt_tokens != null) totalPromptTokens += m.prompt_tokens;
+    if (m.completion_tokens != null) totalCompletionTokens += m.completion_tokens;
+  }
+  const showTokenTotal = totalPromptTokens + totalCompletionTokens > 0;
+
   return (
     <div
       className="flex shrink-0 flex-col overflow-hidden border-l border-[var(--color-border)] bg-[var(--color-bg-surface)]"
@@ -246,6 +283,12 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
       <div className="flex shrink-0 items-center gap-1.5 border-b border-[var(--color-border)] px-2.5 py-1.5">
         <Sparkles size={14} className="shrink-0 text-[var(--color-accent)]" />
         <span className="text-sm font-semibold">Agent</span>
+        {showTokenTotal && (
+          <span className="shrink-0 text-[10px] text-[var(--color-fg-secondary)]">
+            Σ {formatTokenCount(totalPromptTokens)} in / {formatTokenCount(totalCompletionTokens)}{" "}
+            out
+          </span>
+        )}
         <select
           className="ml-1 min-w-0 flex-1 truncate rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] px-1.5 py-0.5 text-xs"
           value={activeId ?? ""}
@@ -313,6 +356,12 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
               >
                 <Markdown content={item.content} />
                 {item.streaming && <span className="animate-pulse">▌</span>}
+                {item.promptTokens != null && item.completionTokens != null && (
+                  <div className="mt-1 text-[10px] text-[var(--color-fg-secondary)]">
+                    {formatTokenCount(item.promptTokens)} in /{" "}
+                    {formatTokenCount(item.completionTokens)} out
+                  </div>
+                )}
               </div>
             );
           }

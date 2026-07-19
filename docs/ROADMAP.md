@@ -275,14 +275,6 @@ exposure of the identical tool server (`VESTIGO_MCP_ENABLED`, default off). See
   array would silently skip the audit row. Currently safe because the MCP SDK's streamable
   HTTP transport rejects JSON-RPC batch arrays outright (removed in the 2025-06-18 MCP
   spec) — revisit if the SDK ever reintroduces batching support.
-- [ ] **A6 — Token-usage metering.** No usage data is captured today; local-LLM sizing
-  advice is estimated, not measured. pydantic-ai exposes per-run token counts — stamp
-  prompt/completion tokens per turn into `agent_messages` (or the conversation row) and
-  surface them in the panel. Estimated shape today (from `tools.py` result budgets):
-  3–5k fixed prompt (system + 20 tool schemas), 3–8k per `search_events` result, up to
-  15 round-trips replaying full history — heavy turns plausibly 30–100k prompt tokens.
-  llama.cpp-class local endpoints are viable (ollama already the documented example) but
-  need a tool-calling-capable ≥14B model, ≥32k context, and prompt caching for latency.
 - [ ] **A7 — Agent config in the admin interface.** Move `VESTIGO_AGENT_*` runtime
   selection (model, provider, base URL, API key, user agent, extra headers, max turns)
   into a DB-backed settings page under the existing admin UI, with **env always winning**
