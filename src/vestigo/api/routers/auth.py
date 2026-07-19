@@ -167,6 +167,23 @@ async def get_me(user: User = Depends(get_current_user)) -> dict[str, Any]:
     return {"user": _user_response(user, await _teams_for_user(user))}
 
 
+@router.get("/users")
+async def list_user_directory(user: User = Depends(get_current_user)) -> dict[str, Any]:
+    """Minimal user directory (id, username, display name) for any signed-in user.
+
+    Lets the UI render human names wherever records carry a user id
+    (annotations `created_by`, saved views, dispositions) — a collaboration
+    tool must show who did what by name, not by opaque id. Deliberately no
+    roles, activity, or admin detail: that stays on the admin-only listing.
+    """
+    rows = await get_store().list_users()
+    return {
+        "users": [
+            {"id": u.id, "username": u.username, "display_name": u.display_name} for u in rows
+        ]
+    }
+
+
 @router.patch("/me")
 async def update_me(
     payload: UpdateMeRequest, user: User = Depends(get_current_user)

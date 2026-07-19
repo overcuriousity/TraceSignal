@@ -227,3 +227,17 @@ describe("isAnalystAnnotation", () => {
     expect(isAnalystAnnotation({ ...base, origin: "system" } as never)).toBe(false);
   });
 });
+
+describe("buildUserNameMap", () => {
+  it("prefers display_name, falls back to username, resolver falls back to raw id", async () => {
+    const { buildUserNameMap, resolveUserName } = await import("../lib/userNames");
+    const map = buildUserNameMap([
+      { id: "user_1", username: "mmustermann", display_name: "Max Mustermann" },
+      { id: "user_2", username: "jdoe", display_name: null },
+    ]);
+    expect(resolveUserName(map, "user_1")).toBe("Max Mustermann");
+    expect(resolveUserName(map, "user_2")).toBe("jdoe");
+    expect(resolveUserName(map, "legacy-username")).toBe("legacy-username");
+    expect(resolveUserName(map, null)).toBe("anonymous");
+  });
+});

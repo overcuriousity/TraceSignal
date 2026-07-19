@@ -206,3 +206,18 @@ async def test_disabled_account_cannot_authenticate(client, admin_bootstrap, sto
     fresh = client.__class__(client.app)
     resp = fresh.post("/api/auth/login", json={"username": "disableme", "password": "abcdefgh12"})
     assert resp.status_code == 403
+
+
+def test_user_directory_requires_auth_and_maps_ids(client, admin_bootstrap):
+    resp = client.get("/api/auth/users")
+    assert resp.status_code == 401
+
+    as_admin(client, admin_bootstrap)
+    client.patch("/api/auth/me", json={"display_name": "Root Admin"})
+    resp = client.get("/api/auth/users")
+    assert resp.status_code == 200
+    users = resp.json()["users"]
+    admin_row = next(u for u in users if u["username"] == "admin")
+    assert admin_row["id"].startswith("user_")
+    assert admin_row["display_name"] == "Root Admin"
+    assert set(admin_row) == {"id", "username", "display_name"}

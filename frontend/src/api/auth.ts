@@ -9,6 +9,11 @@ export const authApi = {
 
   me: () => get<{ user: User }>("/auth/me").then((r) => r.user),
 
+  listUsers: () =>
+    get<{ users: import("../lib/userNames").DirectoryUser[] }>("/auth/users").then(
+      (r) => r.users,
+    ),
+
   updateProfile: (payload: {
     username?: string;
     display_name?: string;
