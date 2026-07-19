@@ -267,7 +267,7 @@ class ClickHouseStore:
         return host, port, secure, parsed.username, parsed.password
 
     @staticmethod
-    def _string_in_clause(prefix: str, values: list[str]) -> tuple[str, dict[str, str]]:
+    def string_in_clause(prefix: str, values: list[str]) -> tuple[str, dict[str, str]]:
         """Build a parameterized IN-list body and its bindings for String values.
 
         Returns ``("{p0:String}, {p1:String}, ...", {"p0": v0, ...})`` — the
@@ -723,7 +723,7 @@ class ClickHouseStore:
         if source_ids is not None:
             if not source_ids:
                 return 0
-            source_in, source_binds = self._string_in_clause("s", source_ids)
+            source_in, source_binds = self.string_in_clause("s", source_ids)
             conditions.append(f"source_id IN ({source_in})")
             parameters.update(source_binds)
         if conditions:
@@ -856,8 +856,8 @@ class ClickHouseStore:
         self.init_schema()
         # Build parameterized IN clauses (distinct prefixes so the bindings
         # don't collide in the merged parameters dict).
-        event_in, event_binds = self._string_in_clause("e", event_ids)
-        source_in, source_binds = self._string_in_clause("s", source_ids)
+        event_in, event_binds = self.string_in_clause("e", event_ids)
+        source_in, source_binds = self.string_in_clause("s", source_ids)
         parameters: dict[str, str] = {**event_binds, **source_binds, "case_id": case_id}
         result = self.client.query(
             f"""

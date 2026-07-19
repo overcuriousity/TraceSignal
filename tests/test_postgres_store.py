@@ -85,12 +85,22 @@ async def test_delete_case_removes_views_annotations_and_detector_runs(store):
     run = await store.create_detector_run(
         "c1", "t1", "value_novelty", params={}, result={"results": []}
     )
+    sigma_rule = await store.create_sigma_rule(
+        case_id="c1",
+        rule_key="ab" * 16,
+        title="rule",
+        yaml_content="title: rule",
+        content_hash="cd" * 32,
+    )
+    sigma_run = await store.create_sigma_run("c1", "t1", params={})
 
     assert await store.delete_case("c1") is True
 
     assert await store.get_view("c1", "v1") is None
     assert await store.list_annotations("c1", "s1", "e1") == []
     assert await store.get_detector_run("c1", run.id) is None
+    assert await store.get_sigma_rule("c1", sigma_rule.id) is None
+    assert await store.get_sigma_run("c1", sigma_run.id) is None
 
 
 @pytest.mark.asyncio
@@ -211,6 +221,9 @@ async def test_init_schema_adopts_pre_alembic_db(tmp_path):
         # drop everything later revisions add, or the upgrade would collide.
         await conn.execute(text("DROP TABLE baseline_definitions"))
         await conn.execute(text("DROP TABLE finding_dispositions"))
+        # 0006 adds the Sigma runner tables.
+        await conn.execute(text("DROP TABLE sigma_rules"))
+        await conn.execute(text("DROP TABLE sigma_runs"))
         await conn.execute(text("ALTER TABLE sources DROP COLUMN time_offset_seconds"))
         # 0005 adds completed_source_ids to the enrichment job-run marker.
         await conn.execute(text("ALTER TABLE enrichment_job_runs DROP COLUMN completed_source_ids"))
