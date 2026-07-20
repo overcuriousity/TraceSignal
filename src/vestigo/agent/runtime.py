@@ -53,7 +53,7 @@ from pydantic_ai.usage import UsageLimits
 
 from vestigo.agent.availability import probe_headers
 from vestigo.agent.config import AgentConfig, is_kimi_coding_endpoint, resolve_agent_config
-from vestigo.agent.tools import AgentScope, build_tool_server
+from vestigo.agent.tools import SPEC_REFERENCE, AgentScope, build_tool_server
 
 LLM_TIMEOUT = 300.0
 
@@ -165,7 +165,22 @@ Be concise. State negative results — a falsified hypothesis is a real result
 and belongs in the answer. If the tools return nothing conclusive, say so and
 name what data would be needed; never fill the gap with plausible
 reconstruction.
+
+## Reading tabular results
+
+Tables come back column-header-once: `{"columns": ["value", "count"], "rows":
+[["alice", 12], ["bob", 3]]}` means value=alice count=12, value=bob count=3.
+Read each row positionally against `columns`. Nothing is abbreviated — the
+values are exactly what the query returned. `field_timeseries` additionally
+hoists the shared time axis into `bucket_starts`, and each series' `counts`
+array lines up with it index by index.
+
 """
+
+# The shared spec models' per-field prose is stripped from the tool schemas,
+# where it was being resent a dozen times per request, and paid once here
+# instead (A13). Generated from the models — see agent/schema_slim.py.
+SYSTEM_PROMPT += SPEC_REFERENCE
 
 
 class KimiAnthropicModel(AnthropicModel):

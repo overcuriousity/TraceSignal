@@ -1,6 +1,84 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-20 (session 77 — PR142 second review round, merged to main).
+Last updated: 2026-07-20 (session 78 — A13 context-overhead reduction, release 1.4.1).
+
+## Session 78 — 2026-07-20: A13 — halving the agent's per-request context (release 1.4.1)
+
+Roadmap A13, all three levers, closing the item. The premise: tool schemas and
+the system prompt are resent with *every* model request, so their size is a
+per-request tax rather than a one-off. Measured first, before touching
+anything — the 28 tool schemas serialized to **69,382 chars (~17.3k tokens)**,
+over half a 32k local-model window before the analyst had typed a word.
+`FilterSpec` alone (3.8k chars) was re-serialized into 12 tools; `propose_chart`
+cost 11.4k on its own.
+
+**(a) Schema slimming + prose relocation** — new `agent/schema_slim.py`.
+Mechanical slimming (drop pydantic's `title`, collapse `anyOf[T, null]`, drop
+`default: null`) took 22% off. The rest came from *relocating* the repeated
+`$defs` prose: `FilterSpec`/`ChartSpec` field descriptions were being paid
+twelve times per request, and are now rendered once into `SYSTEM_PROMPT` by
+`spec_reference_block`. Relocated, never deleted — descriptions are what a
+small model uses to pick a tool, so the block is **generated from the models'
+own `Field(description=...)` values** and can't drift from them. Result:
+69,382 → **32,994 chars (−52%)**.
+
+The transform targets `Tool.parameters` (what `tools/list` advertises) and not
+`Tool.fn_metadata` (what FastMCP validates against) — we advertise slim and
+validate full. It lives in `build_tool_server` rather than a pydantic-ai schema
+transformer so it applies identically across providers (the OpenAI profile
+already strips `title`; the Anthropic profile strips nothing) and covers the
+external `/mcp` surface.
+
+The first version of `slim_schema` had a real bug worth recording: it stripped
+every key named `title`, including the **parameter named `title`** that
+`propose_finding` and `propose_chart` take — leaving those tools advertising a
+`required: ["title", ...]` whose property no longer existed. The fix is to treat
+`properties`/`$defs` as name→schema maps whose keys are user data. There was no
+test asserting anything about generated schemas at all, which is exactly why
+the overhead had been free to grow; `tests/test_agent_schema.py` now covers the
+transform, the callability round-trip, and a **40,000-char budget guard**.
+
+**(b) Tool profiles** — `ToolInfo.tier` (`core`/`extended`), surfaced on
+`GET /api/agent/info`, driving Core / All presets in the tool-selector
+popover. Deliberately *not* new state: a preset just computes a deny list and
+flows through the existing `users.preferences["agent_disabled_tools"]` path, so
+no migration. Because a disabled tool is removed from the request rather than
+stubbed, "Core" reclaims context directly — 11 tools, **15,291 chars (~3.8k
+tokens)**, and a total fixed overhead of ~6.6k tokens including the prompt.
+
+**(c) Compact tool-result encoding** — new `agent/encoding.py`. Results live in
+the persisted history and are resent on every later turn, so their cost
+compounds; dict-per-row lists were repeating each key name once per row.
+`columnar`/`columnar_auto` state the columns once and return rows positionally.
+The biggest single win was `field_timeseries`, where all series share one time
+axis: hoisting it into `bucket_starts` took a capped 8×60 result from 26,054 to
+4,175 chars (−84%). `field_terms` −32%, `field_pivot` −44%, `time_punchcard`
+−65%, `search_events` −31%.
+
+Three constraints shaped this. Values pass through **byte-identical** — a
+forensic result must stay reproducible, so this is a reshaping and the existing
+`MAX_*` caps remain the only lossy step. Each result carries its own `columns`
+legend rather than relying on a convention in the prompt, because persisted
+history is replayed verbatim with no migration hook: one conversation can hold
+both old dict-shaped and new columnar results, so every result has to be
+readable on its own terms. And the re-encoding happens at the agent boundary
+(`_columnize` in `agent/tools.py`), never in `db/queries.py` — those same
+methods serve the Explorer and Visualize HTTP APIs, whose shapes the frontend
+depends on. Checked before changing anything: the frontend reads exactly two
+tool-result keys (`propose_annotation`'s `proposal_id`, `propose_chart`'s
+`ok`), both untouched, so this is invisible to the UI.
+
+Two incidental findings, both folded in. `FastMCP(instructions=...)` is never
+sent on the internal path — `MCPToolset` needs `include_instructions=True` — so
+it only ever reached external `/mcp` clients; kept (it is genuinely their only
+steer) and commented so it isn't mistaken for the agent's live instructions.
+And six metadata list tools returned **unbounded** row lists into the history;
+they now cap at `MAX_LIST_ROWS = 200`.
+
+Released as **1.4.1**. Worth noting the semver stretch: the Core preset is a
+user-visible feature and the unreleased log already held five more, so this is
+a minor version's worth of change carried on a patch number at the maintainer's
+request.
 
 ## Session 77 — 2026-07-20: PR142 second review round — the two paths that missed the guard
 

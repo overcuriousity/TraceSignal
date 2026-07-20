@@ -36,6 +36,8 @@ from vestigo.agent.chart_meta import (
     metric_available,
     requires_field,
 )
+from vestigo.agent.encoding import columnar, columnar_auto
+from vestigo.agent.schema_slim import slim_tool_schema, spec_reference_block
 from vestigo.db._time_fields import TIME_FIELD_SPECS, resolve_time_field
 from vestigo.db.postgres import User
 from vestigo.db.queries import EventQuery, TagFilter
@@ -53,6 +55,11 @@ MAX_ATTRS_PER_EVENT = 40
 # Cap on propose_annotation's event_ids — keeps proposals focused/reviewable
 # and bounds the ClickHouse resolution query.
 MAX_PROPOSAL_EVENTS = 500
+
+# Cap for the metadata list tools (baselines, views, annotations, sigma runs,
+# dispositions). These were unbounded: a long-running case could push an
+# arbitrarily large blob into the history, where it is resent every turn.
+MAX_LIST_ROWS = 200
 
 # A9: viz-tool result caps — tighter than the Visualize page's own bounds
 # (e.g. field_scatter's UI cap is 20000 points, series_limit up to 50) since
@@ -81,29 +88,59 @@ class ToolInfo:
     embeddings_gated: bool = False
     # Only registered for in-app conversations (absent from external /mcp).
     requires_conversation: bool = False
+    # "core" tools make up the lean profile offered in the tool selector, for
+    # small-context local models: enough to run the investigation cycle in
+    # SYSTEM_PROMPT end to end (terrain -> aggregate -> search -> confirm ->
+    # propose). Everything else is "extended" — useful, but droppable when
+    # context is scarcer than capability. Purely a UI preset; disabling is
+    # still the analyst's per-conversation deny list.
+    tier: Literal["core", "extended"] = "extended"
 
 
 TOOL_REGISTRY: tuple[ToolInfo, ...] = (
-    ToolInfo("search_events", "Search events with Explorer-equivalent filters."),
-    ToolInfo("get_event", "Fetch a single event by its event_id (full attribute set)."),
-    ToolInfo("list_fields", "List queryable fields: fixed columns, attribute keys, time parts."),
-    ToolInfo("describe_field", "Probe one field: coverage, numeric-ness, suggested scale/charts."),
-    ToolInfo("list_artifacts", "List the distinct artifact types present in this timeline."),
-    ToolInfo("field_terms", "Top-N value distribution for a field, honoring optional filters."),
+    ToolInfo("search_events", "Search events with Explorer-equivalent filters.", tier="core"),
+    ToolInfo(
+        "get_event", "Fetch a single event by its event_id (full attribute set).", tier="core"
+    ),
+    ToolInfo(
+        "list_fields",
+        "List queryable fields: fixed columns, attribute keys, time parts.",
+        tier="core",
+    ),
+    ToolInfo(
+        "describe_field",
+        "Probe one field: coverage, numeric-ness, suggested scale/charts.",
+        tier="core",
+    ),
+    ToolInfo(
+        "list_artifacts", "List the distinct artifact types present in this timeline.", tier="core"
+    ),
+    ToolInfo(
+        "field_terms",
+        "Top-N value distribution for a field, honoring optional filters.",
+        tier="core",
+    ),
     ToolInfo("field_numeric_stats", "Summary stats + histogram for a numeric field."),
-    ToolInfo("histogram", "Time-bucketed event counts — the timeline's shape."),
-    ToolInfo("field_timeseries", "Per-value event counts bucketed over time for a field."),
+    ToolInfo("histogram", "Time-bucketed event counts — the timeline's shape.", tier="core"),
+    ToolInfo(
+        "field_timeseries", "Per-value event counts bucketed over time for a field.", tier="core"
+    ),
     ToolInfo("time_punchcard", "Event counts by day-of-week x hour-of-day (UTC)."),
     ToolInfo("field_pivot", "Top-X x top-Y co-occurrence count matrix for two fields."),
     ToolInfo("field_scatter", "Random sample of (x, y) numeric value pairs for two fields."),
     ToolInfo("compare", "Compare two filtered layers (time/terms/numeric) of the same timeline."),
-    ToolInfo("run_anomaly_detector", "Run a statistical anomaly detector over the timeline."),
-    ToolInfo("propose_finding", "Propose a distilled finding card with applicable filters."),
+    ToolInfo(
+        "run_anomaly_detector", "Run a statistical anomaly detector over the timeline.", tier="core"
+    ),
+    ToolInfo(
+        "propose_finding", "Propose a distilled finding card with applicable filters.", tier="core"
+    ),
     ToolInfo("propose_chart", "Propose a chart card, validated by executing the underlying query."),
     ToolInfo(
         "propose_annotation",
         "Propose tagging/commenting specific events — the analyst must confirm.",
         requires_conversation=True,
+        tier="core",
     ),
     ToolInfo(
         "semantic_search",
@@ -368,6 +405,14 @@ class ChartSpec(BaseModel):
         return data
 
 
+# The per-field prose that `_apply_schema_slimming` strips out of the repeated
+# `$defs`, rendered once for the system prompt (A13). Generated from the models
+# above, so it cannot drift from them.
+SPEC_REFERENCE: str = spec_reference_block(
+    (FilterSpec, ChartSpec, ChartCompareSpec, ChartOptionsSpec)
+)
+
+
 @dataclass
 class AgentScope:
     """Frozen case/timeline scope a tool server operates in."""
@@ -411,6 +456,67 @@ def _truncate(value: Any, limit: int) -> Any:
     if isinstance(value, str) and len(value) > limit:
         return value[:limit] + "…"
     return value
+
+
+def _columnize(result: Any, *keys: str) -> Any:
+    """Re-encode named list-of-dict fields of a tool result columnar (A13).
+
+    Applied at the agent boundary rather than inside ``EventQueryService``:
+    the same methods serve the Explorer and Visualize HTTP APIs, whose
+    response shapes the frontend depends on. Only the model's copy changes.
+
+    Values are untouched — see ``agent/encoding.py`` for why this is a
+    reshaping and not a truncation.
+    """
+    if not isinstance(result, dict):
+        return result
+    out = dict(result)
+    for key in keys:
+        rows = out.get(key)
+        if isinstance(rows, list) and rows and all(isinstance(row, dict) for row in rows):
+            out[key] = columnar_auto(rows)
+    return out
+
+
+def _compact_timeseries(result: Any) -> Any:
+    """Hoist a timeseries' shared bucket starts out of its per-series rows.
+
+    ``field_value_timeseries`` repeats the same bucket start timestamp in
+    every series — up to 8 series x 60 buckets = 480 copies of ~30 chars.
+    The starts are identical across series by construction, so state them
+    once as ``bucket_starts`` and give each series a bare count array
+    positionally aligned to it. Lossless, and it takes the dominant term out
+    of the result.
+
+    Bails out unchanged if the series ever disagree on their starts, so a
+    future change to the query can't make this silently drop data.
+    """
+    if not isinstance(result, dict):
+        return result
+    series = result.get("series")
+    if not isinstance(series, list) or not series:
+        return result
+
+    starts: list[Any] | None = None
+    counts: list[dict[str, Any]] = []
+    for entry in series:
+        if not isinstance(entry, dict) or not isinstance(entry.get("buckets"), list):
+            return result
+        entry_starts = [b.get("start") for b in entry["buckets"] if isinstance(b, dict)]
+        if len(entry_starts) != len(entry["buckets"]):
+            return result
+        if starts is None:
+            starts = entry_starts
+        elif entry_starts != starts:
+            return result
+        counts.append(
+            {"value": entry.get("value"), "counts": [b.get("count") for b in entry["buckets"]]}
+        )
+
+    out = dict(result)
+    out["bucket_starts"] = starts or []
+    out["series"] = columnar(counts, ["value", "counts"])
+    return out
 
 
 def _slim_annotation(row: Any) -> dict[str, Any]:
@@ -543,6 +649,9 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         _validate_regex,
     )
 
+    # These instructions reach *external* MCP clients only. pydantic-ai's
+    # MCPToolset does not forward them (it needs include_instructions=True),
+    # so the in-app agent is steered entirely by runtime.SYSTEM_PROMPT.
     server = FastMCP(
         "vestigo-investigation",
         instructions=(
@@ -650,7 +759,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         return {
             "total": page.total,
             "returned": len(page.events),
-            "events": [_slim_event(e) for e in page.events],
+            "events": columnar_auto([_slim_event(e) for e in page.events]),
         }
 
     @server.tool()
@@ -798,21 +907,24 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         """
         spec = _validated(filters)
         query = await _build_query(scope, spec)
-        return await run_in_threadpool(service.field_terms, query, field, max(1, min(limit, 100)))
+        result = await run_in_threadpool(service.field_terms, query, field, max(1, min(limit, 100)))
+        return _columnize(result, "values")
 
     @server.tool()
     async def field_numeric_stats(field: str, filters: FilterSpec | None = None) -> dict[str, Any]:
         """Summary stats + fixed-width histogram for a numeric field. count==0 means non-numeric."""
         spec = _validated(filters)
         query = await _build_query(scope, spec)
-        return await run_in_threadpool(service.field_numeric_stats, query, field)
+        result = await run_in_threadpool(service.field_numeric_stats, query, field)
+        return _columnize(result, "bins")
 
     @server.tool()
     async def histogram(filters: FilterSpec | None = None, buckets: int = 48) -> dict[str, Any]:
         """Time-bucketed event counts honoring optional filters — the timeline's shape."""
         spec = _validated(filters)
         query = await _build_query(scope, spec)
-        return await run_in_threadpool(service.histogram, query, min(max(buckets, 4), 120))
+        result = await run_in_threadpool(service.histogram, query, min(max(buckets, 4), 120))
+        return _columnize(result, "buckets")
 
     @server.tool()
     async def field_timeseries(
@@ -830,20 +942,22 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         """
         spec = _validated(filters)
         query = await _build_query(scope, spec)
-        return await run_in_threadpool(
+        result = await run_in_threadpool(
             service.field_value_timeseries,
             query,
             field,
             min(max(buckets, 4), VIZ_TIMESERIES_MAX_BUCKETS),
             max(1, min(series_limit, VIZ_TIMESERIES_MAX_SERIES)),
         )
+        return _compact_timeseries(result)
 
     @server.tool()
     async def time_punchcard(filters: FilterSpec | None = None) -> dict[str, Any]:
         """Event counts by (day-of-week x hour-of-day), UTC — surfaces weekly/daily rhythm."""
         spec = _validated(filters)
         query = await _build_query(scope, spec)
-        return await run_in_threadpool(service.time_punchcard, query)
+        result = await run_in_threadpool(service.time_punchcard, query)
+        return _columnize(result, "cells")
 
     @server.tool()
     async def field_pivot(
@@ -860,7 +974,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         """
         spec = _validated(filters)
         query = await _build_query(scope, spec)
-        return await run_in_threadpool(
+        result = await run_in_threadpool(
             service.field_pivot,
             query,
             field_x,
@@ -868,6 +982,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             max(1, min(limit_x, VIZ_PIVOT_MAX_LIMIT)),
             max(1, min(limit_y, VIZ_PIVOT_MAX_LIMIT)),
         )
+        return _columnize(result, "cells")
 
     @server.tool()
     async def field_scatter(
@@ -1433,15 +1548,17 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         rows = await get_store().list_baseline_definitions(scope.case_id, scope.timeline_id)
         return {
             "total": len(rows),
-            "baselines": [
-                {
-                    "id": r.id,
-                    "name": r.name,
-                    **r.windows_payload(),
-                    "created_by": r.created_by,
-                }
-                for r in rows
-            ],
+            "baselines": columnar_auto(
+                [
+                    {
+                        "id": r.id,
+                        "name": r.name,
+                        **r.windows_payload(),
+                        "created_by": r.created_by,
+                    }
+                    for r in rows[:MAX_LIST_ROWS]
+                ]
+            ),
         }
 
     @server.tool()
@@ -1466,20 +1583,22 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         )
         return {
             "total": len(rows),
-            "dispositions": [
-                {
-                    "id": r.id,
-                    "kind": r.kind,
-                    "detector": r.detector,
-                    "field": r.field,
-                    "value": _truncate(r.value, ATTR_VALUE_TRUNCATE),
-                    "source_id": r.source_id,
-                    "event_id": r.event_id,
-                    "note": _truncate(r.note, MESSAGE_TRUNCATE),
-                    "created_by": r.created_by,
-                }
-                for r in rows
-            ],
+            "dispositions": columnar_auto(
+                [
+                    {
+                        "id": r.id,
+                        "kind": r.kind,
+                        "detector": r.detector,
+                        "field": r.field,
+                        "value": _truncate(r.value, ATTR_VALUE_TRUNCATE),
+                        "source_id": r.source_id,
+                        "event_id": r.event_id,
+                        "note": _truncate(r.note, MESSAGE_TRUNCATE),
+                        "created_by": r.created_by,
+                    }
+                    for r in rows[:MAX_LIST_ROWS]
+                ]
+            ),
         }
 
     @server.tool()
@@ -1490,10 +1609,12 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         rows = await get_store().list_views(scope.case_id)
         return {
             "total": len(rows),
-            "views": [
-                {"id": r.id, "name": r.name, "query": r.query, "filter": r.view_filter or {}}
-                for r in rows
-            ],
+            "views": columnar_auto(
+                [
+                    {"id": r.id, "name": r.name, "query": r.query, "filter": r.view_filter or {}}
+                    for r in rows[:MAX_LIST_ROWS]
+                ]
+            ),
         }
 
     @server.tool()
@@ -1511,7 +1632,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             rows = [r for r in rows if r.annotation_type == annotation_type]
         return {
             "total": len(rows),
-            "annotations": [_slim_annotation(r) for r in rows[:200]],
+            "annotations": columnar_auto([_slim_annotation(r) for r in rows[:MAX_LIST_ROWS]]),
         }
 
     @server.tool()
@@ -1522,7 +1643,10 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         if source_id not in scope.source_ids:
             return {"error": f"source {source_id} is not part of this timeline"}
         rows = await get_store().list_annotations(scope.case_id, source_id, event_id)
-        return {"total": len(rows), "annotations": [_slim_annotation(r) for r in rows]}
+        return {
+            "total": len(rows),
+            "annotations": columnar_auto([_slim_annotation(r) for r in rows[:MAX_LIST_ROWS]]),
+        }
 
     @server.tool()
     async def list_sigma_rules() -> dict[str, Any]:
@@ -1550,7 +1674,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                     "enabled": row.enabled,
                 }
             )
-        return {"total": len(rules), "rules": rules}
+        return {"total": len(rules), "rules": columnar_auto(rules[:MAX_LIST_ROWS])}
 
     @server.tool()
     async def get_sigma_rule(rule_id: str) -> dict[str, Any]:
@@ -1570,17 +1694,19 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         rows = await get_store().list_sigma_runs(scope.case_id, timeline_id=scope.timeline_id)
         return {
             "total": len(rows),
-            "runs": [
-                {
-                    "id": r.id,
-                    "status": r.status,
-                    "created_by": r.created_by,
-                    "created_at": r.created_at.isoformat() if r.created_at else None,
-                    "completed_at": r.completed_at.isoformat() if r.completed_at else None,
-                    "rule_count": len(r.results or []),
-                }
-                for r in rows
-            ],
+            "runs": columnar_auto(
+                [
+                    {
+                        "id": r.id,
+                        "status": r.status,
+                        "created_by": r.created_by,
+                        "created_at": r.created_at.isoformat() if r.created_at else None,
+                        "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+                        "rule_count": len(r.results or []),
+                    }
+                    for r in rows[:MAX_LIST_ROWS]
+                ]
+            ),
         }
 
     @server.tool()
@@ -1609,4 +1735,24 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         for name in scope.disabled_tools & registered:
             server.remove_tool(name)
 
+    _apply_schema_slimming(server)
+
     return server
+
+
+def _apply_schema_slimming(server: FastMCP) -> None:
+    """Replace each tool's advertised parameter schema with a slimmed one (A13).
+
+    Rewriting ``Tool.parameters`` changes what ``tools/list`` reports without
+    touching ``Tool.fn_metadata``, which is what FastMCP actually validates
+    call arguments against — so this shrinks the prompt, never the contract.
+
+    Done here rather than via a pydantic-ai schema transformer so it applies
+    identically across providers (the OpenAI profile already strips ``title``,
+    the Anthropic one strips nothing) and to the external ``/mcp`` surface.
+    """
+    # The only internal-attribute reach in this module; a test guards it
+    # against an MCP SDK bump.
+    manager = server._tool_manager
+    for tool in manager.list_tools():
+        tool.parameters = slim_tool_schema(tool.parameters)

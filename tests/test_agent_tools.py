@@ -44,6 +44,15 @@ async def _call(server, name: str, args: dict[str, Any] | None = None) -> Any:
     return json.loads(result.content[0].text)
 
 
+def _rows(payload: Any) -> list[dict[str, Any]]:
+    """Decode a columnar tool payload back to dict rows (see agent/encoding.py).
+
+    Tabular results are sent to the model column-header-once (A13); tests
+    assert against the decoded rows, which also exercises the round trip.
+    """
+    return [dict(zip(payload["columns"], row, strict=True)) for row in payload["rows"]]
+
+
 async def test_list_baselines_returns_timeline_definitions(store):
     await store.init_schema()
     await store.create_baseline_definition(
@@ -72,7 +81,7 @@ async def test_list_baselines_returns_timeline_definitions(store):
     server = build_tool_server(_scope("c1", "t1"))
     result = await _call(server, "list_baselines")
     assert result["total"] == 1
-    (b,) = result["baselines"]
+    (b,) = _rows(result["baselines"])
     assert b["name"] == "normal week"
     assert b["id"]
     assert b["baseline"]["start"].startswith("2026-01-01")
@@ -93,7 +102,7 @@ async def test_list_dispositions_scoped_and_filtered(store):
     server = build_tool_server(_scope("c1", "t1"))
     result = await _call(server, "list_dispositions", {"kind": "normal"})
     assert result["total"] == 1
-    assert result["dispositions"][0]["field"] == "user"
+    assert _rows(result["dispositions"])[0]["field"] == "user"
     everything = await _call(server, "list_dispositions")
     assert everything["total"] == 2
 
@@ -106,7 +115,7 @@ async def test_list_saved_views(store):
     server = build_tool_server(_scope("c1", "t1"))
     result = await _call(server, "list_saved_views")
     assert result["total"] == 1
-    view = result["views"][0]
+    view = _rows(result["views"])[0]
     assert view["name"] == "failed logins"
     assert view["query"] == "status:4625"
     assert view["filter"] == {"filters": {"status": ["4625"]}}
@@ -124,10 +133,10 @@ async def test_annotations_tools(store):
     assert listed["total"] == 2
     tags_only = await _call(server, "list_annotations", {"annotation_type": "tag"})
     assert tags_only["total"] == 1
-    assert tags_only["annotations"][0]["content"] == "suspicious"
+    assert _rows(tags_only["annotations"])[0]["content"] == "suspicious"
     single = await _call(server, "get_event_annotations", {"source_id": "s1", "event_id": "e2"})
     assert single["total"] == 1
-    assert single["annotations"][0]["created_by"] == "bob"
+    assert _rows(single["annotations"])[0]["created_by"] == "bob"
 
 
 async def test_sigma_rules_tools(store, monkeypatch):
@@ -157,7 +166,7 @@ async def test_sigma_rules_tools(store, monkeypatch):
     server = build_tool_server(_scope("c1", "t1"))
     listed = await _call(server, "list_sigma_rules")
     assert listed["total"] == 1
-    meta = listed["rules"][0]
+    meta = _rows(listed["rules"])[0]
     assert meta["title"] == "Suspicious PowerShell"
     assert "yaml_content" not in meta
 
@@ -191,8 +200,8 @@ async def test_sigma_runs_tools(store):
     server = build_tool_server(_scope("c1", "t1"))
     listed = await _call(server, "list_sigma_runs")
     assert listed["total"] == 1
-    assert listed["runs"][0]["status"] == "completed"
-    assert "results" not in listed["runs"][0]
+    assert _rows(listed["runs"])[0]["status"] == "completed"
+    assert "results" not in _rows(listed["runs"])[0]
 
     full = await _call(server, "get_sigma_run", {"run_id": run.id})
     assert full["results"][0]["match_count"] == 3
@@ -1183,6 +1192,11 @@ async def test_propose_annotation_records_proposal(store, monkeypatch):
         {"event_ids": ["e1", "e2"], "tag": "suspicious", "rationale": "clustered"},
     )
     assert result["status"] == "proposed" and result["event_count"] == 2
+    # AgentPanel reads exactly `proposal_id` off this result (and `ok` off
+    # propose_chart's) to render the proposal cards — the only two tool-result
+    # keys the frontend touches, so the columnar encoding (A13) must never
+    # reshape these two.
+    assert isinstance(result["proposal_id"], str) and result["proposal_id"]
     (p,) = await store.list_agent_proposals(conv.id)
     assert p.tag == "suspicious" and len(p.events) == 2
 
@@ -1258,6 +1272,38 @@ async def test_tool_registry_matches_registered_tools(store):
     async with FastMCPClient(server) as client:
         names = {t.name for t in await client.list_tools()}
     assert names == TOOL_NAMES
+
+
+def test_tool_tiers_are_valid_and_core_is_workable():
+    """The "core" tier is the lean profile offered to small-context models —
+    it has to be able to run the investigation cycle on its own, so guard the
+    tools that cycle depends on rather than just counting them."""
+    from vestigo.agent.tools import TOOL_NAMES, TOOL_REGISTRY
+
+    assert {t.tier for t in TOOL_REGISTRY} <= {"core", "extended"}
+    core = {t.name for t in TOOL_REGISTRY if t.tier == "core"}
+    # Terrain, aggregation, search, and both proposal paths must survive.
+    assert {"list_fields", "field_terms", "search_events", "propose_finding"} <= core
+    assert core < set(TOOL_NAMES), "core must be a strict subset, else it saves nothing"
+
+
+async def test_core_profile_is_a_real_context_saving(store):
+    """Disabling the extended tier must actually shrink what is advertised."""
+    import json
+
+    from vestigo.agent.tools import TOOL_REGISTRY
+
+    await store.init_schema()
+
+    async def advertised(disabled: frozenset[str]) -> int:
+        scope = _scope_with_conversation("c1", "t1", "conv1")
+        scope.disabled_tools = disabled
+        async with FastMCPClient(build_tool_server(scope)) as client:
+            tools = await client.list_tools()
+        return sum(len(json.dumps({"n": t.name, "s": t.inputSchema})) for t in tools)
+
+    extended = frozenset(t.name for t in TOOL_REGISTRY if t.tier != "core")
+    assert await advertised(extended) < await advertised(frozenset()) / 2
 
 
 async def test_disabled_tool_removed_from_server(store):
