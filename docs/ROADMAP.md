@@ -321,19 +321,28 @@ thinking capture as first-class messages, and full-thread JSON export — see
   output size vs. context budget — reuse the existing `_truncate`/cap conventions) and
   keeping the op set append-only so old conversations stay replayable. Lowest-friction,
   highest-fit agent-tool addition; can ship independently of (and before) A8.
-- [ ] **A13 — Shrink the per-request tool-schema overhead (small-context local models).**
+- [ ] **A13 — Shrink the per-request context overhead (small-context local models).**
   Measured 2026-07-20: the 27 tool schemas serialize to ~59k chars ≈ ~15k tokens (plus
   ~1.2k system prompt), resent with every model request — half a 32k local-model window
   before any conversation. The bulk is `FilterSpec`'s full JSON schema inlined into ~14
-  tools (heaviest: `propose_chart` ~1.6k tok, `compare` ~1.2k). Two independent levers:
+  tools (heaviest: `propose_chart` ~1.6k tok, `compare` ~1.2k). Three independent levers:
   (a) schema dedup/slimming — JSON-schema `$defs`/`$ref` sharing for `FilterSpec`/
   `ChartSpec` and tighter per-field descriptions could plausibly halve the overhead
   without dropping a tool (verify the configured provider/protocol actually accepts
-  `$ref` in tool schemas before committing); (b) "tool profile" presets — a lean core
-  set as a selectable default in the tool-selector popover, building on the existing
+  `$ref` in tool schemas; and slim with care — descriptions are what small models use to
+  *pick* tools, so keep the discriminating detail); (b) "tool profile" presets — a lean
+  core set as a selectable default in the tool-selector popover, building on the existing
   per-user-defaults layer (disabled tools are already *removed* from the request, not
-  stubbed, so profiles reclaim context directly). Re-measure and record the numbers in
-  `docs/AGENT.md` when either lands.
+  stubbed, so profiles reclaim context directly); (c) compact tool-result encoding —
+  results live in the history and are resent on every subsequent turn, and today's
+  dict-shaped row lists repeat every key name per row; a header-once columnar/delimited
+  encoding for tabular results (`field_terms`, `search_events`, pivot/timeseries rows)
+  preserves every value exactly (forensic requirement) while cutting the repetitive
+  structure — plausibly 30–50% off the result-heavy part of the history, stacking with
+  the existing row caps. Agent *prose* stays verbose by design: findings feed forensic
+  reports and the transcript is custody record — terse-output schemes (caveman-style)
+  were considered 2026-07-20 and rejected for the output side. Re-measure and record the
+  numbers in `docs/AGENT.md` when any lever lands.
 - ✅ **A9 — Agent-created visualizations (viz parity)** — shipped: five read tools
   (`field_timeseries`, `time_punchcard`, `field_pivot`, `field_scatter`, `compare`) plus
   `propose_chart` (`agent/tools.py`, validate-by-execute, no write); frontend `ChartSpec` →
