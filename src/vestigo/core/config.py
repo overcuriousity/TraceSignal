@@ -271,6 +271,15 @@ class Settings(BaseSettings):
     agent_reasoning_effort: str | None = Field(default=None, pattern="^(off|low|medium|high|max)$")
     # Seconds an availability probe result is cached before re-probing.
     agent_probe_ttl_seconds: float = Field(default=60.0, gt=0)
+    # Model context window in tokens. Unset = history auto-compaction off
+    # (the right number is model-specific, so it's an explicit opt-in).
+    agent_context_window: int | None = Field(default=None, ge=1024)
+    # Fraction of the context window at which older turns get summarized.
+    agent_compact_threshold: float | None = Field(default=None, gt=0.1, lt=1.0)
+    # Admin hard-deny tool list as a JSON array, e.g. '["semantic_search"]'.
+    # Removed from the tool server for the in-app agent AND the external
+    # /mcp transport; per-user/per-chat toggles can only restrict further.
+    agent_disabled_tools: list[str] | None = None
 
     # External MCP endpoint (/mcp): serves the same scoped tool server the
     # built-in agent uses over streamable HTTP, authenticated by scoped

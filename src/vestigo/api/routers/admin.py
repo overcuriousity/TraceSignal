@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from vestigo.agent.availability import reset_probe_cache
 from vestigo.agent.config import EFFORT_VALUES, resolve_agent_config
+from vestigo.agent.tools import TOOL_NAMES, TOOL_REGISTRY
 from vestigo.api.deps import get_store, require_admin
 from vestigo.api.uploads import receive_upload_to_tmp
 from vestigo.core.config import get_settings
@@ -32,6 +33,9 @@ _AGENT_SETTINGS_FIELDS: tuple[str, ...] = (
     "extra_headers",
     "max_turns",
     "reasoning_effort",
+    "context_window",
+    "compact_threshold",
+    "disabled_tools",
 )
 
 router = APIRouter(prefix="/api/admin", tags=["admin"], dependencies=[Depends(require_admin)])
@@ -520,6 +524,9 @@ class AgentSettingsUpdate(BaseModel):
     extra_headers: dict[str, str] | None = None
     max_turns: int | None = Field(default=None, ge=1, le=100)
     reasoning_effort: str | None = None
+    context_window: int | None = Field(default=None, ge=1024, le=10_000_000)
+    compact_threshold: float | None = Field(default=None, gt=0.1, lt=1.0)
+    disabled_tools: list[str] | None = None
 
     @field_validator(
         "model",
@@ -546,6 +553,16 @@ class AgentSettingsUpdate(BaseModel):
             raise ValueError(f"reasoning_effort must be one of {EFFORT_VALUES}")
         return value
 
+    @field_validator("disabled_tools")
+    @classmethod
+    def _validate_disabled_tools(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        unknown = sorted(set(value) - TOOL_NAMES)
+        if unknown:
+            raise ValueError(f"unknown tool name(s): {', '.join(unknown)}")
+        return sorted(set(value))
+
 
 async def _agent_settings_response() -> dict[str, Any]:
     """Build the GET/PUT response shape: effective config, sources, env pins.
@@ -568,6 +585,17 @@ async def _agent_settings_response() -> dict[str, Any]:
         "sources": dict(config.sources),
         "env_vars": env_vars,
         "secret_mode": get_settings().agent_secret_mode,
+        # Full tool catalog so the admin UI renders toggles without
+        # hardcoding tool names.
+        "tools": [
+            {
+                "name": t.name,
+                "description": t.description,
+                "embeddings_gated": t.embeddings_gated,
+                "requires_conversation": t.requires_conversation,
+            }
+            for t in TOOL_REGISTRY
+        ],
     }
 
 

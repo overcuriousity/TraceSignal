@@ -15,17 +15,26 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from pydantic_ai.exceptions import ModelHTTPError
 
+from vestigo import __version__
 from vestigo.agent.availability import agent_available
+from vestigo.agent.compaction import (
+    compact_history,
+    estimate_next_prompt_tokens,
+    should_compact,
+)
 from vestigo.agent.config import resolve_agent_config
 from vestigo.agent.runtime import dump_history, load_history, stream_turn
-from vestigo.agent.tools import build_scope
+from vestigo.agent.tools import TOOL_NAMES, TOOL_REGISTRY, build_scope
 from vestigo.api.deps import (
     get_current_user,
     get_store,
@@ -43,6 +52,10 @@ from vestigo.db.postgres import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/cases", tags=["agent"])
+
+# Non-case-scoped agent endpoints: the config disclosure behind the
+# new-conversation OPSEC notice, and per-user tool preferences.
+info_router = APIRouter(prefix="/api/agent", tags=["agent"])
 
 _AGENT_UNAVAILABLE_DETAIL = (
     "The AI agent is not available: configure VESTIGO_AGENT_MODEL and "
@@ -71,8 +84,23 @@ async def _require_conversation(
     return conversation
 
 
+def _validate_tool_names(value: list[str] | None) -> list[str] | None:
+    if value is None:
+        return None
+    unknown = sorted(set(value) - TOOL_NAMES)
+    if unknown:
+        raise ValueError(f"unknown tool name(s): {', '.join(unknown)}")
+    return sorted(set(value))
+
+
 class CreateConversationRequest(BaseModel):
     timeline_id: str = Field(..., min_length=1)
+    # Per-chat tool restriction chosen in the new-conversation dialog
+    # (user defaults + modal edits, already resolved client-side). Frozen on
+    # the conversation; the admin hard-deny list is unioned in per turn.
+    disabled_tools: list[str] | None = None
+
+    _check_tools = field_validator("disabled_tools")(_validate_tool_names)
 
 
 class SendMessageRequest(BaseModel):
@@ -102,6 +130,7 @@ async def create_conversation(
         payload.timeline_id,
         user.id,
         model_id=f"{config.provider}:{config.model}",
+        disabled_tools=payload.disabled_tools,
     )
     return conversation.to_dict()
 
@@ -135,6 +164,53 @@ async def get_conversation(
     return payload
 
 
+@router.get("/{case_id}/agent/conversations/{conversation_id}/export")
+async def export_conversation(
+    case_id: str,
+    conversation_id: str,
+    case: Case = Depends(require_case_read),
+    user: User = Depends(get_current_user),
+) -> Response:
+    """Export the full conversation as a JSON attachment.
+
+    Contains every message row (user/assistant/tool/thinking/compaction,
+    with tool args/results and measured token usage), the proposals, and
+    ``raw_history`` — the provider-wire pydantic-ai blob, the only place
+    thinking signatures and provider quirks live. Deliberately not gated on
+    ``_require_agent``: the record must stay exportable while the LLM
+    endpoint is down or unconfigured.
+    """
+    conversation = await _require_conversation(case_id, conversation_id, user)
+    store = get_store()
+    messages = await store.list_agent_messages(conversation_id)
+    proposals = await store.list_agent_proposals(conversation_id)
+    payload = {
+        "export_version": 1,
+        "exported_at": datetime.now(UTC).isoformat(),
+        "exported_by": user.username,
+        "vestigo_version": __version__,
+        "conversation": conversation.to_dict(),
+        "messages": [m.to_dict() for m in messages],
+        "proposals": [p.to_dict() for p in proposals],
+        "raw_history": conversation.history or [],
+    }
+    await store.record_audit(
+        action="agent.conversation_export",
+        actor=user,
+        case_id=case_id,
+        target_type="agent_conversation",
+        target_id=conversation_id,
+        detail={"message_count": len(messages)},
+    )
+    return Response(
+        content=json.dumps(payload, indent=2, default=str),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="agent-conversation-{conversation_id}.json"'
+        },
+    )
+
+
 @router.delete("/{case_id}/agent/conversations/{conversation_id}")
 async def delete_conversation(
     case_id: str,
@@ -150,6 +226,20 @@ async def delete_conversation(
 
 def _sse(event: dict[str, Any]) -> str:
     return f"data: {json.dumps(event, default=str)}\n\n"
+
+
+_CONTEXT_OVERFLOW_RE = re.compile(r"context|token|length|too (?:long|large)|maximum", re.IGNORECASE)
+
+
+def _is_context_overflow(exc: ModelHTTPError) -> bool:
+    """Best-effort detection of a context-window overflow across providers.
+
+    There is no standard error code — OpenAI-protocol endpoints answer 400
+    with "maximum context length"-style bodies, others vary — so this is a
+    heuristic: a 400/413 whose body mentions context/token/length terms.
+    False negatives just surface the generic model_error message.
+    """
+    return exc.status_code in (400, 413) and bool(_CONTEXT_OVERFLOW_RE.search(str(exc.body or "")))
 
 
 # Conversations with a turn currently streaming. Two concurrent turns on one
@@ -184,76 +274,187 @@ async def _message_stream_inner(
     if not conversation.title:
         await store.update_agent_conversation(conversation_id, title=payload.content[:_TITLE_MAX])
 
+    config = await resolve_agent_config()
+    # Admin hard-deny ∪ the restriction frozen on this conversation.
+    disabled_tools = frozenset(config.disabled_tools or ()) | frozenset(
+        conversation.disabled_tools or ()
+    )
     scope = await build_scope(
-        case_id, conversation.timeline_id, user, conversation_id=conversation.id
+        case_id,
+        conversation.timeline_id,
+        user,
+        conversation_id=conversation.id,
+        disabled_tools=disabled_tools,
     )
     history = load_history(conversation.history)
+    last_prompt, last_completion = await store.get_last_agent_usage(conversation_id)
+
+    async def _run_compaction(
+        current: list[Any], reason: str
+    ) -> tuple[list[Any], dict[str, Any]] | None:
+        """Compact, persist the forensic record, return (new_history, sse_event).
+
+        None means compaction wasn't possible (nothing old enough to fold,
+        or the summarizer call itself failed) — the caller falls through to
+        its error path.
+        """
+        try:
+            outcome = await compact_history(config, current)
+        except Exception:
+            logger.exception("History compaction failed (conversation %s)", conversation_id)
+            return None
+        if outcome is None:
+            return None
+        estimated = estimate_next_prompt_tokens(
+            last_prompt, last_completion, current, payload.content
+        )
+        # The append-only row keeps the summary AND the exact pre-compaction
+        # wire blob: the original full context stays reconstructible (and
+        # exportable) even though future turns replay the compacted history.
+        await store.add_agent_message(
+            conversation_id,
+            "compaction",
+            outcome.summary,
+            tool_result={
+                "reason": reason,
+                "messages_summarized": outcome.messages_summarized,
+                "estimated_tokens_before": estimated,
+                "pre_compaction_history": dump_history(current),
+            },
+        )
+        await store.update_agent_conversation(
+            conversation_id, history=dump_history(outcome.new_history)
+        )
+        await store.record_audit(
+            action="agent.compaction",
+            actor=user,
+            case_id=case_id,
+            target_type="agent_conversation",
+            target_id=conversation_id,
+            detail={"reason": reason, "messages_summarized": outcome.messages_summarized},
+        )
+        return outcome.new_history, {
+            "type": "compaction",
+            "summary": outcome.summary,
+            "reason": reason,
+        }
+
+    compacted = False
+    estimated = estimate_next_prompt_tokens(last_prompt, last_completion, history, payload.content)
+    if should_compact(config, estimated):
+        compaction = await _run_compaction(history, "threshold")
+        if compaction is not None:
+            history, compaction_event = compaction
+            compacted = True
+            yield _sse(compaction_event)
+
     text_parts: list[str] = []
-    try:
-        async for event in stream_turn(
-            scope,
-            user_text=payload.content,
-            history=history,
-            view_filters=payload.view_filters,
-        ):
-            if event["type"] == "result":
-                turn = event["turn"]
+    for attempt in (0, 1):
+        text_parts = []
+        try:
+            async for event in stream_turn(
+                scope,
+                user_text=payload.content,
+                history=history,
+                view_filters=payload.view_filters,
+            ):
+                if event["type"] == "result":
+                    turn = event["turn"]
+                    await store.add_agent_message(
+                        conversation_id,
+                        "assistant",
+                        turn.output_text,
+                        prompt_tokens=turn.prompt_tokens,
+                        completion_tokens=turn.completion_tokens,
+                    )
+                    await store.update_agent_conversation(
+                        conversation_id, history=dump_history(history + turn.new_messages)
+                    )
+                    yield _sse(
+                        {
+                            "type": "done",
+                            "content": turn.output_text,
+                            "prompt_tokens": turn.prompt_tokens,
+                            "completion_tokens": turn.completion_tokens,
+                        }
+                    )
+                    continue
+                if event["type"] == "text_delta":
+                    text_parts.append(event["text"])
+                elif event["type"] == "thinking":
+                    # One completed reasoning segment (thinking_delta events
+                    # streamed it live; this is the durable record). Model
+                    # prose, not a data access — no audit row.
+                    await store.add_agent_message(conversation_id, "thinking", event["text"])
+                elif event["type"] == "tool_call":
+                    await store.add_agent_message(
+                        conversation_id,
+                        "tool",
+                        tool_name=event["tool"],
+                        tool_args=event["args"],
+                    )
+                    # GET-style reads leave no middleware audit rows, so agent
+                    # tool calls get explicit ones — the custody trail must show
+                    # what the agent queried on whose behalf.
+                    await store.record_audit(
+                        action="agent.tool_call",
+                        actor=user,
+                        case_id=case_id,
+                        target_type="agent_conversation",
+                        target_id=conversation_id,
+                        detail={"tool": event["tool"], "args": event["args"]},
+                    )
+                elif event["type"] == "tool_result":
+                    await store.add_agent_message(
+                        conversation_id,
+                        "tool",
+                        tool_name=event["tool"],
+                        tool_result=event["result"],
+                    )
+                yield _sse(event)
+            return
+        except ModelHTTPError as exc:
+            overflow = _is_context_overflow(exc)
+            if overflow and attempt == 0 and not compacted:
+                # The threshold estimate lagged behind (tool-heavy turn) —
+                # compact now and retry once. Tool rows already persisted by
+                # this attempt stay: the record shows what actually ran.
+                compaction = await _run_compaction(history, "overflow")
+                if compaction is not None:
+                    history, compaction_event = compaction
+                    compacted = True
+                    yield _sse(compaction_event)
+                    continue
+            logger.exception("Agent turn failed (conversation %s)", conversation_id)
+            if text_parts:
                 await store.add_agent_message(
-                    conversation_id,
-                    "assistant",
-                    turn.output_text,
-                    prompt_tokens=turn.prompt_tokens,
-                    completion_tokens=turn.completion_tokens,
+                    conversation_id, "assistant", "".join(text_parts) + " [interrupted]"
                 )
-                await store.update_agent_conversation(
-                    conversation_id, history=dump_history(history + turn.new_messages)
+            if overflow:
+                detail = (
+                    "The conversation no longer fits the model's context window "
+                    "and could not be compacted further — start a new conversation."
                 )
-                yield _sse(
-                    {
-                        "type": "done",
-                        "content": turn.output_text,
-                        "prompt_tokens": turn.prompt_tokens,
-                        "completion_tokens": turn.completion_tokens,
-                    }
-                )
-                continue
-            if event["type"] == "text_delta":
-                text_parts.append(event["text"])
-            elif event["type"] == "tool_call":
-                await store.add_agent_message(
-                    conversation_id,
-                    "tool",
-                    tool_name=event["tool"],
-                    tool_args=event["args"],
-                )
-                # GET-style reads leave no middleware audit rows, so agent
-                # tool calls get explicit ones — the custody trail must show
-                # what the agent queried on whose behalf.
-                await store.record_audit(
-                    action="agent.tool_call",
-                    actor=user,
-                    case_id=case_id,
-                    target_type="agent_conversation",
-                    target_id=conversation_id,
-                    detail={"tool": event["tool"], "args": event["args"]},
-                )
-            elif event["type"] == "tool_result":
-                await store.add_agent_message(
-                    conversation_id,
-                    "tool",
-                    tool_name=event["tool"],
-                    tool_result=event["result"],
-                )
-            yield _sse(event)
-    except Exception:
-        logger.exception("Agent turn failed (conversation %s)", conversation_id)
-        # Persist whatever streamed before the failure so the record stays
-        # truthful, then tell the client.
-        if text_parts:
-            await store.add_agent_message(
-                conversation_id, "assistant", "".join(text_parts) + " [interrupted]"
+            else:
+                detail = f"The model endpoint rejected the request (HTTP {exc.status_code}) — see server logs."
+            yield _sse(
+                {
+                    "type": "error",
+                    "code": "context_overflow" if overflow else "model_error",
+                    "detail": detail,
+                }
             )
-        yield _sse({"type": "error", "detail": "Agent turn failed — see server logs."})
+            return
+        except Exception:
+            logger.exception("Agent turn failed (conversation %s)", conversation_id)
+            # Persist whatever streamed before the failure so the record stays
+            # truthful, then tell the client.
+            if text_parts:
+                await store.add_agent_message(
+                    conversation_id, "assistant", "".join(text_parts) + " [interrupted]"
+                )
+            yield _sse({"type": "error", "detail": "Agent turn failed — see server logs."})
+            return
 
 
 @router.post("/{case_id}/agent/conversations/{conversation_id}/messages")
@@ -411,3 +612,63 @@ async def reject_proposal(
         detail={"conversation_id": conversation_id},
     )
     return {"proposal": decided.to_dict()}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Agent info + per-user tool preferences (info_router, /api/agent)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class PreferencesUpdate(BaseModel):
+    disabled_tools: list[str] = Field(default_factory=list)
+
+    _check_tools = field_validator("disabled_tools")(_validate_tool_names)
+
+
+@info_router.get("/info")
+async def agent_info(user: User = Depends(get_current_user)) -> dict[str, Any]:
+    """Return the agent config any authenticated user may see, plus the tool catalog.
+
+    This deliberately discloses the configured model and API base URL to
+    non-admins: it powers the OPSEC notice shown before every conversation
+    ("evidence is sent to X, processed by Y"). The API key is never included.
+    """
+    await _require_agent()
+    config = await resolve_agent_config()
+    admin_disabled = set(config.disabled_tools or ())
+    prefs = user.preferences or {}
+    user_disabled = [
+        n for n in prefs.get("agent_disabled_tools", []) if isinstance(n, str) and n in TOOL_NAMES
+    ]
+    return {
+        "model": config.model,
+        "provider": config.provider,
+        "api_base_url": config.api_base_url,
+        "context_window": config.context_window,
+        "compact_threshold": config.compact_threshold,
+        "tools": [
+            {
+                "name": t.name,
+                "description": t.description,
+                "embeddings_gated": t.embeddings_gated,
+                "requires_conversation": t.requires_conversation,
+                "admin_disabled": t.name in admin_disabled,
+            }
+            for t in TOOL_REGISTRY
+        ],
+        "user_disabled_tools": user_disabled,
+    }
+
+
+@info_router.put("/preferences")
+async def update_agent_preferences(
+    payload: PreferencesUpdate, user: User = Depends(get_current_user)
+) -> dict[str, Any]:
+    """Persist the user's default tool selection for new conversations."""
+    updated = await get_store().update_user_preferences(
+        user.id, {"agent_disabled_tools": payload.disabled_tools}
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    prefs = updated.preferences or {}
+    return {"disabled_tools": prefs.get("agent_disabled_tools", [])}

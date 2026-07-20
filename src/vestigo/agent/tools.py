@@ -41,6 +41,61 @@ MAX_ATTRS_PER_EVENT = 40
 MAX_PROPOSAL_EVENTS = 500
 
 
+@dataclass(frozen=True)
+class ToolInfo:
+    """Catalog entry for one agent tool — drives toggle UIs and validation.
+
+    Must stay in sync with the ``@server.tool()`` registrations in
+    :func:`build_tool_server` (a registry-parity test enforces this).
+    """
+
+    name: str
+    description: str
+    # Registered but answers with an error when embeddings are off.
+    embeddings_gated: bool = False
+    # Only registered for in-app conversations (absent from external /mcp).
+    requires_conversation: bool = False
+
+
+TOOL_REGISTRY: tuple[ToolInfo, ...] = (
+    ToolInfo("search_events", "Search events with Explorer-equivalent filters."),
+    ToolInfo("get_event", "Fetch a single event by its event_id (full attribute set)."),
+    ToolInfo("list_fields", "List queryable fields: fixed columns and attribute keys."),
+    ToolInfo("list_artifacts", "List the distinct artifact types present in this timeline."),
+    ToolInfo("field_terms", "Top-N value distribution for a field, honoring optional filters."),
+    ToolInfo("field_numeric_stats", "Summary stats + histogram for a numeric field."),
+    ToolInfo("histogram", "Time-bucketed event counts — the timeline's shape."),
+    ToolInfo("run_anomaly_detector", "Run a statistical anomaly detector over the timeline."),
+    ToolInfo("propose_finding", "Propose a distilled finding card with applicable filters."),
+    ToolInfo(
+        "propose_annotation",
+        "Propose tagging/commenting specific events — the analyst must confirm.",
+        requires_conversation=True,
+    ),
+    ToolInfo(
+        "semantic_search",
+        "Find events semantically similar to free text (needs embeddings).",
+        embeddings_gated=True,
+    ),
+    ToolInfo(
+        "similar_events",
+        "Find events semantically similar to an existing event (needs embeddings).",
+        embeddings_gated=True,
+    ),
+    ToolInfo("list_baselines", "List saved baseline definitions (range + suspect windows)."),
+    ToolInfo("list_dispositions", "List analyst verdicts on anomaly findings."),
+    ToolInfo("list_saved_views", "List the analyst's saved filter views for this case."),
+    ToolInfo("list_annotations", "List annotations across this timeline's sources."),
+    ToolInfo("get_event_annotations", "List all annotations attached to one event."),
+    ToolInfo("list_sigma_rules", "List Sigma detection rules available to this case."),
+    ToolInfo("get_sigma_rule", "Fetch one Sigma rule including its full YAML content."),
+    ToolInfo("list_sigma_runs", "List past Sigma evaluations over this timeline."),
+    ToolInfo("get_sigma_run", "Fetch one Sigma run's full per-rule results."),
+)
+
+TOOL_NAMES: frozenset[str] = frozenset(t.name for t in TOOL_REGISTRY)
+
+
 class FilterSpec(BaseModel):
     """Event filters, mirroring the Explorer's filter shape.
 
@@ -123,10 +178,17 @@ class AgentScope:
     field_mappings: dict[str, list[str]] | None
     source_offsets: dict[str, int] | None
     conversation_id: str | None = None
+    # Tools removed from the server after registration (admin hard-deny plus
+    # any per-chat restriction) — invisible to the model, not error stubs.
+    disabled_tools: frozenset[str] = frozenset()
 
 
 async def build_scope(
-    case_id: str, timeline_id: str, user: User, conversation_id: str | None = None
+    case_id: str,
+    timeline_id: str,
+    user: User,
+    conversation_id: str | None = None,
+    disabled_tools: frozenset[str] = frozenset(),
 ) -> AgentScope:
     """Resolve the timeline's source scope once for a conversation turn."""
     from vestigo.api.routers.events import _resolve_timeline_scope
@@ -140,6 +202,7 @@ async def build_scope(
         field_mappings=field_mappings,
         source_offsets=source_offsets,
         conversation_id=conversation_id,
+        disabled_tools=disabled_tools,
     )
 
 
@@ -713,5 +776,15 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         if row is None or row.timeline_id != scope.timeline_id:
             return {"error": f"no sigma run with id {run_id} in this timeline"}
         return row.to_dict()
+
+    if scope.disabled_tools:
+        # Remove after registration rather than skipping registration: the
+        # closures stay uniform above, and the intersection guards names that
+        # were never registered for this scope (propose_annotation outside a
+        # conversation). A removed tool is absent from tools/list, so it never
+        # enters the model's prompt.
+        registered = {t.name for t in server._tool_manager.list_tools()}
+        for name in scope.disabled_tools & registered:
+            server.remove_tool(name)
 
     return server

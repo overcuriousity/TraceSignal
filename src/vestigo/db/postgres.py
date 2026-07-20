@@ -14,6 +14,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -357,6 +358,13 @@ class AgentSettingsRow(Base):
     extra_headers: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     max_turns: Mapped[int | None] = mapped_column(Integer, nullable=True)
     reasoning_effort: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Auto-compaction: model context window in tokens (None = compaction off)
+    # and the fraction of it at which history gets summarized.
+    context_window: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    compact_threshold: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Admin hard-deny tool list — removed from the tool server for the in-app
+    # agent AND the external /mcp transport; users cannot re-enable these.
+    disabled_tools: Mapped[list | None] = mapped_column(JSON, nullable=True)
     updated_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -380,6 +388,9 @@ class AgentSettingsRow(Base):
             "extra_headers": self.extra_headers,
             "max_turns": self.max_turns,
             "reasoning_effort": self.reasoning_effort,
+            "context_window": self.context_window,
+            "compact_threshold": self.compact_threshold,
+            "disabled_tools": self.disabled_tools,
             "updated_by": self.updated_by,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -1027,6 +1038,9 @@ class AgentConversation(Base):
     title: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     # Model identity snapshot (provider + model name) at creation time.
     model_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Per-chat tool restriction (user defaults + modal choice), frozen at
+    # creation — later preference edits never mutate an existing chat.
+    disabled_tools: Mapped[list | None] = mapped_column(JSON, nullable=True)
     history: Mapped[list | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -1049,6 +1063,7 @@ class AgentConversation(Base):
             "user_id": self.user_id,
             "title": self.title,
             "model_id": self.model_id,
+            "disabled_tools": self.disabled_tools,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -1214,6 +1229,10 @@ class User(Base):
     onboarding_completed: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    # Namespaced per-user preference blob (e.g. "agent_disabled_tools").
+    # A JSON column rather than a table: per-user singleton, never queried
+    # by value. Nothing secret lives here.
+    preferences: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
@@ -1239,6 +1258,7 @@ class User(Base):
             "must_change_password": self.must_change_password,
             "auth_provider": self.auth_provider,
             "onboarding_completed": self.onboarding_completed,
+            "preferences": self.preferences,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "last_login_at": self.last_login_at.isoformat() if self.last_login_at else None,
@@ -3122,6 +3142,7 @@ class PostgresStore:
         user_id: str,
         title: str = "",
         model_id: str | None = None,
+        disabled_tools: list[str] | None = None,
     ) -> AgentConversation:
         """Create a new agent conversation."""
         conversation = AgentConversation(
@@ -3131,6 +3152,7 @@ class PostgresStore:
             user_id=user_id,
             title=title,
             model_id=model_id,
+            disabled_tools=disabled_tools,
         )
         async with self.session_factory() as session:
             session.add(conversation)
@@ -3242,6 +3264,26 @@ class PostgresStore:
                 .order_by(AgentMessage.created_at.asc(), AgentMessage.id.asc())
             )
             return list(result.scalars().all())
+
+    async def get_last_agent_usage(self, conversation_id: str) -> tuple[int | None, int | None]:
+        """Return the latest assistant row's measured (prompt, completion) tokens.
+
+        (None, None) when no assistant row has measured usage yet — the
+        compaction estimator then falls back to a size-based heuristic.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(AgentMessage.prompt_tokens, AgentMessage.completion_tokens)
+                .where(
+                    AgentMessage.conversation_id == conversation_id,
+                    AgentMessage.role == "assistant",
+                    AgentMessage.prompt_tokens.is_not(None),
+                )
+                .order_by(AgentMessage.created_at.desc(), AgentMessage.id.desc())
+                .limit(1)
+            )
+            row = result.first()
+            return (row[0], row[1]) if row is not None else (None, None)
 
     # ------------------------------------------------------------------
     # Agent proposals (A1)
@@ -3877,6 +3919,29 @@ class PostgresStore:
             )
             user = result.scalar_one_or_none()
             await session.commit()
+            return user
+
+    async def update_user_preferences(self, user_id: str, patch: dict[str, Any]) -> User | None:
+        """Merge ``patch`` into the user's preferences blob (read-merge-write).
+
+        Keys present with value ``None`` are removed. Returns the updated
+        row, or None if the user is missing.
+        """
+        async with self.session_factory() as session:
+            user = await session.get(User, user_id)
+            if user is None:
+                return None
+            merged = dict(user.preferences or {})
+            for key, value in patch.items():
+                if value is None:
+                    merged.pop(key, None)
+                else:
+                    merged[key] = value
+            # Assign a fresh dict so SQLAlchemy sees the JSON column change.
+            user.preferences = merged
+            user.updated_at = datetime.now(UTC)
+            await session.commit()
+            await session.refresh(user)
             return user
 
     async def set_password(

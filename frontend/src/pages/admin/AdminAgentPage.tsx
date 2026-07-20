@@ -6,6 +6,7 @@ import { ApiError } from "@/api/client";
 import { healthApi } from "@/api/health";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
+import { Checkbox } from "@/components/ui/Checkbox";
 import { Input } from "@/components/ui/Input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/Select";
 import { Spinner } from "@/components/ui/Spinner";
@@ -25,6 +26,10 @@ interface FormState {
   extra_headers: string; // raw JSON text, validated on submit
   max_turns: string;
   reasoning_effort: string;
+  context_window: string;
+  compact_threshold: string;
+  /** Sorted tool names the admin has hard-denied. */
+  disabled_tools: string[];
 }
 
 const EMPTY_FORM: FormState = {
@@ -35,6 +40,9 @@ const EMPTY_FORM: FormState = {
   extra_headers: "",
   max_turns: "",
   reasoning_effort: "",
+  context_window: "",
+  compact_threshold: "",
+  disabled_tools: [],
 };
 
 function toFormState(effective: Record<string, unknown>): FormState {
@@ -50,6 +58,11 @@ function toFormState(effective: Record<string, unknown>): FormState {
         : "",
     max_turns: str(effective.max_turns),
     reasoning_effort: str(effective.reasoning_effort),
+    context_window: str(effective.context_window),
+    compact_threshold: str(effective.compact_threshold),
+    disabled_tools: Array.isArray(effective.disabled_tools)
+      ? [...(effective.disabled_tools as string[])].sort()
+      : [],
   };
 }
 
@@ -83,6 +96,34 @@ function buildPatch(
 
   if (form.reasoning_effort !== baseline.reasoning_effort) {
     patch.reasoning_effort = form.reasoning_effort || null;
+  }
+
+  if (form.context_window !== baseline.context_window) {
+    if (form.context_window === "") {
+      patch.context_window = null;
+    } else {
+      const n = Number(form.context_window);
+      if (!Number.isInteger(n) || n < 1024) {
+        return { patch: {}, error: "Context window must be an integer ≥ 1024 tokens." };
+      }
+      patch.context_window = n;
+    }
+  }
+
+  if (form.compact_threshold !== baseline.compact_threshold) {
+    if (form.compact_threshold === "") {
+      patch.compact_threshold = null;
+    } else {
+      const n = Number(form.compact_threshold);
+      if (!Number.isFinite(n) || n <= 0.1 || n >= 1) {
+        return { patch: {}, error: "Compaction threshold must be between 0.1 and 1 (exclusive)." };
+      }
+      patch.compact_threshold = n;
+    }
+  }
+
+  if (JSON.stringify(form.disabled_tools) !== JSON.stringify(baseline.disabled_tools)) {
+    patch.disabled_tools = form.disabled_tools.length > 0 ? form.disabled_tools : null;
   }
 
   if (form.extra_headers !== baseline.extra_headers) {
@@ -362,6 +403,77 @@ export function AdminAgentPage() {
               ))}
             </SelectContent>
           </Select>
+        </Field>
+
+        <Field label="Context window (tokens)" pinnedBadge={pinnedBadge("context_window")}>
+          <Input
+            type="number"
+            min={1024}
+            value={form.context_window}
+            disabled={isEnvPinned("context_window")}
+            onChange={(e) => set("context_window")(e.target.value)}
+            placeholder="e.g. 200000 — empty disables auto-compaction"
+          />
+          <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
+            The model's context window. When set, long conversations are automatically
+            summarized ("compacted") before they overflow it. Empty = compaction off.
+          </p>
+        </Field>
+
+        <Field label="Compaction threshold" pinnedBadge={pinnedBadge("compact_threshold")}>
+          <Input
+            type="number"
+            min={0.11}
+            max={0.99}
+            step={0.05}
+            value={form.compact_threshold}
+            disabled={isEnvPinned("compact_threshold")}
+            onChange={(e) => set("compact_threshold")(e.target.value)}
+            placeholder="0.85"
+          />
+          <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
+            Compaction triggers when the estimated prompt reaches threshold × context window.
+          </p>
+        </Field>
+
+        <Field label="Tools" pinnedBadge={pinnedBadge("disabled_tools")}>
+          <div className="max-h-64 space-y-0.5 overflow-y-auto rounded border border-[var(--color-border)] p-1.5">
+            {data.tools.map((tool) => {
+              const enabled = !form.disabled_tools.includes(tool.name);
+              return (
+                <label
+                  key={tool.name}
+                  className={`flex items-start gap-2 rounded px-1.5 py-1 hover:bg-[var(--color-bg-elevated)] ${
+                    isEnvPinned("disabled_tools") ? "cursor-not-allowed opacity-50" : "cursor-pointer"
+                  }`}
+                >
+                  <Checkbox
+                    checked={enabled}
+                    disabled={isEnvPinned("disabled_tools")}
+                    onCheckedChange={(v) => {
+                      const next = new Set(form.disabled_tools);
+                      if (v === true) next.delete(tool.name);
+                      else next.add(tool.name);
+                      setForm((f) => ({ ...f, disabled_tools: [...next].sort() }));
+                      setFormError(null);
+                      setTestResult(null);
+                    }}
+                    className="mt-0.5"
+                  />
+                  <span className="min-w-0 text-xs">
+                    <span className="font-mono">{tool.name}</span>
+                    <span className="block text-[11px] text-[var(--color-fg-muted)]">
+                      {tool.description}
+                    </span>
+                  </span>
+                </label>
+              );
+            })}
+          </div>
+          <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
+            Unchecked tools are hard-disabled for everyone — the in-app agent AND the external
+            /mcp endpoint. Users can only restrict further, never re-enable.
+          </p>
         </Field>
       </div>
 

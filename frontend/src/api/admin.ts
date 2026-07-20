@@ -1,6 +1,14 @@
 import { del, get, patch, post, put } from "./client";
 import type { AuditEntry, Team, TeamMember, TeamRole, User } from "./types";
 
+/** One tool in the agent's catalog, for the admin toggle UI. */
+export interface AdminAgentTool {
+  name: string;
+  description: string;
+  embeddings_gated: boolean;
+  requires_conversation: boolean;
+}
+
 /** GET/PUT `/admin/agent-settings` response shape: the effective (env/db/default-merged)
  * AI agent config, the source each field was resolved from, and the env var name for any
  * field currently pinned by the environment (see `resolve_agent_config` in the backend). */
@@ -10,6 +18,8 @@ export interface AgentSettingsResponse {
   env_vars: Record<string, string>;
   /** A10: "env-only" means the backend refuses to store the API key in the DB. */
   secret_mode: "db" | "env-only";
+  /** Full tool catalog — checkbox source for the disabled_tools toggle list. */
+  tools: AdminAgentTool[];
 }
 
 export const adminApi = {

@@ -36,9 +36,12 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelMessagesTypeAdapter,
     PartDeltaEvent,
+    PartEndEvent,
     PartStartEvent,
     TextPart,
     TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
 )
 from pydantic_ai.models import Model
 from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
@@ -264,6 +267,21 @@ async def stream_turn(
                 elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
                     if event.delta.content_delta:
                         yield {"type": "text_delta", "text": event.delta.content_delta}
+                elif isinstance(event, PartStartEvent) and isinstance(event.part, ThinkingPart):
+                    if event.part.content:
+                        yield {"type": "thinking_delta", "text": event.part.content}
+                elif isinstance(event, PartDeltaEvent) and isinstance(
+                    event.delta, ThinkingPartDelta
+                ):
+                    if event.delta.content_delta:
+                        yield {"type": "thinking_delta", "text": event.delta.content_delta}
+                elif isinstance(event, PartEndEvent) and isinstance(event.part, ThinkingPart):
+                    # The end event carries the fully-assembled part, so each
+                    # completed thinking segment (there can be several per turn,
+                    # interleaved with tool calls) flushes without manual
+                    # buffering. Signatures stay in the history blob only.
+                    if event.part.content:
+                        yield {"type": "thinking", "text": event.part.content}
                 elif isinstance(event, FunctionToolCallEvent):
                     yield {
                         "type": "tool_call",

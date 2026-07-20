@@ -1007,3 +1007,444 @@ async def test_delete_conversation_removes_proposals(store):
     assert await store.delete_agent_conversation("c1", conv.id) is True
     assert await store.list_agent_messages(conv.id) == []
     assert await store.list_agent_proposals(conv.id) == []
+
+
+# ---------------------------------------------------------------------------
+# Agent v2: tool toggles, /api/agent info + preferences, thinking, export,
+# auto-compaction
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolver_agent_v2_fields(store, monkeypatch):
+    """context_window / compact_threshold / disabled_tools resolve env→db→default."""
+    monkeypatch.setenv("VESTIGO_AGENT_CONTEXT_WINDOW", "200000")
+    monkeypatch.setenv("VESTIGO_AGENT_DISABLED_TOOLS", '["histogram"]')
+    get_settings.cache_clear()
+    try:
+        config = await resolve_agent_config()
+        assert config.context_window == 200000
+        assert config.sources["context_window"] == "env"
+        assert config.disabled_tools == ["histogram"]
+        assert config.sources["disabled_tools"] == "env"
+        # No env/db value: threshold falls back to its hardcoded default.
+        assert config.compact_threshold == 0.85
+        assert config.sources["compact_threshold"] == "default"
+    finally:
+        get_settings.cache_clear()
+
+
+def test_admin_agent_settings_toggles_roundtrip(client, admin_bootstrap, store):
+    from vestigo.agent.tools import TOOL_REGISTRY
+
+    as_admin(client, admin_bootstrap)
+    body = client.get("/api/admin/agent-settings").json()
+    assert len(body["tools"]) == len(TOOL_REGISTRY)
+    names = {t["name"] for t in body["tools"]}
+    assert {"search_events", "propose_annotation", "semantic_search"} <= names
+
+    put = client.put(
+        "/api/admin/agent-settings",
+        json={
+            "disabled_tools": ["semantic_search", "similar_events"],
+            "context_window": 128000,
+            "compact_threshold": 0.5,
+        },
+    )
+    assert put.status_code == 200, put.text
+    effective = put.json()["effective"]
+    assert effective["disabled_tools"] == ["semantic_search", "similar_events"]
+    assert effective["context_window"] == 128000
+    assert effective["compact_threshold"] == 0.5
+
+    bad = client.put("/api/admin/agent-settings", json={"disabled_tools": ["not_a_tool"]})
+    assert bad.status_code == 422
+
+
+def test_create_conversation_with_disabled_tools(client, admin_bootstrap, agent_on):
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations",
+        json={"timeline_id": timeline_id, "disabled_tools": ["histogram"]},
+    ).json()
+    assert conversation["disabled_tools"] == ["histogram"]
+
+    bad = client.post(
+        f"/api/cases/{case_id}/agent/conversations",
+        json={"timeline_id": timeline_id, "disabled_tools": ["not_a_tool"]},
+    )
+    assert bad.status_code == 422
+
+
+def test_send_message_composes_admin_and_chat_disabled_tools(
+    client, admin_bootstrap, agent_on, store, monkeypatch
+):
+    """The turn's scope carries admin-denied ∪ conversation-denied tools."""
+    from mcp.server.fastmcp import FastMCP
+
+    from vestigo.agent import runtime
+
+    monkeypatch.setenv("VESTIGO_AGENT_DISABLED_TOOLS", '["semantic_search"]')
+    get_settings.cache_clear()
+
+    captured: dict[str, object] = {}
+
+    def spy_build_tool_server(scope):
+        captured["disabled"] = scope.disabled_tools
+        return FastMCP("stub")
+
+    monkeypatch.setattr(runtime, "build_tool_server", spy_build_tool_server)
+
+    async def model_stream(messages, info):
+        yield "ok"
+
+    from pydantic_ai.models.function import FunctionModel
+
+    monkeypatch.setattr(
+        runtime,
+        "build_model",
+        lambda config=None, http_client=None: FunctionModel(stream_function=model_stream),
+    )
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations",
+        json={"timeline_id": timeline_id, "disabled_tools": ["histogram"]},
+    ).json()
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
+        json={"content": "hi"},
+    )
+    assert resp.status_code == 200
+    assert captured["disabled"] == frozenset({"semantic_search", "histogram"})
+
+
+def test_agent_info_503_when_unconfigured(client, admin_bootstrap):
+    as_admin(client, admin_bootstrap)
+    get_settings.cache_clear()
+    assert client.get("/api/agent/info").status_code == 503
+
+
+def test_agent_info_and_preferences(client, admin_bootstrap, agent_on, monkeypatch):
+    as_admin(client, admin_bootstrap)
+    monkeypatch.setenv("VESTIGO_AGENT_DISABLED_TOOLS", '["histogram"]')
+    get_settings.cache_clear()
+
+    info = client.get("/api/agent/info")
+    assert info.status_code == 200, info.text
+    body = info.json()
+    # The OPSEC notice's data: model + endpoint visible, key never.
+    assert body["model"] == "test-model"
+    assert body["api_base_url"] == "http://localhost:9/v1"
+    assert "api_key" not in json.dumps(body)
+    histogram = next(t for t in body["tools"] if t["name"] == "histogram")
+    assert histogram["admin_disabled"] is True
+    search = next(t for t in body["tools"] if t["name"] == "search_events")
+    assert search["admin_disabled"] is False
+    assert body["user_disabled_tools"] == []
+
+    put = client.put("/api/agent/preferences", json={"disabled_tools": ["semantic_search"]})
+    assert put.status_code == 200, put.text
+    assert put.json()["disabled_tools"] == ["semantic_search"]
+    assert client.get("/api/agent/info").json()["user_disabled_tools"] == ["semantic_search"]
+
+    bad = client.put("/api/agent/preferences", json={"disabled_tools": ["not_a_tool"]})
+    assert bad.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_stream_turn_maps_thinking_events(monkeypatch):
+    """ThinkingPart deltas stream as thinking_delta; PartEndEvent flushes the
+    completed segment as a terminal thinking event."""
+    from mcp.server.fastmcp import FastMCP
+    from pydantic_ai.models.function import DeltaThinkingPart, FunctionModel
+
+    from vestigo.agent import runtime
+
+    monkeypatch.setattr(runtime, "build_tool_server", lambda scope: FastMCP("stub"))
+
+    async def model_stream(messages, info):
+        yield {0: DeltaThinkingPart(content="the analyst wants ")}
+        yield {0: DeltaThinkingPart(content="anomalies")}
+        yield "here is my answer"
+
+    scope = AgentScope(
+        case_id="c1",
+        timeline_id="t1",
+        user=None,
+        source_ids=["s1"],
+        field_mappings=None,
+        source_offsets=None,
+    )
+    events = []
+    async for event in runtime.stream_turn(
+        scope, user_text="hi", history=[], model=FunctionModel(stream_function=model_stream)
+    ):
+        events.append(event)
+
+    deltas = "".join(e["text"] for e in events if e["type"] == "thinking_delta")
+    assert deltas == "the analyst wants anomalies"
+    thinking = [e for e in events if e["type"] == "thinking"]
+    assert [e["text"] for e in thinking] == ["the analyst wants anomalies"]
+    assert "".join(e["text"] for e in events if e["type"] == "text_delta") == "here is my answer"
+    assert events[-1]["type"] == "result"
+
+
+def _sse_events(resp) -> list[dict]:
+    return [
+        json.loads(line[len("data: ") :])
+        for line in resp.text.splitlines()
+        if line.startswith("data: ")
+    ]
+
+
+def test_send_message_persists_thinking_rows(client, admin_bootstrap, agent_on, store, monkeypatch):
+    from mcp.server.fastmcp import FastMCP
+    from pydantic_ai.models.function import DeltaThinkingPart, FunctionModel
+
+    from vestigo.agent import runtime
+
+    monkeypatch.setattr(runtime, "build_tool_server", lambda scope: FastMCP("stub"))
+
+    async def model_stream(messages, info):
+        yield {0: DeltaThinkingPart(content="reasoning here")}
+        yield "the answer"
+
+    monkeypatch.setattr(
+        runtime,
+        "build_model",
+        lambda config=None, http_client=None: FunctionModel(stream_function=model_stream),
+    )
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
+        json={"content": "why"},
+    )
+    assert resp.status_code == 200
+    events = _sse_events(resp)
+    assert any(e["type"] == "thinking_delta" for e in events)
+    assert any(e["type"] == "thinking" and e["text"] == "reasoning here" for e in events)
+
+    async def _fetch():
+        return await store.list_agent_messages(conversation["id"])
+
+    messages = asyncio.run(_fetch())
+    roles = [m.role for m in messages]
+    assert roles.index("thinking") < roles.index("assistant")
+    thinking_row = next(m for m in messages if m.role == "thinking")
+    assert thinking_row.content == "reasoning here"
+
+
+def test_export_conversation(client, admin_bootstrap, agent_on, store, monkeypatch):
+    from mcp.server.fastmcp import FastMCP
+    from pydantic_ai.models.function import FunctionModel
+
+    from vestigo.agent import runtime
+
+    monkeypatch.setattr(runtime, "build_tool_server", lambda scope: FastMCP("stub"))
+
+    async def model_stream(messages, info):
+        yield "exported answer"
+
+    monkeypatch.setattr(
+        runtime,
+        "build_model",
+        lambda config=None, http_client=None: FunctionModel(stream_function=model_stream),
+    )
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+    client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
+        json={"content": "question"},
+    )
+
+    resp = client.get(f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/export")
+    assert resp.status_code == 200, resp.text
+    assert "attachment" in resp.headers["content-disposition"]
+    body = resp.json()
+    assert body["export_version"] == 1
+    assert body["conversation"]["id"] == conversation["id"]
+    roles = [m["role"] for m in body["messages"]]
+    assert "user" in roles and "assistant" in roles
+    # raw_history: the provider-wire pydantic-ai blob survives in the export.
+    assert body["raw_history"], "expected the replayable history blob"
+    assert body["vestigo_version"]
+
+    async def _audit():
+        return await store.query_audit(case_id=case_id)
+
+    assert any(a.action == "agent.conversation_export" for a in asyncio.run(_audit()))
+
+    # Export works while the agent endpoint is down (no _require_agent gate).
+    get_settings.cache_clear()
+
+    # Conversations are personal: another admin gets a 404, not the export.
+    client.post(
+        "/api/admin/users",
+        json={"username": "analyst9", "password": "abcdefgh12", "is_admin": True},
+    )
+    other = client.__class__(client.app)
+    login(other, "analyst9", "abcdefgh12")
+    assert (
+        other.get(f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/export")
+    ).status_code == 404
+
+
+def _seed_long_history(store, conversation_id: str, *, last_prompt_tokens: int | None = None):
+    """Three user turns of replayable history (+ optionally a measured assistant row)."""
+    from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+
+    from vestigo.agent.runtime import dump_history
+
+    history = []
+    for i in range(3):
+        history.append(ModelRequest(parts=[UserPromptPart(content=f"question {i}")]))
+        history.append(ModelResponse(parts=[TextPart(content=f"answer {i}")]))
+
+    async def _seed():
+        await store.update_agent_conversation(conversation_id, history=dump_history(history))
+        if last_prompt_tokens is not None:
+            await store.add_agent_message(
+                conversation_id,
+                "assistant",
+                "prior answer",
+                prompt_tokens=last_prompt_tokens,
+                completion_tokens=10,
+            )
+
+    asyncio.run(_seed())
+
+
+def _thinking_free_model(monkeypatch, *, fail_first_stream: str | None = None):
+    """Patch build_model with a FunctionModel serving both the turn (stream)
+    and the compaction summarizer (non-stream). Optionally the first stream
+    call raises ModelHTTPError with the given body."""
+    from mcp.server.fastmcp import FastMCP
+    from pydantic_ai.exceptions import ModelHTTPError
+    from pydantic_ai.messages import ModelResponse, TextPart
+    from pydantic_ai.models.function import FunctionModel
+
+    from vestigo.agent import runtime
+
+    monkeypatch.setattr(runtime, "build_tool_server", lambda scope: FastMCP("stub"))
+    calls = {"stream": 0}
+
+    async def model_stream(messages, info):
+        calls["stream"] += 1
+        if fail_first_stream is not None and calls["stream"] == 1:
+            raise ModelHTTPError(status_code=400, model_name="m", body=fail_first_stream)
+        yield "post-compaction answer"
+
+    async def model_call(messages, info):
+        return ModelResponse(parts=[TextPart(content="a dense summary of turns 0-1")])
+
+    model = FunctionModel(model_call, stream_function=model_stream)
+    monkeypatch.setattr(runtime, "build_model", lambda config=None, http_client=None: model)
+    return calls
+
+
+def test_send_message_compacts_at_threshold(client, admin_bootstrap, agent_on, store, monkeypatch):
+    from vestigo.agent.compaction import COMPACTION_MARKER
+
+    monkeypatch.setenv("VESTIGO_AGENT_CONTEXT_WINDOW", "2048")
+    get_settings.cache_clear()
+    _thinking_free_model(monkeypatch)
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+    # Last measured prompt already far beyond 0.85 × 2048.
+    _seed_long_history(store, conversation["id"], last_prompt_tokens=5000)
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
+        json={"content": "keep going"},
+    )
+    assert resp.status_code == 200
+    events = _sse_events(resp)
+    compaction = next(e for e in events if e["type"] == "compaction")
+    assert compaction["reason"] == "threshold"
+    assert "summary" in compaction and compaction["summary"]
+    assert any(e["type"] == "done" for e in events)
+
+    async def _state():
+        conv = await store.get_agent_conversation(case_id, conversation["id"])
+        msgs = await store.list_agent_messages(conversation["id"])
+        audit = await store.query_audit(case_id=case_id)
+        return conv, msgs, audit
+
+    conv, msgs, audit = asyncio.run(_state())
+    row = next(m for m in msgs if m.role == "compaction")
+    assert row.content == "a dense summary of turns 0-1"
+    assert row.tool_result["reason"] == "threshold"
+    # 3 user turns, 2 kept: only the first turn's 2 messages get folded.
+    assert row.tool_result["messages_summarized"] == 2
+    # Forensic trail: the exact pre-compaction wire blob rides on the row.
+    assert len(row.tool_result["pre_compaction_history"]) == 6
+    assert COMPACTION_MARKER in json.dumps(conv.history)
+    assert any(a.action == "agent.compaction" for a in audit)
+
+
+def test_send_message_overflow_compacts_and_retries(
+    client, admin_bootstrap, agent_on, store, monkeypatch
+):
+    """A provider 400 mentioning context length triggers compact-then-retry —
+    even without a configured context_window."""
+    calls = _thinking_free_model(monkeypatch, fail_first_stream="maximum context length exceeded")
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+    _seed_long_history(store, conversation["id"])
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
+        json={"content": "keep going"},
+    )
+    assert resp.status_code == 200
+    events = _sse_events(resp)
+    compaction = next(e for e in events if e["type"] == "compaction")
+    assert compaction["reason"] == "overflow"
+    done = next(e for e in events if e["type"] == "done")
+    assert done["content"] == "post-compaction answer"
+    assert calls["stream"] == 2
+
+
+def test_send_message_overflow_with_nothing_to_compact(
+    client, admin_bootstrap, agent_on, store, monkeypatch
+):
+    """Overflow on an already-short conversation degrades to a specific,
+    friendly error — not the generic 'see server logs'."""
+    _thinking_free_model(monkeypatch, fail_first_stream="prompt is too long: maximum tokens")
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
+        json={"content": "hello"},
+    )
+    assert resp.status_code == 200
+    events = _sse_events(resp)
+    error = next(e for e in events if e["type"] == "error")
+    assert error["code"] == "context_overflow"
+    assert "context window" in error["detail"]
+    assert not any(e["type"] == "compaction" for e in events)

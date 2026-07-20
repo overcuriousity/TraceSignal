@@ -190,3 +190,33 @@ def test_mcp_end_to_end_tool_call(mcp_client, admin_bootstrap):
     )
     assert called.status_code == 200, called.text
     assert '"total"' in called.text
+
+
+def test_mcp_tools_list_respects_admin_disabled(mcp_client, admin_bootstrap, monkeypatch):
+    """The admin hard-deny list applies to the external transport too."""
+    monkeypatch.setenv("VESTIGO_AGENT_DISABLED_TOOLS", '["list_baselines"]')
+    get_settings.cache_clear()
+    try:
+        as_admin(mcp_client, admin_bootstrap)
+        case_id, tl_id, token = _setup_token(mcp_client)
+        assert _rpc_initialize(mcp_client, token).status_code == 200
+        listed = mcp_client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+                "Authorization": f"Bearer {token}",
+            },
+        )
+        assert listed.status_code == 200, listed.text
+        # Parse tool *names* from the SSE data frame — "list_baselines" also
+        # appears inside another tool's description text.
+        import json as _json
+
+        data_line = next(line for line in listed.text.splitlines() if line.startswith("data: "))
+        names = {t["name"] for t in _json.loads(data_line[len("data: ") :])["result"]["tools"]}
+        assert "list_baselines" not in names
+        assert "list_saved_views" in names
+    finally:
+        get_settings.cache_clear()

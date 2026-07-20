@@ -92,9 +92,19 @@ frontend AgentPanel ──POST /messages (SSE)──► api/routers/agent.py
 - Tools are defined once on a **standard MCP server** (`build_tool_server`);
   the built-in loop consumes it in-process. The same server is also served
   over HTTP for external harnesses — see **External MCP endpoint** below.
-- Streaming is SSE over the POST response (`text_delta`, `tool_call`,
-  `tool_result`, `done`, `error`); the frontend reads it via fetch +
-  ReadableStream (`frontend/src/api/agent.ts`).
+- Streaming is SSE over the POST response (`text_delta`, `thinking_delta`,
+  `thinking`, `compaction`, `tool_call`, `tool_result`, `done`, `error` —
+  `error` may carry a machine-readable `code`, currently `context_overflow`
+  or `model_error`); the frontend reads it via fetch + ReadableStream
+  (`frontend/src/api/agent.ts`).
+- **Thinking is first-class.** `stream_turn` maps pydantic-ai
+  `ThinkingPart` starts/deltas to `thinking_delta` events and flushes each
+  completed segment (on `PartEndEvent`) as a terminal `thinking` event,
+  which the router persists as a `role="thinking"` `agent_messages` row —
+  interleaved correctly with tool calls. The chat UI renders them as
+  collapsed "Thinking" blocks. Thinking *signatures* are never persisted
+  per-row; they live only inside the conversation's replayable `history`
+  blob (and therefore in the JSON export's `raw_history`).
 - One turn at a time per conversation: a POST while another turn is
   streaming gets a 409 (`_active_turns` in `api/routers/agent.py`) —
   concurrent turns would race on the conversation's replayable `history`.
@@ -183,6 +193,63 @@ validates, with identical bounds: `z_threshold` (>0), `min_skew_seconds`
 (≥2), plus `start`/`end` for the mining window. All optional, defaulting
 to server behavior.
 
+### Per-tool enable/disable (three layers)
+
+`TOOL_REGISTRY` (`agent/tools.py`) is the single source of truth for the
+tool catalog (name, one-line description, `embeddings_gated`,
+`requires_conversation`); a registry-parity test keeps it in sync with the
+actual `@server.tool()` registrations. Every tool is toggleable — none are
+hard-wired on. Three deny layers compose (a tool is available only if *no*
+layer denies it):
+
+1. **Admin hard-deny** — `agent_settings.disabled_tools` /
+   `VESTIGO_AGENT_DISABLED_TOOLS` (JSON array). Applies to the in-app agent
+   **and** the external `/mcp` transport; users cannot re-enable these.
+   Edited as a checkbox list on `Admin → Agent`.
+2. **Per-user defaults** — `users.preferences["agent_disabled_tools"]`,
+   edited via `PUT /api/agent/preferences` ("Save as my defaults" in the
+   new-conversation dialog). Only a default for the dialog's checkboxes.
+3. **Per-chat choice** — `agent_conversations.disabled_tools`, frozen at
+   creation from the dialog. Later preference/admin edits never mutate an
+   existing conversation's list (the admin layer still applies at turn
+   time, so an admin deny takes effect everywhere immediately).
+
+Mechanically, `AgentScope.disabled_tools` carries the union of layers 1+3
+(`/mcp`: layer 1 only) and `build_tool_server` removes those tools
+(`FastMCP.remove_tool`) after registration — a disabled tool is *absent*
+from the tool list and the model's prompt, not an error-returning stub.
+Disabling `propose_finding`/`propose_annotation` degrades the sandbox+apply
+workflow to prose-only; the dialog warns about that but does not prevent it.
+
+### New-conversation dialog + OPSEC disclosure
+
+Every new conversation goes through
+`frontend/src/components/agent/NewConversationDialog.tsx` — there is no
+silent lazy-create path and deliberately no "don't show again". The dialog
+shows (a) a prominent OPSEC notice with the *actual* configured endpoint
+URL and model name ("evidence leaves Vestigo…"), and (b) the per-chat tool
+checkboxes pre-populated from the user's saved defaults.
+
+The data comes from `GET /api/agent/info` (`info_router` in
+`api/routers/agent.py`): model, provider, `api_base_url`,
+`context_window`, `compact_threshold`, the tool catalog with
+`admin_disabled` flags, and the user's saved `user_disabled_tools`. This
+deliberately discloses model + base URL to **all authenticated users**
+(that disclosure *is* the OPSEC feature); the API key is never included.
+
+### Conversation JSON export
+
+`GET /api/cases/{case_id}/agent/conversations/{id}/export` (owner-only,
+audited as `agent.conversation_export`, *not* gated on agent availability —
+the record must stay exportable while the LLM endpoint is down) returns the
+whole thread as a JSON attachment: `export_version`, exporter/timestamps,
+the conversation row (incl. `model_id` and `disabled_tools`), every
+`agent_messages` row (user/assistant/tool/thinking/compaction, with tool
+args/results and measured token usage), the proposals, and `raw_history` —
+the provider-wire pydantic-ai history blob (the only place thinking
+signatures and provider quirks live). Download button in the AgentPanel
+header.
+
 ## Configuration
 
 | Variable | Meaning |
@@ -195,6 +262,9 @@ to server behavior.
 | `VESTIGO_AGENT_EXTRA_HEADERS` | JSON object of extra HTTP headers. |
 | `VESTIGO_AGENT_MAX_TURNS` | Model round-trip cap per user message (default 15). |
 | `VESTIGO_AGENT_REASONING_EFFORT` | Reasoning-effort enum: `off` (default), `low`, `medium`, `high`, `max`. Admin-editable; see **Reasoning effort** below. |
+| `VESTIGO_AGENT_CONTEXT_WINDOW` | Model context window in tokens (≥1024). Unset (default) = auto-compaction off. See **Auto-compaction** below. |
+| `VESTIGO_AGENT_COMPACT_THRESHOLD` | Fraction of the window that triggers compaction (0.1–1 exclusive, default 0.85). |
+| `VESTIGO_AGENT_DISABLED_TOOLS` | JSON array of tool names to hard-deny everywhere (in-app + `/mcp`), e.g. `["semantic_search"]`. |
 | `VESTIGO_AGENT_PROBE_TTL_SECONDS` | Availability probe cache (default 60). |
 | `VESTIGO_AGENT_SECRET_MODE` | `db` (default) or `env-only`: refuse DB storage of the API key and ignore any previously stored one — `VESTIGO_AGENT_API_KEY` becomes the only source (A10). Env-only, not admin-editable. |
 | `VESTIGO_MCP_ENABLED` | Serve the external `/mcp` streamable-HTTP endpoint (default `false`). Independent of `VESTIGO_AGENT_*`. |
@@ -226,6 +296,40 @@ The response's `secret_mode` field drives the UI's disabled key input in that mo
 Resolved configs are cached per-fingerprint (hash of the resolved values) so admin edits
 take effect on the next call without a process restart, and `PUT` resets the availability
 probe cache so a following health check re-probes immediately.
+
+### Auto-compaction (context-window awareness)
+
+The runtime replays the full conversation `history` every turn, so long
+investigations eventually overflow the model's context window and the
+provider answers 400. When the operator sets `context_window` (env or admin
+UI — explicit opt-in, since the right number is model-specific),
+`agent/compaction.py` keeps conversations under it:
+
+- **Pre-turn check.** Before each turn the router estimates the next prompt
+  from the last measured usage (`prompt + completion + new input`; falls
+  back to serialized-history-chars/4 when usage was never reported). At
+  `compact_threshold × context_window` it compacts first.
+- **Overflow backstop.** Tool-output sizes make the estimate lag one turn,
+  so a provider 400/413 whose body matches context/token/length wording
+  (`_is_context_overflow`, best-effort across providers) triggers one
+  compact-then-retry — this path works even without a configured window.
+  If nothing is old enough to fold, the client gets a friendly
+  `error{code="context_overflow"}` instead of the generic failure.
+- **What compaction does.** `split_history` cuts at *user-turn boundaries
+  only* (never between a tool_use and its tool_result), keeping the last
+  `KEEP_RECENT_TURNS=2` turns verbatim; the older head is summarized by a
+  toolset-less agent run against the same configured model (forensic
+  summary prompt: goals, findings with exact event_ids/filters, open
+  hypotheses, failed approaches). The new history = a stub user/assistant
+  message *pair* carrying the summary (pair, so strict user/assistant
+  alternation survives Anthropic-protocol replay) + the kept tail.
+- **Forensic trail.** Compaction never destroys the record: an append-only
+  `role="compaction"` message row stores the summary as content and
+  `{reason, messages_summarized, estimated_tokens_before,
+  pre_compaction_history}` (the exact pre-compaction wire blob) in
+  `tool_result`, plus an `agent.compaction` audit row. The chat shows a
+  visible "older turns were summarized" item (SSE `compaction` event), and
+  the JSON export carries everything.
 
 ### Reasoning effort
 
@@ -326,3 +430,15 @@ transport, 404/off behavior when `VESTIGO_MCP_ENABLED` is unset, and that
 the annotated-event filter, and deletion. Frontend:
 `frontend/src/test/agent.test.ts` (FilterSpec → EventFilters mapping,
 including the new fields).
+
+Agent-v2 additions: `tests/test_agent_compaction.py` (turn-boundary
+splitting never orphans tool returns, threshold math, compacted-history
+shape with an injected `FunctionModel`); `tests/test_agent_api.py` (the
+three new resolver fields, admin toggles round-trip + 422 on unknown tool
+names, `/api/agent/info` shape + key-never-leaks, preference round-trip,
+thinking-event mapping via `DeltaThinkingPart` + persisted `thinking` rows,
+the export endpoint incl. owner-only 404 + audit, threshold- and
+overflow-triggered compaction end-to-end, friendly `context_overflow`
+error); `tests/test_agent_tools.py` (registry parity, disabled tools absent
+from `list_tools` and erroring on call); `tests/test_mcp_http.py` (admin
+deny list applies to the external `tools/list`).

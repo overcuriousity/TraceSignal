@@ -1,6 +1,41 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-19 (session 69 — Phase 3 kickoff, Step 0 consolidation).
+Last updated: 2026-07-20 (session 70 — agent v2: compaction, tool toggles, OPSEC dialog, export).
+
+## Session 70 — 2026-07-20: Agent v2 — compaction, tool toggles, OPSEC dialog, JSON export (claude/ai-agent-improvements-lyu1gg)
+
+Four user-requested agent improvements, shipped together (migration `0012_agent_v2`):
+
+- **Context-window auto-compaction** (`agent/compaction.py`, docs/AGENT.md
+  "Auto-compaction"): new `context_window`/`compact_threshold` settings (env + admin UI;
+  unset window = off). Pre-turn estimate from last measured usage; provider 400/413
+  context-overflow detection with one compact-then-retry as backstop; splits at user-turn
+  boundaries only (tool pairs never orphaned), summary via a toolset-less run on the same
+  model, stub user/assistant *pair* keeps Anthropic-protocol alternation. Forensic trail:
+  append-only `role="compaction"` row carries the summary + the exact pre-compaction
+  history blob + an `agent.compaction` audit row; visible chat banner (SSE `compaction`).
+  Friendly `error{code="context_overflow"}` replaces the generic failure when nothing is
+  left to fold.
+- **Three-layer per-tool enable/disable**: new `TOOL_REGISTRY` catalog in `agent/tools.py`
+  (registry-parity tested); admin hard-deny (`agent_settings.disabled_tools` /
+  `VESTIGO_AGENT_DISABLED_TOOLS`, applies to in-app AND `/mcp`, checkbox UI on
+  Admin → Agent), per-user defaults (`users.preferences`, `PUT /api/agent/preferences`),
+  per-chat choice frozen on `agent_conversations.disabled_tools`. Disabled tools are
+  removed from the FastMCP server (absent from the prompt), not error stubs.
+- **New-conversation OPSEC dialog** (`NewConversationDialog.tsx`): every new conversation
+  (no lazy-create path anymore) shows a prominent "evidence leaves Vestigo" notice with
+  the live endpoint URL + model from the new non-admin `GET /api/agent/info` (deliberate
+  disclosure; API key never included) plus the per-chat tool checkboxes.
+- **Thinking capture + full-thread JSON export**: `stream_turn` now maps
+  `ThinkingPart` events (previously dropped) to `thinking_delta`/`thinking` SSE and
+  persists `role="thinking"` rows, rendered as collapsed blocks; new owner-only, audited
+  `GET .../conversations/{id}/export` returns the whole thread (all message rows,
+  proposals, `raw_history` provider-wire blob incl. thinking signatures) as a JSON
+  attachment — download button in the panel header. Export works while the agent
+  endpoint is down.
+
+Tests: new `tests/test_agent_compaction.py`; agent-v2 sections in `test_agent_api.py`
+(49 pass), `test_agent_tools.py`, `test_mcp_http.py`, admin round-trips.
 
 ## Session 69 — 2026-07-19: Phase 3 plan + Step 0 consolidation (feat/phase3-step0)
 

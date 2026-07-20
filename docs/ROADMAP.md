@@ -285,6 +285,12 @@ params on `run_anomaly_detector`, `AgentToken` scoped PATs, and `/mcp` streamabl
 exposure of the identical tool server (`VESTIGO_MCP_ENABLED`, default off). See
 `docs/superpowers/specs/2026-07-19-agent-read-parity-mcp-http-design.md` for the full design.
 
+Agent v2 shipped 2026-07-20: context-window auto-compaction (forensic-trail preserving),
+three-layer per-tool enable/disable (admin hard-deny incl. `/mcp`, per-user defaults,
+per-chat), the new-conversation OPSEC dialog (endpoint + model disclosure to all users),
+thinking capture as first-class messages, and full-thread JSON export — see
+`docs/AGENT.md` for the details.
+
 - [ ] **A11 — `/api/auth/users` directory scope.** Any signed-in user can list the full
   user directory (id, username, display name — needed to render names on annotations).
   Fine for the small-team threat model; add a config flag or scope the listing to co-case
