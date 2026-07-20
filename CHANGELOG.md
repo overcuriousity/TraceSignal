@@ -7,8 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-07-20
+
 ### Added
 
+- **Log template clustering**: structurally identical log lines (variable
+  timestamps/IPs/UUIDs/hex/numbers masked) are grouped into shapes, browsable in
+  a new Templates tab (under Patterns) — mute a routine shape to collapse its
+  events out of the grid immediately, always behind a visible count. Field is
+  filterable in the grid via the new `template_id` facet.
+- **Agent chart proposals**: the agent can now explore data through the same
+  charts as the Visualize page (per-value time series, punch card, field×field
+  pivot, scatter, two-layer compare) and propose one as a live chart card in
+  the chat — "Open in Visualize" jumps to the full page with the same chart,
+  "Save" writes a saved chart credited to the analyst. The agent never writes
+  a chart itself.
 - **Agent auto-compaction**: configurable model context window
   (`VESTIGO_AGENT_CONTEXT_WINDOW` / admin UI); long conversations are summarized
   before they overflow, with the summary shown in chat and the exact
@@ -19,9 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agent tools globally (applies to the in-app agent and the external `/mcp`
   endpoint); users can set personal defaults and adjust the tool set per
   conversation.
-- **New-conversation OPSEC dialog**: starting an agent conversation now always
-  shows where evidence data goes — the configured API endpoint URL and model —
-  plus the tool selection for that chat.
+- **Persistent OPSEC notice**: the agent panel always shows where evidence data
+  goes — the configured API endpoint URL and model — in its empty state, with
+  no dismiss, so it is visible before every first message. Tool selection for a
+  new chat sits next to the input as a popover.
 - **Thinking content**: the model's reasoning segments are streamed, persisted,
   and rendered as collapsible blocks in the chat.
 - **Conversation JSON export**: download any agent thread as JSON — every

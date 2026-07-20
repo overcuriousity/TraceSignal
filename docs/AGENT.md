@@ -152,13 +152,39 @@ in-app agent has. One tool code path, two transports.
   protection targets; Host handling is left to the deployment's reverse
   proxy.
 
-## Tools (21 total; all read-only except the propose→confirm annotation path)
+## Tools (27 total; all read-only except the propose→confirm annotation path)
 
 Core: `search_events`, `get_event`, `list_fields`, `list_artifacts`,
 `field_terms`, `field_numeric_stats`, `histogram`, `run_anomaly_detector`,
 `propose_finding`, `propose_annotation` (conversation-bound only — see
 **Propose→confirm writes** above), and — when embeddings are available —
 `semantic_search`, `similar_events`.
+
+Viz tools (A9, viz parity): `field_timeseries`, `time_punchcard`,
+`field_pivot`, `field_scatter`, `compare` (kind = `time`/`terms`/`numeric`,
+two independent `FilterSpec` layers) wrap the same `db/queries.py` methods
+the Visualize page's endpoints call, with tighter per-tool caps than the
+page's own UI bounds (e.g. `field_scatter` caps at 1000 points vs. the
+page's 20000 — every point counts against the model's context window; see
+`VIZ_*_MAX_*` constants in `agent/tools.py`). `propose_chart(title,
+description, spec)` is the charting analog of `propose_finding`: `spec` is
+a `ChartSpec` (same kind vocabulary as `compare`, plus `terms` / `numeric` /
+`timeseries` / `punchcard` / `pivot` / `scatter`) — the tool validates by
+*executing* the underlying query (same caps as the read tools) and returns
+summary stats, writing nothing. The frontend maps `ChartSpec` onto the
+Visualize page's own `ChartConfig` (`specToChartConfig`,
+`frontend/src/api/agent.ts`) — backend-opaque, same seam as
+`SavedChart.config`, so the backend never learns the frontend's chart
+shape. The chat panel renders a live chart card (`ChartProposalCard.tsx`)
+fetched fresh through `vizApi` (not the tool_result echo, so it stays
+consistent with current data/dispositions) with **Open in Visualize** (a
+route link carrying the mapped `ChartConfig` + filters as URL params) and
+**Save** (the analyst's own click against the existing
+`savedChartsApi.create` — the only write in this flow, credited to the
+analyst; the agent never writes a chart). A failed spec (unknown kind,
+missing required field) surfaces as a tool error with no card — the panel
+pairs `propose_chart`'s call row (title/description/spec) with its result
+row (`ok`) before deciding whether to render.
 
 Read-parity tools (analyst-visible state the agent previously couldn't see):
 `list_baselines` (saved baseline definitions — unlocks the temporal-only

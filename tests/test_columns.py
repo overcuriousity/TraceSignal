@@ -26,3 +26,15 @@ def test_resolve_bare_non_column_token_is_attribute_key():
 def test_all_columns_in_allowlist_resolve_to_themselves():
     for column in TOP_LEVEL_EVENT_COLUMNS:
         assert resolve_column_token(column) == (column, None)
+
+
+def test_template_id_resolves_to_tostring_template_hash():
+    assert resolve_column_token("template_id") == ("toString(template_hash)", None)
+
+
+def test_template_id_is_case_and_whitespace_insensitive():
+    assert resolve_column_token("  Template_Id  ") == ("toString(template_hash)", None)
+
+
+def test_attr_prefix_wins_over_synthetic_column_too():
+    assert resolve_column_token("attr:template_id") == (None, "template_id")

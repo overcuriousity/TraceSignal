@@ -40,6 +40,18 @@ MAX_ATTRS_PER_EVENT = 40
 # and bounds the ClickHouse resolution query.
 MAX_PROPOSAL_EVENTS = 500
 
+# A9: viz-tool result caps — tighter than the Visualize page's own bounds
+# (e.g. field_scatter's UI cap is 20000 points, series_limit up to 50) since
+# viz series are dense and every row/point/cell counts against the model's
+# context window, same discipline as MAX_EVENTS_PER_SEARCH above.
+VIZ_TIMESERIES_MAX_BUCKETS = 60
+VIZ_TIMESERIES_MAX_SERIES = 8
+VIZ_PIVOT_MAX_LIMIT = 12
+VIZ_SCATTER_MAX_POINTS = 1000
+VIZ_COMPARE_MAX_BUCKETS = 60
+VIZ_COMPARE_MAX_TERMS = 30
+VIZ_COMPARE_MAX_BINS = 30
+
 
 @dataclass(frozen=True)
 class ToolInfo:
@@ -65,8 +77,14 @@ TOOL_REGISTRY: tuple[ToolInfo, ...] = (
     ToolInfo("field_terms", "Top-N value distribution for a field, honoring optional filters."),
     ToolInfo("field_numeric_stats", "Summary stats + histogram for a numeric field."),
     ToolInfo("histogram", "Time-bucketed event counts — the timeline's shape."),
+    ToolInfo("field_timeseries", "Per-value event counts bucketed over time for a field."),
+    ToolInfo("time_punchcard", "Event counts by day-of-week x hour-of-day (UTC)."),
+    ToolInfo("field_pivot", "Top-X x top-Y co-occurrence count matrix for two fields."),
+    ToolInfo("field_scatter", "Random sample of (x, y) numeric value pairs for two fields."),
+    ToolInfo("compare", "Compare two filtered layers (time/terms/numeric) of the same timeline."),
     ToolInfo("run_anomaly_detector", "Run a statistical anomaly detector over the timeline."),
     ToolInfo("propose_finding", "Propose a distilled finding card with applicable filters."),
+    ToolInfo("propose_chart", "Propose a chart card, validated by executing the underlying query."),
     ToolInfo(
         "propose_annotation",
         "Propose tagging/commenting specific events — the analyst must confirm.",
@@ -165,6 +183,40 @@ class FilterSpec(BaseModel):
         default=False,
         description="Hide events belonging to analyst-marked routine motifs (kind='routine' dispositions).",
     )
+
+
+class ChartSpec(BaseModel):
+    """Chart spec carried by `propose_chart` — the agent-side equivalent of
+    the Visualize page's ChartConfig, but backend-opaque: the frontend maps
+    this to its own ChartConfig shape for rendering/"Open in Visualize"/
+    "Save", exactly like `SavedChart.config` is opaque JSON server-side.
+    """
+
+    kind: str = Field(
+        description=(
+            'Chart kind: "terms" | "numeric" | "timeseries" | "punchcard" | '
+            '"pivot" | "scatter" | "compare_time" | "compare_terms" | "compare_numeric".'
+        )
+    )
+    field: str | None = Field(
+        default=None, description="Primary field — required for every kind except punchcard."
+    )
+    field_y: str | None = Field(default=None, description="Second field — pivot/scatter only.")
+    filters: FilterSpec | None = Field(default=None, description="Primary layer filters.")
+    comparison_filters: FilterSpec | None = Field(
+        default=None, description="Comparison layer filters — compare_* kinds only."
+    )
+    buckets: int | None = Field(
+        default=None, description="Bucket count — timeseries/compare_time only."
+    )
+    series_limit: int | None = Field(default=None, description="Series cap — timeseries only.")
+    limit: int | None = Field(
+        default=None,
+        description=(
+            "Top-N terms / bin count / point cap / pivot x-axis top-N, meaning depends on kind."
+        ),
+    )
+    limit_y: int | None = Field(default=None, description="Pivot y-axis top-N — pivot only.")
 
 
 @dataclass
@@ -282,7 +334,7 @@ async def _build_query(
         spec.run_id,
     )
     event_ids = _intersect_optional(annotated_ids, spec.event_ids)
-    routine_ids = await _resolve_routine_collapse(
+    routine_scope = await _resolve_routine_collapse(
         scope.case_id, scope.timeline_id, scope.source_ids, spec.collapse_routine
     )
     return EventQuery(
@@ -301,7 +353,8 @@ async def _build_query(
         tags_include=tags_include,
         tags_exclude=tags_exclude,
         event_ids=event_ids,
-        exclude_routine_disposition_ids=routine_ids,
+        exclude_routine_disposition_ids=routine_scope.motif_disposition_ids,
+        exclude_template_hashes=routine_scope.template_hashes,
         # Clamp both ends — the model can pass anything, and a negative
         # LIMIT/OFFSET would surface as a ClickHouse error.
         limit=max(1, min(limit, MAX_EVENTS_PER_SEARCH)),
@@ -432,6 +485,131 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         return await run_in_threadpool(service.histogram, query, min(max(buckets, 4), 120))
 
     @server.tool()
+    async def field_timeseries(
+        field: str,
+        filters: FilterSpec | None = None,
+        buckets: int = 30,
+        series_limit: int = 6,
+    ) -> dict[str, Any]:
+        """Per-value event counts bucketed over time for `field` — how a field's top values trend.
+
+        Capped at the top `series_limit` values by overall count (max 8) so a
+        high-cardinality field doesn't explode into dozens of series; run
+        `field_terms` first to see the full distribution before deciding
+        which values are worth trending.
+        """
+        spec = _validated(filters)
+        query = await _build_query(scope, spec)
+        return await run_in_threadpool(
+            service.field_value_timeseries,
+            query,
+            field,
+            min(max(buckets, 4), VIZ_TIMESERIES_MAX_BUCKETS),
+            max(1, min(series_limit, VIZ_TIMESERIES_MAX_SERIES)),
+        )
+
+    @server.tool()
+    async def time_punchcard(filters: FilterSpec | None = None) -> dict[str, Any]:
+        """Event counts by (day-of-week x hour-of-day), UTC — surfaces weekly/daily rhythm."""
+        spec = _validated(filters)
+        query = await _build_query(scope, spec)
+        return await run_in_threadpool(service.time_punchcard, query)
+
+    @server.tool()
+    async def field_pivot(
+        field_x: str,
+        field_y: str,
+        filters: FilterSpec | None = None,
+        limit_x: int = 8,
+        limit_y: int = 8,
+    ) -> dict[str, Any]:
+        """Top-X x top-Y co-occurrence count matrix for two fields (each axis capped at 12).
+
+        `total` counts only events where both fields are non-empty. Useful
+        for spotting which value-pairs cluster (e.g. user x workstation).
+        """
+        spec = _validated(filters)
+        query = await _build_query(scope, spec)
+        return await run_in_threadpool(
+            service.field_pivot,
+            query,
+            field_x,
+            field_y,
+            max(1, min(limit_x, VIZ_PIVOT_MAX_LIMIT)),
+            max(1, min(limit_y, VIZ_PIVOT_MAX_LIMIT)),
+        )
+
+    @server.tool()
+    async def field_scatter(
+        field_x: str, field_y: str, filters: FilterSpec | None = None, limit: int = 300
+    ) -> dict[str, Any]:
+        """Uniform random sample of (x, y) numeric value pairs for two fields (capped at 1000 points).
+
+        `sampled`/`total` in the response tell you what fraction of matching
+        pairs the sample represents — read correlation cautiously below a
+        few hundred points.
+        """
+        spec = _validated(filters)
+        query = await _build_query(scope, spec)
+        return await run_in_threadpool(
+            service.field_scatter,
+            query,
+            field_x,
+            field_y,
+            max(1, min(limit, VIZ_SCATTER_MAX_POINTS)),
+        )
+
+    @server.tool()
+    async def compare(
+        kind: str,
+        primary_filters: FilterSpec | None = None,
+        comparison_filters: FilterSpec | None = None,
+        field: str | None = None,
+        buckets: int = 30,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Compare two filtered layers of the SAME timeline side by side.
+
+        `kind`: "time" (event counts on a shared bucket grid — `buckets`,
+        max 60), "terms" (top-value counts for `field` — `limit`, max 30, and
+        `field` is required), or "numeric" (fixed-width histograms for
+        `field` on shared bin edges — `limit` used as bin count, max 30,
+        `field` required). `primary_filters`/`comparison_filters` are two
+        independent FilterSpecs (e.g. two time windows, or an artifact type
+        vs the rest) — both scoped to this same case/timeline.
+        """
+        if kind not in ("time", "terms", "numeric"):
+            raise ValueError('kind must be "time", "terms", or "numeric"')
+        if kind in ("terms", "numeric") and not field:
+            raise ValueError(f'kind="{kind}" requires field')
+        primary_spec = _validated(primary_filters)
+        comparison_spec = _validated(comparison_filters)
+        primary_query = await _build_query(scope, primary_spec)
+        comparison_query = await _build_query(scope, comparison_spec)
+        if kind == "time":
+            return await run_in_threadpool(
+                service.compare_time_histogram,
+                primary_query,
+                comparison_query,
+                min(max(buckets, 4), VIZ_COMPARE_MAX_BUCKETS),
+            )
+        if kind == "terms":
+            return await run_in_threadpool(
+                service.compare_field_terms,
+                primary_query,
+                comparison_query,
+                field,
+                max(1, min(limit, VIZ_COMPARE_MAX_TERMS)),
+            )
+        return await run_in_threadpool(
+            service.compare_field_numeric,
+            primary_query,
+            comparison_query,
+            field,
+            max(1, min(limit, VIZ_COMPARE_MAX_BINS)),
+        )
+
+    @server.tool()
     async def run_anomaly_detector(
         detector: str,
         fields: str | None = None,
@@ -515,6 +693,133 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         query = await _build_query(scope, spec, limit=1)
         page = await run_in_threadpool(service.query, query)
         return {"accepted": True, "title": title, "total": page.total}
+
+    @server.tool()
+    async def propose_chart(title: str, description: str, spec: ChartSpec) -> dict[str, Any]:
+        """Propose a chart to the analyst.
+
+        Validates `spec` by actually executing the underlying query (same
+        caps as the read-only viz tools) and returns summary stats — this
+        tool never writes anything. The analyst sees a live chart card built
+        from `spec`, with "Open in Visualize" and "Save" — the analyst's
+        click is what persists a saved chart, never this call. On an invalid
+        spec (unknown kind, missing required field) the call errors so you
+        can correct it — no card is shown for a failed proposal.
+        """
+        kind = spec.kind
+        compare_kinds = {"compare_time", "compare_terms", "compare_numeric"}
+        field_required = kind in {
+            "terms",
+            "numeric",
+            "timeseries",
+            "pivot",
+            "scatter",
+            "compare_terms",
+            "compare_numeric",
+        }
+        if field_required and not spec.field:
+            raise ValueError(f'kind="{kind}" requires field')
+        if kind in {"pivot", "scatter"} and not spec.field_y:
+            raise ValueError(f'kind="{kind}" requires field_y')
+
+        primary_filters = _validated(spec.filters)
+        primary_query = await _build_query(scope, primary_filters)
+
+        if kind == "terms":
+            result = await run_in_threadpool(
+                service.field_terms, primary_query, spec.field, max(1, min(spec.limit or 30, 100))
+            )
+            return {
+                "ok": True,
+                "total": result["total"],
+                "distinct": result["distinct"],
+                "top_values": result["values"][:5],
+            }
+        if kind == "numeric":
+            result = await run_in_threadpool(service.field_numeric_stats, primary_query, spec.field)
+            return {
+                "ok": True,
+                "count": result["count"],
+                "min": result["min"],
+                "max": result["max"],
+                "mean": result["mean"],
+            }
+        if kind == "timeseries":
+            result = await run_in_threadpool(
+                service.field_value_timeseries,
+                primary_query,
+                spec.field,
+                min(max(spec.buckets or 30, 4), VIZ_TIMESERIES_MAX_BUCKETS),
+                max(1, min(spec.series_limit or 6, VIZ_TIMESERIES_MAX_SERIES)),
+            )
+            return {
+                "ok": True,
+                "series_count": len(result["series"]),
+                "interval_seconds": result["interval_seconds"],
+            }
+        if kind == "punchcard":
+            result = await run_in_threadpool(service.time_punchcard, primary_query)
+            return {"ok": True, "total": result["total"], "max_count": result["max_count"]}
+        if kind == "pivot":
+            result = await run_in_threadpool(
+                service.field_pivot,
+                primary_query,
+                spec.field,
+                spec.field_y,
+                max(1, min(spec.limit or 8, VIZ_PIVOT_MAX_LIMIT)),
+                max(1, min(spec.limit_y or 8, VIZ_PIVOT_MAX_LIMIT)),
+            )
+            return {
+                "ok": True,
+                "total": result["total"],
+                "x_distinct": result["x_distinct"],
+                "y_distinct": result["y_distinct"],
+            }
+        if kind == "scatter":
+            result = await run_in_threadpool(
+                service.field_scatter,
+                primary_query,
+                spec.field,
+                spec.field_y,
+                max(1, min(spec.limit or 300, VIZ_SCATTER_MAX_POINTS)),
+            )
+            return {"ok": True, "total": result["total"], "sampled": result["sampled"]}
+
+        if kind not in compare_kinds:
+            raise ValueError(
+                'kind must be one of "terms", "numeric", "timeseries", "punchcard", '
+                '"pivot", "scatter", "compare_time", "compare_terms", "compare_numeric"'
+            )
+        comparison_filters = _validated(spec.comparison_filters)
+        comparison_query = await _build_query(scope, comparison_filters)
+        if kind == "compare_time":
+            result = await run_in_threadpool(
+                service.compare_time_histogram,
+                primary_query,
+                comparison_query,
+                min(max(spec.buckets or 30, 4), VIZ_COMPARE_MAX_BUCKETS),
+            )
+        elif kind == "compare_terms":
+            result = await run_in_threadpool(
+                service.compare_field_terms,
+                primary_query,
+                comparison_query,
+                spec.field,
+                max(1, min(spec.limit or 20, VIZ_COMPARE_MAX_TERMS)),
+            )
+        else:
+            result = await run_in_threadpool(
+                service.compare_field_numeric,
+                primary_query,
+                comparison_query,
+                spec.field,
+                max(1, min(spec.limit or 20, VIZ_COMPARE_MAX_BINS)),
+            )
+        return {
+            "ok": True,
+            "primary_total": result["primary_total"],
+            "comparison_total": result["comparison_total"],
+        }
 
     if scope.conversation_id is not None:
 

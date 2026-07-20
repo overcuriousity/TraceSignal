@@ -31,6 +31,7 @@ from vestigo.api.deps import (
     require_password_current,
 )
 from vestigo.core.jobs import JobStore, get_job_store
+from vestigo.db._template import TEMPLATE_NORMALIZE_VERSION
 from vestigo.db.postgres import DISPOSITION_KINDS, Case, User
 
 router = APIRouter(prefix="/api/cases", tags=["dispositions"])
@@ -85,49 +86,98 @@ def _validate_scope(p: DispositionCreate) -> str:
         if p.detector == "*":
             raise HTTPException(status_code=422, detail="confirmed requires a concrete detector")
     if p.kind == "routine":
-        # Routine is the sequence_motif miner's verdict: value scope is the
-        # (series_field, " → "-joined n-gram) pair, and the occurrence
-        # materialization needs the motif's values/n from `details`.
+        if p.detector not in ("sequence_motif", "log_template"):
+            raise HTTPException(
+                status_code=422,
+                detail="routine requires detector 'sequence_motif' or 'log_template'",
+            )
         if not has_value:
             raise HTTPException(status_code=422, detail="routine requires value scope")
-        if p.detector != "sequence_motif":
-            raise HTTPException(
-                status_code=422, detail="routine requires detector 'sequence_motif'"
-            )
-        values = (p.details or {}).get("values")
-        if (
-            not isinstance(values, list)
-            or not 2 <= len(values) <= 5
-            or not all(isinstance(v, str) and v for v in values)
-        ):
-            raise HTTPException(
-                status_code=422,
-                detail="routine requires details.values (the motif's 2–5 non-empty string values)",
-            )
-        # The displayed value and the materialized occurrences must describe
-        # the same motif — an inconsistent pair would collapse events the row
-        # doesn't announce.
-        if p.value != " → ".join(values):
-            raise HTTPException(
-                status_code=422,
-                detail="routine value must equal ' → '.join(details.values)",
-            )
-        # A snapshotted mining frame must be parseable — materialization
-        # honors it, and a malformed value must never silently degrade to an
-        # unscoped (wider) collapse.
-        for key in ("scope_start", "scope_end"):
-            raw = (p.details or {}).get(key)
-            if raw is None:
-                continue
-            try:
-                if not isinstance(raw, str):
-                    raise ValueError
-                datetime.fromisoformat(raw)
-            except ValueError:
+        if p.detector == "sequence_motif":
+            # sequence_motif's verdict: value scope is the (series_field,
+            # " → "-joined n-gram) pair, and the occurrence materialization
+            # needs the motif's values/n from `details`.
+            values = (p.details or {}).get("values")
+            if (
+                not isinstance(values, list)
+                or not 2 <= len(values) <= 5
+                or not all(isinstance(v, str) and v for v in values)
+            ):
                 raise HTTPException(
                     status_code=422,
-                    detail=f"routine details.{key} must be an ISO timestamp",
-                ) from None
+                    detail=(
+                        "routine requires details.values (the motif's 2–5 non-empty string values)"
+                    ),
+                )
+            # The displayed value and the materialized occurrences must
+            # describe the same motif — an inconsistent pair would collapse
+            # events the row doesn't announce.
+            if p.value != " → ".join(values):
+                raise HTTPException(
+                    status_code=422,
+                    detail="routine value must equal ' → '.join(details.values)",
+                )
+            # A snapshotted mining frame must be parseable — materialization
+            # honors it, and a malformed value must never silently degrade to
+            # an unscoped (wider) collapse.
+            for key in ("scope_start", "scope_end"):
+                raw = (p.details or {}).get(key)
+                if raw is None:
+                    continue
+                try:
+                    if not isinstance(raw, str):
+                        raise ValueError
+                    datetime.fromisoformat(raw)
+                except ValueError:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"routine details.{key} must be an ISO timestamp",
+                    ) from None
+        else:
+            # log_template (W6): value is the decimal template_id — the
+            # collapse predicate binds it straight into
+            # `template_hash IN (...)`, no aux-table materialization, so
+            # identity is enforced here instead of at a job boundary.
+            if p.field != "template_id":
+                raise HTTPException(
+                    status_code=422, detail="log_template routine requires field 'template_id'"
+                )
+            if p.value is None or not p.value.isdigit():
+                raise HTTPException(
+                    status_code=422,
+                    detail="log_template routine value must be the decimal template_id",
+                )
+            details = p.details or {}
+            template = details.get("template")
+            if not isinstance(template, str) or not template:
+                raise HTTPException(
+                    status_code=422, detail="log_template routine requires details.template"
+                )
+            # The collapse predicate is `template_hash NOT IN (...)` against the
+            # materialized column, which is hashed over `message` and nothing
+            # else. `list_log_templates` will happily template any field, so a
+            # disposition minted from an `attr:*` listing would carry a hash
+            # from a different domain and collapse events this row does not
+            # describe — the one thing a routine collapse must never do.
+            # Reject it here: the disposition is the forensic record, and it
+            # must not be creatable in a state the grid cannot honor.
+            templated_field = details.get("field") or "message"
+            if templated_field != "message":
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "log_template routine currently supports only details.field 'message' — "
+                        "the grid's collapse predicate uses the materialized message template hash"
+                    ),
+                )
+            if details.get("template_version") != TEMPLATE_NORMALIZE_VERSION:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "log_template routine requires details.template_version == "
+                        f"{TEMPLATE_NORMALIZE_VERSION}"
+                    ),
+                )
     return "value" if has_value else "event"
 
 

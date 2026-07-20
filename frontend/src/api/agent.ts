@@ -11,6 +11,7 @@
  */
 import { BASE, get, post, put, del, fetchBlobGet, ApiError } from "./client";
 import type { EventFilters, FieldMatchMode } from "./types";
+import type { ChartConfig, ChartType } from "@/components/viz/lib/chartConfig";
 
 /** Backend FilterSpec shape (snake_case) — what agent tool calls carry. */
 export interface AgentFilterSpec {
@@ -31,6 +32,99 @@ export interface AgentFilterSpec {
   run_id?: string | null;
   event_ids?: string[] | null;
   collapse_routine?: boolean;
+}
+
+/**
+ * Backend ChartSpec shape (A9) — carried verbatim on a `propose_chart` tool
+ * call's `tool_args`. Backend-opaque like the viz-tool FilterSpec above: the
+ * frontend owns the mapping to its own `ChartConfig` (see
+ * `specToChartConfig` below), the backend never learns that shape.
+ */
+export interface AgentChartSpec {
+  kind:
+    | "terms"
+    | "numeric"
+    | "timeseries"
+    | "punchcard"
+    | "pivot"
+    | "scatter"
+    | "compare_time"
+    | "compare_terms"
+    | "compare_numeric";
+  field?: string | null;
+  field_y?: string | null;
+  filters?: AgentFilterSpec | null;
+  comparison_filters?: AgentFilterSpec | null;
+  buckets?: number | null;
+  series_limit?: number | null;
+  limit?: number | null;
+  limit_y?: number | null;
+}
+
+/** Which `ChartType` (and matching `Scale`, per `CHART_META`) renders each
+ * `propose_chart` kind by default. */
+const CHART_TYPE_BY_KIND: Record<AgentChartSpec["kind"], ChartType> = {
+  terms: "bar",
+  numeric: "histogram",
+  timeseries: "line",
+  punchcard: "punchcard",
+  pivot: "pivot",
+  scatter: "scatter",
+  compare_time: "time",
+  compare_terms: "bar",
+  compare_numeric: "histogram",
+};
+const SCALE_BY_KIND: Record<AgentChartSpec["kind"], ChartConfig["scale"]> = {
+  terms: "nominal",
+  numeric: "ratio",
+  timeseries: "ratio",
+  punchcard: "nominal",
+  pivot: "nominal",
+  scatter: "ratio",
+  compare_time: "nominal",
+  compare_terms: "nominal",
+  compare_numeric: "ratio",
+};
+
+/**
+ * Map a `propose_chart` spec onto the Visualize page's `ChartConfig` — the
+ * shape every chart component, "Open in Visualize", and "Save" consume.
+ * Mirrors `specToEventFilters` above: agent shapes translate to UI shapes at
+ * the frontend boundary, the backend never learns either UI shape.
+ */
+export function specToChartConfig(spec: AgentChartSpec): ChartConfig {
+  const isCompare = spec.kind.startsWith("compare_");
+  const options: ChartConfig["options"] = {};
+  if (spec.buckets) options.buckets = spec.buckets;
+  if (spec.series_limit) options.topN = spec.series_limit;
+  // `spec.limit` is deliberately overloaded on the backend (see ChartSpec's
+  // field description) — its meaning depends on `kind`, so each kind routes it
+  // to the ChartConfig option its own data path actually reads. Numeric kinds
+  // read `options.bins` (vizApi.fieldNumeric's `bins`, compare's `body.bins`);
+  // routing them to `topN` would silently drop the agent's bin count.
+  if (spec.kind === "pivot") {
+    if (spec.limit) options.limitX = spec.limit;
+    if (spec.limit_y) options.limitY = spec.limit_y;
+  } else if (spec.kind === "scatter") {
+    if (spec.limit) options.sampleLimit = spec.limit;
+  } else if (spec.kind === "numeric" || spec.kind === "compare_numeric") {
+    if (spec.limit) options.bins = spec.limit;
+  } else if (spec.limit) {
+    options.topN = spec.limit;
+  }
+  return {
+    v: 1,
+    field: spec.field ?? null,
+    fieldY: spec.field_y ?? null,
+    scale: SCALE_BY_KIND[spec.kind],
+    chartType: CHART_TYPE_BY_KIND[spec.kind],
+    metric: "count",
+    compare:
+      isCompare && spec.comparison_filters
+        ? { mode: "custom", filters: specToEventFilters(spec.comparison_filters) }
+        : { mode: "off" },
+    options,
+  };
 }
 
 /** An agent-proposed annotation, propose→confirm (A1): the agent never

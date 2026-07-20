@@ -8,7 +8,7 @@
  * loaded by a future frontend — bump the version on breaking shape changes
  * and handle old versions explicitly instead of silently misreading them.
  */
-import type { EventFilters } from "@/api/types";
+import type { CompareTimeResponse, EventFilters, HistogramResponse } from "@/api/types";
 import { filtersToParams, filtersToViewPayload, viewPayloadToFilters } from "@/lib/queryParams";
 import type { Metric } from "./transforms";
 
@@ -220,6 +220,22 @@ export function filterParamsPreservingChartConfig(
     if (k.startsWith("c_")) params.set(k, v);
   }
   return params;
+}
+
+/** Adapt the single-layer histogram response to the compare shape so one
+ * chart component (CompareHistogram) renders both the compare-off and
+ * compare-on cases — shared by the Visualize page and `ChartProposalCard`
+ * (the agent's `propose_chart` "time"/"compare_time" kinds). */
+export function histogramToCompare(h: HistogramResponse): CompareTimeResponse {
+  return {
+    kind: "time",
+    interval_seconds: h.interval_seconds,
+    min: h.min,
+    max: h.max,
+    buckets: h.buckets.map((b) => ({ start: b.start, primary: b.count, comparison: 0 })),
+    primary_total: h.buckets.reduce((sum, b) => sum + b.count, 0),
+    comparison_total: 0,
+  };
 }
 
 /** Shape a ChartConfig for storage (saved charts): compare filters go

@@ -12,6 +12,15 @@ same field.
 
 from __future__ import annotations
 
+SYNTHETIC_COLUMN_EXPRESSIONS: dict[str, str] = {
+    # W6: template_hash is a real column, but exposed under a token that
+    # doesn't share its literal name — toString() so it round-trips through
+    # the same String-typed filter/facet plumbing every other top-level
+    # column token does (decimal string, JS-precision-safe).
+    "template_id": "toString(template_hash)",
+}
+
+
 TOP_LEVEL_EVENT_COLUMNS = frozenset(
     {
         "message",
@@ -75,10 +84,16 @@ def resolve_column_token(token: str) -> tuple[str | None, str | None]:
     always means "attribute" even if the stripped name happens to match a
     column name. Returns ``(None, attribute_key)`` otherwise, with any
     ``attr:`` prefix stripped.
+
+    A token in :data:`SYNTHETIC_COLUMN_EXPRESSIONS` returns that expression
+    instead of the bare token — for a real column exposed under a different
+    name (e.g. ``template_id`` → ``toString(template_hash)``).
     """
     if token.startswith("attr:"):
         return None, token[5:]
     normalized = token.strip().lower()
+    if normalized in SYNTHETIC_COLUMN_EXPRESSIONS:
+        return SYNTHETIC_COLUMN_EXPRESSIONS[normalized], None
     if normalized in TOP_LEVEL_EVENT_COLUMNS:
         return normalized, None
     return None, token

@@ -64,6 +64,19 @@ def test_core_column_collision_rejected():
     assert any("core event column" in p for p in problems)
 
 
+def test_synthetic_column_collision_rejected():
+    """`template_id` is a real column under another name — mappings resolve
+    before column tokens do, so letting one shadow it would silently redirect
+    the Templates tab's drill-to-grid onto an unrelated attribute."""
+    problems = validate_field_mappings({"template_id": ["src_ip"]}, AVAILABLE)
+    assert any("core event column" in p for p in problems)
+    # Case-insensitively, same as the core-column check.
+    assert any(
+        "core event column" in p
+        for p in validate_field_mappings({"Template_ID": ["src_ip"]}, AVAILABLE)
+    )
+
+
 def test_existing_raw_key_collision_rejected():
     problems = validate_field_mappings({"status": ["src_ip"]}, AVAILABLE)
     assert any("existing raw attribute key" in p for p in problems)

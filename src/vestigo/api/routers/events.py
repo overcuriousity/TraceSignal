@@ -8,7 +8,7 @@ import io
 import json
 import re
 from collections.abc import Generator
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from typing import Any, Literal
 
@@ -444,29 +444,58 @@ async def _resolve_annotated_event_ids(
     return list(event_ids)
 
 
+@dataclass
+class RoutineCollapseScope:
+    """The two independent routine-collapse mechanisms, resolved together.
+
+    Motif collapse (``sequence_motif``) anti-joins the materialized
+    ``motif_occurrences`` table by disposition id; template collapse (W6,
+    ``log_template``) is a direct ``template_hash NOT IN (...)`` predicate —
+    no aux table. Both are exposed by one ``collapse_routine`` flag, so they
+    resolve together and the collapsed-count sums both mechanisms.
+    """
+
+    motif_disposition_ids: list[str] | None
+    template_hashes: list[int] | None
+
+    def __bool__(self) -> bool:
+        return bool(self.motif_disposition_ids or self.template_hashes)
+
+
 async def _resolve_routine_collapse(
     case_id: str,
     timeline_id: str,
     source_ids: list[str],
     collapse_routine: bool,
-) -> list[str] | None:
-    """Resolve the active routine-motif disposition ids for grid collapse.
+) -> RoutineCollapseScope:
+    """Resolve the active routine dispositions for grid collapse.
 
-    Returns None unless *collapse_routine* is set and at least one active
-    ``kind="routine"`` disposition exists — the EventQuery anti-join and the
-    collapsed-count both key off exactly this id list, so what is hidden and
+    Empty scope unless *collapse_routine* is set and at least one active
+    ``kind="routine"`` disposition exists — the EventQuery predicates and the
+    collapsed-count both key off exactly this scope, so what is hidden and
     what is counted can never disagree.
     """
+    empty = RoutineCollapseScope(None, None)
     if not collapse_routine:
-        return None
+        return empty
     rows = await get_store().list_dispositions(
         case_id,
         timeline_id=timeline_id,
         source_ids=source_ids,
         kinds=["routine"],
-        detector="sequence_motif",
     )
-    return [d.id for d in rows] or None
+    motif_ids = [d.id for d in rows if d.detector == "sequence_motif"]
+    # `isdigit` guard, not just a None check: creation-time validation cannot
+    # vouch for rows that arrive another way (import, direct DB write, a future
+    # schema change), and this resolver sits on the grid, histogram *and*
+    # export paths — one malformed value must not 500 all three. A row we
+    # cannot parse collapses nothing, which is the safe direction.
+    template_hashes = [
+        int(d.value)
+        for d in rows
+        if d.detector == "log_template" and d.value is not None and d.value.isdigit()
+    ]
+    return RoutineCollapseScope(motif_ids or None, template_hashes or None)
 
 
 async def _resolve_event_id_filters(
@@ -660,7 +689,7 @@ async def list_events(
             ids=ids,
         )
 
-    routine_disposition_ids = await _resolve_routine_collapse(
+    routine_scope = await _resolve_routine_collapse(
         case_id, timeline_id, source_ids, collapse_routine
     )
 
@@ -698,7 +727,8 @@ async def list_events(
             before=before_cursor,
             field_mappings=field_mappings,
             source_offsets=source_offsets,
-            exclude_routine_disposition_ids=routine_disposition_ids,
+            exclude_routine_disposition_ids=routine_scope.motif_disposition_ids,
+            exclude_template_hashes=routine_scope.template_hashes,
         ),
     )
     response = {
@@ -712,18 +742,16 @@ async def list_events(
         "prev_cursor": page.prev_cursor,
     }
     if collapse_routine:
-        # Forensic requirement: a collapse must announce what it hid. Distinct
-        # member events across the active routine dispositions (scoped to this
-        # timeline's sources), regardless of the page's other filters.
-        response["routine_collapsed_count"] = (
-            await run_in_threadpool(
-                service.store.count_motif_occurrences,
-                case_id,
-                routine_disposition_ids,
-                source_ids,
-            )
-            if routine_disposition_ids
-            else 0
+        # Forensic requirement: a collapse must announce what it hid. The
+        # union's cardinality across both routine mechanisms (scoped to this
+        # timeline's sources), regardless of the page's other filters — an
+        # event covered by both must not be double-counted.
+        response["routine_collapsed_count"] = await run_in_threadpool(
+            service.store.count_routine_collapsed,
+            case_id,
+            source_ids,
+            routine_scope.motif_disposition_ids,
+            routine_scope.template_hashes,
         )
     return response
 
@@ -1051,7 +1079,7 @@ async def get_histogram(
         tags_exclude=tags_exclude,
         ids=ids,
     )
-    routine_disposition_ids = await _resolve_routine_collapse(
+    routine_scope = await _resolve_routine_collapse(
         case_id, timeline_id, source_ids, collapse_routine
     )
     service = _get_query_service()
@@ -1080,7 +1108,8 @@ async def get_histogram(
             tags_exclude=tags_exclude_filter,
             field_mappings=field_mappings,
             source_offsets=source_offsets,
-            exclude_routine_disposition_ids=routine_disposition_ids,
+            exclude_routine_disposition_ids=routine_scope.motif_disposition_ids,
+            exclude_template_hashes=routine_scope.template_hashes,
         ),
         buckets=buckets,
     )
@@ -1277,7 +1306,7 @@ async def export_events(
         ids=body.filter.ids,
     )
 
-    routine_disposition_ids = await _resolve_routine_collapse(
+    routine_scope = await _resolve_routine_collapse(
         case_id, timeline_id, source_ids, body.filter.collapse_routine
     )
 
@@ -1307,7 +1336,8 @@ async def export_events(
         tags_exclude=tags_exclude_filter,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
-        exclude_routine_disposition_ids=routine_disposition_ids,
+        exclude_routine_disposition_ids=routine_scope.motif_disposition_ids,
+        exclude_template_hashes=routine_scope.template_hashes,
     )
 
     if _uses_regex(bool(eq.q_regex and eq.q), eq.filter_modes, eq.exclusion_modes):
@@ -2465,6 +2495,72 @@ async def list_anomalies(
     )
     payload["run_id"] = run_id
     return payload
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/log-templates")
+async def list_log_templates(
+    case_id: str,
+    timeline_id: str,
+    field: str = Query(
+        default="message",
+        description=(
+            "Field token to template over. 'message' (default) uses the "
+            "indexed materialized column; any other token (e.g. "
+            "'attr:raw_line') is templated unindexed at query time."
+        ),
+    ),
+    order: str = Query(default="count", pattern="^(count|first_seen|last_seen)$"),
+    baseline_id: str | None = Query(
+        default=None,
+        description=(
+            "ID of a saved baseline definition. Required together with "
+            "only_new=true; its baseline_end splits 'seen before' from 'new'."
+        ),
+    ),
+    only_new: bool = Query(
+        default=False,
+        description="Keep only templates whose earliest occurrence is at/after the baseline's end.",
+    ),
+    limit: int = Query(default=100, ge=1, le=500),
+    case: Case = Depends(require_case_read),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Browse structurally-distinct log-line shapes (W6).
+
+    Variable substrings (timestamps, UUIDs, IPs, hex, digit runs) are masked
+    via a versioned ClickHouse-side regex chain (see
+    docs/ANOMALY_DETECTION.md), so e.g. 50M "Allow TCP <IP>:<PORT> -> ...''
+    lines collapse to one template while a structurally distinct line stands
+    out. Not a scored detector — a browser, sorted by shape frequency (or
+    first/last seen).
+    """
+    source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
+    store = get_store()
+    baseline_end = None
+    if only_new:
+        if baseline_id is None:
+            raise HTTPException(status_code=422, detail="only_new requires baseline_id")
+        definition = await store.get_baseline_definition(case_id, timeline_id, baseline_id)
+        if definition is None:
+            raise HTTPException(
+                status_code=404, detail=f"Unknown baseline definition: {baseline_id}"
+            )
+        baseline_end = ensure_utc(definition.baseline_end)
+
+    svc = _get_stat_anomaly_service()
+    result = await run_in_threadpool(
+        svc.list_log_templates,
+        case_id=case_id,
+        source_ids=source_ids,
+        field=field,
+        limit=limit,
+        order=order,
+        baseline_end=baseline_end,
+        only_new=only_new,
+        field_mappings=field_mappings,
+        source_offsets=source_offsets,
+    )
+    return asdict(result)
 
 
 class TagAnomaliesRequest(BaseModel):
