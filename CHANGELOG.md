@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Path traversal in the frontend catch-all (unauthenticated arbitrary file
+  read).** The route that serves the built SPA joined the request path onto
+  `frontend/dist` and let the filesystem resolve it, so a request line carrying
+  a literal `..` — which neither uvicorn nor Starlette normalizes — returned any
+  file readable by the service account, including the deployment's own `.env`.
+  The route is unauthenticated by design (the browser needs the app shell before
+  login), so this was reachable by anyone who could reach the port. Candidates
+  are now resolved and required to sit inside `frontend/dist`, which also stops
+  a symlink pointing out of it. **Anyone who exposed vestigo-web to an untrusted
+  network should check their proxy access logs for request paths containing `..`
+  and rotate the secrets in `.env` if there is any doubt.**
+
+### Fixed
+
+- **Agent turns no longer die on a LiteLLM context overflow.** The overflow
+  heuristic did not recognise LiteLLM's "exceeds the available context size"
+  phrasing, so an overflow against a proxied local model skipped the
+  compact-and-retry escalation entirely and surfaced as a generic model error,
+  losing the turn.
+
 ## [1.4.1] — 2026-07-20
 
 ### Changed

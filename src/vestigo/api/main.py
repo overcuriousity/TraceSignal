@@ -495,11 +495,27 @@ def create_app() -> FastAPI:
         if assets_dir.is_dir():
             app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
+        # Resolved once: every candidate must land inside this directory.
+        dist_root = _FRONTEND_DIST.resolve()
+        index_html = dist_root / "index.html"
+
         @app.get("/{full_path:path}", include_in_schema=False)
         async def serve_frontend(full_path: str) -> FileResponse:
-            candidate = _FRONTEND_DIST / full_path
-            if candidate.is_file():
+            # `full_path` is attacker-controlled and arrives unnormalized: a
+            # request line may carry a literal `..`, and neither uvicorn's
+            # parser nor Starlette's router collapses it. Joining it onto the
+            # dist directory and calling `.is_file()` lets the *kernel* resolve
+            # the `..`, which turns this unauthenticated catch-all into an
+            # arbitrary-file read of anything the service account can open
+            # (CVE-class path traversal; the deployment's own .env among them).
+            #
+            # So: resolve first, then require the result to sit under
+            # `dist_root` — which also rejects a symlink inside dist that
+            # points out of it. Anything else falls through to the SPA shell,
+            # exactly as an unknown client-side route does.
+            candidate = (dist_root / full_path).resolve()
+            if candidate.is_relative_to(dist_root) and candidate.is_file():
                 return FileResponse(candidate)
-            return FileResponse(_FRONTEND_DIST / "index.html")
+            return FileResponse(index_html)
 
     return app

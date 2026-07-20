@@ -327,13 +327,19 @@ def _sse(event: dict[str, Any]) -> str:
 
 # Known overflow phrasings: OpenAI-protocol "maximum context length is N
 # tokens" / code "context_length_exceeded"; Anthropic "prompt is too long" /
-# "input is too long"; generic "context window" / "token limit" variants.
+# "input is too long"; LiteLLM proxies "exceeds the available context size
+# (N tokens)"; generic "context window" / "token limit" variants.
 # Deliberately NOT bare "token"/"maximum"/"length": those also appear in
 # unrelated 400s ("invalid token", "max_tokens must be ...") and a false
 # positive here burns a summarizer LLM call and surfaces a misleading
 # "start a new conversation" error.
+#
+# A miss is not cosmetic: an unmatched overflow skips the compact-and-retry
+# escalation entirely and dies as a generic model_error, which is how a real
+# turn was lost against a LiteLLM-fronted local model on 2026-07-20. Add the
+# phrasing here (with a test) whenever a provider invents another one.
 _CONTEXT_OVERFLOW_RE = re.compile(
-    r"context[ _-]?(?:length|window|limit)"
+    r"context[ _-]?(?:length|window|limit|size)"
     r"|maximum context"
     r"|prompt is too long"
     r"|input is too long"

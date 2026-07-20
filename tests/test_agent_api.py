@@ -1669,6 +1669,14 @@ def test_is_context_overflow_matches_known_phrasings_only():
     assert _is_context_overflow(_exc('{"code": "context_length_exceeded"}'))
     assert _is_context_overflow(_exc("input is too long for requested model", status=413))
     assert _is_context_overflow(_exc("request exceeds the token limit"))
+    # LiteLLM proxy wording, observed against a local model 2026-07-20. This
+    # one was a miss: it skipped compact-and-retry and lost the turn.
+    assert _is_context_overflow(
+        _exc(
+            "litellm.BadRequestError: Custom_openaiException - request (81855 tokens) "
+            "exceeds the available context size (65536 tokens), try increasing it."
+        )
+    )
     # Unrelated 400s that share individual words.
     assert not _is_context_overflow(_exc("Invalid token provided"))
     assert not _is_context_overflow(_exc("max_tokens must be greater than 0"))
