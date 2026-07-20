@@ -292,16 +292,35 @@ thinking capture as first-class messages, and full-thread JSON export — see
   user directory (id, username, display name — needed to render names on annotations).
   Fine for the small-team threat model; add a config flag or scope the listing to co-case
   members if multi-tenant / large-org deployments emerge (PR137 review follow-up).
-- [ ] **A8 — External MCP toolsets (web research / user-pluggable tools).** Do NOT build
-  bespoke whois/web tools or a custom plugin API: the runtime is pydantic-ai with MCP
+- [ ] **A8 — External MCP toolsets (web research / OSINT / user-pluggable tools).** Do NOT
+  build bespoke whois/web tools or a custom plugin API: the runtime is pydantic-ai with MCP
   toolsets, so let the agent consume operator-configured **external MCP servers**
-  (users write a whois/VT/web-search tool as a tiny MCP server in any language; zero
+  (users write a whois/VT/web-search/Shodan tool as a tiny MCP server in any language; zero
   Vestigo code per tool; symmetric with our own `/mcp` exposure). Hard requirements:
-  (a) OPSEC gate — outbound lookups leak case indicators to third parties; gate behind
+  (a) OPSEC gate — outbound lookups leak case indicators to third parties (the model
+  composes queries from case evidence: an internal hostname or IOC sent to a search
+  provider, a victim IP queried on Shodan, can tip off an adversary); gate behind
   `VESTIGO_ALLOW_ONLINE` **and** per-case opt-in, default off; (b) forensic capture —
-  audit every external call and persist/hash the raw response (external evidence must
-  stay replayable), mark results `origin: external` in the conversation record. Needs
-  its own design round before implementation.
+  audit every external call and persist/hash the raw response with its timestamp
+  (external results drift over time; they are OSINT enrichment with provenance, never
+  evidence), mark results `origin: external` in the conversation record; (c) governance
+  reuse — external tools enter `TOOL_REGISTRY`-equivalent surfacing so the existing three
+  deny layers (admin hard-deny, per-user defaults, per-chat opt-in) and the tool-selector
+  popover apply uniformly; (d) disclosure — extend the persistent OPSEC panel
+  (`AgentPanel.tsx`) to name any enabled network tools and their endpoints; (e) update
+  `docs/AGENT.md`'s sandbox invariant ("the agent queries the backend in its own loop"),
+  which external tools genuinely widen. Feasibility confirmed 2026-07-20: the
+  toggle/audit/disclosure machinery is ready — the work is the policy layer, not plumbing.
+  Needs its own design round before implementation.
+- [ ] **A12 — Local transform tools (CyberChef-class).** Decode/encode (base64, hex, URL,
+  …), hashing, decompression, timestamp conversion as **native tools** in
+  `agent/tools.py` — a curated, append-only op set (or recipe-runner over a vetted op
+  list), not a call-out to a CyberChef server. Pure local computation: no network, fully
+  deterministic, hence reproducible — fits the offline-by-default and forensic
+  requirements with no OPSEC gate. Care points: resource caps (decompression bombs,
+  output size vs. context budget — reuse the existing `_truncate`/cap conventions) and
+  keeping the op set append-only so old conversations stay replayable. Lowest-friction,
+  highest-fit agent-tool addition; can ship independently of (and before) A8.
 - ✅ **A9 — Agent-created visualizations (viz parity)** — shipped: five read tools
   (`field_timeseries`, `time_punchcard`, `field_pivot`, `field_scatter`, `compare`) plus
   `propose_chart` (`agent/tools.py`, validate-by-execute, no write); frontend `ChartSpec` →
