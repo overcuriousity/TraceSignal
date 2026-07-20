@@ -1,6 +1,143 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-20 (session 74 — agent panel UX fixes).
+Last updated: 2026-07-20 (session 77 — PR142 second review round, merged to main).
+
+## Session 77 — 2026-07-20: PR142 second review round — the two paths that missed the guard
+
+A second review of PR142 before merge. The PR's whole thesis is that a chart
+request must never succeed *quietly wrong*, and it enforces that in three
+places (`_check_chart_field`, the `count == 0` raise, the scatter raise). Two
+paths had not been given the same treatment:
+
+- **Numeric mark over a `time:` field rendered a blank box.** `time:date` and
+  `time:year_month` are `interval`, so `chartTypesFor` offered `histogram` and
+  `scatter` — but `VisualizePage`'s numeric probe is disabled for time fields,
+  and every render gate is `data && <Chart/>`. No spinner, no message, no
+  chart. New `chartTypesForField(scale, field)` (`viz/lib/chartOptions.ts`)
+  drops the numeric/scatter marks for a `time:` field and now backs the
+  dropdown, the scale-change clamp and `defaultChartTypeForScale`. A saved
+  chart or URL can still carry the pairing (the time-field effect is gated on
+  `field !== autoProbedField.current`, which a restored config never trips), so
+  the canvas also grew an explicit branch saying the field has no numeric
+  values — the same thing `propose_chart` tells the agent.
+- **`time:` tokens silently no-op'd in the detectors.** `anomaly_stats._col_expr`
+  has no `time:` branch, so `run_anomaly_detector(fields="time:hour_of_day")`
+  fell through to `attributes['time:hour_of_day']` — empty for every row. The
+  detector finished clean with zero findings, reading as "nothing anomalous"
+  rather than "never scanned". `list_fields` advertises these tokens (they are
+  real for charts and filters), so the scoping had to be stated: it now says so
+  in the docstring, and `_reject_time_fields` guards `fields`/`series_field`
+  with an error pointing at frequency / interval_periodicity, which bucket time
+  themselves.
+
+Smaller, both naming-honesty rather than behaviour:
+
+- `VIZ_COMPARE_MAX_{TERMS,BINS,BUCKETS}` → `VIZ_MAX_*`. The rebuilt
+  `propose_chart` routes its non-compare paths through them too, so "COMPARE"
+  in the name had stopped being true.
+- `field_pivot`'s `x_distinct`/`y_distinct` carry two units — a *measured*
+  distinct count the axis may have been truncated against, or the size of a
+  bounded `time:` domain charted whole. Added `x_bounded`/`y_bounded` to say
+  which, echoed in `propose_chart`'s summary and used by the caption builder to
+  pass `undefined` for a bounded axis, so "top N of M" can never claim a
+  truncation that did not occur. Additive response change; the hand-mirrored
+  `FieldPivotResponse` was updated alongside (exactly the duplication
+  Milestone 3's `openapi-typescript` item would remove).
+
+Verification: backend 1363 passed (was 1359), frontend 386 passed (was 383),
+ruff + oxlint + `tsc -b --noEmit` clean, `gen_chart_meta.py` still idempotent.
+The pivot test fake derives `*_bounded` the same way the real service does, so
+it cannot drift into claiming a measured count for a static domain.
+
+## Session 76 — 2026-07-20: PR142 review fixes — virtual time fields reach the analyst
+
+Review of PR142 (chart proposals + virtual `time:` fields) found the
+analyst-facing half of the feature unwired: `viz/lib/timeFields.ts` was
+generated and imported by nothing, so the Visualize picker showed raw tokens
+and a weekday axis read "1".."7". `viz.py`'s own docstring justifies exposing
+time fields to analysts because "anything the agent can chart the analyst has
+to be able to rebuild by hand" — so this closed that gap rather than deleting
+the generated module.
+
+- **New `viz/lib/fieldDisplay.ts`** — token→label, value→display form, used by
+  the picker, all six charts and the compare editor. The load-bearing rule:
+  only text goes through it; keys, `scaleBand` domains, colour-map keys, sort
+  comparators and click payloads stay on the canonical value, the only form
+  that round-trips into a filter, URL or saved chart.
+- **Three silent-wrong-answer bugs found while wiring it**, each verified to
+  fail against the unfixed code before fixing: `BarChart`'s `sort="value"`
+  ordered by display label (defeating the zero-padding `_time_fields.py` pays
+  for — the axis reordered to `Mon, Sun, Tue, Wed`); `Legend` reports
+  `key ?? label` to click-to-filter and `LineChart` passed no `key`, so
+  clicking "Mon" filtered on a value that cannot exist; and
+  `chartTypesFor(scale)[0]` is the *field-free* `time` histogram for every
+  scale, so a scale switch silently dropped the picked field
+  (`defaultChartTypeForScale` added).
+- **Auto-probe bypass.** A `time:` field's SQL yields zero-padded strings, so
+  `field_numeric_stats` could only ever report `count: 0` — the scan was pure
+  waste and landed the analyst on nominal/bar, contradicting the statically
+  known scale. `VisualizePage` now takes the scale from `TIME_FIELDS`.
+- **Honest field stats.** `describe_field` reported a raw count under
+  `coverage`, which means a 0-1 fraction everywhere else in the API →
+  `non_empty_total`. `viz/fields` claimed `coverage: 1.0` for virtual fields,
+  false whenever a timeline holds undated (sentinel) events → `null`, as is
+  `distinct` for the unbounded date parts. A bounded `time:` pivot axis
+  silently ignored `limit_x`/`limit_y` (53×31 = 1643 cells into the model's
+  context with the limit accepted and never applied) → warns, stops echoing
+  the limit, reports `matrix_size`.
+- **A review finding that was wrong, and reverted.** The legacy `compare_*`
+  shim maps a spec with no `comparison_filters` to `{mode: "off"}`; review
+  called that infidelity, since the retired *backend* validated it as a
+  baseline comparison. A test in PR142 already documented the counter-argument:
+  `specToChartConfig` is what drew the card, and it drew one layer. The card is
+  the artifact, so the translation follows the card. Both sides reverted, the
+  comment extended so the next reader doesn't repeat the mistake.
+- **Compare editor** offers a bounded time field's domain as labelled choices
+  instead of free text, which invited typing "Mon" and building a filter that
+  matches nothing.
+- Smaller: `_capped` gained a floor so clamped `buckets` warns like every other
+  option; `_check_chart_field` accepts the spellings `resolve_time_field`
+  resolves; the field-vocabulary cache uses a `None` sentinel so an empty
+  timeline is cached; `gen_chart_meta.py` emits camelCase `readsOptions` to
+  match `ChartOptions` (snake_case matched no TS key).
+
+Verification: backend 1359 passed, frontend 383 passed (was 346), ruff and
+oxlint clean, `gen_chart_meta.py` regeneration idempotent by hash. Shared test
+helpers extracted (`test/helpers/resizeObserver.ts`, `radix.ts`) — no existing
+test drove a Radix Select, which is why the field-picker page test is new
+ground.
+
+## Session 75 — 2026-07-20: agent-tool feasibility items + roadmap triage
+
+Docs-only session (no code changes).
+
+- **Agent-tool feasibility → roadmap.** Assessed adding web search / Shodan /
+  CyberChef-class tools to the agent: the toggle/audit/disclosure machinery is
+  ready, the open work is policy. A8 expanded with the concrete requirements
+  (OPSEC leak rationale, timestamped raw-response provenance, governance +
+  disclosure reuse, AGENT.md sandbox-invariant update); new A12 (local
+  CyberChef-class transforms — native, deterministic, offline, no OPSEC gate,
+  can ship before A8).
+- **Context-overhead measurement → A13.** The 27 tool schemas serialize to
+  ~15k tokens (plus ~1.2k system prompt), resent every request — half a 32k
+  local-model window. Dominated by `FilterSpec` inlined into ~14 tool schemas.
+  Three levers recorded: `$defs`/`$ref` schema dedup, lean tool-profile
+  presets, and header-once columnar tool-result encoding (results are resent
+  in history every turn). Negative decision recorded: agent prose stays
+  verbose — findings feed forensic reports and the transcript is custody
+  record, so caveman-style terse-output schemes were rejected for output.
+- **Roadmap triage.** `ROADMAP.md` reduced to open items only, per its own
+  delete-when-done rule: shipped narrative removed (audit C1/H1–H4 block,
+  Phase 3 Steps 1–2, Milestone 4's shipped-detector prose, Milestone 8's v1/v2
+  ship notes + A9 — all live canonically in `PROGRESS.md` /
+  `ANOMALY_DETECTION.md` / `AGENT.md`); six decision-records-as-checkboxes
+  (M15, M23, M26, W4, A11, confirm-proposal crash-gap, events.py split) moved
+  into an "out of scope & standing decisions" section with explicit revisit
+  triggers; W7's double entry deduped (canonical: Phase 3 Step 3); stale
+  events.py line count updated (1500+ → ~3100). User decision recorded:
+  porting the remaining vendored `*2timesketch` converters to native Parquet
+  is demand-driven, not planned — the vendored scripts are a permanent
+  minimal-dependency alternative, not a porting queue.
 
 ## Session 74 — 2026-07-20: agent panel UX (four reported issues)
 

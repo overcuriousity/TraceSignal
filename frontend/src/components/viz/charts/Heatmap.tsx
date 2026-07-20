@@ -8,6 +8,7 @@ import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
 import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
 import { useChartRef } from "@/components/viz/primitives/useChartRef";
 import { sequentialColor } from "@/components/viz/lib/colors";
+import { valueLabeller } from "@/components/viz/lib/fieldDisplay";
 import type { ChartValueClickHandler } from "@/components/viz/lib/interaction";
 import type { FieldTimeseriesResponse } from "@/api/types";
 
@@ -71,6 +72,7 @@ export function Heatmap({ data, svgRef, height, onValueClick }: HeatmapProps) {
     );
   }
 
+  const labelOf = valueLabeller(data.field);
   const bucketStarts = data.series[0].buckets.map((b) => b.start);
   const maxCount = Math.max(1, ...data.series.flatMap((s) => s.buckets.map((b) => b.count)));
   const resolvedHeight = height ?? Math.max(120, data.series.length * ROW_HEIGHT + 44);
@@ -124,7 +126,9 @@ export function Heatmap({ data, svgRef, height, onValueClick }: HeatmapProps) {
                       style={clickValue ? { cursor: "pointer" } : undefined}
                       onClick={clickValue}
                     >
-                      {s.value.length > 20 ? s.value.slice(0, 19) + "…" : s.value}
+                      {labelOf(s.value).length > 20
+                        ? labelOf(s.value).slice(0, 19) + "…"
+                        : labelOf(s.value)}
                     </text>
                     {s.buckets.map((b) => {
                       const rx = xBand(b.start) ?? 0;
@@ -142,7 +146,7 @@ export function Heatmap({ data, svgRef, height, onValueClick }: HeatmapProps) {
                             setHover({
                               x: rx + xBand.bandwidth() / 2 + margin.left,
                               y: ry + margin.top,
-                              value: s.value,
+                              value: labelOf(s.value),
                               start: b.start,
                               count: b.count,
                             })

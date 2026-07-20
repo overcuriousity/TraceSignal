@@ -185,7 +185,8 @@ in-app agent has. One tool code path, two transports.
 
 ## Tools (27 total; all read-only except the propose→confirm annotation path)
 
-Core: `search_events`, `get_event`, `list_fields`, `list_artifacts`,
+Core: `search_events`, `get_event`, `list_fields`, `describe_field`,
+`list_artifacts`,
 `field_terms`, `field_numeric_stats`, `histogram`, `run_anomaly_detector`,
 `propose_finding`, `propose_annotation` (conversation-bound only — see
 **Propose→confirm writes** above), and — when embeddings are available —
@@ -197,25 +198,103 @@ two independent `FilterSpec` layers) wrap the same `db/queries.py` methods
 the Visualize page's endpoints call, with tighter per-tool caps than the
 page's own UI bounds (e.g. `field_scatter` caps at 1000 points vs. the
 page's 20000 — every point counts against the model's context window; see
-`VIZ_*_MAX_*` constants in `agent/tools.py`). `propose_chart(title,
-description, spec)` is the charting analog of `propose_finding`: `spec` is
-a `ChartSpec` (same kind vocabulary as `compare`, plus `terms` / `numeric` /
-`timeseries` / `punchcard` / `pivot` / `scatter`) — the tool validates by
-*executing* the underlying query (same caps as the read tools) and returns
-summary stats, writing nothing. The frontend maps `ChartSpec` onto the
-Visualize page's own `ChartConfig` (`specToChartConfig`,
-`frontend/src/api/agent.ts`) — backend-opaque, same seam as
-`SavedChart.config`, so the backend never learns the frontend's chart
-shape. The chat panel renders a live chart card (`ChartProposalCard.tsx`)
-fetched fresh through `vizApi` (not the tool_result echo, so it stays
-consistent with current data/dispositions) with **Open in Visualize** (a
-route link carrying the mapped `ChartConfig` + filters as URL params) and
-**Save** (the analyst's own click against the existing
-`savedChartsApi.create` — the only write in this flow, credited to the
-analyst; the agent never writes a chart). A failed spec (unknown kind,
-missing required field) surfaces as a tool error with no card — the panel
-pairs `propose_chart`'s call row (title/description/spec) with its result
-row (`ok`) before deciding whether to render.
+`VIZ_*_MAX_*` constants in `agent/tools.py`).
+
+### `propose_chart` — isomorphic with the analyst's `ChartConfig`
+
+`propose_chart(title, description, spec)` is the charting analog of
+`propose_finding`. `spec` mirrors the Visualize page's `ChartConfig` field for
+field — `chart_type`, `scale`, `field`, `field_y`, `metric`, `filters`,
+`compare{mode, filters}`, `options{...}` — so anything an analyst can build by
+hand the agent can propose, reasoning through the same steps.
+
+This replaced a single flattened `kind` enum whose nine values fused *which
+aggregation* + *which mark* + *compare on/off*. That enum could address only
+7 of 13 chart types (`pie`, `heatmap`, `box`, `violin`, `ecdf`, `sankey` were
+unreachable), could not name a `scale`, hardcoded `metric` to `count`, could
+not express `compare.mode="baseline"`, and overloaded one `limit` field.
+A pie request therefore returned `ok: true` and rendered a bar — the failure
+this design exists to prevent.
+
+**Legality is enforced from one table.** `agent/chart_meta.py` is the source
+of truth for which scales each mark admits, which support a comparison layer,
+which need a second field, and which options each reads;
+`frontend/src/components/viz/lib/chartMeta.ts` is **generated** from it by
+`scripts/gen_chart_meta.py` (outputs committed; `tests/test_chart_meta.py`
+asserts regeneration is a no-op). The analyst gets these rules as affordances —
+a shrinking chart-type dropdown, a disabled Compare control with a reason, a
+force-reset metric. The agent gets them as validation errors that name the
+legal alternatives, e.g. `chart_type="pie" requires scale in {"nominal"}, got
+"ratio". Chart types legal for scale="ratio": …`. The error *is* the dropdown.
+
+Rejections happen before any query: illegal scale/chart_type pair, missing or
+superfluous `field`/`field_y`, unsupported comparison, illegal metric, and an
+unknown field token (with `difflib` near-miss suggestions — an unknown
+attribute key otherwise resolves to an empty Map lookup and returns a cheerful
+`ok: true` over zero rows). Two more fire *after* the query, for the same
+silent-success reason: a numeric chart whose field yields `count == 0` (the
+documented categorical signal) and a scatter with no numeric pairs.
+
+**The result echoes what will be drawn.** `{ok, resolved{chart_type, scale,
+metric, compare_mode, data_kind, field, field_y, options}, warnings, summary}`.
+`ok` stays top-level — `AgentPanel.tsx` gates card creation on it. `resolved`
+is the channel the model reads to confirm its chart is the one it asked for;
+the system prompt requires checking it. `warnings` carries non-fatal issues:
+options this chart type ignores (inert, never fatal) and any limit clamped for
+the validation query — those clamps bound the *tool result* for context
+budget, never the analyst's card.
+
+A **bounded `time:` pivot axis** is a third warning case. Its domain is
+complete and naturally ordered, so `field_pivot` charts all of it rather than
+ranking it by count — `limit_x`/`limit_y` never applied. The tool says so and
+drops that key from `resolved.options`, because an accepted-but-ignored limit
+would leave the model believing it had bounded a matrix it had not.
+`summary.matrix_size` states the resolved cell count outright.
+
+`describe_field(field, filters)` is the agent's equivalent of the page's
+numeric auto-probe: `non_empty_total`, distinct count, numeric stats, a
+suggested `scale` (`numeric.count > 0 → ratio`, else `nominal` — the same test
+`VisualizePage` uses) and the chart types legal for it. Two scans per real
+field, free for virtual `time:` fields.
+
+`non_empty_total` is a *count*, deliberately not named `coverage`: that word
+means a 0-1 fraction in `GET .../viz/fields`, and one name for two units left
+the model unable to compare a field across the two. A virtual field reports
+neither — a time part is undefined for an undated event, so any coverage claim
+would be about data the tool never scanned. The same reasoning makes
+`viz/fields` emit `coverage: null` (and `distinct: null` for the unbounded
+`time:date`/`time:year_month`) rather than a fabricated `1.0`.
+
+The frontend maps the spec onto `ChartConfig` (`specToChartConfig`,
+`frontend/src/api/agent.ts`); `specToChartConfigLegacy` beside it is a frozen
+translation of the retired `kind` shape, since persisted `tool_args` from old
+conversations still re-render through it. `resolveChartOptions`
+(`viz/lib/chartOptions.ts`) is shared with `VisualizePage`, so a proposed
+chart and a hand-built one resolve defaults identically — as is
+`defaultChartTypeForScale` beside it, which exists because
+`chartTypesFor(scale)[0]` is the *field-free* `time` histogram for every
+scale and would silently drop the field that was just picked.
+
+Virtual `time:` fields are analyst-facing too, not an agent-only capability:
+`viz/lib/fieldDisplay.ts` maps a token to its label ("Day of week (UTC)") and a
+value to its display form (`"1" → "Mon"`) for the field picker and every chart.
+Only text goes through it — keys, `scaleBand` domains, colour-map keys, sort
+comparators and click payloads stay on the canonical value, the only form that
+round-trips into a filter, a URL or a saved chart. Two consequences worth
+keeping: `BarChart`'s `sort="value"` orders by the canonical value (the
+zero-padding in `_time_fields.py` is what makes lexical order chronological —
+sorting on labels would silently reshuffle the axis), and `Legend` entries need
+an explicit `key`, since it reports `key ?? label` to click-to-filter.
+`VisualizePage` skips its numeric auto-probe entirely for a `time:` field and
+takes the statically-known scale from `TIME_FIELDS`. The chat panel renders
+a live chart card (`ChartProposalCard.tsx`) fetched fresh through `vizApi` (not
+the tool_result echo, so it stays consistent with current data/dispositions),
+keyed on `chart_type` rather than on the aggregation that fed it — several
+marks share one `dataKind`, and switching on the fetch result is what turned
+the pie into a bar. It offers **Open in Visualize** (a route link carrying the
+mapped `ChartConfig` + filters as URL params) and **Save** (the analyst's own
+click against `savedChartsApi.create` — the only write in this flow, credited
+to the analyst; the agent never writes a chart).
 
 Read-parity tools (analyst-visible state the agent previously couldn't see):
 `list_baselines` (saved baseline definitions — unlocks the temporal-only

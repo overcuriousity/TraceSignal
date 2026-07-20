@@ -1,48 +1,31 @@
-# Vestigo Roadmap — Phase 2 (hardening backlog)
+# Vestigo Roadmap — open backlog
 
 Phase 1 (source management, timelines, explorer, anomaly engine, auth/RBAC/audit,
 visualization, converters) is complete — see
-[`docs/archive/ROADMAP_PHASE1.md`](./archive/ROADMAP_PHASE1.md).
-
-This phase consolidates the remaining findings from the 2026-07-03 repository audit.
-The audit's Critical/High items were fixed directly on `fix/audit-critical-high`:
-
-- ✅ **C1** — Dockerfile CMD pointed at a nonexistent `api.main:app`; now `--factory create_app`.
-- ✅ **H1** — CSV parser read the whole file into memory (`lines = list(fh)`); now streams with
-  incremental byte-offset/line tracking (`ingestion/parser.py::_RecordTrackingIterator`).
-- ✅ **H2** — Airgap enforcement: `vestigo-web` no longer runs `npm install` on every start
-  (builds only when `dist/` is missing; `VESTIGO_FRONTEND_REBUILD=1` forces); uvicorn reloader is
-  development-only; embedding model load forces `HF_HUB_OFFLINE` unless `VESTIGO_ALLOW_ONLINE` and
-  fails with an actionable message instead of silently downloading.
-- ✅ **H3** — Blocking ClickHouse calls in async handlers (`list_events`, histogram, bulk
-  annotate, field/artifact/tag listings, embedding-field recommenders) now go through
-  `run_in_threadpool`, matching viz/anomaly endpoints. Convention: **every**
-  `EventQueryService` call from an `async def` handler must be threadpool-wrapped.
-- ✅ **H4** — Uploads: single-pass copy+hash off the event loop
-  (`ingestion/files.py::copy_and_hash`), capped by `VESTIGO_MAX_UPLOAD_BYTES`
-  (default 10 GiB, 0 disables) with a 413 mid-stream rejection.
+[`docs/archive/ROADMAP_PHASE1.md`](./archive/ROADMAP_PHASE1.md). Shipped work is
+recorded in `docs/PROGRESS.md` and the feature docs (`ANOMALY_DETECTION.md`,
+`AGENT.md`), not here: this file holds only open, condensed action items plus the
+standing-decisions list at the bottom (triaged 2026-07-20; git history has the old
+long form).
 
 Point-in-time PR review findings are archived under `docs/archive/PR{N}_REVIEW_FINDINGS.md`
 (full unrestricted finding set, one file per reviewed PR) once triaged into this backlog or
-resolved — this file holds only the condensed, still-open action items.
+resolved.
 
 ## Phase 3 — investigation depth (active, decided 2026-07-19)
 
 Analyst-depth phase; full rationale in
 `docs/superpowers/specs/2026-07-19-phase3-investigation-depth-design.md`. Agent stays an
-analysis companion — agent-authored stories deferred. Ordered:
+analysis companion — agent-authored stories deferred. Steps 1 (W6 template clustering,
+see `docs/ANOMALY_DETECTION.md` §14) and 2 (A9 viz parity, see `docs/AGENT.md`) shipped.
 
-- ✅ **Step 1 — W6 template clustering** — shipped: `template_hash` materialized column
-  (`db/clickhouse.py`, `db/_template.py`), field-agnostic `list_log_templates`
-  (`db/anomaly_stats.py`) + `GET .../log-templates`, `template_id` facet
-  (`db/_columns.py`), mute disposition (`detector="log_template"`, no occurrence
-  materialization — direct `template_hash` predicate) + grid collapse union count
-  (`ClickHouseStore.count_routine_collapsed`), Templates sub-tab under Patterns
-  (`TemplatesView.tsx`). See `docs/ANOMALY_DETECTION.md` §14.
-- ✅ **Step 2 — A9 viz parity** (see Milestone 8 entry) — shipped.
-- [ ] **Step 3 — W7 Stories, human-first** (see Milestone 5 entry). Own design round;
-  key tension: live embeds in editor vs. point-in-time snapshot on export. Block model
-  leaves room for a later `origin` field (agent authorship later, no migration pain).
+- [ ] **Step 3 — W7 Stories, human-first** (canonical entry; Milestone 5 pointed here).
+  Markdown document per case embedding live references to saved Views, charts, and tagged
+  events — the report writes itself during the investigation. Building blocks (Views,
+  annotations, saved charts, RBAC) all exist; mostly a new Postgres model + frontend
+  editor. Timesketch's most-loved feature. Own design round; key tension: live embeds in
+  editor vs. point-in-time snapshot on export. Block model leaves room for a later
+  `origin` field (agent authorship later, no migration pain).
 
 Parked: D10 (next phase; W6 feeds it), M6 streaming, M7 examination. Standing rule:
 when M6 or M7 resumes, S1 and E1 are designed **jointly** in one `MODEL_REFINEMENT.md`
@@ -50,115 +33,31 @@ round — the data model migrates once, not twice.
 
 ## Milestone 2 — high-leverage improvements
 
-- [ ] **M15 residue — `list_fields_by_artifact` stays live (deliberate).** The per-source
-  field-stats cache (`db/field_stats.py`, shipped) converted `field_inventory`,
-  `list_fields`, and `field_coverage`; the embedding wizard's `list_fields_by_artifact`
-  keeps its live scan because its cost is the randomized per-artifact value sampling that
-  feeds content-aware cohesion scoring — caching only its inventory would save little.
-  Revisit only if the wizard's latency becomes a complaint. HyperLogLog sketches for exact
-  merged `distinct` likewise deferred (max-across-sources approximation documented in the
-  module).
-
-- [ ] **M25 — Port remaining converters to the Parquet interchange format.** M20 shipped the
-  bulk Arrow insert, the upload hardlink-retention fix, the Vestigo Parquet interchange
-  format v1 (`ingestion/parquet_format.py`, `ingestion/parquet_reader.py`), and the
-  `nginx2vestigo.py` converter (pilot). This session added native `*2vestigo.py`
-  Parquet converters for filterlog, suricata, cloudtrail, and pcap, each with its own
-  `tests/test_<name>_converter.py`. Decision (mid-session, user request): the vendored
-  `*2timesketch` scripts stay vendored **permanently** as a minimal-dependency (stdlib-only,
-  no pyarrow) alternative — `scripts/vendor_converters.py` is not retired, and native/vendored
-  converters are listed side by side in `manifest.json`/`/api/converters`. Remaining:
-  journal, browser, apache, cowrie, evtx, syslog, webhoneypot (still vendored-only, not yet
-  ported to native — re-synced to upstream `d4838eb2`, session 59; webhoneypot is new upstream,
-  no native counterpart yet). Follow-ups from the nginx
-  pilot, still open: benchmark converter worker-count/parallel-threshold defaults on a
-  multi-GB log; parallel `.gz` parsing (seek-point indexing) deferred; pcap intra-file
-  parallelism (record-boundary chunking, analogous to nginx's newline chunking) deferred —
-  `pcap2vestigo.py` currently parallelizes only across files, one worker process per file.
-  Also added `timesketch2parquet.py` — a generic Timesketch-compatible CSV/JSONL converter (any
-  column set, no per-source parsing) with no vendored counterpart; column requirements follow
-  upstream `google/timesketch`'s own import spec exactly (`message`/`timestamp_desc`/`datetime`
-  mandatory, `timestamp` substitutable for `datetime` in CSV, `tag` the only other recognized
-  column), not Vestigo's own server-side generic-CSV parser's extra recognized columns. CSV
-  parsing is single-process only (a logical record can span multiple physical lines via quoted
-  embedded newlines, unsafe to newline-chunk); JSONL gets full nginx-style chunked
-  multiprocessing. CSV intra-file parallelism (record-boundary-aware chunking) deferred,
-  same treatment as pcap's.
-
-- [ ] **M23 — detector-scan residue (post 300M-row overhaul, session 27).** Remaining:
-  (a) `canonical_inventory` stays a live query — it only runs when a timeline has field
-  mappings, which the 300M reference case doesn't; add the planned Postgres cache (key =
-  case + sorted sources + mappings + per-source `computed_at`) only if a mapped timeline at
-  that scale measures slow. ((b) — batching per-field novelty scans into one `attributes`
-  pass — landed 2026-07-11, session 50.)
-
-- [ ] **M26 — Unify the two time-histogram implementations (deferred, session 49).** The
-  Explorer's `TimelineHistogram` (div-bars, markers/baseline bands/scroll indicator/mark
-  mode) and the Visualize page's `TimeHistogram`/`CompareHistogram` (d3-SVG, now with its
-  own brush-zoom) duplicate bucket math and brush gestures. Deliberately deferred: after
-  session 49 the shared piece is only the brush gesture, and TimelineHistogram carries
-  Explorer-only concerns that make a merge high-risk/low-payoff. Revisit if the two drift.
+- [ ] **M25 residue — converter follow-ups.** Open from the nginx pilot: benchmark
+  converter worker-count/parallel-threshold defaults on a multi-GB log. Porting the
+  remaining vendored `*2timesketch` scripts (journal, browser, apache, cowrie, evtx,
+  syslog, webhoneypot) to native Parquet converters is **demand-driven, not planned**
+  (decided 2026-07-20) — the vendored scripts stay permanently as the minimal-dependency
+  (stdlib-only, no pyarrow) alternative, listed side by side in
+  `manifest.json`/`/api/converters`. Deferred parallelism work is likewise
+  revisit-on-demand: parallel `.gz` parsing (seek-point indexing), pcap intra-file
+  record-boundary chunking, CSV intra-file record-boundary chunking (a logical CSV
+  record can span physical lines via quoted embedded newlines, unsafe to newline-chunk).
 
 ## Milestone 3 — polish
 
-- [ ] Split `api/routers/events.py` (1500+ lines: query parsing, export streaming, anomaly
-  orchestration, bulk annotation) opportunistically when next touched — not proactively.
 - [ ] Evaluate OpenAPI-generated frontend API types (`openapi-typescript` over `/openapi.json`)
-  to replace the hand-mirrored finding/response types in `frontend/src/api/types.ts` —
-  eliminates the per-detector backend↔frontend type duplication wholesale instead of
-  special-casing single detectors (PR109 review follow-up).
+  to replace the hand-mirrored finding/response types in `frontend/src/api/types.ts`
+  (~1240 lines, ~90 types) — eliminates the per-detector backend↔frontend type duplication
+  wholesale instead of special-casing single detectors (PR109 review follow-up).
 
 ## Milestone 4 — anomaly detector expansion (AMiner-inspired, field-agnostic)
 
 Detectors adapted from [ait-aecid/logdata-anomaly-miner](https://github.com/ait-aecid/logdata-anomaly-miner),
-constrained to be **field-agnostic**: they operate on value identity, syntax, and statistics —
-never on what a field value *means*. Most follow the existing baseline/detect-window pattern in
-`db/anomaly_stats.py` (self-baseline + temporal `baseline_end` modes); a few are mode-less
-(e.g. shipped D2 is positional, `method="sequential"`). All must stay SQL-explainable per the
-forensic-reproducibility requirement. Update `docs/ANOMALY_DETECTION.md` in the same commit as
-each detector.
-
-Prep landed: shared frontend detector scaffolding (`components/analysis/detector-shared.tsx`),
-a `DetectorAccordion` switcher replacing the flat sub-tab strip, standardized
-`["anomalies", caseId, timelineId, ...]` query keys, and an `_col_expr(prefix=...)` param for
-multi-field queries. **D1 (value-combo), D2 (timestamp-order), D3 (charset), D4
-(numeric-range), D5 (entropy), and D6+D7 (interval_periodicity — see below) shipped.** Also
-shipped (beyond the AMiner set, no AMiner equivalent): **proportion_shift** — per-(field, value)
-2×2 G-test of a value's *share* of events between the baseline and each suspect window, BH-FDR
-across the run, rate-ratio effect floor, temporal-only, first-seen excluded (`baseline_cnt ≥ 1`;
-value_novelty owns those).
-
-D6+D7 shipped **merged** as the `interval_periodicity` detector (`method="cadence"`): the
-re-scope confirmed proportion_shift already owns whole-window vanished values, leaving only the
-*periodicity* angle distinct — so per-value silence (D6) is subsumed as the maximal `count = 0`
-"missed" case of the cadence-break direction. Two directions, one BH pool: a baseline-regular
-value that breaks rhythm (Poisson-rate LRT; missed/accelerated) and a baseline-bursty value that
-becomes suspiciously regular (Greenwood spacing statistic; beaconing). Temporal-only, `-log10(p)`
-score. See `docs/ANOMALY_DETECTION.md` §8.
-
-D8 shipped as the `sequence_novelty` detector (`method="ngram"`): per source, time-ordered
-n-grams (n = 2–5, default 3) of one grouping field (`series_field`, default `artifact`),
-assembled entirely in SQL via a `lagInFrame` chain partitioned by (source, window); n-grams
-absent from the baseline window are flagged per suspect window, surprise-scored against the
-window's own complete-n-gram total. Temporal-only. See `docs/ANOMALY_DETECTION.md` §9
-(semantic search renumbered §10).
-
-D9 shipped as the `value_distribution_drift` detector (`method="drift"`): per field, one
-whole-distribution test per suspect window — ClickHouse `kolmogorovSmirnovTestIf` for
-numeric fields, a k-category G-test (top-50 + exact `__other__`, pure-math df=k−1 chi²)
-for categorical; one BH pool across both branches, `-log10(p)` score, effect floors on
-KS D / total-variation distance, field-level `(field, "*")` allowlist key. See
-`docs/ANOMALY_DETECTION.md` §10 (semantic search renumbered §11).
-
-Shipped beyond the AMiner set: **sequence_motif** (`method="motif"`) — the mining complement
-of D8: same per-source `lagInFrame` n-gram assembly (shared `_ngram_inner_sql` helper), but
-mode-less and ranking *recurring* n-grams by support × cadence regularity (CV of
-inter-occurrence gaps + auditable Greenwood z/p, per-source breakdown). Comes with the
-`kind="routine"` disposition (presentation-only, materialized `motif_occurrences` ClickHouse
-table, `collapse_routine` grid filter with an always-visible `routine_collapsed_count`).
-Mined motifs are candidate rule antecedents for D10. See `docs/ANOMALY_DETECTION.md` §12.
-
-Remaining:
+constrained to be **field-agnostic** and SQL-explainable per the forensic-reproducibility
+requirement. D1–D9 plus `proportion_shift` and `sequence_motif` shipped — see
+`docs/ANOMALY_DETECTION.md` for every detector's contract. Update that doc in the same
+commit as any detector change. Remaining:
 
 - [ ] **D10 — Event correlation rules** (AMiner `EventCorrelationDetector`): mine baseline
   implication rules "value A is followed by value B within Δt", flag violations in the detect
@@ -169,16 +68,6 @@ Skipped deliberately: `TSAArimaDetector` (ARIMA forecasting — z-score `frequen
 covers most of it and stays explainable).
 
 ## Milestone 5 — post-mortem workflow parity (Timesketch-inspired, 2026-07-07 gap review)
-
-Gap analysis vs. Timesketch's researcher-loved features and generic forensic-platform
-expectations. Ordered: easy+high value first, then easy+low value, then hard+high value.
-
-Easy, low value (deferred, revisit on demand):
-
-- [ ] **W4 — Python client library.** REST API + `vestigo` CLI exist; a thin typed client for
-  Jupyter/pandas workflows is cheap but no user has asked yet.
-
-Hard, high value:
 
 - [ ] **W5 residue — Sigma runner follow-ups.** The runner shipped (session 63:
   `src/vestigo/sigma/`, `docs/ANOMALY_DETECTION.md` §13). Deliberately deferred:
@@ -194,12 +83,9 @@ Hard, high value:
   the existing `_col_expr` field-expression mechanism. Prerequisite for making bespoke
   unstructured logs first-class. (The old companion "write half" — server-side raw-log
   parsing per [`docs/archive/PLAN_FAST_NGINX_INGESTION.md`](./archive/PLAN_FAST_NGINX_INGESTION.md)
-  — was superseded by the client-side Parquet converter architecture shipped with M20;
-  see M25 above.)
-- [ ] **W7 — Stories (investigative notebook).** Markdown document per case embedding live
-  references to saved Views, charts, and tagged events — the report writes itself during the
-  investigation. Building blocks (Views, annotations, saved charts, RBAC) all exist; this is
-  mostly a new Postgres model + frontend editor. Timesketch's most-loved feature.
+  — was superseded by the client-side Parquet converter architecture shipped with M20.)
+
+W7 (Stories) lives in Phase 3 Step 3 above — single canonical entry.
 
 ## Milestone 6 — streaming ingest ("live forensic" mode, agentless)
 
@@ -273,53 +159,98 @@ Carries over unchanged: provenance chain (Source `file_hash`, per-event
 schema-on-read (W8) gain the new domain for free, auth/RBAC/audit as chain-of-custody
 baseline. In-memory JobStore stays — heavy work lives in converters.
 
-## Milestone 8 — AI investigation agent expansion (v1 shipped 2026-07-19, see docs/AGENT.md)
+## Milestone 8 — AI investigation agent expansion
 
-Read parity + external MCP endpoint shipped 2026-07-19 (session 66): nine new read tools
-(baselines, dispositions, saved views, annotations, Sigma rules/runs), FilterSpec gained
-`annotated`/`annotation_tag_value`/`run_id`/`event_ids`/`collapse_routine`, detector tuning
-params on `run_anomaly_detector`, `AgentToken` scoped PATs, and `/mcp` streamable-HTTP
-exposure of the identical tool server (`VESTIGO_MCP_ENABLED`, default off). See
-`docs/superpowers/specs/2026-07-19-agent-read-parity-mcp-http-design.md` for the full design.
+Agent v1 (read parity + external `/mcp` endpoint) and v2 (compaction, three-layer tool
+toggles, OPSEC disclosure, thinking capture, JSON export) shipped 2026-07-19/20 — see
+`docs/AGENT.md` and `docs/superpowers/specs/2026-07-19-agent-read-parity-mcp-http-design.md`.
 
-Agent v2 shipped 2026-07-20: context-window auto-compaction (forensic-trail preserving),
-three-layer per-tool enable/disable (admin hard-deny incl. `/mcp`, per-user defaults,
-per-chat), the new-conversation OPSEC dialog (endpoint + model disclosure to all users),
-thinking capture as first-class messages, and full-thread JSON export — see
-`docs/AGENT.md` for the details.
-
-- [ ] **A11 — `/api/auth/users` directory scope.** Any signed-in user can list the full
-  user directory (id, username, display name — needed to render names on annotations).
-  Fine for the small-team threat model; add a config flag or scope the listing to co-case
-  members if multi-tenant / large-org deployments emerge (PR137 review follow-up).
-- [ ] **A8 — External MCP toolsets (web research / user-pluggable tools).** Do NOT build
-  bespoke whois/web tools or a custom plugin API: the runtime is pydantic-ai with MCP
+- [ ] **A8 — External MCP toolsets (web research / OSINT / user-pluggable tools).** Do NOT
+  build bespoke whois/web tools or a custom plugin API: the runtime is pydantic-ai with MCP
   toolsets, so let the agent consume operator-configured **external MCP servers**
-  (users write a whois/VT/web-search tool as a tiny MCP server in any language; zero
+  (users write a whois/VT/web-search/Shodan tool as a tiny MCP server in any language; zero
   Vestigo code per tool; symmetric with our own `/mcp` exposure). Hard requirements:
-  (a) OPSEC gate — outbound lookups leak case indicators to third parties; gate behind
+  (a) OPSEC gate — outbound lookups leak case indicators to third parties (the model
+  composes queries from case evidence: an internal hostname or IOC sent to a search
+  provider, a victim IP queried on Shodan, can tip off an adversary); gate behind
   `VESTIGO_ALLOW_ONLINE` **and** per-case opt-in, default off; (b) forensic capture —
-  audit every external call and persist/hash the raw response (external evidence must
-  stay replayable), mark results `origin: external` in the conversation record. Needs
-  its own design round before implementation.
-- ✅ **A9 — Agent-created visualizations (viz parity)** — shipped: five read tools
-  (`field_timeseries`, `time_punchcard`, `field_pivot`, `field_scatter`, `compare`) plus
-  `propose_chart` (`agent/tools.py`, validate-by-execute, no write); frontend `ChartSpec` →
-  `ChartConfig` mapping (`specToChartConfig`, `frontend/src/api/agent.ts`) and a live
-  `ChartProposalCard.tsx` fetched fresh through `vizApi` with "Open in Visualize"/"Save".
-  See `docs/AGENT.md` "Tools" for the full contract.
-- [ ] **Confirm-proposal crash-gap.** A crash between the atomic proposal-decide and the
-  annotation bulk-write leaves a confirmed proposal with no annotations and no retry path.
-  Single-process tradeoff, deliberate; revisit if it bites.
+  audit every external call and persist/hash the raw response with its timestamp
+  (external results drift over time; they are OSINT enrichment with provenance, never
+  evidence), mark results `origin: external` in the conversation record; (c) governance
+  reuse — external tools enter `TOOL_REGISTRY`-equivalent surfacing so the existing three
+  deny layers (admin hard-deny, per-user defaults, per-chat opt-in) and the tool-selector
+  popover apply uniformly; (d) disclosure — extend the persistent OPSEC panel
+  (`AgentPanel.tsx`) to name any enabled network tools and their endpoints; (e) update
+  `docs/AGENT.md`'s sandbox invariant ("the agent queries the backend in its own loop"),
+  which external tools genuinely widen. Feasibility confirmed 2026-07-20: the
+  toggle/audit/disclosure machinery is ready — the work is the policy layer, not plumbing.
+  Needs its own design round before implementation.
+- [ ] **A12 — Local transform tools (CyberChef-class).** Decode/encode (base64, hex, URL,
+  …), hashing, decompression, timestamp conversion as **native tools** in
+  `agent/tools.py` — a curated, append-only op set (or recipe-runner over a vetted op
+  list), not a call-out to a CyberChef server. Pure local computation: no network, fully
+  deterministic, hence reproducible — fits the offline-by-default and forensic
+  requirements with no OPSEC gate. Care points: resource caps (decompression bombs,
+  output size vs. context budget — reuse the existing `_truncate`/cap conventions) and
+  keeping the op set append-only so old conversations stay replayable. Lowest-friction,
+  highest-fit agent-tool addition; can ship independently of (and before) A8.
+- [ ] **A13 — Shrink the per-request context overhead (small-context local models).**
+  Measured 2026-07-20: the 27 tool schemas serialize to ~59k chars ≈ ~15k tokens (plus
+  ~1.2k system prompt), resent with every model request — half a 32k local-model window
+  before any conversation. The bulk is `FilterSpec`'s full JSON schema inlined into ~14
+  tools (heaviest: `propose_chart` ~1.6k tok, `compare` ~1.2k). Three independent levers:
+  (a) schema dedup/slimming — JSON-schema `$defs`/`$ref` sharing for `FilterSpec`/
+  `ChartSpec` and tighter per-field descriptions could plausibly halve the overhead
+  without dropping a tool (verify the configured provider/protocol actually accepts
+  `$ref` in tool schemas; and slim with care — descriptions are what small models use to
+  *pick* tools, so keep the discriminating detail); (b) "tool profile" presets — a lean
+  core set as a selectable default in the tool-selector popover, building on the existing
+  per-user-defaults layer (disabled tools are already *removed* from the request, not
+  stubbed, so profiles reclaim context directly); (c) compact tool-result encoding —
+  results live in the history and are resent on every subsequent turn, and today's
+  dict-shaped row lists repeat every key name per row; a header-once columnar/delimited
+  encoding for tabular results (`field_terms`, `search_events`, pivot/timeseries rows)
+  preserves every value exactly (forensic requirement) while cutting the repetitive
+  structure — plausibly 30–50% off the result-heavy part of the history, stacking with
+  the existing row caps. Agent *prose* stays verbose by design: findings feed forensic
+  reports and the transcript is custody record — terse-output schemes (caveman-style)
+  were considered 2026-07-20 and rejected for the output side. Re-measure and record the
+  numbers in `docs/AGENT.md` when any lever lands.
 
-## Explicitly out of scope (decided during the audit)
+## Explicitly out of scope & standing decisions (with revisit triggers)
 
-- Persistent job store — in-memory is a documented deliberate choice for the single-process
-  deployment model.
-- CSRF tokens — SameSite=Lax cookies plus the LAN threat model are adequate for now.
-- ~~Alembic adoption~~ — **done**: Postgres schema is now Alembic-managed
-  (`db/migrations`), with pre-Alembic databases auto-stamped at `0001` on startup.
-- Proactive router/query-builder splits — churn risk outweighs payoff at current velocity.
-- Bespoke endpoint collection agent (2026-07-14) — building/maintaining a cross-platform
-  collector fleet is a whole product (Velociraptor, osquery); Vestigo stays agentless and
-  accepts pushes from existing collectors instead (Milestone 6).
+Decisions, not work items — each stays as decided unless its trigger fires.
+
+- **Persistent job store** — in-memory is a documented deliberate choice for the
+  single-process deployment model.
+- **CSRF tokens** — SameSite=Lax cookies plus the LAN threat model are adequate for now.
+- **Bespoke endpoint collection agent** (2026-07-14) — building/maintaining a
+  cross-platform collector fleet is a whole product (Velociraptor, osquery); Vestigo stays
+  agentless and accepts pushes from existing collectors instead (Milestone 6).
+- **`api/routers/events.py` split** — opportunistically when next touched, never
+  proactively (churn risk outweighs payoff). Now ~3100 lines (2026-07-20), double the
+  size when this was decided — if it keeps growing untouched, reconsider as a real item.
+- **M15 — `list_fields_by_artifact` stays a live scan.** The per-source field-stats cache
+  (`db/field_stats.py`) covers `field_inventory`/`list_fields`/`field_coverage`; the
+  embedding wizard's cost is its randomized per-artifact value sampling, which caching
+  wouldn't save. HyperLogLog sketches for exact merged `distinct` likewise deferred.
+  Trigger: wizard latency complaints.
+- **M23 — `canonical_inventory` stays a live query.** It only runs when a timeline has
+  field mappings, which the 300M-row reference case doesn't. Trigger: a mapped timeline
+  at that scale measures slow — then add the planned Postgres cache (key = case + sorted
+  sources + mappings + per-source `computed_at`).
+- **M26 — the two time-histogram implementations stay separate.** After session 49 the
+  only shared piece is the brush gesture; `TimelineHistogram` carries Explorer-only
+  concerns that make a merge high-risk/low-payoff. Trigger: the two drift apart.
+- **W4 — Python client library.** REST API + `vestigo` CLI exist; a thin typed client
+  for Jupyter/pandas workflows is cheap. Trigger: a user asks.
+- **Vendored converter ports** — demand-driven only (see M25); the vendored
+  `*2timesketch` scripts are a permanent minimal-dependency alternative, not a porting
+  queue.
+- **A11 — `/api/auth/users` full-directory listing** (id, username, display name —
+  needed to render names on annotations) is fine for the small-team threat model.
+  Trigger: multi-tenant / large-org deployments — then add a config flag or scope the
+  listing to co-case members (PR137 review follow-up).
+- **Confirm-proposal crash-gap** — a crash between the atomic proposal-decide and the
+  annotation bulk-write leaves a confirmed proposal with no annotations and no retry
+  path. Single-process tradeoff, deliberate. Trigger: it bites in practice.

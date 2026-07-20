@@ -6,14 +6,14 @@ import { ChartEmptyState } from "@/components/viz/primitives/ChartEmptyState";
 import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
 import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
 import { useChartRef } from "@/components/viz/primitives/useChartRef";
-import { OTHER_KEY, OTHER_LABEL, sequentialColor } from "@/components/viz/lib/colors";
+import { OTHER_KEY, sequentialColor } from "@/components/viz/lib/colors";
+import { fieldTokenLabel, valueLabeller } from "@/components/viz/lib/fieldDisplay";
 import type { ChartValueClickHandler } from "@/components/viz/lib/interaction";
 import type { FieldPivotResponse } from "@/api/types";
 
 const fmtCount = formatNum(",d");
 const ROW_HEIGHT = 24;
 
-const displayLabel = (key: string) => (key === OTHER_KEY ? OTHER_LABEL : key);
 const truncate = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
 
 interface PivotHeatmapProps {
@@ -54,6 +54,10 @@ export function PivotHeatmap({ data, svgRef, height, onValueClick }: PivotHeatma
   const hasOtherY = data.cells.some((c) => c.y === "");
   const xKeys = [...data.x_values, ...(hasOtherX ? [OTHER_KEY] : [])];
   const yKeys = [...data.y_values, ...(hasOtherY ? [OTHER_KEY] : [])];
+  // Per-axis, not one shared labeller: the axes are different fields, so a
+  // `time:hour_of_day` x `attr:src_ip` pivot must label each side its own way.
+  const labelX = valueLabeller(data.field_x);
+  const labelY = valueLabeller(data.field_y);
 
   // NUL-joined key: a NUL can't appear in a displayable ClickHouse String
   // value, so "a b" x "c" can never collide with "a" x "b c".
@@ -85,7 +89,7 @@ export function PivotHeatmap({ data, svgRef, height, onValueClick }: PivotHeatma
                 scale={xBand}
                 innerHeight={innerHeight}
                 rotate
-                labelFormat={displayLabel}
+                labelFormat={labelX}
               />
               {yKeys.map((yKey) => {
                 const ry = yBand(yKey) ?? 0;
@@ -99,7 +103,7 @@ export function PivotHeatmap({ data, svgRef, height, onValueClick }: PivotHeatma
                       fontSize={11}
                       fill={yKey === OTHER_KEY ? "var(--viz-ink-muted)" : "var(--viz-ink-primary)"}
                     >
-                      {truncate(displayLabel(yKey), 20)}
+                      {truncate(labelY(yKey), 20)}
                     </text>
                     {xKeys.map((xKey) => {
                       const count = counts.get(cellKey(xKey, yKey)) ?? 0;
@@ -154,9 +158,9 @@ export function PivotHeatmap({ data, svgRef, height, onValueClick }: PivotHeatma
       <ChartTooltip x={hover?.x ?? 0} y={hover?.y ?? 0} visible={hover != null}>
         {hover && (
           <>
-            {data.field_x} = {displayLabel(hover.xKey)}
+            {fieldTokenLabel(data.field_x)} = {labelX(hover.xKey)}
             <br />
-            {data.field_y} = {displayLabel(hover.yKey)}
+            {fieldTokenLabel(data.field_y)} = {labelY(hover.yKey)}
             <br />
             <strong>{fmtCount(hover.count)}</strong> events
           </>

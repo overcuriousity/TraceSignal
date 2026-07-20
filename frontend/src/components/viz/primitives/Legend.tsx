@@ -39,7 +39,7 @@ export function Legend({
         );
         return onEntryClick ? (
           <button
-            key={e.label}
+            key={e.key ?? e.label}
             type="button"
             className="flex cursor-pointer items-center gap-1.5 hover:text-[var(--color-fg-primary)]"
             onClick={(evt) => onEntryClick(e.key ?? e.label, evt)}

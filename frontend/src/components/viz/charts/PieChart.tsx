@@ -7,6 +7,7 @@ import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
 import { Legend } from "@/components/viz/primitives/Legend";
 import { useChartRef } from "@/components/viz/primitives/useChartRef";
 import { buildSeriesColorMap, OTHER_KEY, OTHER_LABEL } from "@/components/viz/lib/colors";
+import { fieldValueLabel } from "@/components/viz/lib/fieldDisplay";
 import type { ChartValueClickHandler } from "@/components/viz/lib/interaction";
 import type { FieldTermsResponse } from "@/api/types";
 
@@ -31,7 +32,11 @@ export function PieChart({ terms, svgRef, height = 260, onValueClick }: PieChart
   );
   const ref = useChartRef(svgRef);
 
-  const rows = terms.values.map((v) => ({ key: v.value, label: v.value, count: v.count }));
+  const rows = terms.values.map((v) => ({
+    key: v.value,
+    label: fieldValueLabel(terms.field, v.value),
+    count: v.count,
+  }));
   if (terms.other_count > 0) {
     rows.push({ key: OTHER_KEY, label: OTHER_LABEL, count: terms.other_count });
   }

@@ -1008,10 +1008,13 @@ export interface HistogramResponse {
 /** One chartable field from `viz/fields` — no anomaly heuristics applied. */
 export interface VizFieldInfo {
   token: string;
-  /** Number of distinct non-empty values. */
-  distinct: number;
-  /** Fraction of events with a non-empty value (0-1). */
-  coverage: number;
+  /** Number of distinct non-empty values; null for an unbounded virtual field. */
+  distinct: number | null;
+  /** Fraction of events with a non-empty value (0-1); null for a virtual field,
+   * whose values are derived rather than measured against the data. */
+  coverage: number | null;
+  /** Display name — present only for the virtual `time:` fields. */
+  label?: string;
 }
 
 /** All chartable fields for the Visualization page's field picker, sorted by coverage descending. */
@@ -1114,8 +1117,14 @@ export interface FieldPivotResponse {
   field_y: string;
   x_values: string[];
   y_values: string[];
+  /** Distinct values on this axis — a *measured* count the axis may have been
+   * truncated against, or, when the matching `*_bounded` is true, the size of
+   * a statically-known `time:` domain that was charted whole. Only the former
+   * can mean "there is more than you are seeing". */
   x_distinct: number;
   y_distinct: number;
+  x_bounded: boolean;
+  y_bounded: boolean;
   cells: FieldPivotCell[];
   total: number;
 }

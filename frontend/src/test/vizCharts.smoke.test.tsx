@@ -5,12 +5,13 @@
  * test; catches the "throws on mount" and "throws on empty data" classes of
  * bug cheaply.
  *
- * jsdom has no ResizeObserver, which `ChartFrame` depends on to learn its
- * container width — polyfill it to synchronously report a fixed width so
- * the chart's `{width > 0 && ...}` gate actually renders content.
+ * The `time-field labelling` block is not a smoke test: it pins that every
+ * chart humanises a virtual `time:` field's values in its text while keeping
+ * the canonical value in every key, colour and click payload.
  */
-import { describe, it, expect, beforeAll } from "vitest";
-import { fireEvent, render } from "@testing-library/react";
+import { describe, it, expect, beforeAll, vi } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { installFakeResizeObserver } from "./helpers/resizeObserver";
 import { CompareHistogram } from "@/components/viz/charts/CompareHistogram";
 import { BarChart } from "@/components/viz/charts/BarChart";
 import { PieChart } from "@/components/viz/charts/PieChart";
@@ -35,26 +36,7 @@ import type {
   PunchcardResponse,
 } from "@/api/types";
 
-beforeAll(() => {
-  class FakeResizeObserver {
-    private cb: ResizeObserverCallback;
-    constructor(cb: ResizeObserverCallback) {
-      this.cb = cb;
-    }
-    observe(target: Element) {
-      // Synchronously report a fixed content width, as if the container
-      // were already laid out — jsdom never actually lays anything out.
-      this.cb(
-        [{ target, contentRect: { width: 400 } } as unknown as ResizeObserverEntry],
-        this as unknown as ResizeObserver,
-      );
-    }
-    unobserve() {}
-    disconnect() {}
-  }
-  // @ts-expect-error -- jsdom has no native ResizeObserver
-  global.ResizeObserver = FakeResizeObserver;
-});
+beforeAll(() => installFakeResizeObserver());
 
 const TERMS: FieldTermsResponse = {
   field: "artifact",
@@ -125,6 +107,8 @@ const PIVOT: FieldPivotResponse = {
   y_values: ["WS01", "WS02"],
   x_distinct: 5,
   y_distinct: 3,
+  x_bounded: false,
+  y_bounded: false,
   cells: [
     { x: "alice", y: "WS01", count: 40 },
     { x: "bob", y: "WS02", count: 12 },
@@ -338,5 +322,145 @@ describe("chart smoke render", () => {
     fireEvent.mouseDown(overlay!, { clientX: 100, clientY: 60 });
     fireEvent.mouseUp(overlay!, { clientX: 102, clientY: 60 });
     expect(ranges).toHaveLength(0);
+  });
+});
+
+describe("time-field labelling", () => {
+  // "1".."7" are the canonical day-of-week values (ISO, Mon=1), which is what
+  // filters, keys and colours use. Only text should read "Mon".
+  const DOW_TERMS: FieldTermsResponse = {
+    field: "time:day_of_week",
+    total: 90,
+    distinct: 7,
+    other_count: 0,
+    values: [
+      { value: "1", count: 60 },
+      { value: "7", count: 30 },
+    ],
+  };
+
+  const DOW_TIMESERIES: FieldTimeseriesResponse = {
+    field: "time:day_of_week",
+    interval_seconds: 3600,
+    min: "2024-01-01T00:00:00Z",
+    max: "2024-01-01T01:00:00Z",
+    series: [
+      { value: "1", buckets: HIST_BUCKETS },
+      {
+        value: "7",
+        buckets: [
+          { start: "2024-01-01T00:00:00Z", count: 1 },
+          { start: "2024-01-01T01:00:00Z", count: 4 },
+        ],
+      },
+    ],
+  };
+
+  it("BarChart labels values in the horizontal row column", () => {
+    render(<BarChart terms={DOW_TERMS} />);
+    expect(screen.getByText("Mon")).toBeInTheDocument();
+    expect(screen.getByText("Sun")).toBeInTheDocument();
+  });
+
+  it("BarChart labels values on the vertical band axis", () => {
+    // A different code path from the row column: AxisBottomBand.labelFormat.
+    render(<BarChart terms={DOW_TERMS} orientation="vertical" />);
+    expect(screen.getByText("Mon")).toBeInTheDocument();
+  });
+
+  it("PieChart labels its legend entries", () => {
+    render(<PieChart terms={DOW_TERMS} />);
+    expect(screen.getByText(/^Mon \(/)).toBeInTheDocument();
+  });
+
+  it("Heatmap labels its row axis", () => {
+    render(<Heatmap data={DOW_TIMESERIES} />);
+    expect(screen.getByText("Mon")).toBeInTheDocument();
+  });
+
+  it("LineChart labels its legend entries", () => {
+    render(<LineChart data={DOW_TIMESERIES} showLegend />);
+    expect(screen.getByText("Mon")).toBeInTheDocument();
+  });
+
+  it("SankeyFlow labels the axis whose field is virtual, and only that one", () => {
+    const pivot: FieldPivotResponse = {
+      kind: "pivot",
+      field_x: "time:day_of_week",
+      field_y: "artifact",
+      x_values: ["1", "7"],
+      y_values: ["FILE"],
+      x_distinct: 7,
+      y_distinct: 1,
+      x_bounded: false,
+      y_bounded: false,
+      cells: [
+        { x: "1", y: "FILE", count: 40 },
+        { x: "7", y: "FILE", count: 12 },
+      ],
+      total: 52,
+    };
+    render(<SankeyFlow data={pivot} />);
+    expect(screen.getByText("Mon")).toBeInTheDocument();
+    expect(screen.getByText("FILE")).toBeInTheDocument();
+  });
+
+  it("PivotHeatmap labels each axis by its own field", () => {
+    // x is virtual and y is ordinary — the case a single shared labeller
+    // would get wrong.
+    const pivot: FieldPivotResponse = {
+      kind: "pivot",
+      field_x: "time:hour_of_day",
+      field_y: "artifact",
+      x_values: ["09", "10"],
+      y_values: ["FILE"],
+      x_distinct: 24,
+      y_distinct: 1,
+      x_bounded: false,
+      y_bounded: false,
+      cells: [
+        { x: "09", y: "FILE", count: 40 },
+        { x: "10", y: "FILE", count: 12 },
+      ],
+      total: 52,
+    };
+    render(<PivotHeatmap data={pivot} />);
+    expect(screen.getByText("09:00")).toBeInTheDocument();
+    // The ordinary axis is untouched — not relabelled, not blanked.
+    expect(screen.getByText("FILE")).toBeInTheDocument();
+  });
+
+  it("LineChart legend click reports the canonical value, not the label", () => {
+    // Legend falls back to `entry.key ?? entry.label`; without an explicit
+    // key this would emit "Mon" and filter on a value that cannot exist.
+    const onValueClick = vi.fn();
+    render(<LineChart data={DOW_TIMESERIES} showLegend onValueClick={onValueClick} />);
+    fireEvent.click(screen.getByText("Mon"));
+    expect(onValueClick).toHaveBeenCalledTimes(1);
+    expect(onValueClick.mock.calls[0][0].entries).toEqual([["time:day_of_week", "1"]]);
+  });
+
+  it("PivotHeatmap cell click reports canonical values for both axes", () => {
+    const onValueClick = vi.fn();
+    const pivot: FieldPivotResponse = {
+      kind: "pivot",
+      field_x: "time:hour_of_day",
+      field_y: "artifact",
+      x_values: ["09"],
+      y_values: ["FILE"],
+      x_distinct: 24,
+      y_distinct: 1,
+      x_bounded: false,
+      y_bounded: false,
+      cells: [{ x: "09", y: "FILE", count: 40 }],
+      total: 40,
+    };
+    const { container } = render(<PivotHeatmap data={pivot} onValueClick={onValueClick} />);
+    const cell = container.querySelector("rect[style*='cursor']");
+    fireEvent.click(cell!);
+    expect(onValueClick.mock.calls[0][0].entries).toEqual([
+      ["time:hour_of_day", "09"],
+      ["artifact", "FILE"],
+    ]);
   });
 });

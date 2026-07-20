@@ -11,6 +11,7 @@ import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
 import { Legend } from "@/components/viz/primitives/Legend";
 import { useChartRef } from "@/components/viz/primitives/useChartRef";
 import { buildSeriesColorMap } from "@/components/viz/lib/colors";
+import { valueLabeller } from "@/components/viz/lib/fieldDisplay";
 import type { ChartValueClickHandler } from "@/components/viz/lib/interaction";
 import { svgLocalPoint } from "@/components/viz/lib/pointer";
 import type { FieldTimeseriesResponse } from "@/api/types";
@@ -81,10 +82,15 @@ export function LineChart({
         : Math.max(1, d3max(data.series, (s) => d3max(s.buckets, (b) => b.count) ?? 0) ?? 0),
     [stacked, dates, data.series],
   );
+  // Keyed on the canonical value, never the display label: buildSeriesColorMap
+  // guarantees a value keeps its colour across chart types (bar/pie/line all
+  // build from the same field_terms order), so keying on a label would
+  // reshuffle colours on a bar↔line switch for labelled fields only.
   const colorMap = useMemo(
     () => buildSeriesColorMap(data.series.map((s) => s.value)),
     [data.series],
   );
+  const labelOf = valueLabeller(data.field);
 
   if (isEmpty) {
     return (
@@ -192,7 +198,12 @@ export function LineChart({
       {showLegend && (
         <Legend
           entries={data.series.map((s) => ({
-            label: s.value,
+            // `key` is mandatory, not decorative: Legend reports
+            // `e.key ?? e.label` to onEntryClick, so omitting it would make a
+            // relabelled series ("Mon") filter on its display text, which
+            // matches nothing.
+            key: s.value,
+            label: labelOf(s.value),
             color: colorMap.get(s.value) ?? "var(--color-accent)",
           }))}
           onEntryClick={
@@ -216,7 +227,7 @@ export function LineChart({
           <div>{fmtFull(dates[hoverIdx])}</div>
           {data.series.map((s) => (
             <div key={s.value}>
-              <span style={{ color: colorMap.get(s.value) }}>●</span> {s.value}:{" "}
+              <span style={{ color: colorMap.get(s.value) }}>●</span> {labelOf(s.value)}:{" "}
               <strong>{fmtCount(s.buckets[hoverIdx]?.count ?? 0)}</strong>
             </div>
           ))}

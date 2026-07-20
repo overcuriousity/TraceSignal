@@ -59,7 +59,14 @@ import {
   type Scale,
 } from "@/components/viz/lib/chartConfig";
 import { METRIC_INFO, type Metric } from "@/components/viz/lib/transforms";
-import { CHART_META, chartTypesFor, SCALES } from "@/components/viz/lib/chartMeta";
+import { CHART_META, SCALES } from "@/components/viz/lib/chartMeta";
+import {
+  resolveChartOptions,
+  defaultChartTypeForScale,
+  chartTypesForField,
+} from "@/components/viz/lib/chartOptions";
+import { fieldTokenLabel } from "@/components/viz/lib/fieldDisplay";
+import { isTimeField, TIME_FIELDS } from "@/components/viz/lib/timeFields";
 import { buildCaptionLines, type CaptionFacts } from "@/components/viz/lib/caption";
 import { CHART_PRESETS } from "@/components/viz/lib/presets";
 import { ChartCaption } from "@/components/viz/primitives/ChartCaption";
@@ -68,6 +75,7 @@ import type {
   CompareTermsResponse,
   CompareTimeResponse,
   EventFilters,
+  VizFieldInfo,
 } from "@/api/types";
 
 const SCALE_INFO: Record<Scale, { label: string; hint: string }> = {
@@ -90,6 +98,28 @@ const SCALE_INFO: Record<Scale, { label: string; hint: string }> = {
 };
 
 const METRICS: Metric[] = ["count", "delta", "rate", "ratio", "cumulative"];
+
+/** One field picker option: display name plus a muted qualifier.
+ *
+ * The qualifier is driven off `isTimeField`, not off a null `distinct`: a
+ * virtual field has no measured distinct count, and "time field" tells the
+ * analyst more about why than an empty parenthetical would. Ordinary fields
+ * guard on null anyway, so an absent count renders nothing rather than
+ * "(null distinct)". */
+function fieldOptionText(f: VizFieldInfo) {
+  return (
+    <>
+      {fieldTokenLabel(f.token)}{" "}
+      <span className="text-[var(--color-fg-muted)]">
+        {isTimeField(f.token)
+          ? "(time field)"
+          : f.distinct != null
+            ? `(${f.distinct} distinct)`
+            : null}
+      </span>
+    </>
+  );
+}
 
 /** Why Compare is disabled for a chart type — shown instead of hiding the
  * control (see chartMeta: pie/box/violin/ecdf have no honest two-layer
@@ -151,12 +181,10 @@ export function VisualizePage() {
         ? { mode: "custom", filters: config.compare.filters }
         : null;
 
-  const topN = Math.min(config.options.topN ?? 10, dataKind === "timeseries" ? 20 : 50);
-  const bins = config.options.bins ?? 30;
-  const buckets = config.options.buckets ?? 60;
-  const limitX = config.options.limitX ?? 10;
-  const limitY = config.options.limitY ?? 10;
-  const sampleLimit = config.options.sampleLimit ?? 5000;
+  // Shared with the agent's ChartProposalCard so a proposed chart and a
+  // hand-built one resolve their defaults identically.
+  const resolved = useMemo(() => resolveChartOptions(config), [config]);
+  const { topN, bins, buckets, limitX, limitY, sampleLimit } = resolved;
 
   const svgRef = useRef<SVGSVGElement | null>(null);
   // Preset strip: open by default on a fresh page (no chart state in the
@@ -193,6 +221,17 @@ export function VisualizePage() {
   // data source). `autoProbedField` gates the auto-suggest to once per field
   // — the analyst's manual scale choice is never overridden afterwards.
   const autoProbedField = useRef<string | null>(field);
+  // A virtual `time:` field's scale is known statically, and its SQL yields
+  // zero-padded strings — `field_numeric_stats` would scan the timeline only
+  // to report `count: 0` and land the analyst on nominal/bar, contradicting
+  // TIME_FIELDS. Never probe one.
+  const fieldIsTime = field != null && isTimeField(field);
+  // A pairing the rail never offers but a saved chart or URL can still carry:
+  // a numeric-fed mark over a `time:` field, whose SQL yields strings. Tested
+  // on the data kind rather than on `chartTypesForField`, so a URL with an
+  // inconsistent scale/chartType pair still falls through to its own handling
+  // instead of collecting this (wrong) explanation.
+  const chartTypeUnplottable = fieldIsTime && (dataKind === "numeric" || dataKind === "scatter");
   const numericQuery = useQuery({
     queryKey: ["viz-field-numeric", caseId, timelineId, field, filters, bins],
     queryFn: () => vizApi.fieldNumeric(caseId!, timelineId!, field!, filters, bins),
@@ -201,14 +240,36 @@ export function VisualizePage() {
     // charts (time, punchcard) never need it, and the two-field charts have
     // their own endpoints and keep their chart type — skipping the probe
     // there avoids the field_numeric_stats double-scan.
+    //
+    // `!fieldIsTime` is a top-level conjunct, not part of the probe disjunct:
+    // gating only the probe would still fire the scan whenever a numeric
+    // chart type happened to be selected.
     enabled:
       !!(caseId && timelineId && field) &&
+      !fieldIsTime &&
       (dataKind === "numeric" ||
         (!fieldFree && !requiresSecondField && field !== autoProbedField.current)),
   });
 
+  // Scale suggestion for a virtual time field — the statically-known answer,
+  // no round-trip. Must run before the numeric-probe effect below so the
+  // shared `autoProbedField` ref is spent first; React runs effects in
+  // declaration order.
+  useEffect(() => {
+    if (!field || !fieldIsTime || field === autoProbedField.current) return;
+    // Advance the ref even when the early-return below fires: it means "this
+    // field's one-shot suggestion is spent", not "we fetched something".
+    autoProbedField.current = field;
+    if (fieldFree || requiresSecondField) return;
+    const scale = TIME_FIELDS[field].scale;
+    updateConfig({ scale, chartType: defaultChartTypeForScale(scale, field) });
+  }, [field, fieldIsTime, fieldFree, requiresSecondField, updateConfig]);
+
   useEffect(() => {
     if (!field || field === autoProbedField.current) return;
+    // Inert for time fields anyway (the query is disabled, so `data` stays
+    // undefined) — stated explicitly so the intent survives a refactor.
+    if (fieldIsTime) return;
     if (numericQuery.data == null) return;
     autoProbedField.current = field;
     // Don't yank the analyst off the field-independent charts (time,
@@ -219,14 +280,16 @@ export function VisualizePage() {
       scale: isNumeric ? "ratio" : "nominal",
       chartType: isNumeric ? "histogram" : "bar",
     });
-  }, [field, numericQuery.data, fieldFree, requiresSecondField, updateConfig]);
+  }, [field, fieldIsTime, numericQuery.data, fieldFree, requiresSecondField, updateConfig]);
 
   // Keep chartType valid when the analyst switches scale — clamped at event
   // time rather than in an effect, so there is never a render with an
   // inconsistent scale/chartType pair.
   const handleScaleChange = (s: Scale) => {
-    if (!CHART_META[chartType].scales.includes(s)) {
-      updateConfig({ scale: s, chartType: chartTypesFor(s)[0] });
+    // Also re-picks when the type is legal for the new scale but not for the
+    // field — a `time:` field cannot feed a numeric mark at any scale.
+    if (!chartTypesForField(s, field).includes(chartType)) {
+      updateConfig({ scale: s, chartType: defaultChartTypeForScale(s, field) });
     } else {
       updateConfig({ scale: s });
     }
@@ -283,8 +346,8 @@ export function VisualizePage() {
   });
 
   const timeseriesQuery = useQuery({
-    queryKey: ["viz-field-timeseries", caseId, timelineId, field, filters, topN],
-    queryFn: () => vizApi.fieldTimeseries(caseId!, timelineId!, field!, filters, 60, topN),
+    queryKey: ["viz-field-timeseries", caseId, timelineId, field, filters, buckets, topN],
+    queryFn: () => vizApi.fieldTimeseries(caseId!, timelineId!, field!, filters, buckets, topN),
     enabled: !!(caseId && timelineId && field) && dataKind === "timeseries",
   });
 
@@ -326,7 +389,7 @@ export function VisualizePage() {
     enabled: !!(caseId && timelineId && field && fieldY) && dataKind === "scatter",
   });
 
-  const availableChartTypes = chartTypesFor(scale);
+  const availableChartTypes = chartTypesForField(scale, field);
 
   // Data-derived caption facts for the active query — totals, grid width,
   // and top-N capping feed the truthful caption/export lines.
@@ -368,9 +431,13 @@ export function VisualizePage() {
     facts.primaryTotal = punchcardQuery.data.total;
   } else if (dataKind === "pivot" && pivotQuery.data) {
     facts.primaryTotal = pivotQuery.data.total;
-    facts.xDistinct = pivotQuery.data.x_distinct;
+    // A bounded `time:` axis reports its domain size, not a measured distinct
+    // count, and was charted whole — there is no "rest in Other" to caption.
+    // Left undefined rather than relying on `distinct > shown` happening to be
+    // false, so the caption cannot claim truncation that did not occur.
+    facts.xDistinct = pivotQuery.data.x_bounded ? undefined : pivotQuery.data.x_distinct;
     facts.xShown = pivotQuery.data.x_values.length;
-    facts.yDistinct = pivotQuery.data.y_distinct;
+    facts.yDistinct = pivotQuery.data.y_bounded ? undefined : pivotQuery.data.y_distinct;
     facts.yShown = pivotQuery.data.y_values.length;
   } else if (dataKind === "scatter" && scatterQuery.data) {
     facts.primaryTotal = scatterQuery.data.total;
@@ -438,10 +505,7 @@ export function VisualizePage() {
               <SelectContent>
                 {(fieldsQuery.data?.fields ?? []).map((f) => (
                   <SelectItem key={f.token} value={f.token}>
-                    {f.token}{" "}
-                    <span className="text-[var(--color-fg-muted)]">
-                      ({f.distinct} distinct)
-                    </span>
+                    {fieldOptionText(f)}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -467,10 +531,7 @@ export function VisualizePage() {
                   .filter((f) => f.token !== field)
                   .map((f) => (
                     <SelectItem key={f.token} value={f.token}>
-                      {f.token}{" "}
-                      <span className="text-[var(--color-fg-muted)]">
-                        ({f.distinct} distinct)
-                      </span>
+                      {fieldOptionText(f)}
                     </SelectItem>
                   ))}
               </SelectContent>
@@ -968,6 +1029,17 @@ export function VisualizePage() {
           <div className="flex h-full items-center justify-center text-sm text-[var(--color-fg-muted)]">
             Choose a second field (Y) to chart {CHART_META[chartType].label.toLowerCase()}.
           </div>
+        ) : chartTypeUnplottable ? (
+          // The rail cannot offer this pairing, but a saved chart or a URL can
+          // still carry one. Without this branch the numeric probe stays
+          // disabled, `numericQuery.data` never arrives, and every render gate
+          // below is `data && <Chart/>` — a blank canvas with no spinner and
+          // no explanation.
+          <div className="flex h-full items-center justify-center px-6 text-center text-sm text-[var(--color-fg-muted)]">
+            {fieldTokenLabel(field!)} has no numeric values, so{" "}
+            {CHART_META[chartType].label.toLowerCase()} would render empty. Pick a categorical
+            chart type — bar, pie or heatmap.
+          </div>
         ) : loading ? (
           <div className="flex h-full items-center justify-center">
             <Spinner size={24} />
@@ -987,9 +1059,9 @@ export function VisualizePage() {
               <BarChart
                 terms={compareTermsOn ? undefined : termsQuery.data}
                 compare={compareTermsOn ? compareTermsQuery.data : undefined}
-                orientation={config.options.orientation ?? "horizontal"}
-                sort={config.options.sort ?? "count"}
-                logScale={config.options.logScale ?? false}
+                orientation={resolved.orientation}
+                sort={resolved.sort}
+                logScale={resolved.logScale}
                 svgRef={svgRef}
                 onValueClick={handleChartValueClick}
               />
@@ -1003,8 +1075,8 @@ export function VisualizePage() {
             {chartType === "line" && timeseriesQuery.data && (
               <LineChart
                 data={timeseriesQuery.data}
-                seriesMode={config.options.seriesMode ?? "overlay"}
-                showLegend={config.options.legend ?? true}
+                seriesMode={resolved.seriesMode}
+                showLegend={resolved.legend}
                 svgRef={svgRef}
                 onValueClick={handleChartValueClick}
               />
@@ -1014,7 +1086,7 @@ export function VisualizePage() {
                 <NumericHistogram
                   stats={compareNumericOn ? undefined : numericQuery.data}
                   compare={compareNumericOn ? compareNumericQuery.data : undefined}
-                  logScale={config.options.logScale ?? false}
+                  logScale={resolved.logScale}
                   svgRef={svgRef}
                 />
               )}
@@ -1047,7 +1119,7 @@ export function VisualizePage() {
             {chartType === "scatter" && scatterQuery.data && (
               <ScatterChart
                 data={scatterQuery.data}
-                logScale={config.options.logScale ?? false}
+                logScale={resolved.logScale}
                 svgRef={svgRef}
               />
             )}
