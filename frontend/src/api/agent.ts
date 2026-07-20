@@ -9,7 +9,7 @@
  * GET-only, so `streamMessage` reads the body via fetch + ReadableStream
  * (same wire format as useCaseStream's EventSource, parsed by hand).
  */
-import { BASE, get, post, put, del, fetchBlobGet, ApiError } from "./client";
+import { BASE, get, post, put, patch, del, fetchBlobGet, ApiError } from "./client";
 import type { EventFilters, FieldMatchMode } from "./types";
 import type { ChartConfig, ChartType } from "@/components/viz/lib/chartConfig";
 
@@ -152,8 +152,14 @@ export interface AgentConversation {
   user_id: string;
   title: string;
   model_id: string | null;
-  /** Per-chat tool restriction frozen at creation (null = none). */
+  /** Per-chat tool restriction (null = none). Set at creation, adjustable
+   * afterwards via `updateConversationTools` — a change applies from the next
+   * turn on and is audited, never rewriting what earlier turns could do. */
   disabled_tools: string[] | null;
+  /** Whether a turn is streaming for this conversation *right now* — live
+   * process state, not a column. Lets a reopened panel show a working Stop
+   * instead of an input that silently 409s. */
+  active?: boolean;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -209,6 +215,9 @@ export type AgentStreamEvent =
       prompt_tokens?: number | null;
       completion_tokens?: number | null;
     }
+  /** The turn was stopped by an analyst (this client or another). The partial
+   * turn is still persisted — a stopped turn stays part of the record. */
+  | { type: "cancelled" }
   | { type: "error"; detail: string; code?: string };
 
 /** Compact token count: 890, 12.4k, 1.2M. */
@@ -273,6 +282,20 @@ export const agentApi = {
   getConversation: (caseId: string, conversationId: string) =>
     get<AgentConversation & { messages: AgentMessage[] }>(
       `/cases/${caseId}/agent/conversations/${conversationId}`,
+    ),
+
+  /** Adjust an existing conversation's tool set (audited server-side). */
+  updateConversationTools: (caseId: string, conversationId: string, disabledTools: string[]) =>
+    patch<AgentConversation>(`/cases/${caseId}/agent/conversations/${conversationId}`, {
+      disabled_tools: disabledTools,
+    }),
+
+  /** Stop the turn streaming for this conversation. Idempotent — cancelling an
+   * idle conversation reports `cancelled: false` rather than erroring. */
+  cancelTurn: (caseId: string, conversationId: string) =>
+    post<{ cancelled: boolean }>(
+      `/cases/${caseId}/agent/conversations/${conversationId}/cancel`,
+      {},
     ),
 
   deleteConversation: (caseId: string, conversationId: string) =>

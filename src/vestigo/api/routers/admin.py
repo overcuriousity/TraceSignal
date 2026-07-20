@@ -8,12 +8,13 @@ teams and memberships.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field, field_validator
 
-from vestigo.agent.availability import reset_probe_cache
+from vestigo.agent.availability import list_models, reset_probe_cache
 from vestigo.agent.config import EFFORT_VALUES, resolve_agent_config
 from vestigo.agent.tools import TOOL_NAMES, TOOL_REGISTRY
 from vestigo.api.deps import get_store, require_admin
@@ -603,6 +604,55 @@ async def _agent_settings_response() -> dict[str, Any]:
 async def get_agent_settings(admin: User = Depends(require_admin)) -> dict[str, Any]:
     """Return the effective AI agent configuration, its per-field source, and env pins."""
     return await _agent_settings_response()
+
+
+class AgentModelsRequest(BaseModel):
+    """Credentials to list models against, before they have been saved.
+
+    Each field overrides the corresponding resolved-config value for this
+    request only; omitting one falls back to what is already configured. That
+    fallback is what makes the listing work when the key is env-pinned or
+    already stored — the admin UI never holds those, so it cannot send them.
+    """
+
+    api_base_url: str | None = None
+    api_key: str | None = None
+    provider: str | None = None
+
+
+@router.post("/agent-settings/models")
+async def list_agent_models(
+    payload: AgentModelsRequest, admin: User = Depends(require_admin)
+) -> dict[str, Any]:
+    """List the model ids the configured LLM endpoint advertises.
+
+    Populates the model picker in the admin UI, which is why it takes the
+    *unsaved* form values: an admin typing a new endpoint and key should see
+    its models before committing them. Nothing is persisted and the probe
+    cache is untouched — this is a read against the operator's own endpoint.
+
+    Reaching the network here is deliberate and admin-triggered, consistent
+    with the availability probe (see `TECH_STACK.md` §6): it only ever talks
+    to the endpoint the operator configured, never to a third party.
+
+    Always 200. An unreachable endpoint, a rejected key, or one that serves
+    no listing all return an empty list — the UI falls back to free-text
+    model entry, so a failure here is not an error condition.
+    """
+    config = await resolve_agent_config()
+    # An env-pinned field is not overridable here, matching the PUT endpoint
+    # and the disabled inputs in the UI. It also closes an exfiltration path
+    # the pin would otherwise not cover: overriding `api_base_url` while the
+    # key stays env-pinned would send the operator's key — which this API
+    # never discloses — to a host of the caller's choosing.
+    overrides = {
+        f: v
+        for f, v in payload.model_dump(exclude_unset=True).items()
+        if v not in (None, "") and config.sources.get(f) != "env"
+    }
+    if overrides:
+        config = replace(config, **overrides)
+    return {"models": await list_models(config)}
 
 
 @router.put("/agent-settings")

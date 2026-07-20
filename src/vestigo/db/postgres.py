@@ -3194,13 +3194,21 @@ class PostgresStore:
         *,
         title: str | None = None,
         history: list | None = None,
+        disabled_tools: list[str] | None = None,
     ) -> None:
-        """Update a conversation's title and/or replayable history snapshot."""
+        """Update a conversation's title, replayable history, and/or tool set.
+
+        ``disabled_tools`` accepts ``[]`` meaningfully (re-enable everything),
+        so it is checked against None rather than falsiness — the caller
+        clearing the restriction must not be read as "no change".
+        """
         values: dict[str, Any] = {"updated_at": datetime.now(UTC)}
         if title is not None:
             values["title"] = title
         if history is not None:
             values["history"] = history
+        if disabled_tools is not None:
+            values["disabled_tools"] = disabled_tools
         async with self.session_factory() as session:
             await session.execute(
                 update(AgentConversation)

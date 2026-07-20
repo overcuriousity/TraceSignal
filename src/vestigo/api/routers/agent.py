@@ -13,11 +13,14 @@ must be explainable later from the case record alone.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from time import monotonic
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Response
@@ -32,8 +35,8 @@ from vestigo.agent.compaction import (
     estimate_next_prompt_tokens,
     should_compact,
 )
-from vestigo.agent.config import resolve_agent_config
-from vestigo.agent.runtime import dump_history, load_history, stream_turn
+from vestigo.agent.config import DEFAULT_MAX_TURNS, resolve_agent_config
+from vestigo.agent.runtime import LLM_TIMEOUT, dump_history, load_history, stream_turn
 from vestigo.agent.tools import TOOL_NAMES, TOOL_REGISTRY, build_scope
 from vestigo.api.deps import (
     get_current_user,
@@ -103,12 +106,37 @@ class CreateConversationRequest(BaseModel):
     _check_tools = field_validator("disabled_tools")(_validate_tool_names)
 
 
+class UpdateConversationRequest(BaseModel):
+    """Mutable fields on an existing conversation. Tool set only, for now.
+
+    Omitted means "leave alone", not "clear" — `[]` is a meaningful value here
+    (re-enable every tool), so a PATCH that doesn't mention `disabled_tools`
+    must not silently widen the agent's reach.
+    """
+
+    disabled_tools: list[str] | None = None
+
+    _check_tools = field_validator("disabled_tools")(_validate_tool_names)
+
+
 class SendMessageRequest(BaseModel):
     content: str = Field(..., min_length=1, max_length=32768)
     # Snapshot of the analyst's current Explorer filters (frontend
     # EventFilters shape) — injected as context so the agent is aware of what
     # the analyst is looking at.
     view_filters: dict[str, Any] | None = None
+
+
+def _conversation_payload(conversation: AgentConversation) -> dict[str, Any]:
+    """Conversation dict plus the live `active` flag.
+
+    `active` is process state, not a column — it says whether a turn is
+    streaming *right now*, which is what lets a panel that was closed and
+    reopened (or a second tab) show a working Stop instead of a dead input.
+    """
+    payload = conversation.to_dict()
+    payload["active"] = turn_is_active(conversation.id)
+    return payload
 
 
 @router.post("/{case_id}/agent/conversations")
@@ -132,7 +160,7 @@ async def create_conversation(
         model_id=f"{config.provider}:{config.model}",
         disabled_tools=payload.disabled_tools,
     )
-    return conversation.to_dict()
+    return _conversation_payload(conversation)
 
 
 @router.get("/{case_id}/agent/conversations")
@@ -146,7 +174,7 @@ async def list_conversations(
     conversations = await get_store().list_agent_conversations(
         case_id, timeline_id=timeline_id, user_id=user.id
     )
-    return {"conversations": [c.to_dict() for c in conversations]}
+    return {"conversations": [_conversation_payload(c) for c in conversations]}
 
 
 @router.get("/{case_id}/agent/conversations/{conversation_id}")
@@ -159,7 +187,7 @@ async def get_conversation(
     """Return one conversation with its full message history."""
     conversation = await _require_conversation(case_id, conversation_id, user)
     messages = await get_store().list_agent_messages(conversation_id)
-    payload = conversation.to_dict()
+    payload = _conversation_payload(conversation)
     payload["messages"] = [m.to_dict() for m in messages]
     return payload
 
@@ -211,6 +239,75 @@ async def export_conversation(
     )
 
 
+@router.patch("/{case_id}/agent/conversations/{conversation_id}")
+async def update_conversation(
+    case_id: str,
+    conversation_id: str,
+    payload: UpdateConversationRequest,
+    case: Case = Depends(require_case_read),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Narrow or widen an existing conversation's tool set.
+
+    The turn reads ``conversation.disabled_tools`` fresh on every send, so a
+    change here takes effect from the next turn onward — it never rewrites
+    what earlier turns were allowed to do. Audited for exactly that reason:
+    the conversation row only carries the *current* restriction, so who
+    changed the agent's reach, and when, has to live in the audit trail for
+    the record to stay readable after the fact.
+    """
+    await _require_agent()
+    conversation = await _require_conversation(case_id, conversation_id, user)
+    store = get_store()
+    if payload.disabled_tools is None:
+        return _conversation_payload(conversation)
+    before = sorted(conversation.disabled_tools or ())
+    after = sorted(payload.disabled_tools)
+    if before != after:
+        await store.update_agent_conversation(conversation_id, disabled_tools=after)
+        await store.record_audit(
+            action="agent.conversation_tools_changed",
+            actor=user,
+            case_id=case_id,
+            target_type="agent_conversation",
+            target_id=conversation_id,
+            detail={"disabled_tools_before": before, "disabled_tools_after": after},
+        )
+    updated = await store.get_agent_conversation(case_id, conversation_id)
+    return _conversation_payload(updated or conversation)
+
+
+@router.post("/{case_id}/agent/conversations/{conversation_id}/cancel")
+async def cancel_turn(
+    case_id: str,
+    conversation_id: str,
+    case: Case = Depends(require_case_read),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Stop the turn currently streaming for this conversation, if any.
+
+    Idempotent: cancelling an idle conversation is a no-op, not an error —
+    the client may well be racing the turn's own completion. Signals the
+    generator rather than killing the task so the partial turn still lands in
+    the record (see ``_message_stream_inner``).
+
+    Audited: a stop truncates the record, so who did it has to be recoverable
+    afterwards — the messages alone only show that the turn ended early.
+    """
+    await _require_conversation(case_id, conversation_id, user)
+    if not turn_is_active(conversation_id):
+        return {"cancelled": False}
+    _active_turns[conversation_id].cancel.set()
+    await get_store().record_audit(
+        action="agent.turn_cancelled",
+        actor=user,
+        case_id=case_id,
+        target_type="agent_conversation",
+        target_id=conversation_id,
+    )
+    return {"cancelled": True}
+
+
 @router.delete("/{case_id}/agent/conversations/{conversation_id}")
 async def delete_conversation(
     case_id: str,
@@ -256,11 +353,63 @@ def _is_context_overflow(exc: ModelHTTPError) -> bool:
     return exc.status_code in (400, 413) and bool(_CONTEXT_OVERFLOW_RE.search(str(exc.body or "")))
 
 
-# Conversations with a turn currently streaming. Two concurrent turns on one
-# conversation would race on `history` (last writer wins, the other turn's
-# messages vanish from the replayable record), so send_message 409s instead.
+@dataclass(frozen=True)
+class _ActiveTurn:
+    """A reserved in-flight turn: its cancel signal and when it started."""
+
+    cancel: asyncio.Event
+    started: float
+
+
+# Conversations with a turn currently streaming, mapped to that turn's cancel
+# signal. Two concurrent turns on one conversation would race on `history`
+# (last writer wins, the other turn's messages vanish from the replayable
+# record), so send_message 409s instead.
+#
+# The cancel event is what makes Stop honest. A client aborting its SSE fetch
+# only drops its own connection: with no output flowing (a long tool call, a
+# slow model), Starlette may not notice the disconnect for a while, and the
+# turn keeps running and spending tokens. `cancel_turn` sets this event and
+# `_message_stream_inner` checks it as it streams — so Stop works from any
+# client, including one that navigated away and came back.
+#
 # In-memory on purpose — same single-process deployment premise as JobStore.
-_active_turns: set[str] = set()
+_active_turns: dict[str, _ActiveTurn] = {}
+
+# Ceiling on how long a reservation is believed. `send_message` reserves before
+# returning the StreamingResponse, so if the ASGI task is cancelled before the
+# generator's first step the entry's release (the generator's `finally`) never
+# runs — leaving the conversation permanently "active": a Stop button that does
+# nothing and a 409 on every send, unrecoverable without a restart. Past this
+# age the entry is dropped and the conversation is treated as idle.
+#
+# The tradeoff is deliberate: a turn that genuinely runs longer than this is
+# reported idle, and a concurrent turn then becomes possible (with the `history`
+# race that the reservation exists to prevent). The bound is the worst case a
+# turn can legitimately take — every model request timing out at `LLM_TIMEOUT`,
+# `max_turns` times over — so exceeding it means something is already wrong.
+_TURN_STALE_AFTER = LLM_TIMEOUT * DEFAULT_MAX_TURNS
+
+
+def turn_is_active(conversation_id: str) -> bool:
+    """Whether a turn is currently streaming for this conversation.
+
+    Prunes a stranded reservation as a side effect, so this is the single
+    gate every caller (the 409 check, `cancel_turn`, the `active` payload
+    flag) goes through — otherwise they could disagree about the same entry.
+    """
+    turn = _active_turns.get(conversation_id)
+    if turn is None:
+        return False
+    if monotonic() - turn.started > _TURN_STALE_AFTER:
+        logger.warning(
+            "Dropping stranded turn reservation for conversation %s (age > %.0fs)",
+            conversation_id,
+            _TURN_STALE_AFTER,
+        )
+        _active_turns.pop(conversation_id, None)
+        return False
+    return True
 
 
 async def _message_stream(
@@ -269,11 +418,19 @@ async def _message_stream(
     payload: SendMessageRequest,
     user: User,
 ) -> AsyncGenerator[str]:
+    """Release the turn reservation once the turn ends, however it ends.
+
+    The cancel check lives in `_message_stream_inner`, not here: breaking out
+    of the loop from outside would close the inner generator with a
+    `GeneratorExit`, which — deriving from `BaseException` — no `except
+    Exception` catches, silently dropping the streamed text instead of
+    persisting it.
+    """
     try:
         async for chunk in _message_stream_inner(case_id, conversation, payload, user):
             yield chunk
     finally:
-        _active_turns.discard(conversation.id)
+        _active_turns.pop(conversation.id, None)
 
 
 async def _message_stream_inner(
@@ -284,6 +441,10 @@ async def _message_stream_inner(
 ) -> AsyncGenerator[str]:
     store = get_store()
     conversation_id = conversation.id
+    # The reservation `send_message` made for this turn. Checked as the turn
+    # streams so a stop can persist what ran and return normally — see the
+    # `_cancelled` helper below.
+    reservation = _active_turns.get(conversation_id)
     await store.add_agent_message(conversation_id, "user", payload.content)
     if not conversation.title:
         await store.update_agent_conversation(conversation_id, title=payload.content[:_TITLE_MAX])
@@ -367,9 +528,15 @@ async def _message_stream_inner(
             compactions = 1
             yield _sse(compaction_event)
 
+    def _cancelled() -> bool:
+        return reservation is not None and reservation.cancel.is_set()
+
     text_parts: list[str] = []
     for attempt in range(len(keep_schedule) + 1):
         text_parts = []
+        if _cancelled():
+            yield _sse({"type": "cancelled"})
+            return
         try:
             async for event in stream_turn(
                 scope,
@@ -377,6 +544,23 @@ async def _message_stream_inner(
                 history=history,
                 view_filters=payload.view_filters,
             ):
+                # A stop lands here, between streamed events — so the partial
+                # turn is persisted the same way the interrupt paths below do
+                # it, and the generator returns normally. Breaking out of this
+                # from the *caller* would close this generator with a
+                # `GeneratorExit`, which no `except Exception` catches, and the
+                # streamed text would be lost.
+                #
+                # The bound: a stop takes effect at the next streamed event,
+                # and always before the next model request. A tool call already
+                # in flight still runs to completion first.
+                if _cancelled():
+                    if text_parts:
+                        await store.add_agent_message(
+                            conversation_id, "assistant", "".join(text_parts) + " [stopped]"
+                        )
+                    yield _sse({"type": "cancelled"})
+                    return
                 if event["type"] == "result":
                     turn = event["turn"]
                     await store.add_agent_message(
@@ -498,12 +682,12 @@ async def send_message(
     """
     await _require_agent()
     conversation = await _require_conversation(case_id, conversation_id, user)
-    if conversation_id in _active_turns:
+    if turn_is_active(conversation_id):
         raise HTTPException(
             status_code=409, detail="A turn is already running for this conversation"
         )
     # Reserve before returning the response — the generator's finally releases.
-    _active_turns.add(conversation_id)
+    _active_turns[conversation_id] = _ActiveTurn(cancel=asyncio.Event(), started=monotonic())
     return StreamingResponse(
         _message_stream(case_id, conversation, payload, user),
         media_type="text/event-stream",

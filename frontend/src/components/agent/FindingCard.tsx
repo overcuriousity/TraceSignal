@@ -5,13 +5,17 @@
  * (sandbox + apply model — the agent never touches the analyst's view
  * itself).
  */
-import { ArrowRight, Lightbulb } from "lucide-react";
+import { useMemo, useState } from "react";
+import { ArrowRight, Bookmark, Lightbulb } from "lucide-react";
 import { Button } from "@/components/ui/Button";
+import { Tooltip } from "@/components/ui/Tooltip";
+import { SaveViewDialog } from "@/components/explorer/SaveViewDialog";
 import { specToEventFilters, type AgentFilterSpec } from "@/api/agent";
 import type { EventFilters } from "@/api/types";
 import { Markdown } from "./Markdown";
 
 interface Props {
+  caseId: string;
   title: string;
   description: string;
   spec: AgentFilterSpec;
@@ -43,7 +47,9 @@ function specChips(spec: AgentFilterSpec): string[] {
   return chips;
 }
 
-export function FindingCard({ title, description, spec, total, onApply }: Props) {
+export function FindingCard({ caseId, title, description, spec, total, onApply }: Props) {
+  const [saveOpen, setSaveOpen] = useState(false);
+  const filters = useMemo(() => specToEventFilters(spec), [spec]);
   return (
     <div className="rounded-md border border-[var(--color-accent)] bg-[var(--color-accent-dim)] p-2.5 text-xs">
       <div className="flex items-center gap-1.5 font-semibold text-[var(--color-fg-primary)]">
@@ -69,11 +75,34 @@ export function FindingCard({ title, description, spec, total, onApply }: Props)
         <span className="text-[var(--color-fg-secondary)]">
           {typeof total === "number" ? `${total.toLocaleString()} matching events` : ""}
         </span>
-        <Button variant="accent" size="sm" onClick={() => onApply(specToEventFilters(spec))}>
-          Apply to Explorer
-          <ArrowRight size={12} />
-        </Button>
+        <div className="flex shrink-0 items-center gap-1">
+          {/* Applying is transient (it only writes the URL); saving makes the
+              same filter set durable in the left-hand Views panel, so a
+              finding worth keeping outlives the conversation. Same dialog and
+              same payload normalization the Explorer's own Save View uses. */}
+          <Tooltip content="Save as a View">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 px-1.5"
+              onClick={() => setSaveOpen(true)}
+              aria-label="Save as a View"
+            >
+              <Bookmark size={12} />
+            </Button>
+          </Tooltip>
+          <Button variant="accent" size="sm" onClick={() => onApply(filters)}>
+            Apply to Explorer
+            <ArrowRight size={12} />
+          </Button>
+        </div>
       </div>
+      <SaveViewDialog
+        open={saveOpen}
+        onClose={() => setSaveOpen(false)}
+        caseId={caseId}
+        filters={filters}
+      />
     </div>
   );
 }
