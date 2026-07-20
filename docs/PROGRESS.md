@@ -1,6 +1,33 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-20 (session 73 — PR #140 review fixes, release 1.4.0).
+Last updated: 2026-07-20 (session 74 — agent panel UX fixes).
+
+## Session 74 — 2026-07-20: agent panel UX (four reported issues)
+
+- **Stop button missing after navigating away.** `_active_turns` was a bare
+  set the client never saw, so a reopened panel showed a usable input that
+  409'd on every send. It is now `dict[conversation_id, asyncio.Event]`,
+  surfaced as `active` on every conversation payload (polled while true), and
+  `POST .../cancel` sets the event for the stream loop to break on. Aborting
+  the client fetch alone was never enough — with no output flowing, Starlette
+  may not notice the disconnect for a while and the turn keeps spending
+  tokens. Cancel signals the generator rather than killing the task, so the
+  partial turn is still persisted: a stopped turn stays part of the record.
+- **Tool selector vanished after the first message.** It was gated on
+  `!activeId` because the tool set was frozen at creation. New audited
+  `PATCH .../conversations/{id}` lets it be adjusted; the change applies from
+  the next turn and never rewrites what earlier turns could do. Making the
+  popover always-visible surfaced a latent bug worth noting: its mount-time
+  seeding from the user's saved defaults would have overwritten an existing
+  conversation's actual tool set *and* persisted that through the new PATCH.
+  Hence `seedFromDefaults`.
+- **Panel not resizable.** `panelWidth`/`setPanelWidth` had been sitting
+  unused in `stores/agent.ts` — wired up a drag handle copying
+  InvestigatePanel's existing pattern verbatim.
+- **Finding filters were transient.** "Apply to Explorer" only writes the
+  URL, so a useful filter set died with the conversation. Finding cards now
+  also save one as a View via the Explorer's own `SaveViewDialog`.
+
 
 ## Session 73 — 2026-07-20: PR #140 review fixes + release 1.4.0
 

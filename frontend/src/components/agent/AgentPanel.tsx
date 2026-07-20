@@ -284,6 +284,12 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
     }
     return s;
   }
+  if (e.type === "cancelled") {
+    // Flush whatever streamed before the stop — the partial turn is persisted
+    // server-side, so dropping it here would make the live view disagree with
+    // the record on reload.
+    return { ...s, items: [...flushed, { kind: "error", detail: "Turn stopped." }], liveText: "" };
+  }
   if (e.type === "error") {
     return { ...s, items: [...flushed, { kind: "error", detail: e.detail }], liveText: "" };
   }
@@ -315,6 +321,7 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
   const storeKey = `${caseId}/${timelineId}`;
   const queryClient = useQueryClient();
   const panelWidth = useAgentStore((s) => s.panelWidth);
+  const setPanelWidth = useAgentStore((s) => s.setPanelWidth);
   const activeId = useAgentStore((s) => s.activeConversationByTimeline[storeKey] ?? null);
   const setActiveConversation = useAgentStore((s) => s.setActiveConversation);
 
@@ -334,6 +341,32 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
   const infoQuery = useQuery({ queryKey: ["agent-info"], queryFn: agentApi.getInfo });
   const info = infoQuery.data;
 
+  // ── Resize drag (mirrors InvestigatePanel / EventDetailPanel) ──────────
+  const dragState = useRef<{ startX: number; startWidth: number } | null>(null);
+  const onDragStart = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      dragState.current = { startX: e.clientX, startWidth: panelWidth };
+    },
+    [panelWidth],
+  );
+  useEffect(() => {
+    function onMouseMove(e: MouseEvent) {
+      if (!dragState.current) return;
+      const delta = dragState.current.startX - e.clientX;
+      setPanelWidth(Math.max(320, Math.min(900, dragState.current.startWidth + delta)));
+    }
+    function onMouseUp() {
+      dragState.current = null;
+    }
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+    };
+  }, [setPanelWidth]);
+
   const conversationsQuery = useQuery({
     queryKey: ["agent-conversations", caseId, timelineId],
     queryFn: () => agentApi.listConversations(caseId, timelineId),
@@ -344,7 +377,16 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
     queryKey: ["agent-conversation", caseId, activeId],
     queryFn: () => agentApi.getConversation(caseId, activeId!),
     enabled: !!activeId,
+    // A turn started in another tab (or before this panel was reopened) is
+    // only visible via `active`, and nothing pushes that to us — so poll
+    // while one is running. Once idle, the query goes quiet again.
+    refetchInterval: (q) => (q.state.data?.active ? 2000 : false),
   });
+
+  // A turn is running that this panel is not itself streaming: the analyst
+  // closed the panel or navigated away mid-turn and came back. Without this,
+  // the input looks usable and every send 409s ("A turn is already running").
+  const remoteTurnActive = !!conversationQuery.data?.active && !streaming;
 
   const proposalsQuery = useQuery({
     queryKey: ["agent-proposals", caseId, activeId],
@@ -457,13 +499,15 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
   }, [caseId, timelineId, disabledTools, storeKey, queryClient, setActiveConversation, sendTo]);
 
   const send = useCallback(() => {
-    if (!input.trim() || streaming || creating) return;
+    // remoteTurnActive too: the server 409s a concurrent turn, so sending
+    // here would only surface a confusing error.
+    if (!input.trim() || streaming || creating || remoteTurnActive) return;
     if (!activeId) {
       void createAndSend();
       return;
     }
     void sendTo(activeId);
-  }, [input, streaming, creating, activeId, createAndSend, sendTo]);
+  }, [input, streaming, creating, remoteTurnActive, activeId, createAndSend, sendTo]);
 
   const exportThread = useCallback(async () => {
     if (!activeId) return;
@@ -483,7 +527,42 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
     }
   }, [activeId, caseId, conversationQuery.data]);
 
-  const stop = useCallback(() => abortRef.current?.abort(), []);
+  // Aborting the local fetch only drops this client's SSE stream — with no
+  // output flowing the server may not notice for a while, and the turn keeps
+  // spending tokens. So tell the server too. Also the only thing that can
+  // stop a turn this panel never streamed (remoteTurnActive).
+  const stop = useCallback(() => {
+    abortRef.current?.abort();
+    if (activeId) {
+      void agentApi.cancelTurn(caseId, activeId).finally(() => {
+        queryClient.invalidateQueries({ queryKey: ["agent-conversation", caseId, activeId] });
+      });
+    }
+  }, [caseId, activeId, queryClient]);
+
+  // Tool set: before a conversation exists this seeds the next create; once
+  // one is active it edits that conversation (audited server-side, effective
+  // from the next turn). Seeded from the conversation so reopening the panel
+  // shows what is actually in force, not a stale local guess.
+  const conversationTools = conversationQuery.data?.disabled_tools;
+  useEffect(() => {
+    if (activeId && conversationTools) setDisabledTools(conversationTools);
+  }, [activeId, conversationTools]);
+
+  const toolsMutation = useMutation({
+    mutationFn: (tools: string[]) => agentApi.updateConversationTools(caseId, activeId!, tools),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["agent-conversation", caseId, activeId] });
+    },
+  });
+
+  const handleToolsChange = useCallback(
+    (tools: string[]) => {
+      setDisabledTools(tools);
+      if (activeId) toolsMutation.mutate(tools);
+    },
+    [activeId, toolsMutation],
+  );
 
   const items: ChatItem[] = [
     ...persistedItems,
@@ -503,10 +582,17 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
 
   return (
     <div
-      className="flex shrink-0 flex-col overflow-hidden border-l border-[var(--color-border)] bg-[var(--color-bg-surface)]"
+      className="relative flex shrink-0 flex-col overflow-hidden border-l border-[var(--color-border)] bg-[var(--color-bg-surface)]"
       style={{ width: panelWidth }}
       data-testid="agent-panel"
     >
+      <div
+        onMouseDown={onDragStart}
+        className="absolute left-0 top-0 z-10 h-full w-1 cursor-col-resize opacity-0 transition-opacity hover:bg-[var(--color-accent)] hover:opacity-100"
+        style={{ marginLeft: -2 }}
+        aria-label="Resize agent panel"
+      />
+
       {/* Header */}
       <div className="flex shrink-0 items-center gap-1.5 border-b border-[var(--color-border)] px-2.5 py-1.5">
         <Sparkles size={14} className="shrink-0 text-[var(--color-accent)]" />
@@ -659,6 +745,7 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
             return (
               <FindingCard
                 key={i}
+                caseId={caseId}
                 title={item.title}
                 description={item.description}
                 spec={item.spec}
@@ -709,10 +796,29 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
 
       {/* Input */}
       <div className="shrink-0 border-t border-[var(--color-border)] p-2">
-        {!activeId && (
-          <div className="mb-1.5 flex items-center">
-            <ToolSelectorPopover disabledTools={disabledTools} onChange={setDisabledTools} />
-          </div>
+        <div className="mb-1.5 flex items-center gap-2">
+          <ToolSelectorPopover
+            disabledTools={disabledTools}
+            onChange={handleToolsChange}
+            seedFromDefaults={!activeId}
+          />
+          {toolsMutation.isPending && <Spinner size={11} />}
+          {activeId && !toolsMutation.isPending && disabledTools.length > 0 && (
+            <span className="text-[10px] text-[var(--color-fg-muted)]">
+              applies from the next turn
+            </span>
+          )}
+        </div>
+        {toolsMutation.isError && (
+          <p className="mb-1.5 text-[11px] text-[var(--color-danger)]">
+            Could not change the tool set:{" "}
+            {toolsMutation.error instanceof Error ? toolsMutation.error.message : "unknown error"}
+          </p>
+        )}
+        {remoteTurnActive && (
+          <p className="mb-1.5 flex items-center gap-1.5 text-[11px] text-[var(--color-fg-secondary)]">
+            <Spinner size={11} /> A turn is still running — stop it or wait for it to finish.
+          </p>
         )}
         {createError && (
           <p className="mb-1.5 text-[11px] text-[var(--color-danger)]">
@@ -722,9 +828,11 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
         <div className="flex items-end gap-1.5">
           <textarea
             className="max-h-32 min-h-[3.5rem] flex-1 resize-none rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-[var(--color-accent)]"
-            placeholder="What should the agent look into?"
+            placeholder={
+              remoteTurnActive ? "Waiting for the running turn…" : "What should the agent look into?"
+            }
             value={input}
-            disabled={streaming || creating}
+            disabled={streaming || creating || remoteTurnActive}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey) {
@@ -733,9 +841,14 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
               }
             }}
           />
-          {streaming ? (
-            <Tooltip content="Stop">
-              <Button variant="outline" size="icon" onClick={stop}>
+          {streaming || remoteTurnActive ? (
+            <Tooltip content={remoteTurnActive ? "Stop the running turn" : "Stop"}>
+              <Button
+                variant="outline"
+                size="icon"
+                onClick={stop}
+                aria-label={remoteTurnActive ? "Stop the running turn" : "Stop"}
+              >
                 <Square size={13} />
               </Button>
             </Tooltip>

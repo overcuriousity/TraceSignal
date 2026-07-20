@@ -13,6 +13,7 @@ must be explainable later from the case record alone.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -103,12 +104,32 @@ class CreateConversationRequest(BaseModel):
     _check_tools = field_validator("disabled_tools")(_validate_tool_names)
 
 
+class UpdateConversationRequest(BaseModel):
+    """Mutable fields on an existing conversation. Tool set only, for now."""
+
+    disabled_tools: list[str] = Field(default_factory=list)
+
+    _check_tools = field_validator("disabled_tools")(_validate_tool_names)
+
+
 class SendMessageRequest(BaseModel):
     content: str = Field(..., min_length=1, max_length=32768)
     # Snapshot of the analyst's current Explorer filters (frontend
     # EventFilters shape) — injected as context so the agent is aware of what
     # the analyst is looking at.
     view_filters: dict[str, Any] | None = None
+
+
+def _conversation_payload(conversation: AgentConversation) -> dict[str, Any]:
+    """Conversation dict plus the live `active` flag.
+
+    `active` is process state, not a column — it says whether a turn is
+    streaming *right now*, which is what lets a panel that was closed and
+    reopened (or a second tab) show a working Stop instead of a dead input.
+    """
+    payload = conversation.to_dict()
+    payload["active"] = turn_is_active(conversation.id)
+    return payload
 
 
 @router.post("/{case_id}/agent/conversations")
@@ -132,7 +153,7 @@ async def create_conversation(
         model_id=f"{config.provider}:{config.model}",
         disabled_tools=payload.disabled_tools,
     )
-    return conversation.to_dict()
+    return _conversation_payload(conversation)
 
 
 @router.get("/{case_id}/agent/conversations")
@@ -146,7 +167,7 @@ async def list_conversations(
     conversations = await get_store().list_agent_conversations(
         case_id, timeline_id=timeline_id, user_id=user.id
     )
-    return {"conversations": [c.to_dict() for c in conversations]}
+    return {"conversations": [_conversation_payload(c) for c in conversations]}
 
 
 @router.get("/{case_id}/agent/conversations/{conversation_id}")
@@ -159,7 +180,7 @@ async def get_conversation(
     """Return one conversation with its full message history."""
     conversation = await _require_conversation(case_id, conversation_id, user)
     messages = await get_store().list_agent_messages(conversation_id)
-    payload = conversation.to_dict()
+    payload = _conversation_payload(conversation)
     payload["messages"] = [m.to_dict() for m in messages]
     return payload
 
@@ -211,6 +232,64 @@ async def export_conversation(
     )
 
 
+@router.patch("/{case_id}/agent/conversations/{conversation_id}")
+async def update_conversation(
+    case_id: str,
+    conversation_id: str,
+    payload: UpdateConversationRequest,
+    case: Case = Depends(require_case_read),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Narrow or widen an existing conversation's tool set.
+
+    The turn reads ``conversation.disabled_tools`` fresh on every send, so a
+    change here takes effect from the next turn onward — it never rewrites
+    what earlier turns were allowed to do. Audited for exactly that reason:
+    the conversation row only carries the *current* restriction, so who
+    changed the agent's reach, and when, has to live in the audit trail for
+    the record to stay readable after the fact.
+    """
+    await _require_agent()
+    conversation = await _require_conversation(case_id, conversation_id, user)
+    store = get_store()
+    before = sorted(conversation.disabled_tools or ())
+    after = sorted(payload.disabled_tools or ())
+    if before != after:
+        await store.update_agent_conversation(conversation_id, disabled_tools=after)
+        await store.record_audit(
+            action="agent.conversation_tools_changed",
+            actor=user,
+            case_id=case_id,
+            target_type="agent_conversation",
+            target_id=conversation_id,
+            detail={"disabled_tools_before": before, "disabled_tools_after": after},
+        )
+    updated = await store.get_agent_conversation(case_id, conversation_id)
+    return _conversation_payload(updated or conversation)
+
+
+@router.post("/{case_id}/agent/conversations/{conversation_id}/cancel")
+async def cancel_turn(
+    case_id: str,
+    conversation_id: str,
+    case: Case = Depends(require_case_read),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Stop the turn currently streaming for this conversation, if any.
+
+    Idempotent: cancelling an idle conversation is a no-op, not an error —
+    the client may well be racing the turn's own completion. Signals the
+    generator rather than killing the task so the partial turn still lands in
+    the record (see ``_message_stream``).
+    """
+    await _require_conversation(case_id, conversation_id, user)
+    cancel = _active_turns.get(conversation_id)
+    if cancel is None:
+        return {"cancelled": False}
+    cancel.set()
+    return {"cancelled": True}
+
+
 @router.delete("/{case_id}/agent/conversations/{conversation_id}")
 async def delete_conversation(
     case_id: str,
@@ -256,11 +335,25 @@ def _is_context_overflow(exc: ModelHTTPError) -> bool:
     return exc.status_code in (400, 413) and bool(_CONTEXT_OVERFLOW_RE.search(str(exc.body or "")))
 
 
-# Conversations with a turn currently streaming. Two concurrent turns on one
-# conversation would race on `history` (last writer wins, the other turn's
-# messages vanish from the replayable record), so send_message 409s instead.
+# Conversations with a turn currently streaming, mapped to that turn's cancel
+# signal. Two concurrent turns on one conversation would race on `history`
+# (last writer wins, the other turn's messages vanish from the replayable
+# record), so send_message 409s instead.
+#
+# The value is what makes Stop honest. A client aborting its SSE fetch only
+# drops its own connection: with no output flowing (a long tool call, a slow
+# model), Starlette may not notice the disconnect for a while, and the turn
+# keeps running and spending tokens. `cancel_turn` sets this event, the stream
+# loop checks it between chunks and stops — so Stop works from any client,
+# including one that navigated away and came back.
+#
 # In-memory on purpose — same single-process deployment premise as JobStore.
-_active_turns: set[str] = set()
+_active_turns: dict[str, asyncio.Event] = {}
+
+
+def turn_is_active(conversation_id: str) -> bool:
+    """Whether a turn is currently streaming for this conversation."""
+    return conversation_id in _active_turns
 
 
 async def _message_stream(
@@ -269,11 +362,19 @@ async def _message_stream(
     payload: SendMessageRequest,
     user: User,
 ) -> AsyncGenerator[str]:
+    cancel = _active_turns[conversation.id]
     try:
         async for chunk in _message_stream_inner(case_id, conversation, payload, user):
+            # Checked between chunks rather than by cancelling the task: the
+            # inner generator's own `finally` still runs, so the partial turn
+            # is persisted to `history` exactly as an completed one would be.
+            # A stopped turn is still part of the record.
+            if cancel.is_set():
+                yield _sse({"type": "cancelled"})
+                break
             yield chunk
     finally:
-        _active_turns.discard(conversation.id)
+        _active_turns.pop(conversation.id, None)
 
 
 async def _message_stream_inner(
@@ -503,7 +604,7 @@ async def send_message(
             status_code=409, detail="A turn is already running for this conversation"
         )
     # Reserve before returning the response — the generator's finally releases.
-    _active_turns.add(conversation_id)
+    _active_turns[conversation_id] = asyncio.Event()
     return StreamingResponse(
         _message_stream(case_id, conversation, payload, user),
         media_type="text/event-stream",

@@ -108,6 +108,19 @@ frontend AgentPanel ──POST /messages (SSE)──► api/routers/agent.py
 - One turn at a time per conversation: a POST while another turn is
   streaming gets a 409 (`_active_turns` in `api/routers/agent.py`) —
   concurrent turns would race on the conversation's replayable `history`.
+  `_active_turns` maps each conversation to that turn's `asyncio.Event`, and
+  the live state is surfaced as `active` on every conversation payload, so a
+  panel that was closed or navigated away from mid-turn shows a working Stop
+  instead of an input that silently 409s.
+- **Stop is server-side.** `POST .../{id}/cancel` sets the turn's event; the
+  stream loop checks it between chunks and breaks. Aborting the client's SSE
+  fetch alone is not enough: with no output flowing (a long tool call, a slow
+  model) Starlette may not notice the disconnect for a while and the turn
+  keeps spending tokens. Cancelling signals the generator rather than killing
+  the task, so the inner `finally` still persists the partial turn — a
+  stopped turn stays part of the record. Idempotent: cancelling an idle
+  conversation reports `cancelled: false` rather than erroring, since the
+  client is always racing the turn's own completion.
 - The analyst's current Explorer filters ride along with each message and are
   injected as context, so "filter what I'm looking at further" works.
 
@@ -259,9 +272,24 @@ click. There is deliberately no "don't show again".
 
 Per-chat tool selection is a separate concern, in
 `frontend/src/components/agent/ToolSelector.tsx`: a popover reachable from a
-toolbar button above the input (only shown while no conversation is active
-yet), pre-populated from the user's saved defaults, with "Save as my
-defaults" writing them back.
+toolbar button above the input, always available, with "Save as my defaults"
+writing the current selection back to the user record.
+
+The popover's behavior depends on whether a conversation exists yet:
+
+- **No conversation**: it seeds from the user's saved defaults and the
+  selection is passed to `create_conversation`.
+- **Active conversation**: it seeds from *that conversation's*
+  `disabled_tools` and each change `PATCH`es it. `seedFromDefaults={false}`
+  is load-bearing here — without it the mount-time seeding would replace the
+  analyst's actual restriction with their defaults and persist that.
+
+A change applies from the **next turn** (the turn reads
+`conversation.disabled_tools` fresh on every send); it never rewrites what
+earlier turns were allowed to do. `PATCH` is audited as
+`agent.conversation_tools_changed` with before/after lists: the row carries
+only the current restriction, so who narrowed the agent's reach and when has
+to live in the audit trail for the record to stay readable afterwards.
 
 Both draw from `GET /api/agent/info` (`info_router` in
 `api/routers/agent.py`): model, provider, `api_base_url`,

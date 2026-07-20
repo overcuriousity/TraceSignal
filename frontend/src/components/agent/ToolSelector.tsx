@@ -18,12 +18,22 @@ import { Spinner } from "@/components/ui/Spinner";
 const WORKFLOW_TOOLS = new Set(["propose_finding", "propose_annotation"]);
 
 interface Props {
-  /** The per-chat deny list for the next conversation to be created. */
+  /** The per-chat deny list: for the next conversation to be created, or the
+   * active conversation's own set once one exists. */
   disabledTools: string[];
   onChange: (disabledTools: string[]) => void;
+  /** Seed from the user's saved defaults on mount. Only correct for a
+   * not-yet-created conversation: an existing one already carries its own
+   * set, and seeding over it would silently replace the analyst's actual
+   * restriction with their defaults — and persist that via the caller. */
+  seedFromDefaults?: boolean;
 }
 
-export function ToolSelectorPopover({ disabledTools, onChange }: Props) {
+export function ToolSelectorPopover({
+  disabledTools,
+  onChange,
+  seedFromDefaults = true,
+}: Props) {
   const [open, setOpen] = useState(false);
   const infoQuery = useQuery({ queryKey: ["agent-info"], queryFn: agentApi.getInfo });
   const info = infoQuery.data;
@@ -32,13 +42,13 @@ export function ToolSelectorPopover({ disabledTools, onChange }: Props) {
   // — after that, onToggle below is the sole source of truth.
   const seededRef = useRef(false);
   useEffect(() => {
-    if (!info || seededRef.current) return;
+    if (!info || seededRef.current || !seedFromDefaults) return;
     seededRef.current = true;
     const initial = info.tools
       .filter((t) => !t.admin_disabled && info.user_disabled_tools.includes(t.name))
       .map((t) => t.name);
     if (initial.length > 0) onChange(initial);
-  }, [info, onChange]);
+  }, [info, onChange, seedFromDefaults]);
 
   const savePrefs = useMutation({
     mutationFn: () => agentApi.updatePreferences(disabledTools),

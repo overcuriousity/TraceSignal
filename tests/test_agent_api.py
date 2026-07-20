@@ -733,6 +733,102 @@ def test_send_message_persists_and_streams_token_usage(
     assert assistant.completion_tokens and assistant.completion_tokens > 0
 
 
+def test_active_flag_reflects_a_running_turn(client, admin_bootstrap, agent_on):
+    """`active` is what lets a reopened panel show a working Stop instead of a
+    dead input — it must track the in-flight reservation, not a column."""
+    from vestigo.api.routers import agent as agent_router
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+    assert conversation["active"] is False
+
+    listed = client.get(
+        f"/api/cases/{case_id}/agent/conversations", params={"timeline_id": timeline_id}
+    ).json()["conversations"]
+    assert listed[0]["active"] is False
+
+    agent_router._active_turns[conversation["id"]] = asyncio.Event()
+    try:
+        one = client.get(f"/api/cases/{case_id}/agent/conversations/{conversation['id']}").json()
+        assert one["active"] is True
+        listed = client.get(
+            f"/api/cases/{case_id}/agent/conversations", params={"timeline_id": timeline_id}
+        ).json()["conversations"]
+        assert listed[0]["active"] is True
+    finally:
+        agent_router._active_turns.pop(conversation["id"], None)
+
+
+def test_cancel_sets_the_turn_event_and_is_idempotent(client, admin_bootstrap, agent_on):
+    """Cancel signals the running generator. Cancelling an idle conversation is
+    a no-op, not an error — the client races the turn's own completion."""
+    from vestigo.api.routers import agent as agent_router
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+    url = f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/cancel"
+
+    # Idle: reports nothing to cancel rather than 404/409.
+    assert client.post(url).json() == {"cancelled": False}
+
+    event = asyncio.Event()
+    agent_router._active_turns[conversation["id"]] = event
+    try:
+        assert client.post(url).json() == {"cancelled": True}
+        assert event.is_set()
+    finally:
+        agent_router._active_turns.pop(conversation["id"], None)
+
+
+def test_patch_conversation_tools_updates_and_audits(client, admin_bootstrap, agent_on):
+    """Tool changes take effect from the next turn and land in the audit trail —
+    the row carries only the current restriction, so who narrowed the agent's
+    reach and when has to be recorded somewhere durable."""
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+    url = f"/api/cases/{case_id}/agent/conversations/{conversation['id']}"
+
+    resp = client.patch(url, json={"disabled_tools": ["histogram", "field_terms"]})
+    assert resp.status_code == 200
+    assert resp.json()["disabled_tools"] == ["field_terms", "histogram"]
+
+    # Round-trips on read.
+    assert client.get(url).json()["disabled_tools"] == ["field_terms", "histogram"]
+
+    # An empty list means "re-enable everything", not "no change".
+    assert client.patch(url, json={"disabled_tools": []}).json()["disabled_tools"] == []
+
+    audit = client.get(
+        "/api/admin/audit", params={"action": "agent.conversation_tools_changed"}
+    ).json()["audit"]
+    assert len(audit) == 2
+    # Newest first: the clearing change, then the narrowing one.
+    assert audit[0]["detail"]["disabled_tools_after"] == []
+    assert audit[1]["detail"]["disabled_tools_after"] == ["field_terms", "histogram"]
+
+
+def test_patch_conversation_rejects_unknown_tool(client, admin_bootstrap, agent_on):
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+    resp = client.patch(
+        f"/api/cases/{case_id}/agent/conversations/{conversation['id']}",
+        json={"disabled_tools": ["no_such_tool"]},
+    )
+    assert resp.status_code == 422
+
+
 def test_send_message_409_while_turn_active(client, admin_bootstrap, agent_on, monkeypatch):
     """One turn at a time per conversation — a concurrent POST gets a 409."""
     from vestigo.api.routers import agent as agent_router
@@ -746,12 +842,14 @@ def test_send_message_409_while_turn_active(client, admin_bootstrap, agent_on, m
     url = f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages"
 
     # Simulate an in-flight turn: the reservation is what send_message checks.
-    agent_router._active_turns.add(conversation["id"])
+    import asyncio
+
+    agent_router._active_turns[conversation["id"]] = asyncio.Event()
     try:
         resp = client.post(url, json={"content": "hello"})
         assert resp.status_code == 409
     finally:
-        agent_router._active_turns.discard(conversation["id"])
+        agent_router._active_turns.pop(conversation["id"], None)
 
     # After the reservation is released a turn runs — and releases itself.
     from mcp.server.fastmcp import FastMCP

@@ -26,6 +26,8 @@ const listProposalsMock = vi.fn();
 const getInfoMock = vi.fn().mockResolvedValue({
   api_base_url: "https://llm.example",
   model: "test-model",
+  tools: [{ name: "search_events", description: "", admin_disabled: false }],
+  user_disabled_tools: [],
 });
 
 vi.mock("@/api/agent", async () => {
