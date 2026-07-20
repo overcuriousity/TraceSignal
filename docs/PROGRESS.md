@@ -1,6 +1,38 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-20 (session 74 — agent panel UX fixes).
+Last updated: 2026-07-20 (session 75 — agent-tool feasibility items + roadmap triage).
+
+## Session 75 — 2026-07-20: agent-tool feasibility items + roadmap triage
+
+Docs-only session (no code changes).
+
+- **Agent-tool feasibility → roadmap.** Assessed adding web search / Shodan /
+  CyberChef-class tools to the agent: the toggle/audit/disclosure machinery is
+  ready, the open work is policy. A8 expanded with the concrete requirements
+  (OPSEC leak rationale, timestamped raw-response provenance, governance +
+  disclosure reuse, AGENT.md sandbox-invariant update); new A12 (local
+  CyberChef-class transforms — native, deterministic, offline, no OPSEC gate,
+  can ship before A8).
+- **Context-overhead measurement → A13.** The 27 tool schemas serialize to
+  ~15k tokens (plus ~1.2k system prompt), resent every request — half a 32k
+  local-model window. Dominated by `FilterSpec` inlined into ~14 tool schemas.
+  Three levers recorded: `$defs`/`$ref` schema dedup, lean tool-profile
+  presets, and header-once columnar tool-result encoding (results are resent
+  in history every turn). Negative decision recorded: agent prose stays
+  verbose — findings feed forensic reports and the transcript is custody
+  record, so caveman-style terse-output schemes were rejected for output.
+- **Roadmap triage.** `ROADMAP.md` reduced to open items only, per its own
+  delete-when-done rule: shipped narrative removed (audit C1/H1–H4 block,
+  Phase 3 Steps 1–2, Milestone 4's shipped-detector prose, Milestone 8's v1/v2
+  ship notes + A9 — all live canonically in `PROGRESS.md` /
+  `ANOMALY_DETECTION.md` / `AGENT.md`); six decision-records-as-checkboxes
+  (M15, M23, M26, W4, A11, confirm-proposal crash-gap, events.py split) moved
+  into an "out of scope & standing decisions" section with explicit revisit
+  triggers; W7's double entry deduped (canonical: Phase 3 Step 3); stale
+  events.py line count updated (1500+ → ~3100). User decision recorded:
+  porting the remaining vendored `*2timesketch` converters to native Parquet
+  is demand-driven, not planned — the vendored scripts are a permanent
+  minimal-dependency alternative, not a porting queue.
 
 ## Session 74 — 2026-07-20: agent panel UX (four reported issues)
 
