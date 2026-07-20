@@ -4,12 +4,8 @@ import { ChartEmptyState } from "@/components/viz/primitives/ChartEmptyState";
 import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
 import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
 import { useChartRef } from "@/components/viz/primitives/useChartRef";
-import {
-  buildSeriesColorMap,
-  OTHER_COLOR,
-  OTHER_KEY,
-  OTHER_LABEL,
-} from "@/components/viz/lib/colors";
+import { buildSeriesColorMap, OTHER_COLOR, OTHER_KEY } from "@/components/viz/lib/colors";
+import { fieldTokenLabel, valueLabeller } from "@/components/viz/lib/fieldDisplay";
 import type { ChartValueClickHandler } from "@/components/viz/lib/interaction";
 import type { FieldPivotResponse } from "@/api/types";
 
@@ -19,7 +15,6 @@ const NODE_GAP = 6;
 const LABEL_COL = 118;
 const MIN_LINK_PX = 1;
 
-const displayLabel = (key: string) => (key === OTHER_KEY ? OTHER_LABEL : key);
 const truncate = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
 
 interface SankeyFlowProps {
@@ -138,6 +133,10 @@ function SankeyBody({
   const rightX = innerWidth - NODE_WIDTH;
   const midX = innerWidth / 2;
 
+  // Per-axis labellers: the two sides are different fields, so each labels
+  // its own values (a `time:day_of_week` → `artifact` flow).
+  const labelX = valueLabeller(data.field_x);
+  const labelY = valueLabeller(data.field_y);
   const nodeClick =
     (field: string, key: string) =>
     (e: React.MouseEvent) => {
@@ -150,7 +149,7 @@ function SankeyBody({
     <>
       {links.map((l, i) => {
         const clickable = onValueClick != null && l.xKey !== OTHER_KEY && l.yKey !== OTHER_KEY;
-        const label = `${data.field_x} = ${displayLabel(l.xKey)} → ${data.field_y} = ${displayLabel(l.yKey)}`;
+        const label = `${fieldTokenLabel(data.field_x)} = ${labelX(l.xKey)} → ${fieldTokenLabel(data.field_y)} = ${labelY(l.yKey)}`;
         return (
           <path
             key={i}
@@ -201,7 +200,7 @@ function SankeyBody({
               setHover({
                 x: NODE_WIDTH + marginLeft,
                 y: n.y0 + marginTop,
-                label: `${data.field_x} = ${displayLabel(n.key)}`,
+                label: `${fieldTokenLabel(data.field_x)} = ${labelX(n.key)}`,
                 count: n.total,
               })
             }
@@ -215,7 +214,7 @@ function SankeyBody({
             fontSize={11}
             fill={n.key === OTHER_KEY ? "var(--viz-ink-muted)" : "var(--viz-ink-primary)"}
           >
-            {truncate(displayLabel(n.key), 18)}
+            {truncate(labelX(n.key), 18)}
           </text>
         </g>
       ))}
@@ -233,7 +232,7 @@ function SankeyBody({
               setHover({
                 x: rightX + marginLeft,
                 y: n.y0 + marginTop,
-                label: `${data.field_y} = ${displayLabel(n.key)}`,
+                label: `${fieldTokenLabel(data.field_y)} = ${labelY(n.key)}`,
                 count: n.total,
               })
             }
@@ -246,7 +245,7 @@ function SankeyBody({
             fontSize={11}
             fill={n.key === OTHER_KEY ? "var(--viz-ink-muted)" : "var(--viz-ink-primary)"}
           >
-            {truncate(displayLabel(n.key), 18)}
+            {truncate(labelY(n.key), 18)}
           </text>
         </g>
       ))}

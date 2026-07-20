@@ -363,7 +363,18 @@ class _FakeVizService:
 
     def field_pivot(self, query, field_x, field_y, limit_x, limit_y):
         self.calls.append(("field_pivot", (field_x, field_y, limit_x, limit_y), {}))
-        return {"kind": "pivot", "cells": [], "total": 0, "x_distinct": 0, "y_distinct": 0}
+        # x_values/y_values are part of the real response — the axes the
+        # matrix actually resolved to, which a bounded time axis fills from
+        # its domain rather than from a top-N scan.
+        return {
+            "kind": "pivot",
+            "cells": [],
+            "total": 0,
+            "x_values": [],
+            "y_values": [],
+            "x_distinct": 0,
+            "y_distinct": 0,
+        }
 
     def field_scatter(self, query, field_x, field_y, limit):
         self.calls.append(("field_scatter", (field_x, field_y, limit), {}))
@@ -868,6 +879,55 @@ async def test_time_field_passes_field_validation(store, monkeypatch):
     assert result["resolved"]["field"] == "time:day_of_week"
 
 
+async def test_time_field_validation_matches_the_query_layer_spelling(store, monkeypatch):
+    """`resolve_time_field` normalises case/whitespace, so a token the SQL
+    layer resolves must not be rejected one layer above it."""
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server, "propose_chart", _chart({"chart_type": "bar", "field": "Time:Hour_Of_Day"})
+    )
+    assert result["ok"] is True
+
+
+async def test_bounded_time_axis_warns_that_its_limit_did_not_apply(store, monkeypatch):
+    """A bounded time axis is charted as its whole domain — an hour with no
+    events is a finding. Accepting `limit_x` silently would leave the model
+    believing it had bounded a matrix it had not."""
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "pivot",
+                "field": "time:hour_of_day",
+                "field_y": "country",
+                "options": {"limit_x": 3, "limit_y": 5},
+            }
+        ),
+    )
+    assert any("limit_x does not apply" in w for w in result["warnings"])
+    # ...and it stops claiming a limit that had no effect.
+    assert "limit_x" not in result["resolved"]["options"]
+    # The unbounded axis keeps its limit.
+    assert result["resolved"]["options"]["limit_y"] == 5
+    assert not any("limit_y does not apply" in w for w in result["warnings"])
+
+
+async def test_clamped_buckets_warn_like_every_other_clamped_option(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart({"chart_type": "time", "options": {"buckets": 100_000}}),
+    )
+    assert any("buckets" in w and "clamped" in w for w in result["warnings"])
+    assert result["resolved"]["options"]["buckets"] < 100_000
+
+
 # ── back-compat: persisted conversations still resolve ──────────────────────
 # The retired `kind` enum is absent from the model-facing schema but still
 # understood, for a conversation in flight across a server restart.
@@ -1019,6 +1079,32 @@ async def test_describe_field_answers_time_fields_without_scanning(store, monkey
     assert result["distinct"] == 24
     assert result["top_values"][:3] == ["00", "01", "02"]
     assert not [c for c in fake.calls if c[0] in {"field_terms", "field_numeric_stats"}]
+
+
+async def test_describe_field_reports_a_count_under_a_count_name(store, monkeypatch):
+    """`coverage` means a 0-1 fraction everywhere else in the API.
+
+    Reporting a raw event count under that name left the model unable to
+    compare a field described here against the same field in the viz field
+    list — so the count is named as one.
+    """
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(server, "describe_field", {"field": "user"})
+    assert result["non_empty_total"] == 100
+    assert "coverage" not in result
+
+
+async def test_describe_field_claims_no_coverage_for_a_virtual_field(store, monkeypatch):
+    """A time part is undefined for an undated event, so full coverage would
+    be a claim about data this tool never scanned."""
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(server, "describe_field", {"field": "time:date"})
+    assert "coverage" not in result
+    assert "non_empty_total" not in result
+    # Unbounded domain — no honest distinct count either.
+    assert result["distinct"] is None
 
 
 MAX_PROPOSAL_EVENTS_TEST = 500  # mirror of tools.MAX_PROPOSAL_EVENTS

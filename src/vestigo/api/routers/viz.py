@@ -890,8 +890,10 @@ async def list_viz_fields(
     detector changes silently reshape this list. Each entry carries:
 
     - ``token``    — field token to pass to the viz endpoints' ``field`` param.
-    - ``distinct`` — number of distinct non-empty values.
-    - ``coverage`` — fraction of events with a non-empty value (0-1).
+    - ``distinct`` — number of distinct non-empty values; ``null`` for a
+      virtual field with an unbounded domain (a date, a year-month).
+    - ``coverage`` — fraction of events with a non-empty value (0-1);
+      ``null`` for a virtual field, which is not measured against the data.
     - ``label``    — display name, for virtual fields whose token is not
       self-explanatory; absent for ordinary data fields.
 
@@ -905,6 +907,12 @@ async def list_viz_fields(
     listed here at all — not just exposed to the agent's charting tools —
     because the analyst and the agent must be able to name the same fields;
     anything the agent can chart the analyst has to be able to rebuild by hand.
+
+    Their ``distinct``/``coverage`` are ``null`` rather than measured, and
+    deliberately not faked as ``1.0``: a time part is undefined for an undated
+    (sentinel-timestamp) event, so full coverage would be a claim about the
+    data that this endpoint never checked. A picker showing "—" is honest; a
+    fabricated number in a forensic tool is not.
     """
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
     svc = _get_stat_anomaly_service()
@@ -920,8 +928,8 @@ async def list_viz_fields(
     fields.extend(
         {
             "token": token,
-            "distinct": len(spec.domain) if spec.domain else 0,
-            "coverage": 1.0,
+            "distinct": len(spec.domain) if spec.domain else None,
+            "coverage": None,
             "label": spec.label,
         }
         for token, spec in TIME_FIELD_SPECS.items()

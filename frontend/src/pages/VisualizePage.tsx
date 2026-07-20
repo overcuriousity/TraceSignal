@@ -60,7 +60,9 @@ import {
 } from "@/components/viz/lib/chartConfig";
 import { METRIC_INFO, type Metric } from "@/components/viz/lib/transforms";
 import { CHART_META, chartTypesFor, SCALES } from "@/components/viz/lib/chartMeta";
-import { resolveChartOptions } from "@/components/viz/lib/chartOptions";
+import { resolveChartOptions, defaultChartTypeForScale } from "@/components/viz/lib/chartOptions";
+import { fieldTokenLabel } from "@/components/viz/lib/fieldDisplay";
+import { isTimeField, TIME_FIELDS } from "@/components/viz/lib/timeFields";
 import { buildCaptionLines, type CaptionFacts } from "@/components/viz/lib/caption";
 import { CHART_PRESETS } from "@/components/viz/lib/presets";
 import { ChartCaption } from "@/components/viz/primitives/ChartCaption";
@@ -69,6 +71,7 @@ import type {
   CompareTermsResponse,
   CompareTimeResponse,
   EventFilters,
+  VizFieldInfo,
 } from "@/api/types";
 
 const SCALE_INFO: Record<Scale, { label: string; hint: string }> = {
@@ -91,6 +94,28 @@ const SCALE_INFO: Record<Scale, { label: string; hint: string }> = {
 };
 
 const METRICS: Metric[] = ["count", "delta", "rate", "ratio", "cumulative"];
+
+/** One field picker option: display name plus a muted qualifier.
+ *
+ * The qualifier is driven off `isTimeField`, not off a null `distinct`: a
+ * virtual field has no measured distinct count, and "time field" tells the
+ * analyst more about why than an empty parenthetical would. Ordinary fields
+ * guard on null anyway, so an absent count renders nothing rather than
+ * "(null distinct)". */
+function fieldOptionText(f: VizFieldInfo) {
+  return (
+    <>
+      {fieldTokenLabel(f.token)}{" "}
+      <span className="text-[var(--color-fg-muted)]">
+        {isTimeField(f.token)
+          ? "(time field)"
+          : f.distinct != null
+            ? `(${f.distinct} distinct)`
+            : null}
+      </span>
+    </>
+  );
+}
 
 /** Why Compare is disabled for a chart type — shown instead of hiding the
  * control (see chartMeta: pie/box/violin/ecdf have no honest two-layer
@@ -192,6 +217,11 @@ export function VisualizePage() {
   // data source). `autoProbedField` gates the auto-suggest to once per field
   // — the analyst's manual scale choice is never overridden afterwards.
   const autoProbedField = useRef<string | null>(field);
+  // A virtual `time:` field's scale is known statically, and its SQL yields
+  // zero-padded strings — `field_numeric_stats` would scan the timeline only
+  // to report `count: 0` and land the analyst on nominal/bar, contradicting
+  // TIME_FIELDS. Never probe one.
+  const fieldIsTime = field != null && isTimeField(field);
   const numericQuery = useQuery({
     queryKey: ["viz-field-numeric", caseId, timelineId, field, filters, bins],
     queryFn: () => vizApi.fieldNumeric(caseId!, timelineId!, field!, filters, bins),
@@ -200,14 +230,36 @@ export function VisualizePage() {
     // charts (time, punchcard) never need it, and the two-field charts have
     // their own endpoints and keep their chart type — skipping the probe
     // there avoids the field_numeric_stats double-scan.
+    //
+    // `!fieldIsTime` is a top-level conjunct, not part of the probe disjunct:
+    // gating only the probe would still fire the scan whenever a numeric
+    // chart type happened to be selected.
     enabled:
       !!(caseId && timelineId && field) &&
+      !fieldIsTime &&
       (dataKind === "numeric" ||
         (!fieldFree && !requiresSecondField && field !== autoProbedField.current)),
   });
 
+  // Scale suggestion for a virtual time field — the statically-known answer,
+  // no round-trip. Must run before the numeric-probe effect below so the
+  // shared `autoProbedField` ref is spent first; React runs effects in
+  // declaration order.
+  useEffect(() => {
+    if (!field || !fieldIsTime || field === autoProbedField.current) return;
+    // Advance the ref even when the early-return below fires: it means "this
+    // field's one-shot suggestion is spent", not "we fetched something".
+    autoProbedField.current = field;
+    if (fieldFree || requiresSecondField) return;
+    const scale = TIME_FIELDS[field].scale;
+    updateConfig({ scale, chartType: defaultChartTypeForScale(scale) });
+  }, [field, fieldIsTime, fieldFree, requiresSecondField, updateConfig]);
+
   useEffect(() => {
     if (!field || field === autoProbedField.current) return;
+    // Inert for time fields anyway (the query is disabled, so `data` stays
+    // undefined) — stated explicitly so the intent survives a refactor.
+    if (fieldIsTime) return;
     if (numericQuery.data == null) return;
     autoProbedField.current = field;
     // Don't yank the analyst off the field-independent charts (time,
@@ -218,14 +270,14 @@ export function VisualizePage() {
       scale: isNumeric ? "ratio" : "nominal",
       chartType: isNumeric ? "histogram" : "bar",
     });
-  }, [field, numericQuery.data, fieldFree, requiresSecondField, updateConfig]);
+  }, [field, fieldIsTime, numericQuery.data, fieldFree, requiresSecondField, updateConfig]);
 
   // Keep chartType valid when the analyst switches scale — clamped at event
   // time rather than in an effect, so there is never a render with an
   // inconsistent scale/chartType pair.
   const handleScaleChange = (s: Scale) => {
     if (!CHART_META[chartType].scales.includes(s)) {
-      updateConfig({ scale: s, chartType: chartTypesFor(s)[0] });
+      updateConfig({ scale: s, chartType: defaultChartTypeForScale(s) });
     } else {
       updateConfig({ scale: s });
     }
@@ -437,10 +489,7 @@ export function VisualizePage() {
               <SelectContent>
                 {(fieldsQuery.data?.fields ?? []).map((f) => (
                   <SelectItem key={f.token} value={f.token}>
-                    {f.token}{" "}
-                    <span className="text-[var(--color-fg-muted)]">
-                      ({f.distinct} distinct)
-                    </span>
+                    {fieldOptionText(f)}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -466,10 +515,7 @@ export function VisualizePage() {
                   .filter((f) => f.token !== field)
                   .map((f) => (
                     <SelectItem key={f.token} value={f.token}>
-                      {f.token}{" "}
-                      <span className="text-[var(--color-fg-muted)]">
-                        ({f.distinct} distinct)
-                      </span>
+                      {fieldOptionText(f)}
                     </SelectItem>
                   ))}
               </SelectContent>

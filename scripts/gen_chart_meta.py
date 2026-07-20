@@ -57,6 +57,20 @@ def _ts_union(values: tuple[str, ...]) -> str:
     return " | ".join(_ts_string(v) for v in values)
 
 
+def _camel(name: str) -> str:
+    """``top_n`` -> ``topN``.
+
+    Option *keys* cross the language boundary as data, so they have to be
+    spelled the way each side spells them: the Python names validate against
+    ``ChartOptionsSpec`` (snake_case, it is the model-facing JSON schema),
+    while the emitted names have to match ``ChartOptions`` in
+    ``chartConfig.ts`` (camelCase). Emitting snake_case into TypeScript would
+    produce a list that silently matches no key at all.
+    """
+    head, *rest = name.split("_")
+    return head + "".join(word.capitalize() for word in rest)
+
+
 def _wrap_comment(text: str, indent: str) -> str:
     """Render *text* as wrapped ``//`` comment lines at *indent*."""
     words, lines, current = text.split(), [], ""
@@ -109,7 +123,7 @@ def render_chart_meta() -> str:
             f"    scales: {_ts_string_array(meta.scales)},\n"
             f"    dataKind: {_ts_string(meta.data_kind)},\n"
             f"    defaultScale: {_ts_string(meta.default_scale)},\n"
-            f"    readsOptions: {_ts_string_array(meta.reads_options)},\n"
+            f"    readsOptions: {_ts_string_array([_camel(o) for o in meta.reads_options])},\n"
             f"    supportsCompare: {str(meta.supports_compare).lower()},\n"
             f"    requiresSecondField: {str(meta.requires_second_field).lower()},\n"
             f"  }},\n"

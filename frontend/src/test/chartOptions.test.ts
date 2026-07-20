@@ -6,7 +6,8 @@
  */
 import { describe, expect, it } from "vitest";
 import { DEFAULT_CHART_CONFIG, type ChartConfig } from "@/components/viz/lib/chartConfig";
-import { resolveChartOptions } from "@/components/viz/lib/chartOptions";
+import { resolveChartOptions, defaultChartTypeForScale } from "@/components/viz/lib/chartOptions";
+import { chartTypesFor, SCALES } from "@/components/viz/lib/chartMeta";
 
 const config = (patch: Partial<ChartConfig>): ChartConfig => ({
   ...DEFAULT_CHART_CONFIG,
@@ -56,5 +57,32 @@ describe("resolveChartOptions", () => {
 
   it("keeps an explicit zero", () => {
     expect(resolveChartOptions(config({ chartType: "bar", options: { topN: 0 } })).topN).toBe(0);
+  });
+});
+
+describe("defaultChartTypeForScale", () => {
+  it("never lands on a field-free chart, which would drop the picked field", () => {
+    // The naive `chartTypesFor(s)[0]` returns "time" for every scale, because
+    // CHART_META is keyed with `time` first and it is legal under all four.
+    for (const scale of SCALES) {
+      expect(defaultChartTypeForScale(scale)).not.toBe("time");
+      expect(defaultChartTypeForScale(scale)).not.toBe("punchcard");
+    }
+  });
+
+  it("picks a chart that is legal for the scale", () => {
+    for (const scale of SCALES) {
+      expect(chartTypesFor(scale)).toContain(defaultChartTypeForScale(scale));
+    }
+  });
+
+  it("maps the scales a time field can carry", () => {
+    // time:hour_of_day / day_of_week / month / ... are ordinal.
+    expect(defaultChartTypeForScale("ordinal")).toBe("bar");
+    expect(defaultChartTypeForScale("nominal")).toBe("bar");
+    // time:date / time:year_month are interval and string-valued, so the
+    // numeric marks would render empty — heatmap plots their strings.
+    expect(defaultChartTypeForScale("interval")).toBe("heatmap");
+    expect(defaultChartTypeForScale("ratio")).toBe("line");
   });
 });

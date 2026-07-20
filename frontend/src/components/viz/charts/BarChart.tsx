@@ -8,6 +8,7 @@ import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
 import { Legend } from "@/components/viz/primitives/Legend";
 import { useChartRef } from "@/components/viz/primitives/useChartRef";
 import { buildSeriesColorMap, OTHER_KEY, OTHER_LABEL } from "@/components/viz/lib/colors";
+import { valueLabeller } from "@/components/viz/lib/fieldDisplay";
 import type { ChartValueClickHandler } from "@/components/viz/lib/interaction";
 import type { CompareTermsResponse, FieldTermsResponse } from "@/api/types";
 
@@ -33,7 +34,11 @@ interface BarChartProps {
   rowHeight?: number;
   orientation?: "horizontal" | "vertical";
   /** "count" keeps the server's count-descending order; "value" sorts
-   * lexicographically by value (Other always stays last). */
+   * lexicographically by the *canonical* value — never by the display label,
+   * which may be relabelled ("1" renders as "Mon") or padded. The virtual
+   * `time:` fields are zero-padded server-side precisely so that lexical
+   * order on the canonical value equals chronological order; sorting on the
+   * label would silently reorder the axis. Other always stays last. */
   sort?: "count" | "value";
   /** Log-scaled value axis — zero counts render as zero-length bars. */
   logScale?: boolean;
@@ -74,14 +79,20 @@ export function BarChart({
   } | null>(null);
   const ref = useChartRef(svgRef);
 
+  const fieldToken = compare?.field ?? terms?.field ?? null;
+  const labelOf = valueLabeller(fieldToken);
   const rows: BarRow[] = compare
     ? compare.values.map((v) => ({
         key: v.value,
-        label: v.value,
+        label: labelOf(v.value),
         count: v.primary,
         comparison: v.comparison,
       }))
-    : (terms?.values ?? []).map((v) => ({ key: v.value, label: v.value, count: v.count }));
+    : (terms?.values ?? []).map((v) => ({
+        key: v.value,
+        label: labelOf(v.value),
+        count: v.count,
+      }));
   const otherPrimary = compare ? compare.primary_other : (terms?.other_count ?? 0);
   const otherComparison = compare?.comparison_other ?? 0;
   if (otherPrimary > 0 || (compare && otherComparison > 0)) {
@@ -94,7 +105,7 @@ export function BarChart({
   }
   if (sort === "value") {
     rows.sort((a, b) =>
-      a.key === OTHER_KEY ? 1 : b.key === OTHER_KEY ? -1 : a.label.localeCompare(b.label),
+      a.key === OTHER_KEY ? 1 : b.key === OTHER_KEY ? -1 : a.key.localeCompare(b.key),
     );
   }
 
@@ -107,7 +118,6 @@ export function BarChart({
   }
 
   const grouped = compare != null;
-  const fieldToken = compare?.field ?? terms?.field ?? null;
   const rowClickProps = (r: BarRow) =>
     onValueClick != null && fieldToken != null && r.key !== OTHER_KEY
       ? {
@@ -190,7 +200,7 @@ export function BarChart({
                     scale={x}
                     innerHeight={innerHeight}
                     rotate
-                    labelFormat={(k) => (k === OTHER_KEY ? OTHER_LABEL : k)}
+                    labelFormat={labelOf}
                   />
                   {rows.map((r) => {
                     const bx = x(r.key) ?? 0;

@@ -561,8 +561,10 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         return spec
 
     # Field vocabulary for chart validation, resolved once per tool server
-    # (it is a per-scope constant) rather than per call.
-    field_vocabulary: set[str] = set()
+    # (it is a per-scope constant) rather than per call. ``None`` — not an
+    # empty set — marks "not yet resolved", so a legitimately empty timeline
+    # is cached instead of re-queried on every call.
+    field_vocabulary: set[str] | None = None
 
     async def _known_fields() -> set[str]:
         """Every token that names real data in this timeline.
@@ -572,12 +574,13 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         model was actually told exists. A bare attribute key and its explicit
         ``attr:`` form are both valid, so both are admitted.
         """
-        if not field_vocabulary:
+        nonlocal field_vocabulary
+        if field_vocabulary is None:
             listed = await run_in_threadpool(
                 service.list_fields, scope.case_id, scope.source_ids, scope.field_mappings
             )
             attrs = listed.get("attributes") or []
-            field_vocabulary.update(listed.get("top_level") or [])
+            field_vocabulary = set(listed.get("top_level") or [])
             field_vocabulary.update(attrs)
             field_vocabulary.update(f"attr:{key}" for key in attrs)
             field_vocabulary.update(TIME_FIELD_SPECS)
@@ -591,6 +594,11 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         rows — the same silent-success failure mode as the pie-becomes-bar bug.
         """
         if not token:
+            return
+        # Time tokens are matched the way the query layer matches them
+        # (``resolve_time_field`` normalises case/whitespace), so the tool
+        # never rejects a spelling that ``_field_column_expr`` would resolve.
+        if resolve_time_field(token) is not None:
             return
         known = await _known_fields()
         if token in known:
@@ -656,10 +664,13 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         auto-suggests a scale; this is that probe. Call it before propose_chart
         for any field you have not charted yet, rather than guessing a scale.
 
-        Returns the field's coverage and distinct count, its numeric stats when
-        it parses as a number (`numeric: null` means categorical), the
-        suggested `scale`, and `suggested_chart_types` — the chart types legal
-        for that scale.
+        Returns `non_empty_total` (events with a value for this field under
+        these filters) and `distinct`, its numeric stats when it parses as a
+        number (`numeric: null` means categorical), the suggested `scale`, and
+        `suggested_chart_types` — the chart types legal for that scale.
+
+        `non_empty_total` is a *count*, not the 0-1 `coverage` fraction the
+        viz field list reports — don't compare the two.
 
         Costs two scans for a real field, so probe the fields you intend to
         chart, not every field in the timeline. Virtual `time:` fields are
@@ -673,8 +684,10 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 "exists": True,
                 "virtual": True,
                 "label": time_spec.label,
-                "coverage": 1.0,
-                "distinct": len(domain),
+                # No non_empty_total: a virtual field is derived, not measured.
+                # Claiming full coverage would assert something about the data
+                # that nothing here checked (undated events have no time part).
+                "distinct": len(domain) if domain else None,
                 "numeric": None,
                 "top_values": domain[:10],
                 "suggested_scale": time_spec.scale,
@@ -725,7 +738,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             "field": field,
             "exists": True,
             "virtual": False,
-            "coverage": terms["total"],
+            "non_empty_total": terms["total"],
             "distinct": terms["distinct"],
             "numeric": (
                 {
@@ -1082,8 +1095,8 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         await _check_chart_field(spec.field, "field")
         await _check_chart_field(spec.field_y, "field_y")
 
-        def _capped(value: int | None, default: int, cap: int, name: str) -> int:
-            resolved = max(1, min(value or default, cap))
+        def _capped(value: int | None, default: int, cap: int, name: str, floor: int = 1) -> int:
+            resolved = max(floor, min(value or default, cap))
             if value is not None and resolved != value:
                 warnings.append(
                     f"options.{name}={value} clamped to {resolved} for this validation "
@@ -1103,6 +1116,10 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             comparison_query = await _build_query(scope, comparison_filters)
 
         applied: dict[str, Any] = {}
+        #: Options this chart type nominally reads but that this *particular*
+        #: spec made inert (a bounded time axis ignores its limit). Kept out
+        #: of the `resolved` echo below, which otherwise re-adds them.
+        inert_options: set[str] = set()
 
         # ── execute, dispatching on the aggregation the mark needs ───────────
         if data_kind == "terms":
@@ -1160,7 +1177,9 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                     "mean": result["mean"],
                 }
         elif data_kind == "timeseries":
-            applied["buckets"] = min(max(opts.buckets or 30, 4), VIZ_TIMESERIES_MAX_BUCKETS)
+            applied["buckets"] = _capped(
+                opts.buckets, 30, VIZ_TIMESERIES_MAX_BUCKETS, "buckets", floor=4
+            )
             applied["top_n"] = _capped(opts.top_n, 6, VIZ_TIMESERIES_MAX_SERIES, "top_n")
             result = await run_in_threadpool(
                 service.field_value_timeseries,
@@ -1174,7 +1193,9 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 "interval_seconds": result["interval_seconds"],
             }
         elif data_kind == "time":
-            applied["buckets"] = min(max(opts.buckets or 30, 4), VIZ_COMPARE_MAX_BUCKETS)
+            applied["buckets"] = _capped(
+                opts.buckets, 30, VIZ_COMPARE_MAX_BUCKETS, "buckets", floor=4
+            )
             if comparison_query is not None:
                 result = await run_in_threadpool(
                     service.compare_time_histogram,
@@ -1208,10 +1229,30 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 applied["limit_x"],
                 applied["limit_y"],
             )
+            # A bounded `time:` axis is charted as its whole natural-order
+            # domain (an hour with no events is a finding, not a value to
+            # hide), so its limit never applied. Say so and stop echoing a
+            # limit that did nothing — silence here would leave the model
+            # believing it had bounded a matrix it had not.
+            for axis, token in (("x", spec.field), ("y", spec.field_y)):
+                axis_spec = resolve_time_field(token or "")
+                if axis_spec is None or axis_spec.domain is None:
+                    continue
+                applied.pop(f"limit_{axis}", None)
+                inert_options.add(f"limit_{axis}")
+                warnings.append(
+                    f'options.limit_{axis} does not apply to "{token}": a bounded time '
+                    f"axis is charted as its full {len(axis_spec.domain)}-value domain, "
+                    "so empty slots stay visible."
+                )
             summary = {
                 "total": result["total"],
                 "x_distinct": result["x_distinct"],
                 "y_distinct": result["y_distinct"],
+                # Size of the matrix the model is about to reason over —
+                # what the axes actually resolved to, which for a bounded
+                # time axis is its whole domain rather than a limit.
+                "matrix_size": len(result["x_values"]) * len(result["y_values"]),
             }
         else:  # scatter
             applied["sample_limit"] = _capped(
@@ -1235,7 +1276,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         # Presentation options don't reach the query, but belong in the echo —
         # they are part of what the analyst will see.
         for key in meta.reads_options:
-            if key in applied:
+            if key in applied or key in inert_options:
                 continue
             value = getattr(opts, key)
             if value is not None:

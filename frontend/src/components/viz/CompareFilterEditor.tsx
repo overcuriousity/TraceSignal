@@ -2,6 +2,8 @@ import { useState } from "react";
 import { Plus } from "lucide-react";
 import type { EventFilters } from "@/api/types";
 import type { VizFieldInfo } from "@/api/types";
+import { fieldTokenLabel, fieldValueLabel } from "@/components/viz/lib/fieldDisplay";
+import { TIME_FIELDS } from "@/components/viz/lib/timeFields";
 import { FilterChips } from "@/components/explorer/FilterChips";
 import { Input } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
@@ -32,6 +34,11 @@ interface Props {
 export function CompareFilterEditor({ filters, onChange, fields }: Props) {
   const [fieldKey, setFieldKey] = useState<string>("");
   const [fieldValue, setFieldValue] = useState("");
+  // A bounded `time:` field has a known, complete value list, and its
+  // canonical values are opaque ("1" = Monday). Free text would let the
+  // analyst type the label they can see on every axis and build a filter that
+  // silently matches nothing — so offer the domain instead of an input.
+  const timeDomain = fieldKey ? TIME_FIELDS[fieldKey]?.domain : undefined;
 
   const addFieldFilter = () => {
     if (!fieldKey || !fieldValue) return;
@@ -67,27 +74,51 @@ export function CompareFilterEditor({ filters, onChange, fields }: Props) {
         className="h-7 text-xs"
       />
       <div className="flex items-center gap-1">
-        <Select value={fieldKey || undefined} onValueChange={setFieldKey}>
+        <Select
+          value={fieldKey || undefined}
+          onValueChange={(v) => {
+            setFieldKey(v);
+            // The pending value belongs to the old field's vocabulary.
+            setFieldValue("");
+          }}
+        >
           <SelectTrigger className="h-7 flex-1 text-xs">
             <SelectValue placeholder="Field…" />
           </SelectTrigger>
           <SelectContent>
             {fields.map((f) => (
               <SelectItem key={f.token} value={f.token}>
-                {f.token}
+                {fieldTokenLabel(f.token)}
               </SelectItem>
             ))}
           </SelectContent>
         </Select>
-        <Input
-          value={fieldValue}
-          onChange={(e) => setFieldValue(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") addFieldFilter();
-          }}
-          placeholder="value"
-          className="h-7 flex-1 text-xs"
-        />
+        {timeDomain ? (
+          <Select value={fieldValue || undefined} onValueChange={setFieldValue}>
+            <SelectTrigger className="h-7 flex-1 text-xs">
+              <SelectValue placeholder="value" />
+            </SelectTrigger>
+            <SelectContent>
+              {timeDomain.map((v) => (
+                // Label is display-only; the canonical value is what is
+                // stored, so relabelling never invalidates a saved filter.
+                <SelectItem key={v} value={v}>
+                  {fieldValueLabel(fieldKey, v)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        ) : (
+          <Input
+            value={fieldValue}
+            onChange={(e) => setFieldValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") addFieldFilter();
+            }}
+            placeholder="value"
+            className="h-7 flex-1 text-xs"
+          />
+        )}
         <Button
           variant="ghost"
           size="sm"

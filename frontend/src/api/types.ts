@@ -1008,10 +1008,13 @@ export interface HistogramResponse {
 /** One chartable field from `viz/fields` — no anomaly heuristics applied. */
 export interface VizFieldInfo {
   token: string;
-  /** Number of distinct non-empty values. */
-  distinct: number;
-  /** Fraction of events with a non-empty value (0-1). */
-  coverage: number;
+  /** Number of distinct non-empty values; null for an unbounded virtual field. */
+  distinct: number | null;
+  /** Fraction of events with a non-empty value (0-1); null for a virtual field,
+   * whose values are derived rather than measured against the data. */
+  coverage: number | null;
+  /** Display name — present only for the virtual `time:` fields. */
+  label?: string;
 }
 
 /** All chartable fields for the Visualization page's field picker, sorted by coverage descending. */

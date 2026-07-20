@@ -244,18 +244,49 @@ options this chart type ignores (inert, never fatal) and any limit clamped for
 the validation query — those clamps bound the *tool result* for context
 budget, never the analyst's card.
 
+A **bounded `time:` pivot axis** is a third warning case. Its domain is
+complete and naturally ordered, so `field_pivot` charts all of it rather than
+ranking it by count — `limit_x`/`limit_y` never applied. The tool says so and
+drops that key from `resolved.options`, because an accepted-but-ignored limit
+would leave the model believing it had bounded a matrix it had not.
+`summary.matrix_size` states the resolved cell count outright.
+
 `describe_field(field, filters)` is the agent's equivalent of the page's
-numeric auto-probe: coverage, distinct count, numeric stats, a suggested
-`scale` (`numeric.count > 0 → ratio`, else `nominal` — the same test
+numeric auto-probe: `non_empty_total`, distinct count, numeric stats, a
+suggested `scale` (`numeric.count > 0 → ratio`, else `nominal` — the same test
 `VisualizePage` uses) and the chart types legal for it. Two scans per real
 field, free for virtual `time:` fields.
+
+`non_empty_total` is a *count*, deliberately not named `coverage`: that word
+means a 0-1 fraction in `GET .../viz/fields`, and one name for two units left
+the model unable to compare a field across the two. A virtual field reports
+neither — a time part is undefined for an undated event, so any coverage claim
+would be about data the tool never scanned. The same reasoning makes
+`viz/fields` emit `coverage: null` (and `distinct: null` for the unbounded
+`time:date`/`time:year_month`) rather than a fabricated `1.0`.
 
 The frontend maps the spec onto `ChartConfig` (`specToChartConfig`,
 `frontend/src/api/agent.ts`); `specToChartConfigLegacy` beside it is a frozen
 translation of the retired `kind` shape, since persisted `tool_args` from old
 conversations still re-render through it. `resolveChartOptions`
 (`viz/lib/chartOptions.ts`) is shared with `VisualizePage`, so a proposed
-chart and a hand-built one resolve defaults identically. The chat panel renders
+chart and a hand-built one resolve defaults identically — as is
+`defaultChartTypeForScale` beside it, which exists because
+`chartTypesFor(scale)[0]` is the *field-free* `time` histogram for every
+scale and would silently drop the field that was just picked.
+
+Virtual `time:` fields are analyst-facing too, not an agent-only capability:
+`viz/lib/fieldDisplay.ts` maps a token to its label ("Day of week (UTC)") and a
+value to its display form (`"1" → "Mon"`) for the field picker and every chart.
+Only text goes through it — keys, `scaleBand` domains, colour-map keys, sort
+comparators and click payloads stay on the canonical value, the only form that
+round-trips into a filter, a URL or a saved chart. Two consequences worth
+keeping: `BarChart`'s `sort="value"` orders by the canonical value (the
+zero-padding in `_time_fields.py` is what makes lexical order chronological —
+sorting on labels would silently reshuffle the axis), and `Legend` entries need
+an explicit `key`, since it reports `key ?? label` to click-to-filter.
+`VisualizePage` skips its numeric auto-probe entirely for a `time:` field and
+takes the statically-known scale from `TIME_FIELDS`. The chat panel renders
 a live chart card (`ChartProposalCard.tsx`) fetched fresh through `vizApi` (not
 the tool_result echo, so it stays consistent with current data/dispositions),
 keyed on `chart_type` rather than on the aggregation that fed it — several

@@ -13,8 +13,26 @@
  * a saved chart, or an agent proposal cannot ask for more than the analyst
  * could have asked for by hand.
  */
-import { CHART_META } from "./chartMeta";
-import type { ChartConfig, ChartOptions } from "./chartConfig";
+import { CHART_META, chartTypesFor } from "./chartMeta";
+import type { ChartConfig, ChartOptions, ChartType, Scale } from "./chartConfig";
+
+/**
+ * Preference order for "the chart type to land on for this scale".
+ *
+ * Not `chartTypesFor(scale)[0]`: `CHART_META`'s key order starts with `time`,
+ * whose `scales` is all four, so the naive pick sends every scale to the
+ * *field-free* events-over-time chart — dropping the field the analyst just
+ * chose. `heatmap` is the interval answer rather than `line`/`histogram`
+ * because interval fields include the string-valued `time:date` and
+ * `time:year_month`, which have no numeric stats to plot.
+ */
+const CHART_TYPE_PREFERENCE: ChartType[] = ["bar", "heatmap", "line", "histogram", "time"];
+
+/** The chart type to select when only the scale is known. */
+export function defaultChartTypeForScale(scale: Scale): ChartType {
+  const legal = chartTypesFor(scale);
+  return CHART_TYPE_PREFERENCE.find((c) => legal.includes(c)) ?? legal[0];
+}
 
 export interface ResolvedChartOptions {
   topN: number;

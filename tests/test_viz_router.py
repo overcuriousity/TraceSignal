@@ -89,12 +89,23 @@ async def test_list_viz_fields_appends_virtual_time_fields_last(monkeypatch):
     assert fields[0]["token"] == "artifact"
     trailing = fields[1:]
     assert [f["token"] for f in trailing] == list(TIME_FIELD_SPECS)
+    # A virtual field's stats are null, never fabricated: a time part is
+    # undefined for an undated (sentinel-timestamp) event, so claiming
+    # coverage 1.0 would assert something this endpoint never measured.
+    # `distinct` is the domain size only where the domain is bounded.
     hour = next(f for f in trailing if f["token"] == "time:hour_of_day")
     assert hour == {
         "token": "time:hour_of_day",
         "distinct": 24,
-        "coverage": 1.0,
+        "coverage": None,
         "label": "Hour of day (UTC)",
+    }
+    date = next(f for f in trailing if f["token"] == "time:date")
+    assert date == {
+        "token": "time:date",
+        "distinct": None,
+        "coverage": None,
+        "label": "Date (UTC)",
     }
 
 

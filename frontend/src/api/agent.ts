@@ -174,6 +174,11 @@ export function specToChartConfig(spec: AgentChartSpec): ChartConfig {
  * exactly what a historical chart card rendered — do not "improve" it, and do
  * not port fixes here from the current path (the overloaded `limit`, the
  * falsy guards, and `metric` always being "count" are all faithful).
+ *
+ * That includes `compare_*` without `comparison_filters` mapping to
+ * `{mode: "off"}`: the old *backend* validated it as a baseline comparison,
+ * but this function is what drew the card, and it drew one layer. The card is
+ * the artifact, so the translation follows the card, not the validation.
  */
 function specToChartConfigLegacy(spec: AgentChartSpecLegacy): ChartConfig {
   const isCompare = spec.kind.startsWith("compare_");
