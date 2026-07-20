@@ -4541,3 +4541,101 @@ def test_distribution_drift_probe_is_windowed():
     probe_sql = client.full_queries[2]
     assert "toFloat64OrNull" in probe_sql
     assert "{b0:String}" in probe_sql and "{w0s:String}" in probe_sql
+
+
+# ---------------------------------------------------------------------------
+# list_log_templates (W6)
+# ---------------------------------------------------------------------------
+
+
+def _template_rows() -> FakeQueryResult:
+    return FakeQueryResult(
+        result_rows=[
+            (
+                "12345",
+                "Allow TCP <IP>:<NUM> -> <IP>:<NUM>",
+                3,
+                1,
+                datetime(2026, 1, 1, tzinfo=UTC),
+                datetime(2026, 1, 2, tzinfo=UTC),
+                "Allow TCP 10.0.0.5:4433 -> 10.0.0.9:443",
+            )
+        ],
+        column_names=[
+            "template_id",
+            "template",
+            "cnt",
+            "distinct_sources",
+            "first_seen",
+            "last_seen",
+            "example",
+        ],
+    )
+
+
+def test_list_log_templates_default_field_uses_indexed_column():
+    client = RecordingClient([_template_rows(), FakeQueryResult(result_rows=[(1,)], column_names=[])])
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.list_log_templates("c1", ["s1"])
+    assert result.field == "message"
+    assert result.total_templates == 1
+    assert len(result.templates) == 1
+    row = result.templates[0]
+    assert row.template_id == "12345"
+    assert row.count == 3
+    assert row.distinct_sources == 1
+    assert row.example == "Allow TCP 10.0.0.5:4433 -> 10.0.0.9:443"
+    # Indexed fast path groups by the materialized column, not a recomputed hash.
+    assert "template_hash AS th" in client.full_queries[0]
+    assert "cityHash64" not in client.full_queries[0]
+
+
+def test_list_log_templates_non_message_field_computes_hash_inline():
+    client = RecordingClient([_template_rows(), FakeQueryResult(result_rows=[(1,)], column_names=[])])
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.list_log_templates("c1", ["s1"], field="attr:raw_line")
+    sql = client.full_queries[0]
+    assert "cityHash64(replaceRegexpAll(" in sql
+    assert "attributes[{fk:String}]" in sql
+    assert "!= ''" in sql  # empty-value guard applies to non-message fields
+
+
+def test_list_log_templates_only_new_requires_baseline_end():
+    svc = _svc([])
+    try:
+        svc.list_log_templates("c1", ["s1"], only_new=True)
+        raise AssertionError("expected ValueError")
+    except ValueError as e:
+        assert "baseline_end" in str(e)
+
+
+def test_list_log_templates_only_new_filters_on_first_seen():
+    client = RecordingClient([_template_rows(), FakeQueryResult(result_rows=[(1,)], column_names=[])])
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.list_log_templates(
+        "c1", ["s1"], only_new=True, baseline_end=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    assert "first_seen >= {baseline_end:String}" in client.full_queries[0]
+    assert "baseline_end" in client._all_parameters[0]
+
+
+def test_list_log_templates_rejects_unknown_order():
+    svc = _svc([])
+    try:
+        svc.list_log_templates("c1", ["s1"], order="bogus")
+        raise AssertionError("expected ValueError")
+    except ValueError as e:
+        assert "order" in str(e)
+
+
+def test_list_log_templates_order_and_limit_applied():
+    client = RecordingClient([_template_rows(), FakeQueryResult(result_rows=[(1,)], column_names=[])])
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.list_log_templates("c1", ["s1"], order="first_seen", limit=25)
+    sql = client.full_queries[0]
+    assert "ORDER BY first_seen ASC" in sql
+    assert client._all_parameters[0]["lim"] == 25

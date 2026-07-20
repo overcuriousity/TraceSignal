@@ -303,13 +303,20 @@ export function PatternsView({ caseId, timelineId, onSelectEvent, onJumpToTime }
     staleTime: 60_000,
   });
 
-  // Active routine dispositions — renders matching motifs dimmed and fills
-  // the "Routine patterns" section (with unmark).
+  // Active routine dispositions — shared cache key across every routine
+  // mechanism (sequence_motif here, log_template in TemplatesView): the
+  // `useDisposition` optimistic update writes to this exact key regardless
+  // of detector, so fetching unfiltered and splitting by `detector`
+  // client-side keeps the optimistic dim working for both without one
+  // overwriting the other's cache entry.
   const { data: routineData } = useQuery({
     queryKey: ["dispositions", caseId, timelineId, "routine"],
-    queryFn: () => dispositionsApi.list(caseId, timelineId, { kind: "routine", detector: "sequence_motif" }),
+    queryFn: () => dispositionsApi.list(caseId, timelineId, { kind: "routine" }),
   });
-  const routineRows = useMemo(() => routineData?.dispositions ?? [], [routineData]);
+  const routineRows = useMemo(
+    () => (routineData?.dispositions ?? []).filter((d) => d.detector === "sequence_motif"),
+    [routineData],
+  );
   const routineValues = useMemo(
     () => new Set(routineRows.map((d) => `${d.field}:${d.value}`)),
     [routineRows],

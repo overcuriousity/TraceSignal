@@ -52,6 +52,7 @@ import { ScatterChart } from "@/components/viz/charts/ScatterChart";
 import {
   chartConfigToParams,
   filterParamsPreservingChartConfig,
+  histogramToCompare,
   paramsToChartConfig,
   type ChartConfig,
   type ChartType,
@@ -67,7 +68,6 @@ import type {
   CompareTermsResponse,
   CompareTimeResponse,
   EventFilters,
-  HistogramResponse,
 } from "@/api/types";
 
 const SCALE_INFO: Record<Scale, { label: string; hint: string }> = {
@@ -99,20 +99,6 @@ function compareUnavailableReason(chartType: ChartType): string {
     return "Compare isn't supported for this chart type yet.";
   }
   return "This chart type has no honest two-layer encoding — overlaid layers would misrepresent one of them. Use Bar, Histogram, or the Time histogram to compare.";
-}
-
-/** Adapt the single-layer histogram response to the compare shape so one
- * chart component renders both the compare-off and compare-on cases. */
-function histogramToCompare(h: HistogramResponse): CompareTimeResponse {
-  return {
-    kind: "time",
-    interval_seconds: h.interval_seconds,
-    min: h.min,
-    max: h.max,
-    buckets: h.buckets.map((b) => ({ start: b.start, primary: b.count, comparison: 0 })),
-    primary_total: h.buckets.reduce((sum, b) => sum + b.count, 0),
-    comparison_total: 0,
-  };
 }
 
 export function VisualizePage() {

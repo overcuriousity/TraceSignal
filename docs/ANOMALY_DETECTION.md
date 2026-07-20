@@ -1459,6 +1459,110 @@ disposition mechanism.
 
 ---
 
+## 14. Log templates (structural line clustering)
+
+**What it answers:** "What are the *shapes* of the lines in this log, and
+how many of each?" Not a scored detector — a browser. Many logs are 90%+ one
+or two routine shapes (heartbeats, routine auth, health checks) with the
+interesting rest buried inside; grouping by shape turns "scroll 50M rows" into
+"mute the routine shape, see what's left."
+
+**How it works.** Every event's templated field (`message` by default) is
+run through an ordered chain of `replaceRegexpAll` substitutions that mask
+variable substrings, then hashed (`cityHash64`) to a `template_hash`. Events
+sharing a hash share a shape. The chain, in order (each pattern must run
+before a broader one downstream would otherwise consume part of it):
+
+| # | Pattern | Placeholder |
+|---|---|---|
+| 1 | ISO-ish timestamp (`2026-07-20T10:00:01.123Z`, `... 10:00:00+02:00`) | `<TS>` |
+| 2 | UUID | `<UUID>` |
+| 3 | MAC address | `<MAC>` |
+| 4 | IPv6 (2–7 colon-separated hex groups) | `<IP6>` |
+| 5 | IPv4 | `<IP>` |
+| 6 | Hex run, 8+ chars, optional `0x`/`0X` prefix | `<HEX>` |
+| 7 | Any remaining digit run | `<NUM>` |
+
+All patterns are RE2-compatible (ClickHouse's regex engine — no
+backreferences, no lookaround). Digit masking is unconditional: "HTTP 404"
+and "HTTP 500" collapse to one template (`HTTP <NUM>`) — a deliberate
+coarseness call (confirmed 2026-07-20); status/error codes stay visible via
+each template's `example` row, just not split into separate templates. If
+this proves too coarse for a given corpus, Drain3 (offline, pure Python) is
+the evaluated fallback — not implemented, since the regex pass hasn't yet
+proven insufficient.
+
+**Storage.** `template_hash UInt64` is a `MATERIALIZED` column on `events`
+(`db/clickhouse.py`, alongside `search_blob`'s identical pattern) — computed
+server-side, correct immediately even on parts written before the column
+existed (MATERIALIZED columns compute on read), with a bloom-filter skip
+index backfilled asynchronously (`MATERIALIZE COLUMN`/`INDEX`, non-blocking
+at startup). No normalized-text column is stored: a template's representative
+text is reconstructed on demand by applying the same expression to
+`any(message)` per group, avoiding a second message-sized column.
+
+**Field-agnostic, like every other detector.** The materialized column is
+fixed to `message` (the one field required non-null on every `Event`), but
+`list_log_templates` accepts any field token `_col_expr` resolves — for a
+non-`message` field, the hash is computed inline per-query (unindexed, an
+explicit cost tradeoff: no skip-index pruning, a live regex pass over the
+scanned rows). Browsing a `message`-templated corpus is the fast, indexed
+path; browsing any other field works, just isn't accelerated.
+
+**Versioned, append-only identity.** Like `ParserConfig`/`EmbeddingConfig`,
+the regex chain is versioned (`TEMPLATE_NORMALIZE_VERSION = 1`,
+`src/vestigo/db/_template.py`) and never modified in place — a stored part's
+materialized hash would go stale silently, splitting one template's identity
+across old and new parts, a forensic-reproducibility violation. A future
+coarseness change ships as a new column (`template_hash_v2`), not an
+`ALTER MODIFY` of this expression.
+
+**Browsing.** `GET /{case}/timelines/{tl}/log-templates` (`field`, `order` —
+count/first_seen/last_seen, `limit`, optional `baseline_id` + `only_new`)
+returns each template's id (a decimal string — `cityHash64` is a UInt64,
+stringified to avoid JS 53-bit float precision loss), reconstructed text,
+count, distinct source count, first/last seen, and one representative raw
+example. `only_new` (paired with a baseline definition's `baseline_end`)
+keeps only templates whose earliest occurrence across the full scope is
+at/after the split — "never seen in the baseline" — expressed as a single
+`HAVING first_seen >= baseline_end` on the grouped subquery rather than an
+anti-join: cheaper and equivalent for one split point. No BH-FDR, no Finding
+dataclass, no allowlist — a browser, not a scored run. Templates UI lives as
+a **Templates** sub-tab under the Investigate panel's Patterns tab (grouped
+with sequence-motif mining as the other "recurring shape" discovery tool).
+
+**Facet.** `template_id` resolves through the same `resolve_column_token`
+allowlist every other field token uses (`toString(template_hash)`), so the
+grid can filter to one template's events exactly like any other field.
+
+**Mute disposition & grid collapse.** *Mute* writes a `kind="routine"`
+disposition (`detector="log_template"`, value = the decimal template id,
+`details` snapshots `{template, template_version, field, example,
+count_at_mute}` as the audit record). Unlike sequence_motif, **no occurrence
+materialization job runs** — template membership is a direct predicate on
+the materialized `template_hash` column (`template_hash IN (...)`), so there
+is no aux table to populate and no 500k-row cap to hit; muting takes effect
+immediately. The Explorer's *Collapse routine* toggle excludes muted
+templates' events via `template_hash NOT IN (...)` alongside the existing
+`motif_occurrences` anti-join, and `routine_collapsed_count` reports the
+*union* of both mechanisms' covered events (not a naive sum — an event
+covered by both a routine motif and a muted template must not be
+double-counted; computed via one `UNION ALL ... uniqExact` query,
+`ClickHouseStore.count_routine_collapsed`). As with motifs, muting is
+presentation-only and never enters `dispositions_hash`; deleting the
+disposition restores the events immediately.
+
+**Asymmetry, v1.** Muting only supports `field == "message"` (the indexed
+column the mute predicate binds to) — browsing is field-agnostic, muting
+isn't yet. Revisit if an analyst wants to mute on a non-`message` field.
+
+**Novelty.** No standalone detector — `only_new` on the browser covers "what
+templates are new since the baseline" without a Finding/BH-FDR apparatus.
+Revisit as a full detector-registry entry if that need grows past a browser
+flag.
+
+---
+
 ## Reality check (2026-07)
 
 This document was written alongside an audit of every statistical detector's

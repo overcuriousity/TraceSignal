@@ -26,6 +26,7 @@ import {
 import {
   agentApi,
   formatTokenCount,
+  type AgentChartSpec,
   type AgentFilterSpec,
   type AgentMessage,
   type AgentProposal,
@@ -37,6 +38,7 @@ import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { FindingCard } from "./FindingCard";
+import { ChartProposalCard } from "./ChartProposalCard";
 import { ProposalCard } from "./ProposalCard";
 import { NewConversationDialog } from "./NewConversationDialog";
 import { Markdown } from "./Markdown";
@@ -71,11 +73,23 @@ type ChatItem =
       spec: AgentFilterSpec;
       total?: number | null;
     }
+  | { kind: "chart"; title: string; description: string; spec: AgentChartSpec }
   | { kind: "proposal"; proposalId: string }
   | { kind: "error"; detail: string };
 
+interface ProposeChartArgs {
+  title?: string;
+  description?: string;
+  spec?: AgentChartSpec;
+}
+
 function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
   const items: ChatItem[] = [];
+  // propose_chart needs both its call row (title/description/spec) and its
+  // paired result row (ok — no card on a failed validation) — buffered here
+  // since the two arrive as separate rows, same pairing propose_annotation
+  // resolves the other way (result-only, no buffering needed there).
+  let pendingChart: { title: string; description: string; spec: AgentChartSpec } | null = null;
   for (const m of messages) {
     if (m.role === "user") {
       items.push({ kind: "user", content: m.content });
@@ -101,6 +115,13 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
       if (result?.proposal_id) {
         items.push({ kind: "proposal", proposalId: result.proposal_id });
       }
+    } else if (m.role === "tool" && m.tool_name === "propose_chart" && !m.tool_args) {
+      // Result row: only a successful validation ("ok": true) gets a card —
+      // a failed spec (bad kind, missing field) produced a tool error, no
+      // proposal to show.
+      const result = m.tool_result as { ok?: boolean } | null;
+      if (result?.ok && pendingChart) items.push({ kind: "chart", ...pendingChart });
+      pendingChart = null;
     } else if (m.role === "tool" && m.tool_args) {
       // Tool rows come in pairs (call with args, then result); render on the
       // call row and let the result row pass silently.
@@ -116,6 +137,15 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
           description: args.description ?? "",
           spec: args.filters ?? {},
         });
+      } else if (m.tool_name === "propose_chart") {
+        const args = m.tool_args as ProposeChartArgs;
+        if (args.spec) {
+          pendingChart = {
+            title: args.title ?? "Chart",
+            description: args.description ?? "",
+            spec: args.spec,
+          };
+        }
       } else if (m.tool_name) {
         items.push({ kind: "tool", tool: m.tool_name, args: m.tool_args });
       }
@@ -134,9 +164,17 @@ interface StreamState {
   liveText: string;
   /** In-flight thinking segment; finalized by the terminal "thinking" event. */
   liveThinking: string;
+  /** propose_chart's call args, buffered until the paired result's `ok`
+   * lands — see itemsFromMessages' matching comment. */
+  pendingChart: { title: string; description: string; spec: AgentChartSpec } | null;
 }
 
-const EMPTY_STREAM: StreamState = { items: [], liveText: "", liveThinking: "" };
+const EMPTY_STREAM: StreamState = {
+  items: [],
+  liveText: "",
+  liveThinking: "",
+  pendingChart: null,
+};
 
 function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
   if (e.type === "text_delta") {
@@ -161,6 +199,7 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
     // A compaction mid-turn means the failed attempt is being retried — its
     // partial thinking will be re-streamed, so drop the stale deltas too.
     return {
+      ...s,
       items: [...flushed, { kind: "compaction", summary: e.summary }],
       liveText: "",
       liveThinking: "",
@@ -192,12 +231,25 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
       // known — the call event only carries the proposed tag/comment.
       return { ...s, items: flushed, liveText: "" };
     }
+    if (e.tool === "propose_chart") {
+      // Buffered until the paired tool_result reports ok — a failed spec
+      // shows no card, same contract as itemsFromMessages.
+      const args = e.args as { title?: string; description?: string; spec?: AgentChartSpec };
+      return {
+        ...s,
+        items: flushed,
+        liveText: "",
+        pendingChart: args.spec
+          ? { title: args.title ?? "Chart", description: args.description ?? "", spec: args.spec }
+          : null,
+      };
+    }
     return { ...s, items: [...flushed, { kind: "tool", tool: e.tool, args: e.args }], liveText: "" };
   }
   if (e.type === "tool_result") {
     // Most tool_result rows stay invisible (results feed the model, not
-    // the analyst) — propose_annotation is the one exception, since its
-    // proposal_id is only known once the result lands.
+    // the analyst) — propose_annotation/propose_chart are exceptions, since
+    // what they render is only known once the result lands.
     if (e.tool === "propose_annotation") {
       const result = e.result as { proposal_id?: string } | null;
       return {
@@ -206,6 +258,16 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
           ? [...flushed, { kind: "proposal", proposalId: result.proposal_id }]
           : flushed,
         liveText: "",
+      };
+    }
+    if (e.tool === "propose_chart") {
+      const result = e.result as { ok?: boolean } | null;
+      const chart = s.pendingChart;
+      return {
+        ...s,
+        items: result?.ok && chart ? [...flushed, { kind: "chart", ...chart }] : flushed,
+        liveText: "",
+        pendingChart: null,
       };
     }
     return s;
@@ -348,6 +410,7 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
             items: prev.items.filter((i) => i.kind === "error"),
             liveText: "",
             liveThinking: "",
+            pendingChart: null,
           }));
         } else {
           setStream(EMPTY_STREAM);
@@ -574,6 +637,18 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
                 spec={item.spec}
                 total={item.total}
                 onApply={onApplyFilters}
+              />
+            );
+          }
+          if (item.kind === "chart") {
+            return (
+              <ChartProposalCard
+                key={i}
+                caseId={caseId}
+                timelineId={timelineId}
+                title={item.title}
+                description={item.description}
+                spec={item.spec}
               />
             );
           }

@@ -1,6 +1,103 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-20 (session 70 — agent v2: compaction, tool toggles, OPSEC dialog, export).
+Last updated: 2026-07-20 (session 72 — A9 agent viz parity).
+
+## Session 72 — 2026-07-20: A9 agent viz parity (Phase 3 Step 2)
+
+Gives the AI agent the same charting the analyst has on the Visualize page —
+see `docs/AGENT.md` "Tools" for the full contract.
+
+- **Five read tools** (`agent/tools.py`): `field_timeseries`, `time_punchcard`,
+  `field_pivot`, `field_scatter`, `compare` (kind = time/terms/numeric, two
+  independent `FilterSpec` layers) — thin wrappers over the same
+  `db/queries.py` methods the Visualize page's endpoints call, threadpooled,
+  each with its own cap tighter than the page's own UI bounds (`VIZ_*_MAX_*`
+  constants) since viz series are dense and every point counts against the
+  model's context window.
+- **`propose_chart(title, description, spec)`**: the charting analog of
+  `propose_finding` — `spec` is a `ChartSpec` (kind = terms/numeric/
+  timeseries/punchcard/pivot/scatter/compare_time/compare_terms/
+  compare_numeric). Validates by *executing* the underlying query (same caps
+  as the read tools) and returns summary stats; writes nothing — no proposal
+  row, unlike `propose_annotation`, since the only write in this flow is the
+  analyst's own "Save" click against the existing `savedChartsApi.create`.
+- **Frontend mapping** (`frontend/src/api/agent.ts`): `specToChartConfig`
+  maps the backend `ChartSpec` onto the Visualize page's own `ChartConfig` —
+  backend-opaque, same seam as `SavedChart.config` (the backend never learns
+  the frontend's chart shape). `histogramToCompare` moved from `VisualizePage.tsx`
+  into the shared `chartConfig.ts` so both the page and the new card use one
+  copy.
+- **`ChartProposalCard.tsx`**: renders in the agent chat panel — fetches live
+  through `vizApi` (not the tool_result echo, so the chart stays consistent
+  with current data/dispositions) and reuses the Visualize page's pure chart
+  components. "Open in Visualize" is a route link carrying the mapped
+  `ChartConfig` + filters as URL params; "Save" is the analyst's own
+  `savedChartsApi.create` call. `AgentPanel.tsx` gained a `"chart"` `ChatItem`
+  kind — `propose_chart`'s call row (title/description/spec) and its paired
+  result row (`ok`) are matched up (both in `itemsFromMessages` for persisted
+  history and `foldStreamEvent` for the live stream) before a card renders; a
+  failed spec (unknown kind, missing required field) surfaces as a tool error
+  with no card.
+
+Tests: `tests/test_agent_tools.py` (20 new cases — read-tool cap clamping,
+`propose_chart` dispatch/validation/cap clamping, registry parity),
+`frontend/src/test/agent.test.ts` (`specToChartConfig` round-trip through the
+same URL-param path "Open in Visualize" uses),
+`frontend/src/test/chartProposalCard.test.tsx` (live-fetch smoke render per
+kind, Save, Open-in-Visualize link), `frontend/src/test/agentPanelChart.test.tsx`
+(call+result pairing — ok:true renders one card, ok:false or a missing result
+renders none). Full backend suite and full frontend suite (35 files, 312
+tests) green.
+
+## Session 71 — 2026-07-20: W6 log template clustering (Phase 3 Step 1)
+
+Structurally-distinct log-line shapes, browsable and mutable independent of any
+detector run — see `docs/ANOMALY_DETECTION.md` §14 for the full design.
+
+- **Schema**: `template_hash UInt64 MATERIALIZED cityHash64(<normalize-expr>)` on `events`
+  (`db/clickhouse.py`), same shape as `search_blob`: bloom-filter skip index, async
+  `MATERIALIZE COLUMN`/`INDEX` backfill, correct immediately on old parts (MATERIALIZED
+  computes on read). No stored normalized-text column — reconstructed on demand via
+  `any(message)` through the same expression.
+- **Normalization** (`db/_template.py`): versioned (`TEMPLATE_NORMALIZE_VERSION = 1`),
+  append-only regex chain masking timestamp/UUID/MAC/IPv6/IPv4/hex/digit-run substrings,
+  RE2-safe. Field-configurable — the module builds the expression over any SQL expression
+  a caller passes, not hardcoded to `message`, per user pushback during planning that a
+  hardcoded field would violate the field-agnostic detector convention (Milestone 4).
+  Digit masking is unconditional (confirmed decision): "HTTP 404"/"HTTP 500" collapse to
+  one template; escape hatch is a future `template_hash_v2` column, never an in-place
+  `ALTER MODIFY` of v1's expression (would silently split identity across old/new parts).
+- **Browsing**: `StatisticalAnomalyService.list_log_templates` (`db/anomaly_stats.py`) —
+  indexed fast path for `field="message"`, unindexed inline-hash path for any other
+  `_col_expr`-resolvable token (the field-agnostic proof); `only_new` + a baseline's
+  `baseline_end` is the entire "novelty" story (`HAVING first_seen >= baseline_end` on a
+  grouped subquery, no anti-join, no BH-FDR/Finding machinery — a browser, not a scored
+  detector). `GET /{case}/timelines/{tl}/log-templates` endpoint.
+- **Facet**: `template_id` token in `db/_columns.py::SYNTHETIC_COLUMN_EXPRESSIONS`
+  (`toString(template_hash)`) — resolves through the same allowlist every other field
+  token uses, so the grid filters to one template exactly like any other field.
+- **Mute + collapse**: `kind="routine"`, `detector="log_template"` disposition
+  (`api/routers/dispositions.py`) — value = decimal template id, `details` snapshots the
+  audit record. Deliberately **no occurrence-materialization job** (unlike
+  `sequence_motif`): membership is a direct `template_hash IN (...)` predicate, no aux
+  table needed. New `EventQuery.exclude_template_hashes` (`db/queries.py`),
+  `ClickHouseStore.count_routine_collapsed` computes the *union* of motif- and
+  template-collapsed events via one `UNION ALL ... uniqExact` query (a naive sum would
+  double-count an event covered by both mechanisms) — `_resolve_routine_collapse` in
+  `api/routers/events.py` now returns a `RoutineCollapseScope` split by detector; agent
+  `_build_query` mirrors the same resolution for search/grid parity.
+- **UI**: `TemplatesView.tsx` — new **Templates** sub-tab under the Investigate panel's
+  Patterns tab (user decision: panel tab bar was already tight, not a 6th top-level tab).
+  Shares the routine-dispositions cache key with `PatternsView` (both fetch unfiltered,
+  split client-side by `detector`) so `useDisposition`'s hardcoded optimistic-update key
+  keeps working for both mechanisms without one overwriting the other's cache entry.
+
+Tests: `tests/test_template_expr.py` (regex-chain unit), `tests/test_template_clickhouse.py`
+(19 live-ClickHouse cases — grouping, hashing, upgrade path, browsing, facet filter,
+mute/unmute round trip), `tests/test_anomaly_stats.py`/`test_columns.py`/`test_queries.py`/
+`test_dispositions_api.py`/`test_events_router.py`/`test_agent_tools.py` (unit extensions),
+`frontend/src/test/templatesView.test.tsx`. Full backend suite (1149 passed, 10 pre-existing
+unrelated env-config failures excluded) and full frontend suite (33 files, 292 passed) green.
 
 ## Session 70 — 2026-07-20: Agent v2 — compaction, tool toggles, OPSEC dialog, JSON export (claude/ai-agent-improvements-lyu1gg)
 

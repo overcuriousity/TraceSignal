@@ -159,6 +159,11 @@ class EventQuery:
     # of a deleted disposition never suppress anything, and must always
     # surface the collapsed count alongside — nothing hidden silently.
     exclude_routine_disposition_ids: list[str] | None = None
+    # Active muted log-template hashes (W6, "log_template" routine
+    # dispositions) — membership is a direct predicate on the materialized
+    # `template_hash` column, unlike motifs, so no aux-table anti-join is
+    # needed here.
+    exclude_template_hashes: list[int] | None = None
     # Unified tag include/exclude filters — distinct from event_ids/exclude_event_ids
     # because they carry OR-between-two-systems semantics internally, ANDed
     # alongside every other restriction (see TagFilter).
@@ -836,6 +841,12 @@ class EventQueryService:
                 f"{self.store.database}.motif_occurrences WHERE case_id = "
                 f"{{{cid_name}:String}} AND has({{{did_name}:Array(String)}}, disposition_id))"
             )
+
+        if query.exclude_template_hashes:
+            # Direct predicate — the materialized template_hash column IS the
+            # membership test, no aux table (contrast exclude_routine_disposition_ids).
+            th_name = builder.bind(query.exclude_template_hashes)
+            builder.add(f"template_hash NOT IN {{{th_name}:Array(UInt64)}}")
 
         if query.tags_include is not None:
             builder.add_tag_filter(query.tags_include, negate=False)

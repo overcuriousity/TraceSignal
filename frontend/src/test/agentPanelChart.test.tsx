@@ -1,0 +1,139 @@
+/**
+ * AgentPanel (A9): a persisted propose_chart CALL+RESULT row pair with
+ * result.ok === true folds into exactly one ChartProposalCard — and a
+ * failed validation (ok !== true, or a missing result) produces none. Mocks
+ * ChartProposalCard itself to isolate itemsFromMessages' pairing logic from
+ * the card's own data fetching (covered by chartProposalCard.test.tsx).
+ */
+import { describe, it, expect, vi, beforeEach, beforeAll } from "vitest";
+import { render, screen } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { AgentPanel } from "@/components/agent/AgentPanel";
+import { TooltipProvider } from "@/components/ui/Tooltip";
+import { useAgentStore } from "@/stores/agent";
+import type { AgentConversation, AgentMessage } from "@/api/agent";
+
+beforeAll(() => {
+  // jsdom has no scrollTo — AgentPanel auto-scrolls the transcript on update.
+  Element.prototype.scrollTo = vi.fn();
+});
+
+const listConversationsMock = vi.fn();
+const getConversationMock = vi.fn();
+const listProposalsMock = vi.fn();
+
+vi.mock("@/api/agent", async () => {
+  const actual = await vi.importActual<typeof import("@/api/agent")>("@/api/agent");
+  return {
+    ...actual,
+    agentApi: {
+      listConversations: (...args: unknown[]) => listConversationsMock(...args),
+      getConversation: (...args: unknown[]) => getConversationMock(...args),
+      listProposals: (...args: unknown[]) => listProposalsMock(...args),
+    },
+  };
+});
+
+vi.mock("@/components/agent/ChartProposalCard", () => ({
+  ChartProposalCard: (props: { title: string }) => (
+    <div data-testid="chart-proposal-card">{props.title}</div>
+  ),
+}));
+
+const CASE = "c1";
+const TL = "t1";
+const CONV_ID = "conv1";
+
+function conversation(): AgentConversation {
+  return {
+    id: CONV_ID,
+    case_id: CASE,
+    timeline_id: TL,
+    user_id: "u1",
+    title: "Investigating",
+    model_id: "m",
+    disabled_tools: null,
+    created_at: null,
+    updated_at: null,
+  };
+}
+
+function chartMessages(resultOk: boolean | "missing"): AgentMessage[] {
+  const call: AgentMessage = {
+    id: "m1",
+    conversation_id: CONV_ID,
+    role: "tool",
+    content: "",
+    tool_name: "propose_chart",
+    tool_args: {
+      title: "Artifact spread",
+      description: "top artifacts",
+      spec: { kind: "terms", field: "artifact" },
+    },
+    tool_result: null,
+    created_at: null,
+  };
+  if (resultOk === "missing") return [call];
+  const result: AgentMessage = {
+    id: "m2",
+    conversation_id: CONV_ID,
+    role: "tool",
+    content: "",
+    tool_name: "propose_chart",
+    tool_args: null,
+    tool_result: { ok: resultOk, total: 100 },
+    created_at: null,
+  };
+  return [call, result];
+}
+
+function renderPanel() {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={qc}>
+      <TooltipProvider>
+        <AgentPanel
+          caseId={CASE}
+          timelineId={TL}
+          currentFilters={{}}
+          onApplyFilters={vi.fn()}
+          onClose={vi.fn()}
+        />
+      </TooltipProvider>
+    </QueryClientProvider>,
+  );
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  useAgentStore.getState().setActiveConversation(`${CASE}/${TL}`, CONV_ID);
+  listConversationsMock.mockResolvedValue({ conversations: [conversation()] });
+  listProposalsMock.mockResolvedValue({ proposals: [] });
+});
+
+describe("AgentPanel propose_chart folding", () => {
+  it("a call+result pair with ok:true renders exactly one ChartProposalCard", async () => {
+    getConversationMock.mockResolvedValue({ ...conversation(), messages: chartMessages(true) });
+    renderPanel();
+    const cards = await screen.findAllByTestId("chart-proposal-card");
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toHaveTextContent("Artifact spread");
+  });
+
+  it("a result with ok:false renders no card", async () => {
+    getConversationMock.mockResolvedValue({ ...conversation(), messages: chartMessages(false) });
+    renderPanel();
+    // Let the conversation query settle, then assert nothing appeared.
+    await screen.findByTestId("agent-panel");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.queryByTestId("chart-proposal-card")).toBeNull();
+  });
+
+  it("a call row with no paired result renders no card", async () => {
+    getConversationMock.mockResolvedValue({ ...conversation(), messages: chartMessages("missing") });
+    renderPanel();
+    await screen.findByTestId("agent-panel");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.queryByTestId("chart-proposal-card")).toBeNull();
+  });
+});

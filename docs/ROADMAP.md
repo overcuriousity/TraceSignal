@@ -32,11 +32,14 @@ Analyst-depth phase; full rationale in
 `docs/superpowers/specs/2026-07-19-phase3-investigation-depth-design.md`. Agent stays an
 analysis companion — agent-authored stories deferred. Ordered:
 
-- [ ] **Step 1 — W6 template clustering** (see Milestone 5 entry). First: independent,
-  and template IDs become a facet the later steps consume. Reuse the `routine` collapse
-  machinery for "mute template".
-- [ ] **Step 2 — A9 viz parity** (see Milestone 8 entry). Own design round; before
-  Stories so the chart-spec is exercised once before Stories embeds it.
+- ✅ **Step 1 — W6 template clustering** — shipped: `template_hash` materialized column
+  (`db/clickhouse.py`, `db/_template.py`), field-agnostic `list_log_templates`
+  (`db/anomaly_stats.py`) + `GET .../log-templates`, `template_id` facet
+  (`db/_columns.py`), mute disposition (`detector="log_template"`, no occurrence
+  materialization — direct `template_hash` predicate) + grid collapse union count
+  (`ClickHouseStore.count_routine_collapsed`), Templates sub-tab under Patterns
+  (`TemplatesView.tsx`). See `docs/ANOMALY_DETECTION.md` §14.
+- ✅ **Step 2 — A9 viz parity** (see Milestone 8 entry) — shipped.
 - [ ] **Step 3 — W7 Stories, human-first** (see Milestone 5 entry). Own design round;
   key tension: live embeds in editor vs. point-in-time snapshot on export. Block model
   leaves room for a later `origin` field (agent authorship later, no migration pain).
@@ -182,12 +185,6 @@ Hard, high value:
   automatic `logsource` scoping (rules currently run over the full timeline scope,
   logsource stored + displayed for manual selection); end-to-end run test against live
   ClickHouse (covered manually via `/verify`; unit tests cover compiler/loader/router).
-- [ ] **W6 — Log template clustering (Drain-style).** Collapse structurally identical lines
-  into templates so 50M repeats of one error can be muted and the one odd line surfaces.
-  Deterministic and SQL-explainable beats embeddings here: start with a ClickHouse-side
-  normalization pass (digits/hex/UUID masked, group by normalized message), evaluate Drain3
-  (offline, pure Python) if that proves too coarse. Complements, not replaces, the embedding
-  pipeline.
 - [ ] **W8 — Query-time field extraction (schema-on-read, read half).** Define a virtual
   field as a regex capture over a raw attribute (usually `message`), then facet, histogram,
   and run detectors on it without re-ingest — Splunk `rex` / ES runtime fields, but forensically
@@ -305,22 +302,12 @@ thinking capture as first-class messages, and full-thread JSON export — see
   audit every external call and persist/hash the raw response (external evidence must
   stay replayable), mark results `origin: external` in the conversation record. Needs
   its own design round before implementation.
-- [ ] **A9 — Agent-created visualizations (viz parity).** Give the agent the same charting
-  a human has on the Visualize page, in two symmetric halves: (a) **read tools** wrapping
-  the existing viz queries (`field_timeseries`, `time_punchcard`, `field_pivot`,
-  `field_scatter`, `compare_layers` — field-terms/numeric/histogram already exist)
-  returning budget-capped compact series so the model can *find* a pattern before showing
-  it; (b) a **`propose_chart` tool** carrying the exact chart spec (chart type + the same
-  validated params the viz endpoints take + FilterSpec); the backend validates by
-  executing the query and echoing summary stats, the panel renders a **live chart card**
-  reusing the Visualize page's chart components, with "Open in Visualize" (applies the
-  spec through the normal URL path) and "Save" (the analyst's click writes a saved chart
-  via the existing endpoint, credited to the analyst — no proposal lifecycle needed since
-  the analyst executes the write). Sandbox+apply invariant holds: the agent never mutates
-  the analyst's view or writes anything itself. Result caps matter: viz series are dense —
-  per-tool row/bucket budgets like `search_events`. Needs its own design round
-  (chart-spec schema shared backend↔frontend, card rendering reuse vs. simplified
-  renderer) before implementation.
+- ✅ **A9 — Agent-created visualizations (viz parity)** — shipped: five read tools
+  (`field_timeseries`, `time_punchcard`, `field_pivot`, `field_scatter`, `compare`) plus
+  `propose_chart` (`agent/tools.py`, validate-by-execute, no write); frontend `ChartSpec` →
+  `ChartConfig` mapping (`specToChartConfig`, `frontend/src/api/agent.ts`) and a live
+  `ChartProposalCard.tsx` fetched fresh through `vizApi` with "Open in Visualize"/"Save".
+  See `docs/AGENT.md` "Tools" for the full contract.
 - [ ] **Confirm-proposal crash-gap.** A crash between the atomic proposal-decide and the
   annotation bulk-write leaves a confirmed proposal with no annotations and no retry path.
   Single-process tradeoff, deliberate; revisit if it bites.

@@ -214,6 +214,7 @@ from vestigo.db._dt import (
 )
 from vestigo.db._offsets import active_offsets, bind_offset_params, effective_ts_sql
 from vestigo.db._scan import HEAVY_SCAN_GATE, HEAVY_SCAN_SETTINGS
+from vestigo.db._template import template_normalize_expr
 from vestigo.db.clickhouse import ClickHouseStore
 from vestigo.db.field_mappings import mapping_coalesce_expr, resolve_mapping
 
@@ -1000,6 +1001,34 @@ class NoveltyFieldInfo:
     coverage: float  # fraction of events with a non-empty value (0–1)
     kind: str  # "constant" | "identifier" | "categorical" | "sparse"
     recommended: bool  # True → include in default scan
+
+
+@dataclass
+class LogTemplateRow:
+    """One structurally-distinct log-line shape (W6).
+
+    ``template_id`` is a decimal string (not a Python int) at this
+    boundary — ``cityHash64`` returns a UInt64 that would silently lose
+    precision through JSON's float number type, the same reason
+    ``event_id`` is always stringified.
+    """
+
+    template_id: str
+    template: str  # normalized shape, e.g. "Allow TCP <IP>:<NUM> -> <IP>:<NUM>"
+    count: int
+    distinct_sources: int
+    first_seen: str | None  # ISO, UTC
+    last_seen: str | None  # ISO, UTC
+    example: str  # one representative raw value of the templated field
+
+
+@dataclass
+class LogTemplatesResult:
+    """Return value of :meth:`StatisticalAnomalyService.list_log_templates`."""
+
+    field: str
+    total_templates: int  # distinct templates before `limit`
+    templates: list[LogTemplateRow] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -5609,6 +5638,116 @@ class StatisticalAnomalyService:
                     f"the routine collapse for this motif is partial."
                 )
         return written, warnings
+
+    @_gated_scan
+    def list_log_templates(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        field: str = "message",
+        limit: int = 100,
+        order: str = "count",
+        baseline_end: datetime | None = None,
+        only_new: bool = False,
+        field_mappings: dict[str, list[str]] | None = None,
+        source_offsets: dict[str, int] | None = None,
+    ) -> LogTemplatesResult:
+        """Browse structurally-distinct log-line shapes (W6).
+
+        Field-agnostic like every other detector: *field* defaults to
+        ``"message"`` (the fast, indexed path — groups by the materialized
+        ``template_hash`` column) but accepts any token ``_col_expr``
+        resolves, computing the hash inline for that expression instead —
+        unindexed, an explicit and documented cost tradeoff for the
+        flexibility (see docs/ANOMALY_DETECTION.md).
+
+        Not a scored detector: no Finding dataclass, no BH-FDR, no
+        allowlist — this is a browser. ``only_new`` (paired with
+        ``baseline_end``) is the entire "novelty" story: a template whose
+        earliest occurrence across the full scope is at/after
+        ``baseline_end`` has never been seen in the baseline, expressed as a
+        single ``HAVING first_seen >= baseline_end`` rather than an
+        anti-join — cheaper and equivalent for a single split point.
+        """
+        if order not in ("count", "first_seen", "last_seen"):
+            raise ValueError(f"unknown order: {order!r}")
+        self.ch.init_schema()
+        db = self.ch.database
+        params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        bind_offset_params(source_offsets, params)
+        eff = effective_ts_sql(source_offsets)
+
+        normalized_field = field.strip().lower()
+        if normalized_field == "message":
+            hash_expr = "template_hash"
+            field_col = "message"
+        else:
+            field_col = _col_expr(field, params, field_mappings)
+            hash_expr = f"cityHash64({template_normalize_expr(field_col)})"
+        template_text_expr = template_normalize_expr(f"any({field_col})")
+        empty_guard = f"AND {field_col} != ''" if normalized_field != "message" else ""
+
+        # One grouped subquery is the single source of truth for both the
+        # listing and the total-template count, so `only_new` (an aggregate
+        # condition on the grouped `first_seen`) filters both identically.
+        inner_sql = f"""
+            SELECT
+                {hash_expr} AS th,
+                {template_text_expr} AS template,
+                count() AS cnt,
+                uniqExact(source_id) AS distinct_sources,
+                min({eff}) AS first_seen,
+                max({eff}) AS last_seen,
+                any({field_col}) AS example
+            FROM {db}.events
+            WHERE case_id = {{cid:String}}
+              AND has({{src:Array(String)}}, source_id)
+              AND {VESTIGO_NOT_SENTINEL_SQL}
+              {empty_guard}
+            GROUP BY th
+        """
+        outer_pred = "1"
+        if only_new:
+            if baseline_end is None:
+                raise ValueError("only_new requires baseline_end")
+            params["baseline_end"] = to_clickhouse_utc(baseline_end, precise=True)
+            outer_pred = "first_seen >= {baseline_end:String}"
+
+        order_col = {"count": "cnt", "first_seen": "first_seen", "last_seen": "last_seen"}[order]
+        order_dir = "DESC" if order in ("count", "last_seen") else "ASC"
+
+        params["lim"] = limit
+        sql = f"""
+            SELECT toString(th) AS template_id, template, cnt, distinct_sources,
+                   first_seen, last_seen, example
+            FROM ({inner_sql})
+            WHERE {outer_pred}
+            ORDER BY {order_col} {order_dir}
+            LIMIT {{lim:UInt64}}
+            {HEAVY_SCAN_SETTINGS}
+        """
+        rows = self.ch.client.query(sql, parameters=params).result_rows
+
+        count_sql = f"""
+            SELECT count() FROM ({inner_sql}) WHERE {outer_pred} {HEAVY_SCAN_SETTINGS}
+        """
+        total = self.ch.client.query(
+            count_sql, parameters={k: v for k, v in params.items() if k != "lim"}
+        ).result_rows[0][0]
+
+        templates = [
+            LogTemplateRow(
+                template_id=r[0],
+                template=r[1],
+                count=int(r[2]),
+                distinct_sources=int(r[3]),
+                first_seen=_present_ts(r[4]),
+                last_seen=_present_ts(r[5]),
+                example=r[6],
+            )
+            for r in rows
+        ]
+        return LogTemplatesResult(field=field, total_templates=int(total), templates=templates)
 
     @_gated_scan
     def find_order_violations(

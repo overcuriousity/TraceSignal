@@ -282,6 +282,64 @@ class TestSearchBlob:
         assert store.search_blob_ready() is True
 
 
+class _TemplateHashClient(_RecordingClient):
+    """Fake with controllable template_hash column/index state."""
+
+    def __init__(self, has_column: bool, has_index: bool | None = None):
+        super().__init__()
+        self.has_column = has_column
+        self.has_index = has_column if has_index is None else has_index
+
+    def query(self, query, parameters=None):
+        self.queries.append((query, parameters))
+        if "system.columns" in query and "template_hash" in query:
+            return _FakeResult([(1 if self.has_column else 0,)])
+        if "system.data_skipping_indices" in query:
+            return _FakeResult([(1 if self.has_index else 0,)])
+        return _FakeResult([(42,)])
+
+
+class TestTemplateHash:
+    def test_ddl_contains_template_hash_column_and_index(self):
+        from vestigo.db.clickhouse import _TEMPLATE_HASH_COLUMN_DDL, _TEMPLATE_HASH_INDEX_DDL
+
+        assert "template_hash UInt64 MATERIALIZED cityHash64" in _TEMPLATE_HASH_COLUMN_DDL
+        assert "bloom_filter" in _TEMPLATE_HASH_INDEX_DDL
+        assert "{template_hash_column}" in _EVENTS_TABLE_DDL
+        assert "{template_hash_index}" in _EVENTS_TABLE_DDL
+        # Field-agnostic building block: the expression is over `message` at
+        # the DDL level (the one column required non-null on every Event),
+        # not silently coupled to any other assumption about field meaning.
+        assert "message" in _TEMPLATE_HASH_COLUMN_DDL
+
+    def test_ensure_upgrades_missing_column(self, store):
+        store.client = _TemplateHashClient(has_column=False)
+        store._ensure_template_hash()
+        cmds = store.client.commands
+        assert any("ADD COLUMN IF NOT EXISTS template_hash" in c for c in cmds)
+        assert any("ADD INDEX IF NOT EXISTS template_hash_idx" in c for c in cmds)
+        assert any(
+            "MATERIALIZE COLUMN template_hash SETTINGS mutations_sync = 0" in c for c in cmds
+        )
+        assert any(
+            "MATERIALIZE INDEX template_hash_idx SETTINGS mutations_sync = 0" in c for c in cmds
+        )
+
+    def test_ensure_noop_when_column_present(self, store):
+        store.client = _TemplateHashClient(has_column=True)
+        store._ensure_template_hash()
+        assert store.client.commands == []
+
+    def test_ensure_resumes_when_column_present_but_index_missing(self, store):
+        # Regression: a crash between ADD COLUMN and ADD INDEX must not
+        # permanently strand the table without the index.
+        store.client = _TemplateHashClient(has_column=True, has_index=False)
+        store._ensure_template_hash()
+        cmds = store.client.commands
+        assert any("ADD COLUMN IF NOT EXISTS template_hash" in c for c in cmds)
+        assert any("ADD INDEX IF NOT EXISTS template_hash_idx" in c for c in cmds)
+
+
 def _make_event(i: int, **overrides) -> Event:
     kwargs: dict = {
         "case_id": "case-1",

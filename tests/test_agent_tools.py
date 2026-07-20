@@ -261,6 +261,30 @@ async def test_filterspec_collapse_routine(store):
     assert plain.exclude_routine_disposition_ids is None
 
 
+async def test_filterspec_collapse_routine_log_template(store):
+    """W6: agent-side search/grid parity — a log_template routine
+    disposition resolves to exclude_template_hashes, not the motif
+    disposition-id anti-join path."""
+    from vestigo.agent.tools import FilterSpec, _build_query
+
+    await store.init_schema()
+    await store.create_disposition(
+        "c1",
+        "routine",
+        detector="log_template",
+        timeline_id="t1",
+        field="template_id",
+        value="987654321",
+        details={"template": "Allow TCP <IP>", "template_version": 1},
+    )
+    scope = _scope("c1", "t1", source_ids=["s1"])
+    query = await _build_query(scope, FilterSpec(collapse_routine=True))
+    assert query.exclude_template_hashes == [987654321]
+    assert query.exclude_routine_disposition_ids is None
+    plain = await _build_query(scope, FilterSpec())
+    assert plain.exclude_template_hashes is None
+
+
 @pytest.mark.asyncio
 async def test_run_anomaly_detector_passes_tuning_params(store, monkeypatch):
     import vestigo.api.routers.events as events_router
@@ -313,6 +337,291 @@ async def test_run_anomaly_detector_rejects_out_of_bounds(store):
     with pytest.raises(ToolError):
         await _call(
             server, "run_anomaly_detector", {"detector": "sequence_novelty", "ngram_size": 9}
+        )
+
+
+# ---------------------------------------------------------------------------
+# A9 viz read tools: field_timeseries, time_punchcard, field_pivot,
+# field_scatter, compare — pass-through + cap clamping. Monkeypatches
+# _get_query_service (same seam build_tool_server resolves at build time)
+# with a fake recording service, so these run without live ClickHouse — the
+# existing detector/query tools in this file take the same approach.
+# ---------------------------------------------------------------------------
+
+
+class _FakeVizService:
+    def __init__(self):
+        self.calls: list[tuple[str, tuple, dict]] = []
+
+    def field_value_timeseries(self, query, field, buckets, series_limit):
+        self.calls.append(("field_value_timeseries", (field, buckets, series_limit), {}))
+        return {"field": field, "series": [], "interval_seconds": 3600, "min": None, "max": None}
+
+    def time_punchcard(self, query):
+        self.calls.append(("time_punchcard", (), {}))
+        return {"kind": "punchcard", "cells": [], "total": 0, "max_count": 0}
+
+    def field_pivot(self, query, field_x, field_y, limit_x, limit_y):
+        self.calls.append(("field_pivot", (field_x, field_y, limit_x, limit_y), {}))
+        return {"kind": "pivot", "cells": [], "total": 0, "x_distinct": 0, "y_distinct": 0}
+
+    def field_scatter(self, query, field_x, field_y, limit):
+        self.calls.append(("field_scatter", (field_x, field_y, limit), {}))
+        return {"kind": "scatter", "points": [], "total": 0, "sampled": 0}
+
+    def compare_time_histogram(self, primary, comparison, buckets):
+        self.calls.append(("compare_time_histogram", (buckets,), {}))
+        return {"kind": "time", "buckets": [], "primary_total": 0, "comparison_total": 0}
+
+    def compare_field_terms(self, primary, comparison, field, limit):
+        self.calls.append(("compare_field_terms", (field, limit), {}))
+        return {"kind": "terms", "field": field, "primary_total": 0, "comparison_total": 0}
+
+    def compare_field_numeric(self, primary, comparison, field, bins):
+        self.calls.append(("compare_field_numeric", (field, bins), {}))
+        return {"kind": "numeric", "field": field, "primary_total": 0, "comparison_total": 0}
+
+
+def _patch_viz_service(monkeypatch) -> _FakeVizService:
+    import vestigo.api.routers.events as events_router
+
+    fake = _FakeVizService()
+    monkeypatch.setattr(events_router, "_get_query_service", lambda: fake)
+    return fake
+
+
+async def test_field_timeseries_clamps_buckets_and_series_limit(store, monkeypatch):
+    fake = _patch_viz_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    await _call(
+        server, "field_timeseries", {"field": "attr:status", "buckets": 500, "series_limit": 50}
+    )
+    name, args, _ = fake.calls[0]
+    assert name == "field_value_timeseries"
+    assert args == ("attr:status", 60, 8)  # clamped to VIZ_TIMESERIES_MAX_BUCKETS/SERIES
+
+
+async def test_time_punchcard_passes_through(store, monkeypatch):
+    fake = _patch_viz_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(server, "time_punchcard")
+    assert result["kind"] == "punchcard"
+    assert fake.calls[0][0] == "time_punchcard"
+
+
+async def test_field_pivot_clamps_limits(store, monkeypatch):
+    fake = _patch_viz_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    await _call(
+        server,
+        "field_pivot",
+        {"field_x": "attr:user", "field_y": "attr:host", "limit_x": 100, "limit_y": 100},
+    )
+    name, args, _ = fake.calls[0]
+    assert name == "field_pivot"
+    assert args == ("attr:user", "attr:host", 12, 12)  # clamped to VIZ_PIVOT_MAX_LIMIT
+
+
+async def test_field_scatter_clamps_limit(store, monkeypatch):
+    fake = _patch_viz_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    await _call(
+        server, "field_scatter", {"field_x": "attr:bytes", "field_y": "attr:latency", "limit": 20000}
+    )
+    name, args, _ = fake.calls[0]
+    assert name == "field_scatter"
+    assert args == ("attr:bytes", "attr:latency", 1000)  # clamped to VIZ_SCATTER_MAX_POINTS
+
+
+async def test_compare_time_dispatches_and_clamps_buckets(store, monkeypatch):
+    fake = _patch_viz_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(server, "compare", {"kind": "time", "buckets": 500})
+    assert result["kind"] == "time"
+    name, args, _ = fake.calls[0]
+    assert name == "compare_time_histogram"
+    assert args == (60,)  # clamped to VIZ_COMPARE_MAX_BUCKETS
+
+
+async def test_compare_terms_requires_field(store):
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    with pytest.raises(ToolError):
+        await _call(server, "compare", {"kind": "terms"})
+
+
+async def test_compare_terms_dispatches_and_clamps_limit(store, monkeypatch):
+    fake = _patch_viz_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(server, "compare", {"kind": "terms", "field": "attr:status", "limit": 999})
+    assert result["kind"] == "terms"
+    name, args, _ = fake.calls[0]
+    assert name == "compare_field_terms"
+    assert args == ("attr:status", 30)  # clamped to VIZ_COMPARE_MAX_TERMS
+
+
+async def test_compare_numeric_dispatches_and_clamps_bins(store, monkeypatch):
+    fake = _patch_viz_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server, "compare", {"kind": "numeric", "field": "attr:bytes", "limit": 999}
+    )
+    assert result["kind"] == "numeric"
+    name, args, _ = fake.calls[0]
+    assert name == "compare_field_numeric"
+    assert args == ("attr:bytes", 30)  # clamped to VIZ_COMPARE_MAX_BINS
+
+
+async def test_compare_rejects_unknown_kind(store):
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    with pytest.raises(ToolError):
+        await _call(server, "compare", {"kind": "bogus"})
+
+
+# ---------------------------------------------------------------------------
+# A9 propose_chart: validate-by-execute, summary stats echoed, no proposal
+# row (unlike propose_annotation — the analyst's Save click is the only
+# write, mirroring propose_finding's no-write contract).
+# ---------------------------------------------------------------------------
+
+
+class _FakeChartService(_FakeVizService):
+    def field_terms(self, query, field, limit):
+        self.calls.append(("field_terms", (field, limit), {}))
+        return {
+            "field": field,
+            "total": 100,
+            "distinct": 4,
+            "other_count": 5,
+            "values": [{"value": "a", "count": 60}, {"value": "b", "count": 40}],
+        }
+
+    def field_numeric_stats(self, query, field):
+        self.calls.append(("field_numeric_stats", (field,), {}))
+        return {"field": field, "count": 100, "min": 0, "max": 99, "mean": 50, "stddev": 10}
+
+
+def _patch_chart_service(monkeypatch) -> _FakeChartService:
+    import vestigo.api.routers.events as events_router
+
+    fake = _FakeChartService()
+    monkeypatch.setattr(events_router, "_get_query_service", lambda: fake)
+    return fake
+
+
+async def test_propose_chart_terms(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        {
+            "title": "Top artifacts",
+            "description": "artifact distribution",
+            "spec": {"kind": "terms", "field": "artifact", "limit": 500},
+        },
+    )
+    assert result["ok"] is True
+    assert result["total"] == 100
+    assert len(result["top_values"]) == 2
+    name, args, _ = fake.calls[0]
+    assert name == "field_terms"
+    assert args == ("artifact", 100)  # limit clamped to field_terms' own 100 cap
+
+
+async def test_propose_chart_numeric(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        {
+            "title": "Bytes",
+            "description": "bytes distribution",
+            "spec": {"kind": "numeric", "field": "attr:bytes"},
+        },
+    )
+    assert result["ok"] is True
+    assert result["mean"] == 50
+
+
+async def test_propose_chart_timeseries(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        {
+            "title": "Status over time",
+            "description": "",
+            "spec": {"kind": "timeseries", "field": "attr:status", "buckets": 999},
+        },
+    )
+    assert result["ok"] is True
+    name, args, _ = fake.calls[0]
+    assert name == "field_value_timeseries"
+    assert args == ("attr:status", 60, 6)  # buckets clamped, default series_limit
+
+
+async def test_propose_chart_pivot_requires_field_y(store):
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    with pytest.raises(ToolError):
+        await _call(
+            server,
+            "propose_chart",
+            {"title": "t", "description": "", "spec": {"kind": "pivot", "field": "attr:user"}},
+        )
+
+
+async def test_propose_chart_scatter(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        {
+            "title": "t",
+            "description": "",
+            "spec": {
+                "kind": "scatter",
+                "field": "attr:bytes",
+                "field_y": "attr:latency",
+                "limit": 50000,
+            },
+        },
+    )
+    assert result["ok"] is True
+    name, args, _ = fake.calls[0]
+    assert args == ("attr:bytes", "attr:latency", 1000)  # clamped to VIZ_SCATTER_MAX_POINTS
+
+
+async def test_propose_chart_compare_time(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        {"title": "t", "description": "", "spec": {"kind": "compare_time", "buckets": 999}},
+    )
+    assert result["ok"] is True
+    assert "primary_total" in result and "comparison_total" in result
+    name, args, _ = fake.calls[0]
+    assert name == "compare_time_histogram"
+    assert args == (60,)
+
+
+async def test_propose_chart_unknown_kind(store):
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    with pytest.raises(ToolError):
+        await _call(
+            server, "propose_chart", {"title": "t", "description": "", "spec": {"kind": "bogus"}}
+        )
+
+
+async def test_propose_chart_missing_required_field(store):
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    with pytest.raises(ToolError):
+        await _call(
+            server, "propose_chart", {"title": "t", "description": "", "spec": {"kind": "terms"}}
         )
 
 

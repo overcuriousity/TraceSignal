@@ -36,6 +36,7 @@ from vestigo.core.config import get_settings
 from vestigo.db._arrow_schema import EVENT_ARROW_SCHEMA
 from vestigo.db._dt import is_null_ts_sentinel, to_clickhouse_utc
 from vestigo.db._scan import HEAVY_SCAN_SETTINGS
+from vestigo.db._template import template_hash_expr
 from vestigo.models.event import Event
 
 logger = logging.getLogger(__name__)
@@ -140,6 +141,17 @@ _SEARCH_BLOB_EXPR = (
 _SEARCH_BLOB_COLUMN_DDL = f"search_blob String MATERIALIZED {_SEARCH_BLOB_EXPR} CODEC(ZSTD(3))"
 _SEARCH_BLOB_INDEX_DDL = "search_blob_idx search_blob TYPE ngrambf_v1(3, 65536, 4, 0) GRANULARITY 1"
 
+# `template_hash` (W6): structural-shape identity of `message` — variable
+# substrings (timestamps, UUIDs, IPs, hex, digit runs) masked via the
+# versioned regex chain in `_template.py`, then hashed. MATERIALIZED like
+# search_blob: correct immediately on old parts (computed on read), only the
+# bloom index's pruning waits on MATERIALIZE COLUMN/INDEX (_ensure_template_hash).
+# No normalized-text column is stored — `list_log_templates` reconstructs the
+# representative template text on demand via the same expression applied to
+# `any(message)` per group, avoiding a second message-sized column.
+_TEMPLATE_HASH_COLUMN_DDL = f"template_hash UInt64 MATERIALIZED {template_hash_expr('message')}"
+_TEMPLATE_HASH_INDEX_DDL = "template_hash_idx template_hash TYPE bloom_filter GRANULARITY 4"
+
 # `timestamp` is deliberately non-Nullable: it sits in the MergeTree sort key,
 # and a Nullable sort-key column (via allow_nullable_key) disables ClickHouse's
 # read-in-order optimization — turning every ORDER BY timestamp LIMIT N grid
@@ -172,7 +184,9 @@ CREATE TABLE IF NOT EXISTS {database}.{table} (
     embedding_model LowCardinality(String),
     embedding_config_hash FixedString(64),
     {search_blob_column},
+    {template_hash_column},
     INDEX {search_blob_index},
+    INDEX {template_hash_index},
     INDEX content_hash_idx content_hash TYPE bloom_filter GRANULARITY 4
 )
 ENGINE = MergeTree()
@@ -296,10 +310,13 @@ class ClickHouseStore:
                 table="events",
                 search_blob_column=_SEARCH_BLOB_COLUMN_DDL,
                 search_blob_index=_SEARCH_BLOB_INDEX_DDL,
+                template_hash_column=_TEMPLATE_HASH_COLUMN_DDL,
+                template_hash_index=_TEMPLATE_HASH_INDEX_DDL,
             )
         )
         self._assert_not_legacy_schema()
         self._ensure_search_blob()
+        self._ensure_template_hash()
         self.client.command(_MOTIF_OCCURRENCES_DDL.format(database=self.database))
         self._schema_ready = True
         # Enrichment output moved into events.attributes (stage_enrichment_rows / finalize_enrichment_apply);
@@ -384,6 +401,50 @@ class ClickHouseStore:
         logger.info(
             "search_blob column/index added; background materialization started "
             "(text-search fast path activates when system.mutations drains)"
+        )
+
+    def _has_template_hash_column(self) -> bool:
+        result = self.client.query(
+            "SELECT count() FROM system.columns "
+            "WHERE database = {db:String} AND table = 'events' AND name = 'template_hash'",
+            parameters={"db": self.database},
+        )
+        return bool(result.result_rows and result.result_rows[0][0])
+
+    def _has_template_hash_index(self) -> bool:
+        result = self.client.query(
+            "SELECT count() FROM system.data_skipping_indices "
+            "WHERE database = {db:String} AND table = 'events' AND name = 'template_hash_idx'",
+            parameters={"db": self.database},
+        )
+        return bool(result.result_rows and result.result_rows[0][0])
+
+    def _ensure_template_hash(self) -> None:
+        """In-place upgrade for pre-`template_hash` deployments (W6). Idempotent.
+
+        Same shape as :meth:`_ensure_search_blob`: add column + index, then
+        kick off ``MATERIALIZE COLUMN``/``MATERIALIZE INDEX`` asynchronously.
+        A MATERIALIZED column read from a not-yet-mutated part is computed on
+        the fly, so `list_log_templates` and the mute-template collapse are
+        correct immediately — only the bloom index's pruning waits.
+        """
+        if self._has_template_hash_column() and self._has_template_hash_index():
+            return
+        table = f"{self.database}.events"
+        self.client.command(
+            f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {_TEMPLATE_HASH_COLUMN_DDL}"
+        )
+        self.client.command(
+            f"ALTER TABLE {table} ADD INDEX IF NOT EXISTS {_TEMPLATE_HASH_INDEX_DDL}"
+        )
+        self.client.command(
+            f"ALTER TABLE {table} MATERIALIZE COLUMN template_hash SETTINGS mutations_sync = 0"
+        )
+        self.client.command(
+            f"ALTER TABLE {table} MATERIALIZE INDEX template_hash_idx SETTINGS mutations_sync = 0"
+        )
+        logger.info(
+            "template_hash column/index added; background materialization started"
         )
 
     # Re-check cadence for search_blob_ready while materialization is pending.
@@ -495,6 +556,74 @@ class ClickHouseStore:
             f"SELECT uniqExact(event_id) FROM {self.database}.motif_occurrences "
             "WHERE case_id = {cid:String} AND has({dids:Array(String)}, disposition_id)"
             + source_pred,
+            parameters=params,
+        )
+        rows = result.result_rows
+        return int(rows[0][0]) if rows else 0
+
+    def count_template_events(
+        self, case_id: str, template_hashes: list[int], source_ids: list[str] | None = None
+    ) -> int:
+        """Events covered by the given muted log-templates (W6).
+
+        Unlike motif occurrences, membership needs no side table — it's a
+        direct predicate on the materialized ``template_hash`` column — so
+        this is a plain count, not a lookup against an aux table.
+        """
+        if not template_hashes:
+            return 0
+        self.init_schema()
+        params: dict[str, Any] = {"cid": case_id, "ths": template_hashes}
+        source_pred = ""
+        if source_ids is not None:
+            params["sids"] = source_ids
+            source_pred = " AND has({sids:Array(String)}, source_id)"
+        result = self.client.query(
+            f"SELECT count() FROM {self.database}.events "
+            "WHERE case_id = {cid:String} AND has({ths:Array(UInt64)}, template_hash)"
+            + source_pred,
+            parameters=params,
+        )
+        rows = result.result_rows
+        return int(rows[0][0]) if rows else 0
+
+    def count_routine_collapsed(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        motif_disposition_ids: list[str] | None,
+        template_hashes: list[int] | None,
+    ) -> int:
+        """Distinct events hidden by either routine-collapse mechanism.
+
+        A plain ``count_motif_occurrences(...) + count_template_events(...)``
+        would double-count an event that is both a motif-occurrence member
+        *and* carries a muted template — the grid excludes it on either
+        predicate matching (an OR at the set level), so the reported count
+        must be the union's cardinality, not the sum. One UNION ALL query
+        (deduped by ``uniqExact``) over both sources is the union count.
+        """
+        if not motif_disposition_ids and not template_hashes:
+            return 0
+        self.init_schema()
+        params: dict[str, Any] = {"cid": case_id, "sids": source_ids}
+        branches = []
+        if template_hashes:
+            params["ths"] = template_hashes
+            branches.append(
+                f"SELECT toString(event_id) AS eid FROM {self.database}.events "
+                "WHERE case_id = {cid:String} AND has({sids:Array(String)}, source_id) "
+                "AND has({ths:Array(UInt64)}, template_hash)"
+            )
+        if motif_disposition_ids:
+            params["dids"] = motif_disposition_ids
+            branches.append(
+                f"SELECT event_id AS eid FROM {self.database}.motif_occurrences "
+                "WHERE case_id = {cid:String} AND has({sids:Array(String)}, source_id) "
+                "AND has({dids:Array(String)}, disposition_id)"
+            )
+        result = self.client.query(
+            f"SELECT uniqExact(eid) FROM ({' UNION ALL '.join(branches)})",
             parameters=params,
         )
         rows = result.result_rows

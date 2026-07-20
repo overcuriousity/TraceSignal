@@ -250,6 +250,120 @@ def test_routine_disposition_invariants_and_create(client, admin_bootstrap, stor
     assert {d["id"] for d in routine} == {row["id"], materialize_calls[1][5]}
 
 
+def test_log_template_routine_disposition_invariants_and_create(
+    client, admin_bootstrap, store, monkeypatch
+):
+    """log_template routine (W6): requires field='template_id', a decimal
+    value, and details.template/template_version — and, unlike
+    sequence_motif, schedules NO materialization job (membership is a plain
+    column predicate, no aux table)."""
+    as_admin(client, admin_bootstrap)
+    case_id, tl_id = _setup_case(client)
+    base = _base(case_id, tl_id)
+
+    # Wrong field rejected.
+    assert (
+        client.post(
+            base,
+            json={
+                "kind": "routine",
+                "detector": "log_template",
+                "field": "artifact",
+                "value": "12345",
+                "details": {"template": "Allow TCP <IP>", "template_version": 1},
+            },
+        ).status_code
+        == 422
+    )
+    # Non-decimal value rejected.
+    assert (
+        client.post(
+            base,
+            json={
+                "kind": "routine",
+                "detector": "log_template",
+                "field": "template_id",
+                "value": "not-a-number",
+                "details": {"template": "Allow TCP <IP>", "template_version": 1},
+            },
+        ).status_code
+        == 422
+    )
+    # Missing details.template rejected.
+    assert (
+        client.post(
+            base,
+            json={
+                "kind": "routine",
+                "detector": "log_template",
+                "field": "template_id",
+                "value": "12345",
+                "details": {"template_version": 1},
+            },
+        ).status_code
+        == 422
+    )
+    # Wrong template_version rejected.
+    assert (
+        client.post(
+            base,
+            json={
+                "kind": "routine",
+                "detector": "log_template",
+                "field": "template_id",
+                "value": "12345",
+                "details": {"template": "Allow TCP <IP>", "template_version": 2},
+            },
+        ).status_code
+        == 422
+    )
+    # Event scope rejected — log_template is value-scoped only.
+    assert (
+        client.post(
+            base,
+            json={
+                "kind": "routine",
+                "detector": "log_template",
+                "source_id": "s1",
+                "event_id": "e1",
+            },
+        ).status_code
+        == 422
+    )
+
+    from vestigo.api.routers import dispositions as dispo_module
+
+    materialize_calls: list[tuple] = []
+    monkeypatch.setattr(
+        dispo_module,
+        "_run_motif_materialization_job",
+        lambda *args: materialize_calls.append(args),
+    )
+    resp = client.post(
+        base,
+        json={
+            "kind": "routine",
+            "detector": "log_template",
+            "field": "template_id",
+            "value": "987654321",
+            "details": {
+                "template": "Allow TCP <IP>:<NUM> -> <IP>:<NUM>",
+                "template_version": 1,
+                "field": "message",
+                "example": "Allow TCP 10.0.0.5:4433 -> 10.0.0.9:443",
+                "count_at_mute": 3,
+            },
+        },
+    ).json()
+    row = resp["disposition"]
+    assert row["kind"] == "routine"
+    assert row["detector"] == "log_template"
+    assert row["value"] == "987654321"
+    # No occurrence-materialization job — membership is a column predicate.
+    assert "materialization_job_id" not in resp
+    assert materialize_calls == []
+
+
 def test_dispositions_hash_ignores_routine():
     """routine is presentation-only — never enters the reproducibility hash."""
     value_normal = FindingDisposition(

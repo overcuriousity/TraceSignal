@@ -1398,6 +1398,104 @@ async def test_list_anomalies_does_not_persist_when_status_not_ok(
     assert response["run_id"] is None
 
 
+# ---------------------------------------------------------------------------
+# list_log_templates (W6)
+# ---------------------------------------------------------------------------
+
+
+class _FakeTemplateService:
+    """Records the kwargs list_log_templates was called with."""
+
+    def __init__(self, result):
+        self._result = result
+        self.calls: list[dict] = []
+
+    def list_log_templates(self, **kwargs):
+        self.calls.append(kwargs)
+        return self._result
+
+
+@pytest.mark.asyncio
+async def test_list_log_templates_returns_payload(timeline_setup, monkeypatch):
+    from vestigo.db.anomaly_stats import LogTemplateRow, LogTemplatesResult
+
+    result = LogTemplatesResult(
+        field="message",
+        total_templates=1,
+        templates=[
+            LogTemplateRow(
+                template_id="42",
+                template="Allow TCP <IP>:<NUM> -> <IP>:<NUM>",
+                count=3,
+                distinct_sources=1,
+                first_seen="2026-01-01T00:00:00+00:00",
+                last_seen="2026-01-02T00:00:00+00:00",
+                example="Allow TCP 10.0.0.5:4433 -> 10.0.0.9:443",
+            )
+        ],
+    )
+    fake_svc = _FakeTemplateService(result)
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    response = await events.list_log_templates(
+        "c1",
+        "t1",
+        field="message",
+        order="count",
+        baseline_id=None,
+        only_new=False,
+        limit=100,
+        case=Case(id="c1"),
+        user=_fake_user(),
+    )
+
+    assert response["field"] == "message"
+    assert response["total_templates"] == 1
+    assert response["templates"][0]["template_id"] == "42"
+    assert fake_svc.calls[0]["field"] == "message"
+    assert fake_svc.calls[0]["only_new"] is False
+
+
+@pytest.mark.asyncio
+async def test_list_log_templates_only_new_without_baseline_id_is_422(timeline_setup, monkeypatch):
+    fake_svc = _FakeTemplateService(None)
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await events.list_log_templates(
+            "c1",
+            "t1",
+            field="message",
+            order="count",
+            baseline_id=None,
+            only_new=True,
+            limit=100,
+            case=Case(id="c1"),
+            user=_fake_user(),
+        )
+    assert excinfo.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_list_log_templates_unknown_baseline_id_is_404(timeline_setup, monkeypatch):
+    fake_svc = _FakeTemplateService(None)
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await events.list_log_templates(
+            "c1",
+            "t1",
+            field="message",
+            order="count",
+            baseline_id="no-such-baseline",
+            only_new=True,
+            limit=100,
+            case=Case(id="c1"),
+            user=_fake_user(),
+        )
+    assert excinfo.value.status_code == 404
+
+
 @pytest.mark.asyncio
 async def test_tag_anomalies_always_persists_a_run(
     timeline_setup, monkeypatch, stub_field_stats_cache

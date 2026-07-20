@@ -7,10 +7,13 @@
 import { describe, expect, it } from "vitest";
 import {
   specToEventFilters,
+  specToChartConfig,
   formatTokenCount,
+  type AgentChartSpec,
   type AgentFilterSpec,
   type AgentProposal,
 } from "@/api/agent";
+import { chartConfigToParams, paramsToChartConfig } from "@/components/viz/lib/chartConfig";
 import { filtersToParams, paramsToFilters } from "@/lib/queryParams";
 import { computeEffectiveFilters, overlaysFromApplied } from "@/lib/effectiveFilters";
 import type { EventFilters } from "@/api/types";
@@ -225,6 +228,108 @@ describe("isAnalystAnnotation", () => {
     expect(isAnalystAnnotation({ ...base, origin: "user" } as never)).toBe(true);
     expect(isAnalystAnnotation({ ...base, origin: "agentic-analysis" } as never)).toBe(true);
     expect(isAnalystAnnotation({ ...base, origin: "system" } as never)).toBe(false);
+  });
+});
+
+describe("specToChartConfig", () => {
+  it("maps each kind to its chart type, round-tripping through URL params", () => {
+    const cases: [AgentChartSpec["kind"], string][] = [
+      ["terms", "bar"],
+      ["numeric", "histogram"],
+      ["timeseries", "line"],
+      ["punchcard", "punchcard"],
+      ["pivot", "pivot"],
+      ["scatter", "scatter"],
+      ["compare_time", "time"],
+      ["compare_terms", "bar"],
+      ["compare_numeric", "histogram"],
+    ];
+    for (const [kind, chartType] of cases) {
+      const config = specToChartConfig({ kind, field: "artifact" });
+      expect(config.chartType).toBe(chartType);
+      // Round-trip through the same URL-param path "Open in Visualize" uses.
+      const params = chartConfigToParams(config);
+      expect(paramsToChartConfig(params).chartType).toBe(chartType);
+    }
+  });
+
+  it("carries field/fieldY through", () => {
+    const config = specToChartConfig({ kind: "pivot", field: "attr:user", field_y: "attr:host" });
+    expect(config.field).toBe("attr:user");
+    expect(config.fieldY).toBe("attr:host");
+  });
+
+  it("maps buckets/series_limit into options for timeseries", () => {
+    const config = specToChartConfig({
+      kind: "timeseries",
+      field: "attr:status",
+      buckets: 40,
+      series_limit: 5,
+    });
+    expect(config.options.buckets).toBe(40);
+    expect(config.options.topN).toBe(5);
+  });
+
+  it("maps pivot limit/limit_y into limitX/limitY, not topN", () => {
+    const config = specToChartConfig({
+      kind: "pivot",
+      field: "attr:user",
+      field_y: "attr:host",
+      limit: 6,
+      limit_y: 9,
+    });
+    expect(config.options.limitX).toBe(6);
+    expect(config.options.limitY).toBe(9);
+    expect(config.options.topN).toBeUndefined();
+  });
+
+  it("maps scatter limit into sampleLimit", () => {
+    const config = specToChartConfig({
+      kind: "scatter",
+      field: "attr:bytes",
+      field_y: "attr:latency",
+      limit: 500,
+    });
+    expect(config.options.sampleLimit).toBe(500);
+  });
+
+  it("maps terms limit into topN", () => {
+    const config = specToChartConfig({ kind: "terms", field: "artifact", limit: 25 });
+    expect(config.options.topN).toBe(25);
+  });
+
+  it("non-compare kinds ignore comparison_filters", () => {
+    const config = specToChartConfig({
+      kind: "terms",
+      field: "artifact",
+      comparison_filters: { q: "should be ignored" },
+    });
+    expect(config.compare.mode).toBe("off");
+  });
+
+  it("compare_* kinds map comparison_filters to a custom compare layer", () => {
+    const config = specToChartConfig({
+      kind: "compare_terms",
+      field: "artifact",
+      comparison_filters: { source_id: "s2" },
+    });
+    expect(config.compare.mode).toBe("custom");
+    if (config.compare.mode === "custom") {
+      expect(config.compare.filters.sourceId).toBe("s2");
+    }
+  });
+
+  it("compare_* kind without comparison_filters falls back to off", () => {
+    const config = specToChartConfig({ kind: "compare_time" });
+    expect(config.compare.mode).toBe("off");
+  });
+
+  it("scale matches the chart type's valid scales", () => {
+    // numeric/scatter/compare_numeric need interval|ratio scales in CHART_META.
+    expect(specToChartConfig({ kind: "numeric", field: "attr:bytes" }).scale).toBe("ratio");
+    expect(
+      specToChartConfig({ kind: "scatter", field: "a", field_y: "b" }).scale,
+    ).toBe("ratio");
   });
 });
 

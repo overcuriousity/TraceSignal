@@ -2,10 +2,23 @@ import { get, post } from "./client";
 import type {
   AnomaliesResponse,
   Annotation,
+  LogTemplatesResponse,
   NoveltyFieldsResponse,
   NumericFieldsResponse,
   TagAnomaliesResponse,
 } from "./types";
+
+export interface LogTemplatesParams {
+  /** Field token to template over. Defaults to "message" (the indexed path). */
+  field?: string;
+  order?: "count" | "first_seen" | "last_seen";
+  /** ID of a saved baseline definition. Required together with only_new. */
+  baseline_id?: string;
+  /** Keep only templates whose earliest occurrence is at/after the baseline's end. */
+  only_new?: boolean;
+  limit?: number;
+  [key: string]: string | number | boolean | null | undefined;
+}
 
 export interface AnomalyParams {
   detector?: "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range" | "charset" | "entropy" | "proportion_shift" | "interval_periodicity" | "sequence_novelty" | "sequence_motif" | "value_distribution_drift";
@@ -66,6 +79,13 @@ export const anomaliesApi = {
   numericFields: (caseId: string, timelineId: string) =>
     get<NumericFieldsResponse>(
       `/cases/${caseId}/timelines/${timelineId}/anomalies/numeric-fields`,
+    ),
+
+  /** Browse structurally-distinct log-line shapes (W6). Not a scored detector. */
+  logTemplates: (caseId: string, timelineId: string, params: LogTemplatesParams = {}) =>
+    get<LogTemplatesResponse>(
+      `/cases/${caseId}/timelines/${timelineId}/log-templates`,
+      params,
     ),
 
   /**

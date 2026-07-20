@@ -135,6 +135,8 @@ def test_upgrade_path_adds_column_index_and_drops_message_idx(store):
         table="events",
         search_blob_column="legacy_placeholder UInt8 DEFAULT 0",
         search_blob_index="message_idx message TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 1",
+        template_hash_column="legacy_template_placeholder UInt8 DEFAULT 0",
+        template_hash_index="legacy_template_idx legacy_template_placeholder TYPE bloom_filter GRANULARITY 4",
     )
     store.client.command(f"CREATE DATABASE IF NOT EXISTS {scratch_db}")
     store.client.command(legacy_ddl)

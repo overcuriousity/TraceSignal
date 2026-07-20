@@ -628,6 +628,27 @@ export interface AnomaliesResponse {
   dismissed_count?: number;
 }
 
+/** One structurally-distinct log-line shape (W6). */
+export interface LogTemplateRow {
+  /** Decimal string — a UInt64 hash, always stringified to avoid JS number precision loss. */
+  template_id: string;
+  /** Normalized shape, e.g. "Allow TCP <IP>:<NUM> -> <IP>:<NUM>". */
+  template: string;
+  count: number;
+  distinct_sources: number;
+  first_seen: string | null;
+  last_seen: string | null;
+  /** One representative raw value of the templated field. */
+  example: string;
+}
+
+export interface LogTemplatesResponse {
+  field: string;
+  /** Distinct templates matching the scope, before `limit`. */
+  total_templates: number;
+  templates: LogTemplateRow[];
+}
+
 /** One suspect window in a baseline definition (half-open [start, end)). */
 export interface SuspectWindow {
   id?: string;

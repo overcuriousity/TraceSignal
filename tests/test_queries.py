@@ -141,6 +141,23 @@ def test_routine_collapse_anti_join_is_parameterized(service: EventQueryService)
     assert "motif_occurrences" not in query
 
 
+def test_template_hash_exclusion_is_parameterized_uint64(service: EventQueryService) -> None:
+    """W6: exclude_template_hashes binds a direct predicate on the
+    materialized template_hash column — no aux-table anti-join, and the
+    array is typed UInt64 (not String, since template_hash is a hash)."""
+    service.query(EventQuery(case_id="case-1", exclude_template_hashes=[123, 456]))
+    query, params = _last_query(service)
+    assert "template_hash NOT IN {" in query
+    assert ":Array(UInt64)}" in query
+    assert "motif_occurrences" not in query
+    assert params is not None
+    assert [123, 456] in list(params.values())
+
+    service.query(EventQuery(case_id="case-1"))
+    query, _ = _last_query(service)
+    assert "template_hash NOT IN" not in query
+
+
 def test_source_ids_filter_is_parameterized(service: EventQueryService) -> None:
     """Multiple source_ids use a typed `IN {p:Array(String)}` — source_id is a
     String column, and the bare-column IN form keeps ClickHouse able to use

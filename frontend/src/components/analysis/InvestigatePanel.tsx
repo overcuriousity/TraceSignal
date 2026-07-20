@@ -41,6 +41,7 @@ import { GLOSSARY } from "@/lib/glossary";
 import { DetectorAccordion } from "./DetectorAccordion";
 import { FindingsFeed } from "./FindingsFeed";
 import { PatternsView } from "./PatternsView";
+import { TemplatesView } from "./TemplatesView";
 import { SigmaPanel } from "./SigmaPanel";
 import { BaselineBuilderDrawer } from "./BaselineBuilderDrawer";
 import { NormalValuesList } from "./WindowsNormality";
@@ -90,6 +91,7 @@ export function InvestigatePanel({
   const [tab, setTab] = useState<Tab>(similarAnchor ? "similar" : "anomalies");
   const [normalOpen, setNormalOpen] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [patternsSubTab, setPatternsSubTab] = useState<"sequences" | "templates">("sequences");
 
   const setFrame = useBaselineStore((s) => s.setFrame);
   const markMode = useBaselineStore((s) => s.markMode);
@@ -315,13 +317,41 @@ export function InvestigatePanel({
         )}
 
         {tab === "patterns" && (
-          <PatternsView
-            caseId={caseId}
-            timelineId={timelineId}
-            onSelectEvent={onSelectEvent}
-            onDrillField={onDrillField}
-            onJumpToTime={onJumpToTime}
-          />
+          <div className="space-y-3">
+            <div className="flex gap-1 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] p-0.5 text-xs">
+              {(
+                [
+                  ["sequences", "Sequences"],
+                  ["templates", "Templates"],
+                ] as [typeof patternsSubTab, string][]
+              ).map(([id, label]) => (
+                <button
+                  key={id}
+                  className={cn(
+                    "flex-1 rounded px-2 py-1 font-medium transition-base",
+                    patternsSubTab === id
+                      ? "bg-[var(--color-bg-surface)] text-[var(--color-accent)]"
+                      : "text-[var(--color-fg-muted)] hover:text-[var(--color-fg-secondary)]",
+                  )}
+                  onClick={() => setPatternsSubTab(id)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {patternsSubTab === "sequences" && (
+              <PatternsView
+                caseId={caseId}
+                timelineId={timelineId}
+                onSelectEvent={onSelectEvent}
+                onDrillField={onDrillField}
+                onJumpToTime={onJumpToTime}
+              />
+            )}
+            {patternsSubTab === "templates" && (
+              <TemplatesView caseId={caseId} timelineId={timelineId} onDrillField={onDrillField} />
+            )}
+          </div>
         )}
 
         {tab === "sigma" && (
