@@ -1,6 +1,64 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-20 (session 75 — agent-tool feasibility items + roadmap triage).
+Last updated: 2026-07-20 (session 76 — PR142 review fixes: time fields reach the analyst).
+
+## Session 76 — 2026-07-20: PR142 review fixes — virtual time fields reach the analyst
+
+Review of PR142 (chart proposals + virtual `time:` fields) found the
+analyst-facing half of the feature unwired: `viz/lib/timeFields.ts` was
+generated and imported by nothing, so the Visualize picker showed raw tokens
+and a weekday axis read "1".."7". `viz.py`'s own docstring justifies exposing
+time fields to analysts because "anything the agent can chart the analyst has
+to be able to rebuild by hand" — so this closed that gap rather than deleting
+the generated module.
+
+- **New `viz/lib/fieldDisplay.ts`** — token→label, value→display form, used by
+  the picker, all six charts and the compare editor. The load-bearing rule:
+  only text goes through it; keys, `scaleBand` domains, colour-map keys, sort
+  comparators and click payloads stay on the canonical value, the only form
+  that round-trips into a filter, URL or saved chart.
+- **Three silent-wrong-answer bugs found while wiring it**, each verified to
+  fail against the unfixed code before fixing: `BarChart`'s `sort="value"`
+  ordered by display label (defeating the zero-padding `_time_fields.py` pays
+  for — the axis reordered to `Mon, Sun, Tue, Wed`); `Legend` reports
+  `key ?? label` to click-to-filter and `LineChart` passed no `key`, so
+  clicking "Mon" filtered on a value that cannot exist; and
+  `chartTypesFor(scale)[0]` is the *field-free* `time` histogram for every
+  scale, so a scale switch silently dropped the picked field
+  (`defaultChartTypeForScale` added).
+- **Auto-probe bypass.** A `time:` field's SQL yields zero-padded strings, so
+  `field_numeric_stats` could only ever report `count: 0` — the scan was pure
+  waste and landed the analyst on nominal/bar, contradicting the statically
+  known scale. `VisualizePage` now takes the scale from `TIME_FIELDS`.
+- **Honest field stats.** `describe_field` reported a raw count under
+  `coverage`, which means a 0-1 fraction everywhere else in the API →
+  `non_empty_total`. `viz/fields` claimed `coverage: 1.0` for virtual fields,
+  false whenever a timeline holds undated (sentinel) events → `null`, as is
+  `distinct` for the unbounded date parts. A bounded `time:` pivot axis
+  silently ignored `limit_x`/`limit_y` (53×31 = 1643 cells into the model's
+  context with the limit accepted and never applied) → warns, stops echoing
+  the limit, reports `matrix_size`.
+- **A review finding that was wrong, and reverted.** The legacy `compare_*`
+  shim maps a spec with no `comparison_filters` to `{mode: "off"}`; review
+  called that infidelity, since the retired *backend* validated it as a
+  baseline comparison. A test in PR142 already documented the counter-argument:
+  `specToChartConfig` is what drew the card, and it drew one layer. The card is
+  the artifact, so the translation follows the card. Both sides reverted, the
+  comment extended so the next reader doesn't repeat the mistake.
+- **Compare editor** offers a bounded time field's domain as labelled choices
+  instead of free text, which invited typing "Mon" and building a filter that
+  matches nothing.
+- Smaller: `_capped` gained a floor so clamped `buckets` warns like every other
+  option; `_check_chart_field` accepts the spellings `resolve_time_field`
+  resolves; the field-vocabulary cache uses a `None` sentinel so an empty
+  timeline is cached; `gen_chart_meta.py` emits camelCase `readsOptions` to
+  match `ChartOptions` (snake_case matched no TS key).
+
+Verification: backend 1359 passed, frontend 383 passed (was 346), ruff and
+oxlint clean, `gen_chart_meta.py` regeneration idempotent by hash. Shared test
+helpers extracted (`test/helpers/resizeObserver.ts`, `radix.ts`) — no existing
+test drove a Radix Select, which is why the field-picker page test is new
+ground.
 
 ## Session 75 — 2026-07-20: agent-tool feasibility items + roadmap triage
 
