@@ -148,4 +148,38 @@ describe("AgentPanel turn control", () => {
     await waitFor(() => expect(getInfoMock).toHaveBeenCalled());
     expect(updateToolsMock).not.toHaveBeenCalled();
   });
+
+  it("does not carry one conversation's tool set over to another", async () => {
+    // An unrestricted conversation reports `disabled_tools: null`. Skipping
+    // those when syncing local state left the previous conversation's
+    // restriction in place, and the first toggle PATCHed it onto this one —
+    // silently narrowing the agent's reach with a misleading audit row.
+    const OTHER = "conv2";
+    getConversationMock.mockImplementation((_case: string, id: string) =>
+      Promise.resolve(
+        id === CONV_ID
+          ? { ...conversation({ disabled_tools: ["histogram"] }), messages: [] }
+          : { ...conversation({ id: OTHER, disabled_tools: null }), messages: [] },
+      ),
+    );
+    listConversationsMock.mockResolvedValue({
+      conversations: [conversation(), conversation({ id: OTHER })],
+    });
+
+    renderPanel();
+    await screen.findByTestId("agent-panel");
+    // "histogram" is disabled here, so the popover reports the restriction.
+    await screen.findByText(/applies from the next turn/);
+
+    // Switch to the unrestricted conversation.
+    useAgentStore.getState().setActiveConversation(`${CASE}/${TL}`, OTHER);
+    await waitFor(() =>
+      expect(getConversationMock).toHaveBeenCalledWith(CASE, OTHER),
+    );
+
+    // Local state must follow the new conversation, not keep the old set...
+    await waitFor(() => expect(screen.queryByText(/applies from the next turn/)).toBeNull());
+    // ...and nothing may have been written to either conversation.
+    expect(updateToolsMock).not.toHaveBeenCalled();
+  });
 });

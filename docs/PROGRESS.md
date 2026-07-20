@@ -6,13 +6,28 @@ Last updated: 2026-07-20 (session 74 — agent panel UX fixes).
 
 - **Stop button missing after navigating away.** `_active_turns` was a bare
   set the client never saw, so a reopened panel showed a usable input that
-  409'd on every send. It is now `dict[conversation_id, asyncio.Event]`,
-  surfaced as `active` on every conversation payload (polled while true), and
-  `POST .../cancel` sets the event for the stream loop to break on. Aborting
-  the client fetch alone was never enough — with no output flowing, Starlette
-  may not notice the disconnect for a while and the turn keeps spending
-  tokens. Cancel signals the generator rather than killing the task, so the
-  partial turn is still persisted: a stopped turn stays part of the record.
+  409'd on every send. It is now a dict of per-conversation reservations
+  (cancel `asyncio.Event` + start timestamp), surfaced as `active` on every
+  conversation payload (polled while true), and `POST .../cancel` sets the
+  event for the turn generator to notice. Aborting the client fetch alone was
+  never enough — with no output flowing, Starlette may not notice the
+  disconnect for a while and the turn keeps spending tokens. Cancel signals
+  the generator rather than killing the task, so what the agent already wrote
+  is persisted as a `[stopped]` assistant message: a stopped turn stays part
+  of the record. The stop itself is audited (`agent.turn_cancelled`).
+  - Review of the first cut caught the interesting one: the cancel check
+    started out in the *caller*, which broke out of the turn generator and so
+    closed it with a `GeneratorExit`. That derives from `BaseException`, so
+    neither `except Exception` handler ran and the streamed text was silently
+    dropped — the opposite of the guarantee being advertised. The check moved
+    inside the generator, where a plain `return` persists and unwinds
+    normally. The bug survived the first round of tests because they poked
+    `_active_turns` directly and never drove the generator; there is now a
+    test that actually cancels mid-stream and asserts on the message rows.
+  - A stranded reservation (ASGI task dying between the endpoint reserving
+    and the generator's first step) used to be an invisible 409; now that
+    `active` is user-visible it would have been a permanent Stop button on a
+    dead conversation, so reservations past `_TURN_STALE_AFTER` get pruned.
 - **Tool selector vanished after the first message.** It was gated on
   `!activeId` because the tool set was frozen at creation. New audited
   `PATCH .../conversations/{id}` lets it be adjusted; the change applies from
@@ -20,10 +35,26 @@ Last updated: 2026-07-20 (session 74 — agent panel UX fixes).
   popover always-visible surfaced a latent bug worth noting: its mount-time
   seeding from the user's saved defaults would have overwritten an existing
   conversation's actual tool set *and* persisted that through the new PATCH.
-  Hence `seedFromDefaults`.
+  Hence `seedFromDefaults`. Review turned up the mirror-image leak — an
+  unrestricted conversation reports `disabled_tools: null`, and the local
+  state sync skipped those, so switching conversations kept the *previous*
+  one's restriction and the next toggle PATCHed it onto the new conversation
+  with a misleading audit row. Fixed with `?? []` plus keying the popover on
+  the conversation id. `PATCH` is also a real partial update now: omitting
+  the field no longer clears the tool set.
 - **Panel not resizable.** `panelWidth`/`setPanelWidth` had been sitting
   unused in `stores/agent.ts` — wired up a drag handle copying
   InvestigatePanel's existing pattern verbatim.
+- **Model was free text in the admin settings.** Now a dropdown fed by
+  `POST /api/admin/agent-settings/models`, which reuses the availability
+  probe's `GET /models` request (`availability.py::list_models` — same
+  per-provider URL and Kimi auth quirks). It takes the *unsaved* form
+  credentials so an endpoint's models show before committing it, falling back
+  to the resolved config for the key, which the browser never holds. Env-pinned
+  fields are deliberately not overridable per request: redirecting
+  `api_base_url` while the key stays pinned would ship a key this API never
+  discloses to a caller-chosen host. Free text remains the fallback whenever
+  the listing is empty, and stays reachable for models a listing omits.
 - **Finding filters were transient.** "Apply to Explorer" only writes the
   URL, so a useful filter set died with the conversation. Finding cards now
   also save one as a View via the Explorer's own `SaveViewDialog`.

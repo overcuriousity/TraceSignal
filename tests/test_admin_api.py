@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from tests.conftest import as_admin, login
@@ -253,6 +254,143 @@ def test_agent_settings_requires_admin(client, admin_bootstrap, store):
     login(plain_client, "plainagent", "abcdefgh12")
     assert plain_client.get("/api/admin/agent-settings").status_code == 403
     assert plain_client.put("/api/admin/agent-settings", json={"model": "x"}).status_code == 403
+
+
+def _unpinned_agent_config(monkeypatch):
+    """Pin the resolved config to a known, env-free baseline.
+
+    A developer `.env` can pin agent fields, which would otherwise make the
+    override assertions here depend on the machine running the tests.
+    """
+    from vestigo.agent.config import AgentConfig
+    from vestigo.api.routers import admin as admin_router
+
+    config = AgentConfig(
+        model=None,
+        provider="openai",
+        api_base_url=None,
+        api_key=None,
+        user_agent=None,
+        extra_headers=None,
+        max_turns=15,
+        reasoning_effort="off",
+        sources={},
+    )
+
+    async def _resolved(*args, **kwargs):
+        return config
+
+    monkeypatch.setattr(admin_router, "resolve_agent_config", _resolved)
+    return config
+
+
+def test_agent_models_lists_ids_from_the_endpoint(client, admin_bootstrap, store, monkeypatch):
+    """The model picker's source: ids parsed out of the endpoint's listing."""
+    seen: dict[str, object] = {}
+
+    async def fake_get_models(config):
+        seen["base_url"] = config.api_base_url
+        seen["api_key"] = config.api_key
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "gpt-4o-mini"}, {"id": "gpt-4o"}, {"id": "gpt-4o"}]},
+        )
+
+    monkeypatch.setattr(availability, "_get_models", fake_get_models)
+    _unpinned_agent_config(monkeypatch)
+    as_admin(client, admin_bootstrap)
+
+    resp = client.post(
+        "/api/admin/agent-settings/models",
+        json={"api_base_url": "http://llm.example/v1", "api_key": "sk-typed"},
+    )
+    assert resp.status_code == 200
+    # Deduped and sorted.
+    assert resp.json()["models"] == ["gpt-4o", "gpt-4o-mini"]
+    # Unsaved form values are what got probed — the whole point is seeing an
+    # endpoint's models before committing it.
+    assert seen["base_url"] == "http://llm.example/v1"
+    assert seen["api_key"] == "sk-typed"
+
+
+def test_agent_models_empty_when_endpoint_gives_nothing(
+    client, admin_bootstrap, store, monkeypatch
+):
+    """Unreachable, unparseable, or listing-free endpoints all degrade to the
+    free-text fallback rather than surfacing an error."""
+    as_admin(client, admin_bootstrap)
+
+    async def unreachable(config):
+        return None
+
+    monkeypatch.setattr(availability, "_get_models", unreachable)
+    resp = client.post("/api/admin/agent-settings/models", json={})
+    assert resp.status_code == 200
+    assert resp.json()["models"] == []
+
+    async def not_a_listing(config):
+        return httpx.Response(200, json={"object": "list"})
+
+    monkeypatch.setattr(availability, "_get_models", not_a_listing)
+    assert client.post("/api/admin/agent-settings/models", json={}).json()["models"] == []
+
+    async def not_json(config):
+        return httpx.Response(200, content=b"<html>nope</html>")
+
+    monkeypatch.setattr(availability, "_get_models", not_json)
+    assert client.post("/api/admin/agent-settings/models", json={}).json()["models"] == []
+
+
+def test_agent_models_ignores_overrides_for_env_pinned_fields(
+    client, admin_bootstrap, store, monkeypatch
+):
+    """An env-pinned field is not overridable per-request.
+
+    Otherwise redirecting `api_base_url` while the key stays env-pinned would
+    ship the operator's key — which this API never discloses — to a host the
+    caller picked.
+    """
+    import dataclasses
+
+    seen: dict[str, object] = {}
+
+    async def fake_get_models(config):
+        seen["base_url"] = config.api_base_url
+        seen["api_key"] = config.api_key
+        return httpx.Response(200, json={"data": []})
+
+    monkeypatch.setattr(availability, "_get_models", fake_get_models)
+    base = _unpinned_agent_config(monkeypatch)
+    pinned = dataclasses.replace(
+        base,
+        api_base_url="http://pinned.example/v1",
+        api_key="sk-env-secret",
+        sources={"api_base_url": "env", "api_key": "env"},
+    )
+
+    async def _resolved(*args, **kwargs):
+        return pinned
+
+    from vestigo.api.routers import admin as admin_router
+
+    monkeypatch.setattr(admin_router, "resolve_agent_config", _resolved)
+    as_admin(client, admin_bootstrap)
+
+    client.post(
+        "/api/admin/agent-settings/models",
+        json={"api_base_url": "http://attacker.example/v1"},
+    )
+    assert seen["base_url"] == "http://pinned.example/v1"
+    assert seen["api_key"] == "sk-env-secret"
+
+
+def test_agent_models_requires_admin(client, admin_bootstrap, store):
+    as_admin(client, admin_bootstrap)
+    client.post("/api/admin/users", json={"username": "plainmodels", "password": "abcdefgh12"})
+
+    plain_client = client.__class__(client.app)
+    login(plain_client, "plainmodels", "abcdefgh12")
+    assert plain_client.post("/api/admin/agent-settings/models", json={}).status_code == 403
 
 
 def test_agent_settings_get_masks_key(client, admin_bootstrap, store):

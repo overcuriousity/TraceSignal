@@ -170,6 +170,42 @@ export function AdminAgentPage() {
   const [clearApiKey, setClearApiKey] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<"reachable" | "unreachable" | null>(null);
+  /** Free-text model entry: forced when the endpoint offers no listing, opt-in
+   * otherwise (a model the listing omits is still a legitimate value). */
+  const [customModel, setCustomModel] = useState(false);
+
+  // Debounced so typing a base URL doesn't fire a request per keystroke at a
+  // half-written host.
+  const [modelQueryCreds, setModelQueryCreds] = useState({ api_base_url: "", api_key: "" });
+  useEffect(() => {
+    const id = setTimeout(
+      () => setModelQueryCreds({ api_base_url: form.api_base_url, api_key: apiKeyInput }),
+      600,
+    );
+    return () => clearTimeout(id);
+  }, [form.api_base_url, apiKeyInput]);
+
+  // The key is only sent when the admin typed a new one; otherwise the backend
+  // falls back to the stored/env-pinned key, which the browser never holds.
+  // An env-pinned model can't be changed here, so don't bother the endpoint.
+  const canListModels =
+    !!modelQueryCreds.api_base_url &&
+    (!!modelQueryCreds.api_key || !!data?.effective.api_key_set) &&
+    data?.sources.model !== "env";
+  const modelsQuery = useQuery({
+    queryKey: ["admin", "agent-models", modelQueryCreds, form.provider],
+    queryFn: () =>
+      adminApi.listAgentModels({
+        api_base_url: modelQueryCreds.api_base_url,
+        provider: form.provider || undefined,
+        ...(modelQueryCreds.api_key ? { api_key: modelQueryCreds.api_key } : {}),
+      }),
+    enabled: canListModels,
+    // The operator's own endpoint, but still a network call — don't re-poll it.
+    staleTime: 5 * 60 * 1000,
+    retry: false,
+  });
+  const models = modelsQuery.data?.models ?? [];
 
   useEffect(() => {
     if (!data) return;
@@ -275,12 +311,59 @@ export function AdminAgentPage() {
 
       <div className="space-y-3">
         <Field label="Model" pinnedBadge={pinnedBadge("model")}>
-          <Input
-            value={form.model}
-            disabled={isEnvPinned("model")}
-            onChange={(e) => set("model")(e.target.value)}
-            placeholder="gpt-4o-mini"
-          />
+          {/* A dropdown only once the endpoint has actually listed something.
+              Free text is the fallback whenever it hasn't — no listing, an
+              unreachable endpoint, or credentials not filled in yet — and
+              stays reachable via "Enter manually" for models a listing omits. */}
+          {isEnvPinned("model") || customModel || models.length === 0 ? (
+            <Input
+              value={form.model}
+              disabled={isEnvPinned("model")}
+              onChange={(e) => set("model")(e.target.value)}
+              placeholder="gpt-4o-mini"
+            />
+          ) : (
+            <Select value={form.model || undefined} onValueChange={(v) => set("model")(v)}>
+              <SelectTrigger>
+                <SelectValue placeholder="Select model" />
+              </SelectTrigger>
+              <SelectContent>
+                {/* A saved model the endpoint no longer lists still has to be
+                    selectable, or opening the dropdown would silently drop it. */}
+                {(models.includes(form.model) || !form.model ? models : [form.model, ...models]).map(
+                  (m) => (
+                    <SelectItem key={m} value={m}>
+                      {m}
+                    </SelectItem>
+                  ),
+                )}
+              </SelectContent>
+            </Select>
+          )}
+          {!isEnvPinned("model") && (
+            <p className="mt-1 flex items-center gap-1.5 text-[11px] text-[var(--color-fg-muted)]">
+              {modelsQuery.isFetching ? (
+                <>
+                  <Spinner size={10} /> Loading models from the endpoint…
+                </>
+              ) : models.length > 0 ? (
+                <>
+                  {models.length} model{models.length === 1 ? "" : "s"} from the endpoint.{" "}
+                  <button
+                    type="button"
+                    className="underline hover:text-[var(--color-fg-primary)]"
+                    onClick={() => setCustomModel((c) => !c)}
+                  >
+                    {customModel ? "Choose from the list" : "Enter manually"}
+                  </button>
+                </>
+              ) : canListModels ? (
+                <>The endpoint listed no models — enter the name manually.</>
+              ) : (
+                <>Set the API base URL and key to load the endpoint&rsquo;s model list.</>
+              )}
+            </p>
+          )}
         </Field>
 
         <Field label="Provider" pinnedBadge={pinnedBadge("provider")}>

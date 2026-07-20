@@ -76,7 +76,9 @@ type ChatItem =
     }
   | { kind: "chart"; title: string; description: string; spec: AgentChartSpec }
   | { kind: "proposal"; proposalId: string }
-  | { kind: "error"; detail: string };
+  | { kind: "error"; detail: string }
+  /** Something happened that isn't a failure — a turn the analyst stopped. */
+  | { kind: "notice"; detail: string };
 
 interface ProposeChartArgs {
   title?: string;
@@ -288,7 +290,7 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
     // Flush whatever streamed before the stop — the partial turn is persisted
     // server-side, so dropping it here would make the live view disagree with
     // the record on reload.
-    return { ...s, items: [...flushed, { kind: "error", detail: "Turn stopped." }], liveText: "" };
+    return { ...s, items: [...flushed, { kind: "notice", detail: "Turn stopped." }], liveText: "" };
   }
   if (e.type === "error") {
     return { ...s, items: [...flushed, { kind: "error", detail: e.detail }], liveText: "" };
@@ -379,8 +381,9 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
     enabled: !!activeId,
     // A turn started in another tab (or before this panel was reopened) is
     // only visible via `active`, and nothing pushes that to us — so poll
-    // while one is running. Once idle, the query goes quiet again.
-    refetchInterval: (q) => (q.state.data?.active ? 2000 : false),
+    // while one is running. Not while *this* panel streams: it already has
+    // the turn's events first-hand. Once idle, the query goes quiet again.
+    refetchInterval: (q) => (q.state.data?.active && !streaming ? 2000 : false),
   });
 
   // A turn is running that this panel is not itself streaming: the analyst
@@ -544,9 +547,16 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
   // one is active it edits that conversation (audited server-side, effective
   // from the next turn). Seeded from the conversation so reopening the panel
   // shows what is actually in force, not a stale local guess.
+  // `?? []`, not a truthiness check: an unrestricted conversation reports
+  // `null`, and skipping those would leave the *previous* conversation's
+  // restriction in local state — which the next toggle would then PATCH onto
+  // this one, silently narrowing it and writing a misleading audit row.
   const conversationTools = conversationQuery.data?.disabled_tools;
   useEffect(() => {
-    if (activeId && conversationTools) setDisabledTools(conversationTools);
+    if (activeId) setDisabledTools(conversationTools ?? []);
+    // No active conversation: back to a clean slate for the next create. The
+    // popover remounts (see its `key`) and re-seeds from the user's defaults.
+    else setDisabledTools([]);
   }, [activeId, conversationTools]);
 
   const toolsMutation = useMutation({
@@ -590,6 +600,8 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
         onMouseDown={onDragStart}
         className="absolute left-0 top-0 z-10 h-full w-1 cursor-col-resize opacity-0 transition-opacity hover:bg-[var(--color-accent)] hover:opacity-100"
         style={{ marginLeft: -2 }}
+        role="separator"
+        aria-orientation="vertical"
         aria-label="Resize agent panel"
       />
 
@@ -781,6 +793,13 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
               />
             );
           }
+          if (item.kind === "notice") {
+            return (
+              <p key={i} className="px-1 text-xs italic text-[var(--color-fg-muted)]">
+                {item.detail}
+              </p>
+            );
+          }
           return (
             <p key={i} className="px-1 text-xs text-[var(--color-danger)]">
               {item.detail}
@@ -797,7 +816,11 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
       {/* Input */}
       <div className="shrink-0 border-t border-[var(--color-border)] p-2">
         <div className="mb-1.5 flex items-center gap-2">
+          {/* Keyed so switching conversations (or starting a new one)
+              remounts it: `seededRef` inside is mount-scoped, so without this
+              a new chat would never re-seed from the user's saved defaults. */}
           <ToolSelectorPopover
+            key={activeId ?? "new"}
             disabledTools={disabledTools}
             onChange={handleToolsChange}
             seedFromDefaults={!activeId}

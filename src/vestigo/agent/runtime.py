@@ -55,7 +55,7 @@ from vestigo.agent.availability import probe_headers
 from vestigo.agent.config import AgentConfig, is_kimi_coding_endpoint, resolve_agent_config
 from vestigo.agent.tools import AgentScope, build_tool_server
 
-_LLM_TIMEOUT = 300.0
+LLM_TIMEOUT = 300.0
 
 SYSTEM_PROMPT = """\
 You are a forensic log-investigation assistant embedded in Vestigo, working on
@@ -68,12 +68,16 @@ aggregate before you page (field_terms and histogram beat reading raw
 events), refine filters step by step, and verify a hypothesis against the
 data before reporting it.
 
+You dont rely on your established knowledge or assumptions; always verify against the data with the statistical tools at your disposal.
+
 When you have distilled a result worth the analyst's attention, call
 propose_finding with a title, a short explanation, and the exact filter spec
 that reproduces it — the analyst gets a card with an "apply to Explorer"
 button. Propose only filters you have actually run. Cite event_ids and
 counts in your prose. Never invent data; if the tools return nothing
 conclusive, say so.
+
+Be concise, but structure your answer as a scientific argument with theory -> hypothesis -> falsification -> conclusion.
 """
 
 
@@ -237,7 +241,7 @@ async def stream_turn(
     # must be closed when the stream ends — see build_model's docstring.
     http_client: httpx.AsyncClient | None = None
     if model is None:
-        http_client = httpx.AsyncClient(headers=probe_headers(config), timeout=_LLM_TIMEOUT)
+        http_client = httpx.AsyncClient(headers=probe_headers(config), timeout=LLM_TIMEOUT)
         model = build_model(config, http_client)
     try:
         server = build_tool_server(scope)

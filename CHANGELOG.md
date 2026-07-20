@@ -12,12 +12,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Stop a running agent turn** — a turn that is still running when you close
   the panel or navigate away is now visible when you come back, with a Stop
   button that actually cancels it server-side instead of only dropping your
-  own stream. The partial turn is still recorded.
+  own stream. Whatever the agent had already written is kept, marked
+  `[stopped]`, and who stopped it is recorded in the audit trail.
 - **Agent tool selection stays editable** — the tool popover no longer
   disappears once a conversation starts; changing it now adjusts that
   conversation (from the next turn onward) and is written to the audit trail.
 - **Resizable agent panel** — drag its left edge, same as the Investigate and
   event-detail panels. The width persists.
+- **Model picker in the agent admin settings** — once the API base URL and key
+  are set, the model field becomes a dropdown populated from the endpoint's own
+  model listing instead of a name typed from memory. Free-text entry remains the
+  fallback when an endpoint offers no listing, and stays available for models a
+  listing omits.
 - **Save an agent finding as a View** — finding cards get a save action
   alongside "Apply to Explorer", so a filter set worth keeping lands in the
   left-hand Views panel instead of dying with the conversation.

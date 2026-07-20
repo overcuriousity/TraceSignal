@@ -108,19 +108,37 @@ frontend AgentPanel ──POST /messages (SSE)──► api/routers/agent.py
 - One turn at a time per conversation: a POST while another turn is
   streaming gets a 409 (`_active_turns` in `api/routers/agent.py`) —
   concurrent turns would race on the conversation's replayable `history`.
-  `_active_turns` maps each conversation to that turn's `asyncio.Event`, and
-  the live state is surfaced as `active` on every conversation payload, so a
-  panel that was closed or navigated away from mid-turn shows a working Stop
-  instead of an input that silently 409s.
-- **Stop is server-side.** `POST .../{id}/cancel` sets the turn's event; the
-  stream loop checks it between chunks and breaks. Aborting the client's SSE
-  fetch alone is not enough: with no output flowing (a long tool call, a slow
-  model) Starlette may not notice the disconnect for a while and the turn
-  keeps spending tokens. Cancelling signals the generator rather than killing
-  the task, so the inner `finally` still persists the partial turn — a
-  stopped turn stays part of the record. Idempotent: cancelling an idle
-  conversation reports `cancelled: false` rather than erroring, since the
-  client is always racing the turn's own completion.
+  `_active_turns` maps each conversation to that turn's reservation (a cancel
+  `asyncio.Event` plus a start timestamp), and the live state is surfaced as
+  `active` on every conversation payload, so a panel that was closed or
+  navigated away from mid-turn shows a working Stop instead of an input that
+  silently 409s. The reservation is taken before the `StreamingResponse` is
+  returned and released by the generator's `finally`; a reservation older than
+  `_TURN_STALE_AFTER` (`LLM_TIMEOUT × DEFAULT_MAX_TURNS`, the worst case a turn
+  can legitimately take) is treated as stranded and pruned, so an ASGI task
+  that died before the generator's first step can't leave a conversation
+  permanently "running".
+- **Stop is server-side.** `POST .../{id}/cancel` sets the turn's cancel event;
+  `_message_stream_inner` checks it as it streams and returns. Aborting the
+  client's SSE fetch alone is not enough: with no output flowing (a long tool
+  call, a slow model) Starlette may not notice the disconnect for a while and
+  the turn keeps spending tokens.
+  - **What a stop persists.** The text streamed before the stop is written as
+    an assistant message tagged `[stopped]`, exactly as the interrupt paths
+    write `[interrupted]`. Like those, it does *not* enter the replayable
+    `history` blob — `stream_turn` only hands back `new_messages` on its
+    terminal `result` event, so a turn that never got there has no history
+    contribution to make.
+  - **When it takes effect.** At the next streamed event, and always before
+    the next model request. A tool call already in flight runs to completion
+    first. The check deliberately lives *inside* the turn generator: breaking
+    out of it from the caller would close it with a `GeneratorExit`, which —
+    deriving from `BaseException` — no `except Exception` catches, silently
+    discarding the streamed text instead of persisting it.
+  - Idempotent: cancelling an idle conversation reports `cancelled: false`
+    rather than erroring, since the client is always racing the turn's own
+    completion. A real cancel is audited as `agent.turn_cancelled` — a stop
+    truncates the record, so who did it has to stay recoverable.
 - The analyst's current Explorer filters ride along with each message and are
   injected as context, so "filter what I'm looking at further" works.
 
@@ -284,9 +302,20 @@ The popover's behavior depends on whether a conversation exists yet:
   is load-bearing here — without it the mount-time seeding would replace the
   analyst's actual restriction with their defaults and persist that.
 
+Two details keep one conversation's restriction from leaking onto another:
+the panel syncs local state with `conversationTools ?? []` (an unrestricted
+conversation reports `null`, and skipping those would strand the previous
+conversation's set, which the next toggle would then `PATCH` onto this one),
+and the popover is keyed on the conversation id so it remounts — its
+`seededRef` is mount-scoped, so without that a new chat would never re-seed
+from the user's defaults.
+
 A change applies from the **next turn** (the turn reads
 `conversation.disabled_tools` fresh on every send); it never rewrites what
-earlier turns were allowed to do. `PATCH` is audited as
+earlier turns were allowed to do. `PATCH` is a genuine partial update —
+omitting `disabled_tools` leaves it alone, since `[]` already means
+"re-enable everything" and a silent widening of the agent's reach would be
+the worst possible default. It is audited as
 `agent.conversation_tools_changed` with before/after lists: the row carries
 only the current restriction, so who narrowed the agent's reach and when has
 to live in the audit trail for the record to stay readable afterwards.
@@ -354,6 +383,31 @@ The DB-stored key is plaintext at rest; `VESTIGO_AGENT_SECRET_MODE=env-only` (A1
 PUT refuse key storage (400) and the resolver ignore any previously stored key, so
 `VESTIGO_AGENT_API_KEY` is the only source — clearing a leftover stored key stays allowed.
 The response's `secret_mode` field drives the UI's disabled key input in that mode.
+
+#### Model picker
+
+`POST /api/admin/agent-settings/models` (admin-only) returns the model ids the
+configured endpoint advertises, so the model field can be a dropdown rather than a
+name typed from memory. It reuses the availability probe's `GET /models` request —
+same per-provider URL and Kimi auth quirks (`agent/availability.py::list_models`),
+parsing the `{"data": [{"id": ...}]}` shape both protocols return.
+
+- It takes the **unsaved** form credentials, because the point is seeing an endpoint's
+  models before committing them. Omitted fields fall back to the resolved config, which
+  is how it works at all for a key that is env-pinned or already stored — the browser
+  never holds those.
+- **Env-pinned fields are not overridable per request.** Beyond matching the PUT
+  endpoint, this closes a path the pin would otherwise leave open: overriding
+  `api_base_url` while the key stays env-pinned would ship the operator's key — which
+  this API never discloses — to a host the caller chose.
+- It always returns 200. Unreachable, auth-rejected, unparseable, and listing-free
+  endpoints all yield `[]`, and the UI falls back to free-text entry — which also stays
+  reachable via "Enter manually" for a model the listing omits, and preserves a saved
+  model the endpoint no longer lists. Nothing is persisted and the probe cache is
+  untouched.
+- Like the availability probe, this reaches the network only on an admin's action and
+  only to the operator's own configured endpoint (`TECH_STACK.md` §6). The frontend
+  debounces it so typing a base URL doesn't fire a request per keystroke.
 Resolved configs are cached per-fingerprint (hash of the resolved values) so admin edits
 take effect on the next call without a process restart, and `PUT` resets the availability
 probe cache so a following health check re-probes immediately.

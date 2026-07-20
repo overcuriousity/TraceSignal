@@ -82,7 +82,8 @@ def _models_probe_url(config: AgentConfig) -> str:
     return f"{base}/models"
 
 
-async def _probe(config: AgentConfig) -> bool:
+def _models_headers(config: AgentConfig) -> dict[str, str]:
+    """Headers for the model-listing request, including auth."""
     headers = probe_headers(config)
     if config.api_key:
         if config.provider == "anthropic":
@@ -96,17 +97,55 @@ async def _probe(config: AgentConfig) -> bool:
                 headers.setdefault("Authorization", f"Bearer {config.api_key}")
         else:
             headers.setdefault("Authorization", f"Bearer {config.api_key}")
+    return headers
+
+
+async def _get_models(config: AgentConfig) -> httpx.Response | None:
+    """GET the model-listing endpoint. None means it did not answer usably."""
     url = _models_probe_url(config)
     try:
         async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT) as client:
-            response = await client.get(url, headers=headers)
+            response = await client.get(url, headers=_models_headers(config))
     except httpx.HTTPError as exc:
         logger.warning("Agent endpoint probe failed (%s): %s", url, exc)
-        return False
+        return None
     if response.status_code >= 400:
         logger.warning("Agent endpoint probe got HTTP %s from %s", response.status_code, url)
-        return False
-    return True
+        return None
+    return response
+
+
+async def list_models(config: AgentConfig) -> list[str]:
+    """Model ids the configured endpoint advertises, best-effort.
+
+    Both the OpenAI-compatible and Anthropic listings are ``{"data": [{"id":
+    ...}]}``, so one shape covers both. Every failure — unreachable, auth
+    rejected, unparseable, or an endpoint that simply serves no listing —
+    collapses to an empty list: the caller's fallback is free-text model
+    entry, so there is nothing useful to distinguish here.
+    """
+    response = await _get_models(config)
+    if response is None:
+        return []
+    try:
+        body = response.json()
+    except ValueError:
+        logger.warning("Agent model listing was not JSON (%s)", _models_probe_url(config))
+        return []
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, list):
+        return []
+    models = {
+        entry["id"]
+        for entry in data
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str) and entry["id"]
+    }
+    return sorted(models)
+
+
+async def _probe(config: AgentConfig) -> bool:
+    """The availability probe: the endpoint answering its listing at all."""
+    return (await _get_models(config)) is not None
 
 
 async def _refresh_cache(config: AgentConfig, fingerprint: str) -> None:

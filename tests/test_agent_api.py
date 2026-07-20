@@ -733,6 +733,15 @@ def test_send_message_persists_and_streams_token_usage(
     assert assistant.completion_tokens and assistant.completion_tokens > 0
 
 
+def _reserve_turn(agent_router, conversation_id: str, *, age: float = 0.0):
+    """Fake the reservation `send_message` makes, optionally already aged."""
+    from time import monotonic
+
+    turn = agent_router._ActiveTurn(cancel=asyncio.Event(), started=monotonic() - age)
+    agent_router._active_turns[conversation_id] = turn
+    return turn
+
+
 def test_active_flag_reflects_a_running_turn(client, admin_bootstrap, agent_on):
     """`active` is what lets a reopened panel show a working Stop instead of a
     dead input — it must track the in-flight reservation, not a column."""
@@ -750,7 +759,7 @@ def test_active_flag_reflects_a_running_turn(client, admin_bootstrap, agent_on):
     ).json()["conversations"]
     assert listed[0]["active"] is False
 
-    agent_router._active_turns[conversation["id"]] = asyncio.Event()
+    _reserve_turn(agent_router, conversation["id"])
     try:
         one = client.get(f"/api/cases/{case_id}/agent/conversations/{conversation['id']}").json()
         assert one["active"] is True
@@ -777,13 +786,19 @@ def test_cancel_sets_the_turn_event_and_is_idempotent(client, admin_bootstrap, a
     # Idle: reports nothing to cancel rather than 404/409.
     assert client.post(url).json() == {"cancelled": False}
 
-    event = asyncio.Event()
-    agent_router._active_turns[conversation["id"]] = event
+    turn = _reserve_turn(agent_router, conversation["id"])
     try:
         assert client.post(url).json() == {"cancelled": True}
-        assert event.is_set()
+        assert turn.cancel.is_set()
     finally:
         agent_router._active_turns.pop(conversation["id"], None)
+
+    # A stop truncates the record, so it has to be attributable afterwards.
+    audit = client.get("/api/admin/audit", params={"action": "agent.turn_cancelled"}).json()[
+        "audit"
+    ]
+    assert len(audit) == 1
+    assert audit[0]["target_id"] == conversation["id"]
 
 
 def test_patch_conversation_tools_updates_and_audits(client, admin_bootstrap, agent_on):
@@ -816,6 +831,96 @@ def test_patch_conversation_tools_updates_and_audits(client, admin_bootstrap, ag
     assert audit[1]["detail"]["disabled_tools_after"] == ["field_terms", "histogram"]
 
 
+def test_patch_conversation_without_tools_leaves_them_alone(client, admin_bootstrap, agent_on):
+    """Omitting the field means "no change", not "clear" — a PATCH that says
+    nothing about tools must not silently widen the agent's reach."""
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations",
+        json={"timeline_id": timeline_id, "disabled_tools": ["histogram"]},
+    ).json()
+    url = f"/api/cases/{case_id}/agent/conversations/{conversation['id']}"
+
+    assert client.patch(url, json={}).json()["disabled_tools"] == ["histogram"]
+    assert client.get(url).json()["disabled_tools"] == ["histogram"]
+    # A no-op must not manufacture an audit row either.
+    audit = client.get(
+        "/api/admin/audit", params={"action": "agent.conversation_tools_changed"}
+    ).json()["audit"]
+    assert audit == []
+
+
+def test_stranded_turn_reservation_expires(client, admin_bootstrap, agent_on):
+    """`send_message` reserves before the generator starts, so a reservation can
+    strand if the ASGI task dies in between. Without an age ceiling that
+    conversation would 409 forever and show a Stop button that does nothing."""
+    from vestigo.api.routers import agent as agent_router
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+    url = f"/api/cases/{case_id}/agent/conversations/{conversation['id']}"
+
+    _reserve_turn(agent_router, conversation["id"], age=agent_router._TURN_STALE_AFTER + 1)
+    try:
+        assert client.get(url).json()["active"] is False
+        # ...and the entry is pruned, so the conversation is usable again.
+        assert conversation["id"] not in agent_router._active_turns
+        assert client.post(f"{url}/cancel").json() == {"cancelled": False}
+    finally:
+        agent_router._active_turns.pop(conversation["id"], None)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_turn_persists_what_streamed(store, monkeypatch):
+    """A stopped turn stays part of the record.
+
+    The cancel check has to live *inside* the turn generator: signalling it
+    from the caller and breaking out closes the generator with a
+    ``GeneratorExit``, which — deriving from ``BaseException`` — no ``except
+    Exception`` catches, so the streamed text would vanish.
+    """
+    from vestigo.api.routers import agent as agent_router
+
+    await store.init_schema()
+    user = await store.create_user("u1", "analyst", is_admin=True)
+    case = await store.create_case("c1", "Case 1", owner_id=user.id)
+    timeline = await store.create_timeline(case.id, "tl1", "Timeline 1", source_ids=[])
+    conversation = await store.create_agent_conversation(
+        case.id, timeline.id, user.id, model_id="stub:stub"
+    )
+
+    turn = _reserve_turn(agent_router, conversation.id)
+
+    async def fake_stream_turn(scope, *, user_text, history, view_filters=None):
+        yield {"type": "text_delta", "text": "partial "}
+        yield {"type": "text_delta", "text": "answer"}
+        turn.cancel.set()  # analyst hits Stop mid-turn
+        yield {"type": "text_delta", "text": "never streamed"}
+        raise AssertionError("the turn should have stopped before this")
+
+    monkeypatch.setattr(agent_router, "stream_turn", fake_stream_turn)
+
+    payload = agent_router.SendMessageRequest(content="look into this")
+    chunks = [
+        chunk async for chunk in agent_router._message_stream(case.id, conversation, payload, user)
+    ]
+
+    events = [json.loads(c.removeprefix("data: ").strip()) for c in chunks]
+    assert events[-1] == {"type": "cancelled"}
+    # The reservation is released, so the conversation is usable again.
+    assert conversation.id not in agent_router._active_turns
+
+    messages = await store.list_agent_messages(conversation.id)
+    assistant = [m for m in messages if m.role == "assistant"]
+    assert len(assistant) == 1
+    # Marked, and carrying exactly what streamed before the stop.
+    assert assistant[0].content == "partial answer [stopped]"
+
+
 def test_patch_conversation_rejects_unknown_tool(client, admin_bootstrap, agent_on):
     as_admin(client, admin_bootstrap)
     case_id, timeline_id = _make_case_and_timeline(client)
@@ -842,9 +947,7 @@ def test_send_message_409_while_turn_active(client, admin_bootstrap, agent_on, m
     url = f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages"
 
     # Simulate an in-flight turn: the reservation is what send_message checks.
-    import asyncio
-
-    agent_router._active_turns[conversation["id"]] = asyncio.Event()
+    _reserve_turn(agent_router, conversation["id"])
     try:
         resp = client.post(url, json={"content": "hello"})
         assert resp.status_code == 409

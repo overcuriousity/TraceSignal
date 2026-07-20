@@ -87,4 +87,13 @@ export const adminApi = {
 
   putAgentSettings: (patch: Record<string, unknown>) =>
     put<AgentSettingsResponse>("/admin/agent-settings", patch),
+
+  /** Model ids the configured LLM endpoint advertises, for the model picker.
+   * Takes the *unsaved* credentials so an admin sees an endpoint's models
+   * before committing them; omitted fields fall back to what is already
+   * configured (the key is never sent back to the browser, so it usually is).
+   * Never errors on an unreachable endpoint — an empty list means "fall back
+   * to free-text entry". */
+  listAgentModels: (creds: { api_base_url?: string; api_key?: string; provider?: string }) =>
+    post<{ models: string[] }>("/admin/agent-settings/models", creds),
 };
