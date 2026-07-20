@@ -21,6 +21,12 @@ beforeAll(() => {
 const listConversationsMock = vi.fn();
 const getConversationMock = vi.fn();
 const listProposalsMock = vi.fn();
+// The panel's OPSEC notice and the tool popover share one `agent-info` query;
+// stubbed here so it resolves instead of failing into react-query's error path.
+const getInfoMock = vi.fn().mockResolvedValue({
+  api_base_url: "https://llm.example",
+  model: "test-model",
+});
 
 vi.mock("@/api/agent", async () => {
   const actual = await vi.importActual<typeof import("@/api/agent")>("@/api/agent");
@@ -30,6 +36,7 @@ vi.mock("@/api/agent", async () => {
       listConversations: (...args: unknown[]) => listConversationsMock(...args),
       getConversation: (...args: unknown[]) => getConversationMock(...args),
       listProposals: (...args: unknown[]) => listProposalsMock(...args),
+      getInfo: (...args: unknown[]) => getInfoMock(...args),
     },
   };
 });

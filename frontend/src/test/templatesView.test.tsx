@@ -163,4 +163,60 @@ describe("TemplatesView", () => {
     fireEvent.click(filterButtons[0]);
     expect(onDrillField).toHaveBeenCalledWith("template_id", "111");
   });
+
+  it("offers no mute action for a non-message field", async () => {
+    // The grid's collapse predicate only knows the message template hash, so
+    // an attr:* shape has nothing to collapse — browsing stays, muting goes.
+    fieldsMock.mockResolvedValue({ fields: [{ token: "attr:raw_line" }] });
+    renderView();
+    await screen.findByText(/Allow TCP/);
+    expect(screen.getAllByTitle(/^Mute:/).length).toBe(2);
+
+    fireEvent.change(screen.getByDisplayValue("Message"), { target: { value: "attr:raw_line" } });
+    await waitFor(() =>
+      expect(screen.getAllByTitle(/only available for Message templates/).length).toBe(2),
+    );
+    expect(screen.queryByTitle(/^Mute:/)).toBeNull();
+  });
+
+  it("lists a muted template that has fallen off the current page, using its snapshot", async () => {
+    // Muted shapes are driven by the dispositions, not the listing — otherwise
+    // a mute outside the top-N would be impossible to reverse from this tab.
+    dispositionsListMock.mockResolvedValue({
+      dispositions: [
+        {
+          id: "d9",
+          case_id: CASE,
+          timeline_id: TL,
+          kind: "routine",
+          detector: "log_template",
+          field: "template_id",
+          value: "999",
+          source_id: null,
+          event_id: null,
+          note: null,
+          details: {
+            template: "Rotated log segment <NUM>",
+            template_version: 1,
+            count_at_mute: 4200,
+          },
+          created_by: null,
+          created_at: null,
+        },
+      ],
+    });
+    renderView();
+    await screen.findByText(/Muted templates \(1\)/);
+    expect(screen.getByText(/Rotated log segment/)).toBeTruthy();
+    // The count comes from details.count_at_mute and is labelled as a snapshot,
+    // since the shape is not on the current page to re-count.
+    // toLocaleString is locale-dependent (4,200 / 4.200), so match on the
+    // digits and the "at mute" label rather than a fixed separator.
+    expect(screen.getByTitle(/Count recorded when this template was muted/).textContent).toMatch(
+      /4.200 at mute/,
+    );
+
+    fireEvent.click(screen.getByTitle(/^Unmute/));
+    await waitFor(() => expect(dispositionsRemoveMock).toHaveBeenCalledWith(CASE, TL, "d9"));
+  });
 });

@@ -426,7 +426,9 @@ async def test_field_scatter_clamps_limit(store, monkeypatch):
     fake = _patch_viz_service(monkeypatch)
     server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
     await _call(
-        server, "field_scatter", {"field_x": "attr:bytes", "field_y": "attr:latency", "limit": 20000}
+        server,
+        "field_scatter",
+        {"field_x": "attr:bytes", "field_y": "attr:latency", "limit": 20000},
     )
     name, args, _ = fake.calls[0]
     assert name == "field_scatter"

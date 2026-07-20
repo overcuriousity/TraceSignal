@@ -38,7 +38,18 @@ const ORDER_OPTIONS = [
   { value: "last_seen", label: "Newest first" },
 ] as const;
 
+/** Mirrors `db/_template.py::TEMPLATE_NORMALIZE_VERSION`, which is the source
+ * of truth — the disposition API rejects any other value, so a bump there must
+ * be mirrored here. */
 const TEMPLATE_VERSION = 1;
+
+/** Muting is only offered for `message` templates. The grid's collapse
+ * predicate is `template_hash NOT IN (...)` against the materialized column,
+ * which is hashed over `message` alone; a mute minted from an `attr:*` listing
+ * would carry a hash from a different domain and collapse events the row does
+ * not describe. Other fields stay browsable — read-only exploration. The API
+ * enforces the same rule (`routers/dispositions.py::_validate_scope`). */
+const MUTABLE_FIELD = "message";
 
 export function TemplatesView({ caseId, timelineId, onDrillField }: Props) {
   const [field, setField] = useState("message");
@@ -74,9 +85,19 @@ export function TemplatesView({ caseId, timelineId, onDrillField }: Props) {
     () => (routineData?.dispositions ?? []).filter((d) => d.detector === "log_template"),
     [routineData],
   );
-  const mutedIds = useMemo(() => new Set(routineRows.map((d) => d.value)), [routineRows]);
+  // Mutes only ever exist for `message` (see MUTABLE_FIELD), so template ids
+  // from an `attr:*` listing must not be matched against them — the two hash
+  // domains are unrelated and would collide by coincidence.
+  const canMute = field === MUTABLE_FIELD;
+  const mutedIds = useMemo(
+    () => (canMute ? new Set(routineRows.map((d) => d.value)) : new Set<string | null>()),
+    [routineRows, canMute],
+  );
 
   const dispositionMut = useDisposition(caseId, timelineId);
+  // `useDisposition` is one shared mutation, so gate the spinner on which row
+  // it is actually carrying — otherwise every Mute button spins at once.
+  const mutingId = dispositionMut.isPending ? dispositionMut.variables?.value : undefined;
   const unmarkMut = useMutation({
     mutationFn: (id: string) => dispositionsApi.remove(caseId, timelineId, id),
     onSuccess: () => {
@@ -86,9 +107,28 @@ export function TemplatesView({ caseId, timelineId, onDrillField }: Props) {
     meta: { errorTitle: "Couldn't unmute template" },
   });
 
-  const templates = data?.templates ?? [];
+  const templates = useMemo(() => data?.templates ?? [], [data]);
   const activeTemplates = templates.filter((t) => !mutedIds.has(t.template_id));
-  const mutedTemplates = templates.filter((t) => mutedIds.has(t.template_id));
+  // Driven by the dispositions, not by the current page: a muted shape that
+  // falls outside the top-`limit` listing (likely under a first/last-seen sort)
+  // would otherwise be invisible and therefore impossible to unmute. The page
+  // is only used to enrich a row when it happens to be present; everything
+  // needed to display and reverse a mute is snapshotted in `details`.
+  const mutedTemplates = useMemo(() => {
+    if (!canMute) return [];
+    const onPage = new Map(templates.map((t) => [t.template_id, t]));
+    return routineRows.map((d) => {
+      const details = (d.details ?? {}) as { template?: unknown; count_at_mute?: unknown };
+      const row = d.value ? onPage.get(d.value) : undefined;
+      return {
+        dispositionId: d.id,
+        templateId: d.value ?? "",
+        template: row?.template ?? (typeof details.template === "string" ? details.template : ""),
+        count: row?.count ?? (typeof details.count_at_mute === "number" ? details.count_at_mute : 0),
+        stale: !row,
+      };
+    });
+  }, [routineRows, templates, canMute]);
 
   return (
     <div className="space-y-3">
@@ -178,28 +218,37 @@ export function TemplatesView({ caseId, timelineId, onDrillField }: Props) {
                       <Filter size={12} />
                     </button>
                   )}
-                  <button
-                    title="Mute: a routine, expected line shape — its events disappear from the grid immediately (always with a visible count). Reversible via Unmute below."
-                    className="rounded p-0.5 text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-accent)]"
-                    disabled={dispositionMut.isPending}
-                    onClick={() =>
-                      dispositionMut.mutate({
-                        kind: "routine",
-                        detector: "log_template",
-                        field: "template_id",
-                        value: t.template_id,
-                        details: {
-                          template: t.template,
-                          template_version: TEMPLATE_VERSION,
-                          field,
-                          example: t.example,
-                          count_at_mute: t.count,
-                        },
-                      })
-                    }
-                  >
-                    {dispositionMut.isPending ? <Spinner size={11} /> : <EyeOff size={12} />}
-                  </button>
+                  {canMute ? (
+                    <button
+                      title="Mute: a routine, expected line shape — its events disappear from the grid immediately (always with a visible count). Reversible via Unmute below."
+                      className="rounded p-0.5 text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-accent)]"
+                      disabled={mutingId === t.template_id}
+                      onClick={() =>
+                        dispositionMut.mutate({
+                          kind: "routine",
+                          detector: "log_template",
+                          field: "template_id",
+                          value: t.template_id,
+                          details: {
+                            template: t.template,
+                            template_version: TEMPLATE_VERSION,
+                            field,
+                            example: t.example,
+                            count_at_mute: t.count,
+                          },
+                        })
+                      }
+                    >
+                      {mutingId === t.template_id ? <Spinner size={11} /> : <EyeOff size={12} />}
+                    </button>
+                  ) : (
+                    <span
+                      title={`Muting is only available for Message templates — the grid collapses events by the materialized message template hash, so a ${field} shape has no collapse predicate.`}
+                      className="cursor-not-allowed p-0.5 text-[var(--color-fg-muted)] opacity-40"
+                    >
+                      <EyeOff size={12} />
+                    </span>
+                  )}
                 </div>
               </div>
               <div className="flex flex-wrap items-center gap-2 text-xs text-[var(--color-fg-muted)]">
@@ -222,32 +271,31 @@ export function TemplatesView({ caseId, timelineId, onDrillField }: Props) {
             Muted templates ({mutedTemplates.length})
           </div>
           <div className="space-y-1">
-            {mutedTemplates.map((t) => {
-              const row = routineRows.find((d) => d.value === t.template_id);
-              return (
-                <div
-                  key={t.template_id}
-                  className="flex items-center gap-2 rounded border border-[var(--color-border)] px-2 py-1.5 text-xs"
+            {mutedTemplates.map((t) => (
+              <div
+                key={t.dispositionId}
+                className="flex items-center gap-2 rounded border border-[var(--color-border)] px-2 py-1.5 text-xs"
+              >
+                <span className="min-w-0 flex-1 break-all font-mono text-[var(--color-fg-secondary)]">
+                  {truncate(t.template, 120)}
+                </span>
+                <span
+                  className="shrink-0 text-[var(--color-fg-muted)]"
+                  title={t.stale ? "Count recorded when this template was muted" : undefined}
                 >
-                  <span className="min-w-0 flex-1 break-all font-mono text-[var(--color-fg-secondary)]">
-                    {truncate(t.template, 120)}
-                  </span>
-                  <span className="shrink-0 text-[var(--color-fg-muted)]">
-                    ×{t.count.toLocaleString()}
-                  </span>
-                  {row && (
-                    <button
-                      title="Unmute — its events reappear in the grid immediately"
-                      className="flex shrink-0 items-center gap-1 rounded p-0.5 text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-fg-primary)]"
-                      disabled={unmarkMut.isPending}
-                      onClick={() => unmarkMut.mutate(row.id)}
-                    >
-                      {unmarkMut.isPending ? <Spinner size={11} /> : <Undo2 size={12} />}
-                    </button>
-                  )}
-                </div>
-              );
-            })}
+                  ×{t.count.toLocaleString()}
+                  {t.stale && " at mute"}
+                </span>
+                <button
+                  title="Unmute — its events reappear in the grid immediately"
+                  className="flex shrink-0 items-center gap-1 rounded p-0.5 text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-fg-primary)]"
+                  disabled={unmarkMut.isPending}
+                  onClick={() => unmarkMut.mutate(t.dispositionId)}
+                >
+                  {unmarkMut.isPending ? <Spinner size={11} /> : <Undo2 size={12} />}
+                </button>
+              </div>
+            ))}
           </div>
         </div>
       )}

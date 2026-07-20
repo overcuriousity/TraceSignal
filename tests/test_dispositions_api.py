@@ -317,6 +317,26 @@ def test_log_template_routine_disposition_invariants_and_create(
         ).status_code
         == 422
     )
+    # A template mined over a non-message field is rejected: the collapse
+    # predicate only knows the materialized message hash, so such a row would
+    # collapse events it does not describe.
+    assert (
+        client.post(
+            base,
+            json={
+                "kind": "routine",
+                "detector": "log_template",
+                "field": "template_id",
+                "value": "12345",
+                "details": {
+                    "template": "<TS> <IP> GET /x",
+                    "template_version": 1,
+                    "field": "attr:raw_line",
+                },
+            },
+        ).status_code
+        == 422
+    )
     # Event scope rejected — log_template is value-scoped only.
     assert (
         client.post(

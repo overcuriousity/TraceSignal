@@ -140,14 +140,17 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
         });
       } else if (m.tool_name === "propose_chart") {
         const args = m.tool_args as ProposeChartArgs;
-        if (args.spec) {
-          pendingChart = {
-            title: args.title ?? "Chart",
-            description: args.description ?? "",
-            spec: args.spec,
-          };
-        }
+        pendingChart = args.spec
+          ? {
+              title: args.title ?? "Chart",
+              description: args.description ?? "",
+              spec: args.spec,
+            }
+          : null;
       } else if (m.tool_name) {
+        // Clearing here too: a propose_chart call whose result row is absent
+        // (tool error) must not pair its args with a later call's result.
+        pendingChart = null;
         items.push({ kind: "tool", tool: m.tool_name, args: m.tool_args });
       }
     }
@@ -245,7 +248,15 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
           : null,
       };
     }
-    return { ...s, items: [...flushed, { kind: "tool", tool: e.tool, args: e.args }], liveText: "" };
+    // Any other tool call clears the buffer: a propose_chart whose result
+    // never arrives (tool error) must not have its args pair with some later
+    // call's result.
+    return {
+      ...s,
+      items: [...flushed, { kind: "tool", tool: e.tool, args: e.args }],
+      liveText: "",
+      pendingChart: null,
+    };
   }
   if (e.type === "tool_result") {
     // Most tool_result rows stay invisible (results feed the model, not

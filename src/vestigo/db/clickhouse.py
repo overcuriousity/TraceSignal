@@ -443,9 +443,7 @@ class ClickHouseStore:
         self.client.command(
             f"ALTER TABLE {table} MATERIALIZE INDEX template_hash_idx SETTINGS mutations_sync = 0"
         )
-        logger.info(
-            "template_hash column/index added; background materialization started"
-        )
+        logger.info("template_hash column/index added; background materialization started")
 
     # Re-check cadence for search_blob_ready while materialization is pending.
     _SEARCH_BLOB_RECHECK_SECONDS = 60.0
@@ -569,6 +567,17 @@ class ClickHouseStore:
         Unlike motif occurrences, membership needs no side table — it's a
         direct predicate on the materialized ``template_hash`` column — so
         this is a plain count, not a lookup against an aux table.
+
+        The template predicate is written ``template_hash IN {ths}``, not the
+        ``has({ths}, template_hash)`` form used everywhere else in this file.
+        Deliberate: ``template_hash_idx`` is a ``bloom_filter`` skip index, and
+        ClickHouse only applies one for ``equals``/``in``/``notIn`` on the
+        indexed column. Its documented ``has`` support is for
+        ``has(array_column, value)`` — an array *column* — so the constant-array
+        form here would read every granule. Do not "restore" the convention.
+        (The index does nothing for the grid's own ``template_hash NOT IN``
+        collapse either — a bloom filter cannot prune a negation — so these
+        count paths are the only place it pays for itself.)
         """
         if not template_hashes:
             return 0
@@ -580,8 +589,7 @@ class ClickHouseStore:
             source_pred = " AND has({sids:Array(String)}, source_id)"
         result = self.client.query(
             f"SELECT count() FROM {self.database}.events "
-            "WHERE case_id = {cid:String} AND has({ths:Array(UInt64)}, template_hash)"
-            + source_pred,
+            "WHERE case_id = {cid:String} AND template_hash IN {ths:Array(UInt64)}" + source_pred,
             parameters=params,
         )
         rows = result.result_rows
@@ -611,9 +619,11 @@ class ClickHouseStore:
         if template_hashes:
             params["ths"] = template_hashes
             branches.append(
+                # `IN`, not `has(...)` — see count_template_events on why the
+                # bloom skip index requires this form.
                 f"SELECT toString(event_id) AS eid FROM {self.database}.events "
                 "WHERE case_id = {cid:String} AND has({sids:Array(String)}, source_id) "
-                "AND has({ths:Array(UInt64)}, template_hash)"
+                "AND template_hash IN {ths:Array(UInt64)}"
             )
         if motif_disposition_ids:
             params["dids"] = motif_disposition_ids

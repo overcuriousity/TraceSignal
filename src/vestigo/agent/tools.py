@@ -213,8 +213,7 @@ class ChartSpec(BaseModel):
     limit: int | None = Field(
         default=None,
         description=(
-            "Top-N terms / bin count / point cap / pivot x-axis top-N, "
-            "meaning depends on kind."
+            "Top-N terms / bin count / point cap / pivot x-axis top-N, meaning depends on kind."
         ),
     )
     limit_y: int | None = Field(default=None, description="Pivot y-axis top-N — pivot only.")

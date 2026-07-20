@@ -283,6 +283,16 @@ describe("specToChartConfig", () => {
     expect(config.options.topN).toBeUndefined();
   });
 
+  it("maps numeric limit into bins, not topN", () => {
+    // `limit` means bin count for the numeric kinds — the histogram data path
+    // reads options.bins, so routing it to topN would drop it silently.
+    for (const kind of ["numeric", "compare_numeric"] as const) {
+      const config = specToChartConfig({ kind, field: "attr:bytes", limit: 20 });
+      expect(config.options.bins).toBe(20);
+      expect(config.options.topN).toBeUndefined();
+    }
+  });
+
   it("maps scatter limit into sampleLimit", () => {
     const config = specToChartConfig({
       kind: "scatter",

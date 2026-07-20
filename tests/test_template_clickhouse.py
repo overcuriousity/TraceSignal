@@ -147,6 +147,16 @@ def test_list_log_templates_order_by_count_is_descending(store):
     assert result.templates[0].count == 3  # the routine "Allow TCP" shape wins
 
 
+def test_list_log_templates_total_survives_truncation(store):
+    """`total_templates` counts every distinct shape, not the page. It rides in
+    on `count() OVER ()`, evaluated before LIMIT — so truncating the listing
+    must not truncate the count the UI shows ("showing top N of M")."""
+    svc = StatisticalAnomalyService(clickhouse=store)
+    result = svc.list_log_templates(CASE_ID, [SOURCE_ID], limit=1)
+    assert len(result.templates) == 1
+    assert result.total_templates == 3
+
+
 def test_list_log_templates_only_new_filters_by_baseline(store):
     svc = StatisticalAnomalyService(clickhouse=store)
     # only_new keeps templates whose first_seen >= baseline_end — "never
@@ -156,15 +166,11 @@ def test_list_log_templates_only_new_filters_by_baseline(store):
     from datetime import UTC, datetime
 
     far_future = datetime(2999, 1, 1, tzinfo=UTC)
-    result = svc.list_log_templates(
-        CASE_ID, [SOURCE_ID], only_new=True, baseline_end=far_future
-    )
+    result = svc.list_log_templates(CASE_ID, [SOURCE_ID], only_new=True, baseline_end=far_future)
     assert result.total_templates == 0  # nothing is "new" relative to a future split
 
     far_past = datetime(2000, 1, 1, tzinfo=UTC)
-    result = svc.list_log_templates(
-        CASE_ID, [SOURCE_ID], only_new=True, baseline_end=far_past
-    )
+    result = svc.list_log_templates(CASE_ID, [SOURCE_ID], only_new=True, baseline_end=far_past)
     assert result.total_templates == 3  # everything is "new" relative to a past split
 
 
@@ -195,9 +201,7 @@ def test_template_id_facet_filters_the_grid(store):
         )
     )
     assert page.total == 3
-    assert all(
-        e["message"].startswith("Allow TCP") for e in page.events
-    )
+    assert all(e["message"].startswith("Allow TCP") for e in page.events)
 
 
 def test_mute_template_collapse_and_unmute_round_trip(store):

@@ -26,7 +26,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from vestigo.db._columns import TOP_LEVEL_EVENT_COLUMNS
+from vestigo.db._columns import SYNTHETIC_COLUMN_EXPRESSIONS, TOP_LEVEL_EVENT_COLUMNS
 
 # Practical guard rails — a mapping is analyst-curated metadata, not bulk data.
 MAX_CANONICAL_FIELDS = 64
@@ -102,7 +102,11 @@ def validate_field_mappings(
     if len(mappings) > MAX_CANONICAL_FIELDS:
         problems.append(f"At most {MAX_CANONICAL_FIELDS} canonical fields are supported.")
 
-    core_lower = {c.lower() for c in TOP_LEVEL_EVENT_COLUMNS}
+    # Synthetic tokens count as core: `_col_expr` resolves mappings *before*
+    # `resolve_column_token`, so a canonical field named e.g. `template_id`
+    # would shadow the synthetic column and silently redirect the Templates
+    # tab's drill-to-grid onto an unrelated attribute.
+    core_lower = {c.lower() for c in TOP_LEVEL_EVENT_COLUMNS} | set(SYNTHETIC_COLUMN_EXPRESSIONS)
     seen_raw: dict[str, str] = {}
     for canonical, raw_keys in mappings.items():
         name = canonical.strip()

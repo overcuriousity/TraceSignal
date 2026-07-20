@@ -31,6 +31,7 @@ from vestigo.api.deps import (
     require_password_current,
 )
 from vestigo.core.jobs import JobStore, get_job_store
+from vestigo.db._template import TEMPLATE_NORMALIZE_VERSION
 from vestigo.db.postgres import DISPOSITION_KINDS, Case, User
 
 router = APIRouter(prefix="/api/cases", tags=["dispositions"])
@@ -105,8 +106,7 @@ def _validate_scope(p: DispositionCreate) -> str:
                 raise HTTPException(
                     status_code=422,
                     detail=(
-                        "routine requires details.values "
-                        "(the motif's 2–5 non-empty string values)"
+                        "routine requires details.values (the motif's 2–5 non-empty string values)"
                     ),
                 )
             # The displayed value and the materialized occurrences must
@@ -153,10 +153,30 @@ def _validate_scope(p: DispositionCreate) -> str:
                 raise HTTPException(
                     status_code=422, detail="log_template routine requires details.template"
                 )
-            if details.get("template_version") != 1:
+            # The collapse predicate is `template_hash NOT IN (...)` against the
+            # materialized column, which is hashed over `message` and nothing
+            # else. `list_log_templates` will happily template any field, so a
+            # disposition minted from an `attr:*` listing would carry a hash
+            # from a different domain and collapse events this row does not
+            # describe — the one thing a routine collapse must never do.
+            # Reject it here: the disposition is the forensic record, and it
+            # must not be creatable in a state the grid cannot honor.
+            templated_field = details.get("field") or "message"
+            if templated_field != "message":
                 raise HTTPException(
                     status_code=422,
-                    detail="log_template routine requires details.template_version == 1",
+                    detail=(
+                        "log_template routine currently supports only details.field 'message' — "
+                        "the grid's collapse predicate uses the materialized message template hash"
+                    ),
+                )
+            if details.get("template_version") != TEMPLATE_NORMALIZE_VERSION:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "log_template routine requires details.template_version == "
+                        f"{TEMPLATE_NORMALIZE_VERSION}"
+                    ),
                 )
     return "value" if has_value else "event"
 

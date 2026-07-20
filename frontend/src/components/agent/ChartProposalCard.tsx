@@ -11,12 +11,13 @@
  * analyst's own action.
  *
  * Live fetch (not the tool_result summary echo) keeps the chart consistent
- * with the analyst's current data/dispositions; if the fetch fails the
- * tool's summary stats still render as a fallback line.
+ * with the analyst's current data/dispositions — the summary the tool returned
+ * is a validation receipt for the model, not a display value, and is
+ * deliberately not shown here.
  */
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { useQuery, useMutation } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { BarChart3, ExternalLink, Save } from "lucide-react";
 import { vizApi, savedChartsApi, type CompareMode } from "@/api/viz";
 import { eventsApi } from "@/api/events";
@@ -60,6 +61,18 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
   const compareOn = config.compare.mode !== "off";
   const compareApiSpec: CompareMode | null =
     config.compare.mode === "custom" ? { mode: "custom", filters: config.compare.filters } : null;
+
+  // Every kind but time/punchcard needs a field, and pivot/scatter need two.
+  // `propose_chart` rejects an incomplete spec before a card is ever shown, so
+  // this should be unreachable — but an un-run query renders as neither
+  // loading nor error, i.e. a silently blank chart box, so say so explicitly
+  // rather than leave the analyst looking at nothing.
+  const specComplete =
+    dataKind === "time" || dataKind === "punchcard"
+      ? true
+      : dataKind === "pivot" || dataKind === "scatter"
+        ? !!(config.field && config.fieldY)
+        : !!config.field;
 
   const chartQuery = useQuery({
     queryKey: ["agent-chart", caseId, timelineId, config, filters],
@@ -157,19 +170,20 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
           };
       }
     },
-    enabled:
-      dataKind === "time" || dataKind === "punchcard"
-        ? true
-        : dataKind === "pivot" || dataKind === "scatter"
-          ? !!(config.field && config.fieldY)
-          : !!config.field,
+    enabled: specComplete,
   });
 
+  const qc = useQueryClient();
   const [name, setName] = useState("");
   const saveMutation = useMutation({
     mutationFn: () =>
       savedChartsApi.create(caseId, timelineId, name.trim(), chartConfigToStored(config)),
-    onSuccess: () => setName(""),
+    onSuccess: () => {
+      setName("");
+      // Same key SavedChartsRail reads, so an open Visualize page picks the
+      // new chart up instead of showing a stale rail.
+      qc.invalidateQueries({ queryKey: ["viz-saved-charts", caseId, timelineId] });
+    },
   });
 
   const openParams = chartConfigToParams(config, filtersToParams(filters));
@@ -188,6 +202,11 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
       )}
 
       <div className="mt-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-surface)] p-2">
+        {!specComplete && (
+          <p className="py-2 text-[var(--color-fg-muted)]">
+            This chart proposal is missing a field, so there is nothing to plot.
+          </p>
+        )}
         {chartQuery.isLoading && (
           <div className="flex items-center justify-center py-6">
             <Spinner size={16} />

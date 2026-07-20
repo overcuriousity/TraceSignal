@@ -4548,7 +4548,10 @@ def test_distribution_drift_probe_is_windowed():
 # ---------------------------------------------------------------------------
 
 
-def _template_rows() -> FakeQueryResult:
+def _template_rows(n_groups: int = 1) -> FakeQueryResult:
+    """One listing row. The trailing `n_groups` is the `count() OVER ()`
+    window value — the pre-LIMIT template total rides on every row, so the
+    listing is a single scan rather than a listing plus a counting query."""
     return FakeQueryResult(
         result_rows=[
             (
@@ -4559,6 +4562,7 @@ def _template_rows() -> FakeQueryResult:
                 datetime(2026, 1, 1, tzinfo=UTC),
                 datetime(2026, 1, 2, tzinfo=UTC),
                 "Allow TCP 10.0.0.5:4433 -> 10.0.0.9:443",
+                n_groups,
             )
         ],
         column_names=[
@@ -4569,12 +4573,13 @@ def _template_rows() -> FakeQueryResult:
             "first_seen",
             "last_seen",
             "example",
+            "n_groups",
         ],
     )
 
 
 def test_list_log_templates_default_field_uses_indexed_column():
-    client = RecordingClient([_template_rows(), FakeQueryResult(result_rows=[(1,)], column_names=[])])
+    client = RecordingClient([_template_rows()])
     svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
     svc.ch = FakeClickHouseStore(client)
     result = svc.list_log_templates("c1", ["s1"])
@@ -4592,7 +4597,7 @@ def test_list_log_templates_default_field_uses_indexed_column():
 
 
 def test_list_log_templates_non_message_field_computes_hash_inline():
-    client = RecordingClient([_template_rows(), FakeQueryResult(result_rows=[(1,)], column_names=[])])
+    client = RecordingClient([_template_rows()])
     svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
     svc.ch = FakeClickHouseStore(client)
     svc.list_log_templates("c1", ["s1"], field="attr:raw_line")
@@ -4612,7 +4617,7 @@ def test_list_log_templates_only_new_requires_baseline_end():
 
 
 def test_list_log_templates_only_new_filters_on_first_seen():
-    client = RecordingClient([_template_rows(), FakeQueryResult(result_rows=[(1,)], column_names=[])])
+    client = RecordingClient([_template_rows()])
     svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
     svc.ch = FakeClickHouseStore(client)
     svc.list_log_templates(
@@ -4632,10 +4637,32 @@ def test_list_log_templates_rejects_unknown_order():
 
 
 def test_list_log_templates_order_and_limit_applied():
-    client = RecordingClient([_template_rows(), FakeQueryResult(result_rows=[(1,)], column_names=[])])
+    client = RecordingClient([_template_rows()])
     svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
     svc.ch = FakeClickHouseStore(client)
     svc.list_log_templates("c1", ["s1"], order="first_seen", limit=25)
     sql = client.full_queries[0]
     assert "ORDER BY first_seen ASC" in sql
     assert client._all_parameters[0]["lim"] == 25
+
+
+def test_list_log_templates_totals_come_from_one_scan():
+    """`total_templates` is the window count carried on the listing rows —
+    a second counting query would re-run the whole regex chain and GROUP BY."""
+    client = RecordingClient([_template_rows(n_groups=42)])
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.list_log_templates("c1", ["s1"], limit=1)
+    assert result.total_templates == 42
+    assert len(result.templates) == 1
+    assert len(client.full_queries) == 1
+    assert "count() OVER () AS n_groups" in client.full_queries[0]
+
+
+def test_list_log_templates_empty_result_reports_zero_total():
+    client = RecordingClient([FakeQueryResult(result_rows=[], column_names=[])])
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.list_log_templates("c1", ["s1"])
+    assert result.total_templates == 0
+    assert result.templates == []

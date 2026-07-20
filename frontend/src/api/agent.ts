@@ -97,11 +97,18 @@ export function specToChartConfig(spec: AgentChartSpec): ChartConfig {
   const options: ChartConfig["options"] = {};
   if (spec.buckets) options.buckets = spec.buckets;
   if (spec.series_limit) options.topN = spec.series_limit;
+  // `spec.limit` is deliberately overloaded on the backend (see ChartSpec's
+  // field description) — its meaning depends on `kind`, so each kind routes it
+  // to the ChartConfig option its own data path actually reads. Numeric kinds
+  // read `options.bins` (vizApi.fieldNumeric's `bins`, compare's `body.bins`);
+  // routing them to `topN` would silently drop the agent's bin count.
   if (spec.kind === "pivot") {
     if (spec.limit) options.limitX = spec.limit;
     if (spec.limit_y) options.limitY = spec.limit_y;
   } else if (spec.kind === "scatter") {
     if (spec.limit) options.sampleLimit = spec.limit;
+  } else if (spec.kind === "numeric" || spec.kind === "compare_numeric") {
+    if (spec.limit) options.bins = spec.limit;
   } else if (spec.limit) {
     options.topN = spec.limit;
   }

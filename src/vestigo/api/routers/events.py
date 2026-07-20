@@ -485,8 +485,15 @@ async def _resolve_routine_collapse(
         kinds=["routine"],
     )
     motif_ids = [d.id for d in rows if d.detector == "sequence_motif"]
+    # `isdigit` guard, not just a None check: creation-time validation cannot
+    # vouch for rows that arrive another way (import, direct DB write, a future
+    # schema change), and this resolver sits on the grid, histogram *and*
+    # export paths — one malformed value must not 500 all three. A row we
+    # cannot parse collapses nothing, which is the safe direction.
     template_hashes = [
-        int(d.value) for d in rows if d.detector == "log_template" and d.value is not None
+        int(d.value)
+        for d in rows
+        if d.detector == "log_template" and d.value is not None and d.value.isdigit()
     ]
     return RoutineCollapseScope(motif_ids or None, template_hashes or None)
 
@@ -2532,9 +2539,7 @@ async def list_log_templates(
     baseline_end = None
     if only_new:
         if baseline_id is None:
-            raise HTTPException(
-                status_code=422, detail="only_new requires baseline_id"
-            )
+            raise HTTPException(status_code=422, detail="only_new requires baseline_id")
         definition = await store.get_baseline_definition(case_id, timeline_id, baseline_id)
         if definition is None:
             raise HTTPException(

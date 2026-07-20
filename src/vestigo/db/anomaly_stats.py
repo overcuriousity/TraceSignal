@@ -5685,11 +5685,14 @@ class StatisticalAnomalyService:
             field_col = _col_expr(field, params, field_mappings)
             hash_expr = f"cityHash64({template_normalize_expr(field_col)})"
         template_text_expr = template_normalize_expr(f"any({field_col})")
-        empty_guard = f"AND {field_col} != ''" if normalized_field != "message" else ""
+        # Applied for every field including `message`: `message` is non-null by
+        # contract but may still be empty, and an empty string is not a shape
+        # worth listing (it would rank as a template of its own).
+        empty_guard = f"AND {field_col} != ''"
 
-        # One grouped subquery is the single source of truth for both the
-        # listing and the total-template count, so `only_new` (an aggregate
-        # condition on the grouped `first_seen`) filters both identically.
+        # One grouped subquery drives the listing and, via `count() OVER ()`,
+        # the total-template count, so `only_new` (an aggregate condition on
+        # the grouped `first_seen`) filters both identically.
         inner_sql = f"""
             SELECT
                 {hash_expr} AS th,
@@ -5717,9 +5720,16 @@ class StatisticalAnomalyService:
         order_dir = "DESC" if order in ("count", "last_seen") else "ASC"
 
         params["lim"] = limit
+        # Single scan: `count() OVER ()` runs after the subquery's GROUP BY and
+        # the `only_new` filter but before ORDER BY/LIMIT, so every surviving
+        # row carries the pre-LIMIT template total — same trick as
+        # `QueryService._field_terms_body`. Counting it with a second query
+        # would re-run the whole regex chain and GROUP BY over the events
+        # table, doubling the cost of the one call that is already the most
+        # expensive thing on this tab.
         sql = f"""
             SELECT toString(th) AS template_id, template, cnt, distinct_sources,
-                   first_seen, last_seen, example
+                   first_seen, last_seen, example, count() OVER () AS n_groups
             FROM ({inner_sql})
             WHERE {outer_pred}
             ORDER BY {order_col} {order_dir}
@@ -5727,13 +5737,7 @@ class StatisticalAnomalyService:
             {HEAVY_SCAN_SETTINGS}
         """
         rows = self.ch.client.query(sql, parameters=params).result_rows
-
-        count_sql = f"""
-            SELECT count() FROM ({inner_sql}) WHERE {outer_pred} {HEAVY_SCAN_SETTINGS}
-        """
-        total = self.ch.client.query(
-            count_sql, parameters={k: v for k, v in params.items() if k != "lim"}
-        ).result_rows[0][0]
+        total = int(rows[0][7]) if rows else 0
 
         templates = [
             LogTemplateRow(
@@ -5747,7 +5751,7 @@ class StatisticalAnomalyService:
             )
             for r in rows
         ]
-        return LogTemplatesResult(field=field, total_templates=int(total), templates=templates)
+        return LogTemplatesResult(field=field, total_templates=total, templates=templates)
 
     @_gated_scan
     def find_order_violations(

@@ -1,6 +1,54 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-20 (session 72 — A9 agent viz parity).
+Last updated: 2026-07-20 (session 73 — PR #140 review fixes, release 1.4.0).
+
+## Session 73 — 2026-07-20: PR #140 review fixes + release 1.4.0
+
+Merged `main` (persistent OPSEC notice / tool-selector popover) into the W6+A9
+branch — clean auto-merge; `AgentPanel.tsx` took both sides, since main owned
+the conversation-creation and footer regions while this branch owned the
+propose_chart pairing and chart render branch.
+
+Then a code review of the branch, fixed in order of severity:
+
+- **Mute could collapse events it didn't announce.** The Templates tab offered
+  every `attr:*` field, but a mute always resolved through
+  `template_hash NOT IN (...)` — hashed over `message` alone. Muting an
+  `attr:raw_line` shape therefore hid an unrelated set. `ANOMALY_DETECTION.md`
+  had already specified message-only muting; the code just never enforced it.
+  Now enforced in the UI (disabled, explained control) *and* in
+  `_validate_scope` (`details.field != "message"` → 422).
+- **Agent chart bin counts were dropped.** `specToChartConfig` routed
+  `spec.limit` to `options.topN` for numeric kinds, but the histogram path
+  reads `options.bins` — the agent's requested binning silently vanished and a
+  meaningless `topN` rode into "Save"/"Open in Visualize".
+- **`template_id` was not reserved** against canonical field mappings, which
+  resolve *before* column tokens — a mapping of that name would shadow the
+  facet and redirect drill-to-grid onto an unrelated attribute.
+- **`int(d.value)` was unguarded** in `_resolve_routine_collapse`: one
+  malformed `log_template` disposition would 500 the grid, histogram *and*
+  export. Now `isdigit`-filtered — an unparseable row collapses nothing.
+- **`list_log_templates` scanned the table twice**, re-running the regex chain
+  and GROUP BY purely to count. Now one scan via `count() OVER ()`, the same
+  window trick `QueryService._field_terms_body` uses.
+- **The bloom skip index was dead weight**: `has({ths}, template_hash)` is not
+  an indexable form (ClickHouse's `has` support is for array *columns*).
+  Rewritten as `template_hash IN {ths}` on both count paths, with a comment so
+  it doesn't get "fixed" back to the file's `has(...)` convention.
+- Version literal replaced with `TEMPLATE_NORMALIZE_VERSION`; empty-value guard
+  applied to `message` too; muted templates now listed from the dispositions
+  rather than the current page (a mute outside the top-N was unreachable, so
+  un-mutable); per-row mute spinner; saved-chart list invalidation; a
+  `pendingChart` buffer that could pair a failed proposal's args with a later
+  result; and a doc comment describing a fallback that did not exist.
+
+Suite: 1170 backend passed, 315 frontend passed. The 10 failures in
+`test_admin_api`/`test_agent_api`/`test_embeddings_capability`/`test_uploads`
+are pre-existing dev-`.env` config collisions — verified identical on a clean
+stash of these changes.
+
+Cut **1.4.0** (not 1.3.1): the release is six new features and no breaking
+changes, which is a MINOR bump under the semver policy the CHANGELOG declares.
 
 ## Session 72 — 2026-07-20: A9 agent viz parity (Phase 3 Step 2)
 

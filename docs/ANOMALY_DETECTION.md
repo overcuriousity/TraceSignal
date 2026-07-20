@@ -1501,6 +1501,14 @@ at startup). No normalized-text column is stored: a template's representative
 text is reconstructed on demand by applying the same expression to
 `any(message)` per group, avoiding a second message-sized column.
 
+The skip index only earns its keep on the collapsed-count queries, and only
+if they are written `template_hash IN {…}`. ClickHouse applies a
+`bloom_filter` index for `equals`/`in`/`notIn` on the indexed column; its
+`has` support is for `has(array_column, value)`, so the `has({ths}, col)`
+form used elsewhere in `clickhouse.py` would read every granule. It cannot
+help the grid's own `template_hash NOT IN (...)` collapse at all — a bloom
+filter answers "definitely absent", which no negation can prune on.
+
 **Field-agnostic, like every other detector.** The materialized column is
 fixed to `message` (the one field required non-null on every `Event`), but
 `list_log_templates` accepts any field token `_col_expr` resolves — for a
@@ -1526,14 +1534,24 @@ example. `only_new` (paired with a baseline definition's `baseline_end`)
 keeps only templates whose earliest occurrence across the full scope is
 at/after the split — "never seen in the baseline" — expressed as a single
 `HAVING first_seen >= baseline_end` on the grouped subquery rather than an
-anti-join: cheaper and equivalent for one split point. No BH-FDR, no Finding
-dataclass, no allowlist — a browser, not a scored run. Templates UI lives as
+anti-join: cheaper and equivalent for one split point. `total_templates` (the
+pre-`limit` count behind the UI's "showing top N") rides in on a
+`count() OVER ()` window over the same grouped subquery, so the whole listing
+is one scan — counting it separately would re-run the regex chain and the
+GROUP BY over the events table, doubling the cost of the most expensive call
+on the tab. Empty values are excluded for every field including `message`:
+non-null by contract, but an empty string is not a shape worth ranking. No
+BH-FDR, no Finding dataclass, no allowlist — a browser, not a scored run. Templates UI lives as
 a **Templates** sub-tab under the Investigate panel's Patterns tab (grouped
 with sequence-motif mining as the other "recurring shape" discovery tool).
 
 **Facet.** `template_id` resolves through the same `resolve_column_token`
 allowlist every other field token uses (`toString(template_hash)`), so the
-grid can filter to one template's events exactly like any other field.
+grid can filter to one template's events exactly like any other field. It is
+also reserved as a canonical field-mapping name: mappings resolve *before*
+column tokens, so a timeline defining `template_id` as a mapping would
+otherwise shadow the column and silently redirect this facet onto an
+unrelated attribute.
 
 **Mute disposition & grid collapse.** *Mute* writes a `kind="routine"`
 disposition (`detector="log_template"`, value = the decimal template id,
@@ -1555,6 +1573,15 @@ disposition restores the events immediately.
 **Asymmetry, v1.** Muting only supports `field == "message"` (the indexed
 column the mute predicate binds to) — browsing is field-agnostic, muting
 isn't yet. Revisit if an analyst wants to mute on a non-`message` field.
+
+Enforced at both layers, deliberately: the Templates tab replaces Mute with a
+disabled, explained control for any non-`message` field, and
+`_validate_scope` rejects a `log_template` disposition whose `details.field`
+is anything else. Without that check a mute minted from an `attr:*` listing
+would carry a hash from a different domain into `template_hash NOT IN (...)`
+and collapse events the row does not describe — a collapse that hides
+something other than what it announces, which is the one failure mode this
+whole mechanism exists to avoid.
 
 **Novelty.** No standalone detector — `only_new` on the browser covers "what
 templates are new since the baseline" without a Finding/BH-FDR apparatus.
