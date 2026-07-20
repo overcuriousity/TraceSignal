@@ -242,6 +242,8 @@ async def test_init_schema_adopts_pre_alembic_db(tmp_path):
         )
         # Simulate a database from before one of the hand-rolled ALTERs.
         await conn.execute(text("ALTER TABLE users DROP COLUMN onboarding_completed"))
+        # 0012 adds the per-user preferences blob.
+        await conn.execute(text("ALTER TABLE users DROP COLUMN preferences"))
     await s.init_schema()
     async with s.engine.begin() as conn:
         version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar()

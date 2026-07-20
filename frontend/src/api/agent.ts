@@ -9,7 +9,7 @@
  * GET-only, so `streamMessage` reads the body via fetch + ReadableStream
  * (same wire format as useCaseStream's EventSource, parsed by hand).
  */
-import { BASE, get, post, del, ApiError } from "./client";
+import { BASE, get, post, put, del, fetchBlobGet, ApiError } from "./client";
 import type { EventFilters, FieldMatchMode } from "./types";
 
 /** Backend FilterSpec shape (snake_case) — what agent tool calls carry. */
@@ -58,6 +58,8 @@ export interface AgentConversation {
   user_id: string;
   title: string;
   model_id: string | null;
+  /** Per-chat tool restriction frozen at creation (null = none). */
+  disabled_tools: string[] | null;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -65,7 +67,7 @@ export interface AgentConversation {
 export interface AgentMessage {
   id: string;
   conversation_id: string;
-  role: "user" | "assistant" | "tool";
+  role: "user" | "assistant" | "tool" | "thinking" | "compaction";
   content: string;
   tool_name: string | null;
   tool_args: Record<string, unknown> | null;
@@ -75,8 +77,36 @@ export interface AgentMessage {
   completion_tokens?: number | null;
 }
 
+/** One tool in the agent's catalog (GET /api/agent/info). */
+export interface AgentToolInfo {
+  name: string;
+  description: string;
+  embeddings_gated: boolean;
+  requires_conversation: boolean;
+  /** Hard-denied by the admin — cannot be re-enabled per user/chat. */
+  admin_disabled: boolean;
+}
+
+/**
+ * Non-admin agent config disclosure: powers the OPSEC notice ("evidence is
+ * sent to {api_base_url}, processed by {model}") and the tool toggles in the
+ * new-conversation dialog. Never contains the API key.
+ */
+export interface AgentInfo {
+  model: string | null;
+  provider: string;
+  api_base_url: string | null;
+  context_window: number | null;
+  compact_threshold: number | null;
+  tools: AgentToolInfo[];
+  user_disabled_tools: string[];
+}
+
 export type AgentStreamEvent =
   | { type: "text_delta"; text: string }
+  | { type: "thinking_delta"; text: string }
+  | { type: "thinking"; text: string }
+  | { type: "compaction"; summary: string; reason?: string }
   | { type: "tool_call"; tool_call_id: string; tool: string; args: Record<string, unknown> }
   | { type: "tool_result"; tool_call_id: string; tool: string; result: unknown }
   | {
@@ -85,7 +115,7 @@ export type AgentStreamEvent =
       prompt_tokens?: number | null;
       completion_tokens?: number | null;
     }
-  | { type: "error"; detail: string };
+  | { type: "error"; detail: string; code?: string };
 
 /** Compact token count: 890, 12.4k, 1.2M. */
 export function formatTokenCount(n: number): string {
@@ -128,9 +158,17 @@ export function specToEventFilters(spec: AgentFilterSpec): EventFilters {
 }
 
 export const agentApi = {
-  createConversation: (caseId: string, timelineId: string) =>
+  /** Config + tool catalog for the current user (see AgentInfo). */
+  getInfo: () => get<AgentInfo>(`/agent/info`),
+
+  /** Persist the user's default tool selection for new conversations. */
+  updatePreferences: (disabledTools: string[]) =>
+    put<{ disabled_tools: string[] }>(`/agent/preferences`, { disabled_tools: disabledTools }),
+
+  createConversation: (caseId: string, timelineId: string, disabledTools?: string[]) =>
     post<AgentConversation>(`/cases/${caseId}/agent/conversations`, {
       timeline_id: timelineId,
+      ...(disabledTools && disabledTools.length > 0 ? { disabled_tools: disabledTools } : {}),
     }),
 
   listConversations: (caseId: string, timelineId?: string) =>
@@ -145,6 +183,10 @@ export const agentApi = {
 
   deleteConversation: (caseId: string, conversationId: string) =>
     del<{ deleted: boolean }>(`/cases/${caseId}/agent/conversations/${conversationId}`),
+
+  /** Full-thread JSON export (messages, tool calls, thinking, raw history). */
+  exportConversation: (caseId: string, conversationId: string) =>
+    fetchBlobGet(`/cases/${caseId}/agent/conversations/${conversationId}/export`),
 
   listProposals: (caseId: string, conversationId: string) =>
     get<{ proposals: AgentProposal[] }>(

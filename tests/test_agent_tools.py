@@ -399,3 +399,47 @@ async def test_list_sigma_runs_not_starved_by_other_timelines(store):
     server = build_tool_server(_scope("c1", "t1"))
     result = await _call(server, "list_sigma_runs")
     assert result["total"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Tool registry + per-tool disable (scope.disabled_tools)
+# ---------------------------------------------------------------------------
+
+
+async def test_tool_registry_matches_registered_tools(store):
+    """TOOL_REGISTRY is the single source of truth for toggle UIs — it must
+    exactly mirror what build_tool_server registers (with a conversation
+    scope, where every tool incl. propose_annotation exists)."""
+    from vestigo.agent.tools import TOOL_NAMES
+
+    await store.init_schema()
+    server = build_tool_server(_scope_with_conversation("c1", "t1", "conv1"))
+    async with FastMCPClient(server) as client:
+        names = {t.name for t in await client.list_tools()}
+    assert names == TOOL_NAMES
+
+
+async def test_disabled_tool_removed_from_server(store):
+    await store.init_schema()
+    scope = _scope("c1", "t1")
+    scope.disabled_tools = frozenset({"search_events", "list_baselines"})
+    server = build_tool_server(scope)
+    async with FastMCPClient(server) as client:
+        names = {t.name for t in await client.list_tools()}
+        assert "search_events" not in names
+        assert "list_baselines" not in names
+        assert "list_fields" in names
+        with pytest.raises(ToolError):
+            await client.call_tool("search_events", {})
+
+
+async def test_disabling_unregistered_tool_is_harmless(store):
+    """Disabling propose_annotation on a conversation-less scope (where it was
+    never registered) must not crash the remove pass."""
+    await store.init_schema()
+    scope = _scope("c1", "t1")
+    scope.disabled_tools = frozenset({"propose_annotation"})
+    server = build_tool_server(scope)
+    async with FastMCPClient(server) as client:
+        names = {t.name for t in await client.list_tools()}
+    assert "propose_annotation" not in names

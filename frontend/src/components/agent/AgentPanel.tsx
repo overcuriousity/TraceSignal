@@ -10,7 +10,18 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Plus, Send, Sparkles, Square, Trash2, Wrench, X } from "lucide-react";
+import {
+  Archive,
+  Brain,
+  Download,
+  Plus,
+  Send,
+  Sparkles,
+  Square,
+  Trash2,
+  Wrench,
+  X,
+} from "lucide-react";
 
 import {
   agentApi,
@@ -21,11 +32,13 @@ import {
   type AgentStreamEvent,
 } from "@/api/agent";
 import { useAgentStore } from "@/stores/agent";
+import { triggerDownload } from "@/lib/download";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { FindingCard } from "./FindingCard";
 import { ProposalCard } from "./ProposalCard";
+import { NewConversationDialog } from "./NewConversationDialog";
 import { Markdown } from "./Markdown";
 import type { EventFilters } from "@/api/types";
 
@@ -49,6 +62,8 @@ type ChatItem =
       completionTokens?: number | null;
     }
   | { kind: "tool"; tool: string; args?: Record<string, unknown> | null }
+  | { kind: "thinking"; content: string; streaming?: boolean }
+  | { kind: "compaction"; summary: string }
   | {
       kind: "finding";
       title: string;
@@ -64,6 +79,10 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
   for (const m of messages) {
     if (m.role === "user") {
       items.push({ kind: "user", content: m.content });
+    } else if (m.role === "thinking") {
+      if (m.content) items.push({ kind: "thinking", content: m.content });
+    } else if (m.role === "compaction") {
+      items.push({ kind: "compaction", summary: m.content });
     } else if (m.role === "assistant") {
       if (m.content) {
         items.push({
@@ -113,17 +132,40 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
 interface StreamState {
   items: ChatItem[];
   liveText: string;
+  /** In-flight thinking segment; finalized by the terminal "thinking" event. */
+  liveThinking: string;
 }
 
-const EMPTY_STREAM: StreamState = { items: [], liveText: "" };
+const EMPTY_STREAM: StreamState = { items: [], liveText: "", liveThinking: "" };
 
 function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
   if (e.type === "text_delta") {
     return { ...s, liveText: s.liveText + e.text };
   }
+  if (e.type === "thinking_delta") {
+    return { ...s, liveThinking: s.liveThinking + e.text };
+  }
+  if (e.type === "thinking") {
+    // The terminal event carries the full segment — it replaces the
+    // accumulated deltas rather than appending after them.
+    return {
+      ...s,
+      items: [...s.items, { kind: "thinking", content: e.text }],
+      liveThinking: "",
+    };
+  }
   const flushed: ChatItem[] = s.liveText
     ? [...s.items, { kind: "assistant", content: s.liveText }]
     : s.items;
+  if (e.type === "compaction") {
+    // A compaction mid-turn means the failed attempt is being retried — its
+    // partial thinking will be re-streamed, so drop the stale deltas too.
+    return {
+      items: [...flushed, { kind: "compaction", summary: e.summary }],
+      liveText: "",
+      liveThinking: "",
+    };
+  }
   if (e.type === "tool_call") {
     if (e.tool === "propose_finding") {
       const args = e.args as {
@@ -132,6 +174,7 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
         filters?: AgentFilterSpec;
       };
       return {
+        ...s,
         items: [
           ...flushed,
           {
@@ -147,9 +190,9 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
     if (e.tool === "propose_annotation") {
       // Rendered from the paired tool_result below, once proposal_id is
       // known — the call event only carries the proposed tag/comment.
-      return { items: flushed, liveText: "" };
+      return { ...s, items: flushed, liveText: "" };
     }
-    return { items: [...flushed, { kind: "tool", tool: e.tool, args: e.args }], liveText: "" };
+    return { ...s, items: [...flushed, { kind: "tool", tool: e.tool, args: e.args }], liveText: "" };
   }
   if (e.type === "tool_result") {
     // Most tool_result rows stay invisible (results feed the model, not
@@ -158,6 +201,7 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
     if (e.tool === "propose_annotation") {
       const result = e.result as { proposal_id?: string } | null;
       return {
+        ...s,
         items: result?.proposal_id
           ? [...flushed, { kind: "proposal", proposalId: result.proposal_id }]
           : flushed,
@@ -167,15 +211,17 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
     return s;
   }
   if (e.type === "error") {
-    return { items: [...flushed, { kind: "error", detail: e.detail }], liveText: "" };
+    return { ...s, items: [...flushed, { kind: "error", detail: e.detail }], liveText: "" };
   }
   // "done" is handled by the caller via query invalidation.
   return s;
 }
 
 function itemsFromStream(s: StreamState): ChatItem[] {
-  if (!s.liveText) return s.items;
-  return [...s.items, { kind: "assistant", content: s.liveText, streaming: true }];
+  const out = [...s.items];
+  if (s.liveThinking) out.push({ kind: "thinking", content: s.liveThinking, streaming: true });
+  if (s.liveText) out.push({ kind: "assistant", content: s.liveText, streaming: true });
+  return out;
 }
 
 function ToolRow({ tool, args }: { tool: string; args?: Record<string, unknown> | null }) {
@@ -202,6 +248,10 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
   const [stream, setStream] = useState<StreamState>(EMPTY_STREAM);
   const [streaming, setStreaming] = useState(false);
   const [pendingUserText, setPendingUserText] = useState<string | null>(null);
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -228,14 +278,6 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
     return map;
   }, [proposalsQuery.data]);
 
-  const createMutation = useMutation({
-    mutationFn: () => agentApi.createConversation(caseId, timelineId),
-    onSuccess: (conversation) => {
-      queryClient.invalidateQueries({ queryKey: ["agent-conversations", caseId, timelineId] });
-      setActiveConversation(storeKey, conversation.id);
-    },
-  });
-
   const deleteMutation = useMutation({
     mutationFn: (id: string) => agentApi.deleteConversation(caseId, id),
     onSuccess: () => {
@@ -253,82 +295,118 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [persistedItems.length, liveItems.length, stream.liveText.length]);
 
-  const send = useCallback(async () => {
-    const content = input.trim();
-    if (!content || streaming) return;
-    setInput("");
-    setPendingUserText(content);
-    setStream(EMPTY_STREAM);
-    setStreaming(true);
-    const abort = new AbortController();
-    abortRef.current = abort;
-    let conversationId = activeId;
-    // Keep failed turns on screen: the finally block only clears the live
-    // transcript when the turn ended cleanly, so an error item stays visible.
-    let failed = false;
-    try {
-      if (!conversationId) {
-        const conversation = await agentApi.createConversation(caseId, timelineId);
-        queryClient.invalidateQueries({ queryKey: ["agent-conversations", caseId, timelineId] });
-        setActiveConversation(storeKey, conversation.id);
-        conversationId = conversation.id;
-      }
-      await agentApi.streamMessage(
-        caseId,
-        conversationId,
-        { content, view_filters: currentFilters },
-        (event) => {
-          if (event.type === "error") failed = true;
-          setStream((prev) => foldStreamEvent(prev, event));
-          if (event.type === "tool_result" && event.tool === "propose_annotation") {
-            queryClient.invalidateQueries({ queryKey: ["agent-proposals", caseId, conversationId] });
-          }
-        },
-        abort.signal,
-      );
-    } catch (err) {
-      if (!abort.signal.aborted) {
-        failed = true;
-        const detail = err instanceof Error ? err.message : "Request failed";
-        setStream((prev) => foldStreamEvent(prev, { type: "error", detail }));
-      }
-    } finally {
-      setStreaming(false);
-      abortRef.current = null;
-      if (conversationId) {
+  const sendTo = useCallback(
+    async (conversationId: string) => {
+      const content = input.trim();
+      if (!content || streaming) return;
+      setInput("");
+      setPendingUserText(content);
+      setStream(EMPTY_STREAM);
+      setStreaming(true);
+      const abort = new AbortController();
+      abortRef.current = abort;
+      // Keep failed turns on screen: the finally block only clears the live
+      // transcript when the turn ended cleanly, so an error item stays visible.
+      let failed = false;
+      try {
+        await agentApi.streamMessage(
+          caseId,
+          conversationId,
+          { content, view_filters: currentFilters },
+          (event) => {
+            if (event.type === "error") failed = true;
+            setStream((prev) => foldStreamEvent(prev, event));
+            if (event.type === "tool_result" && event.tool === "propose_annotation") {
+              queryClient.invalidateQueries({
+                queryKey: ["agent-proposals", caseId, conversationId],
+              });
+            }
+          },
+          abort.signal,
+        );
+      } catch (err) {
+        if (!abort.signal.aborted) {
+          failed = true;
+          const detail = err instanceof Error ? err.message : "Request failed";
+          setStream((prev) => foldStreamEvent(prev, { type: "error", detail }));
+        }
+      } finally {
+        setStreaming(false);
+        abortRef.current = null;
         // Await the transcript refetch before dropping the live items —
         // clearing first flashed the finished turn empty until data landed.
         await queryClient.invalidateQueries({
           queryKey: ["agent-conversation", caseId, conversationId],
         });
         queryClient.invalidateQueries({ queryKey: ["agent-conversations", caseId, timelineId] });
+        setPendingUserText(null);
+        if (failed) {
+          // The persisted refetch already carries the user message and any
+          // partial assistant text ("[interrupted]") — keep only the error
+          // item(s) live so nothing renders twice.
+          setStream((prev) => ({
+            items: prev.items.filter((i) => i.kind === "error"),
+            liveText: "",
+            liveThinking: "",
+          }));
+        } else {
+          setStream(EMPTY_STREAM);
+        }
       }
-      setPendingUserText(null);
-      if (failed) {
-        // The persisted refetch already carries the user message and any
-        // partial assistant text ("[interrupted]") — keep only the error
-        // item(s) live so nothing renders twice. If the conversation never
-        // got created, restore the input so the message isn't lost.
-        setStream((prev) => ({
-          items: prev.items.filter((i) => i.kind === "error"),
-          liveText: "",
-        }));
-        if (!conversationId) setInput(content);
-      } else {
-        setStream(EMPTY_STREAM);
-      }
+    },
+    [input, streaming, caseId, timelineId, currentFilters, queryClient],
+  );
+
+  // Every new conversation goes through the dialog (OPSEC notice + tool
+  // selection) — there is no silent lazy-create path anymore.
+  const send = useCallback(() => {
+    if (!input.trim() || streaming) return;
+    if (!activeId) {
+      setDialogOpen(true);
+      return;
     }
-  }, [
-    input,
-    streaming,
-    activeId,
-    caseId,
-    timelineId,
-    storeKey,
-    currentFilters,
-    queryClient,
-    setActiveConversation,
-  ]);
+    void sendTo(activeId);
+  }, [input, streaming, activeId, sendTo]);
+
+  const [creating, setCreating] = useState(false);
+  const handleCreate = useCallback(
+    async (disabledTools: string[]) => {
+      setCreating(true);
+      setCreateError(null);
+      try {
+        const conversation = await agentApi.createConversation(caseId, timelineId, disabledTools);
+        queryClient.invalidateQueries({ queryKey: ["agent-conversations", caseId, timelineId] });
+        setActiveConversation(storeKey, conversation.id);
+        setDialogOpen(false);
+        // A message typed before the dialog opened sends immediately.
+        if (input.trim()) void sendTo(conversation.id);
+      } catch (err) {
+        // Dialog stays open with the error shown; the user can retry or cancel.
+        setCreateError(err instanceof Error ? err.message : "Could not start the conversation.");
+      } finally {
+        setCreating(false);
+      }
+    },
+    [caseId, timelineId, storeKey, queryClient, setActiveConversation, input, sendTo],
+  );
+
+  const exportThread = useCallback(async () => {
+    if (!activeId) return;
+    setExporting(true);
+    setExportError(null);
+    try {
+      const blob = await agentApi.exportConversation(caseId, activeId);
+      // Titles are free user text — keep only filename-safe characters.
+      const title = (conversationQuery.data?.title || activeId)
+        .replace(/[^\p{L}\p{N}._-]+/gu, "_")
+        .slice(0, 60);
+      triggerDownload(blob, `agent-${title || activeId}.json`);
+    } catch (err) {
+      setExportError(err instanceof Error ? err.message : "Export failed.");
+    } finally {
+      setExporting(false);
+    }
+  }, [activeId, caseId, conversationQuery.data]);
 
   const stop = useCallback(() => abortRef.current?.abort(), []);
 
@@ -367,7 +445,11 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
         <select
           className="ml-1 min-w-0 flex-1 truncate rounded border border-[var(--color-border)] bg-[var(--color-bg-base)] px-1.5 py-0.5 text-xs"
           value={activeId ?? ""}
-          onChange={(e) => setActiveConversation(storeKey, e.target.value || null)}
+          onChange={(e) => {
+            const id = e.target.value || null;
+            setActiveConversation(storeKey, id);
+            if (!id) setDialogOpen(true);
+          }}
         >
           <option value="">New conversation…</option>
           {conversations.map((c) => (
@@ -377,15 +459,17 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
           ))}
         </select>
         <Tooltip content="New conversation">
-          <Button
-            variant="ghost"
-            size="icon"
-            disabled={createMutation.isPending}
-            onClick={() => setActiveConversation(storeKey, null)}
-          >
+          <Button variant="ghost" size="icon" disabled={creating} onClick={() => setDialogOpen(true)}>
             <Plus size={13} />
           </Button>
         </Tooltip>
+        {activeId && (
+          <Tooltip content="Export conversation as JSON">
+            <Button variant="ghost" size="icon" disabled={exporting} onClick={exportThread}>
+              <Download size={13} />
+            </Button>
+          </Tooltip>
+        )}
         {activeId && (
           <Tooltip content="Delete conversation">
             <Button
@@ -402,6 +486,12 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
           <X size={14} />
         </Button>
       </div>
+
+      {exportError && (
+        <p className="border-b border-[var(--color-border)] px-2.5 py-1 text-[11px] text-[var(--color-danger)]">
+          Export failed: {exportError}
+        </p>
+      )}
 
       {/* Messages */}
       <div ref={scrollRef} className="flex-1 space-y-2.5 overflow-y-auto p-2.5">
@@ -442,6 +532,38 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
           }
           if (item.kind === "tool") {
             return <ToolRow key={i} tool={item.tool} args={item.args} />;
+          }
+          if (item.kind === "thinking") {
+            return (
+              <details
+                key={i}
+                className="rounded border border-[var(--color-border)] px-2 py-1 text-[11px] text-[var(--color-fg-secondary)]"
+              >
+                <summary className="flex cursor-pointer select-none items-center gap-1.5">
+                  <Brain size={11} className="shrink-0" />
+                  <span className={item.streaming ? "animate-pulse" : ""}>
+                    {item.streaming ? "Thinking…" : "Thinking"}
+                  </span>
+                </summary>
+                <div className="mt-1 whitespace-pre-wrap break-words">{item.content}</div>
+              </details>
+            );
+          }
+          if (item.kind === "compaction") {
+            return (
+              <details
+                key={i}
+                className="rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-2 py-1 text-[11px] text-[var(--color-fg-secondary)]"
+              >
+                <summary className="flex cursor-pointer select-none items-center gap-1.5">
+                  <Archive size={11} className="shrink-0" />
+                  <span>
+                    Older turns were summarized to stay within the model's context window
+                  </span>
+                </summary>
+                <div className="mt-1 whitespace-pre-wrap break-words">{item.summary}</div>
+              </details>
+            );
           }
           if (item.kind === "finding") {
             return (
@@ -514,6 +636,17 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
           )}
         </div>
       </div>
+
+      <NewConversationDialog
+        open={dialogOpen}
+        onOpenChange={(open) => {
+          setDialogOpen(open);
+          if (!open) setCreateError(null);
+        }}
+        onCreate={handleCreate}
+        creating={creating}
+        error={createError}
+      />
     </div>
   );
 }

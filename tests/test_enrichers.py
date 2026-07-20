@@ -422,6 +422,8 @@ async def test_init_schema_drops_legacy_staging_table(tmp_path):
         await conn.execute(
             text("ALTER TABLE annotations ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT false")
         )
+        # 0012 adds the per-user preferences blob.
+        await conn.execute(text("ALTER TABLE users DROP COLUMN preferences"))
         await conn.execute(text("DROP TABLE enrichment_results_staging"))
         await conn.execute(
             text(

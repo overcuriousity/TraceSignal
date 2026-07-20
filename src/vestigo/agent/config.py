@@ -59,6 +59,9 @@ def is_kimi_coding_endpoint(base_url: str | None) -> bool:
 _DEFAULT_PROVIDER = "openai"
 _DEFAULT_MAX_TURNS = 15
 _DEFAULT_REASONING_EFFORT = "off"
+# Shared with agent/compaction.py's should_compact fallback — one constant so
+# the resolver default and the runtime fallback can never drift apart.
+DEFAULT_COMPACT_THRESHOLD = 0.85
 
 # (AgentConfig field, Settings attribute, AgentSettingsRow attribute)
 _FIELD_MAP: tuple[tuple[str, str, str], ...] = (
@@ -70,6 +73,9 @@ _FIELD_MAP: tuple[tuple[str, str, str], ...] = (
     ("extra_headers", "agent_extra_headers", "extra_headers"),
     ("max_turns", "agent_max_turns", "max_turns"),
     ("reasoning_effort", "agent_reasoning_effort", "reasoning_effort"),
+    ("context_window", "agent_context_window", "context_window"),
+    ("compact_threshold", "agent_compact_threshold", "compact_threshold"),
+    ("disabled_tools", "agent_disabled_tools", "disabled_tools"),
 )
 
 _DEFAULTS: dict[str, Any] = {
@@ -81,6 +87,10 @@ _DEFAULTS: dict[str, Any] = {
     "extra_headers": None,
     "max_turns": _DEFAULT_MAX_TURNS,
     "reasoning_effort": _DEFAULT_REASONING_EFFORT,
+    # None = auto-compaction off; the right window is model-specific.
+    "context_window": None,
+    "compact_threshold": DEFAULT_COMPACT_THRESHOLD,
+    "disabled_tools": None,
 }
 
 
@@ -102,6 +112,9 @@ class AgentConfig:
     extra_headers: dict[str, str] | None
     max_turns: int
     reasoning_effort: str
+    context_window: int | None = None
+    compact_threshold: float | None = None
+    disabled_tools: list[str] | None = None
     sources: dict[str, str] = field(default_factory=dict)
 
 
@@ -163,6 +176,9 @@ async def resolve_agent_config(settings: Settings | None = None) -> AgentConfig:
         extra_headers=resolved["extra_headers"],
         max_turns=resolved["max_turns"],
         reasoning_effort=resolved["reasoning_effort"],
+        context_window=resolved["context_window"],
+        compact_threshold=resolved["compact_threshold"],
+        disabled_tools=resolved["disabled_tools"],
         sources=sources,
     )
 
@@ -183,6 +199,9 @@ def config_fingerprint(config: AgentConfig) -> str:
         "extra_headers": config.extra_headers,
         "max_turns": config.max_turns,
         "reasoning_effort": config.reasoning_effort,
+        "context_window": config.context_window,
+        "compact_threshold": config.compact_threshold,
+        "disabled_tools": config.disabled_tools,
     }
     blob = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()

@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Agent auto-compaction**: configurable model context window
+  (`VESTIGO_AGENT_CONTEXT_WINDOW` / admin UI); long conversations are summarized
+  before they overflow, with the summary shown in chat and the exact
+  pre-compaction history preserved on an append-only, audited record. Provider
+  context-overflow errors now compact-and-retry once, then fail with a specific,
+  friendly message instead of a generic one.
+- **Per-tool enable/disable, three layers**: admins can hard-disable individual
+  agent tools globally (applies to the in-app agent and the external `/mcp`
+  endpoint); users can set personal defaults and adjust the tool set per
+  conversation.
+- **New-conversation OPSEC dialog**: starting an agent conversation now always
+  shows where evidence data goes — the configured API endpoint URL and model —
+  plus the tool selection for that chat.
+- **Thinking content**: the model's reasoning segments are streamed, persisted,
+  and rendered as collapsible blocks in the chat.
+- **Conversation JSON export**: download any agent thread as JSON — every
+  message, tool call with arguments and results, thinking content, token usage,
+  compaction records, and the raw provider-wire history.
+
 ## [1.3.0] — 2026-07-19
 
 ### Added

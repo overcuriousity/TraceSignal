@@ -150,10 +150,22 @@ class MCPEndpoint:
                 return {"type": "http.request", "body": body, "more_body": False}
             return await receive()
 
+        from vestigo.agent.config import resolve_agent_config
         from vestigo.agent.tools import build_scope, build_tool_server
 
         try:
-            agent_scope = await build_scope(token_row.case_id, token_row.timeline_id, user)
+            # Only the admin hard-deny layer applies here — per-user/per-chat
+            # tool preferences are an in-app concept. Resolved per request on
+            # purpose: an admin deny must apply to the next /mcp call, not
+            # after some cache TTL. One small Postgres read per request is
+            # fine at this deployment's scale.
+            config = await resolve_agent_config()
+            agent_scope = await build_scope(
+                token_row.case_id,
+                token_row.timeline_id,
+                user,
+                disabled_tools=frozenset(config.disabled_tools or ()),
+            )
         except HTTPException as exc:
             await JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})(
                 scope, replay_receive, send
