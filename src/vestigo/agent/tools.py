@@ -62,9 +62,9 @@ VIZ_TIMESERIES_MAX_BUCKETS = 60
 VIZ_TIMESERIES_MAX_SERIES = 8
 VIZ_PIVOT_MAX_LIMIT = 12
 VIZ_SCATTER_MAX_POINTS = 1000
-VIZ_COMPARE_MAX_BUCKETS = 60
-VIZ_COMPARE_MAX_TERMS = 30
-VIZ_COMPARE_MAX_BINS = 30
+VIZ_MAX_BUCKETS = 60
+VIZ_MAX_TERMS = 30
+VIZ_MAX_BINS = 30
 
 
 @dataclass(frozen=True)
@@ -610,6 +610,27 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             "Call list_fields for the full set."
         )
 
+    def _reject_time_fields(tokens: str | None, label: str) -> None:
+        """Reject virtual ``time:`` tokens where the detectors cannot honour them.
+
+        ``db/anomaly_stats.py``'s ``_col_expr`` has no ``time:`` branch, so such
+        a token falls through to ``attributes['time:hour_of_day']`` — a lookup
+        that is empty for every row. The detector then completes cleanly with
+        zero findings, which reads as "nothing anomalous" rather than "that
+        field was never scanned". ``list_fields`` advertises these tokens
+        (they are real for charts and filters), so the scoping has to be said
+        somewhere; an error beats a confidently empty result.
+        """
+        for token in (t.strip() for t in (tokens or "").split(",")):
+            if token and resolve_time_field(token) is not None:
+                raise ValueError(
+                    f'{label} "{token}" is a virtual time field, which the anomaly '
+                    "detectors cannot scan — they read stored columns and attributes, "
+                    "and a time part is computed per query. Use it with propose_chart "
+                    "or as a filter instead. For temporal anomalies use the frequency "
+                    "or interval_periodicity detectors, which bucket time themselves."
+                )
+
     @server.tool()
     async def search_events(
         filters: FilterSpec | None = None,
@@ -648,8 +669,11 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
 
         `time_fields` are virtual: they are defined for every dated event and
         let you put a time part on an axis or in a filter (an hour-of-day x
-        country heatmap; "weekends only"). Use `describe_field` before charting
-        a field you have not charted yet — it reports the scale.
+        country heatmap; "weekends only"). They are computed per query, not
+        stored, so they work with propose_chart and the viz/search tools but
+        **not** with run_anomaly_detector, which scans stored columns and
+        attributes. Use `describe_field` before charting a field you have not
+        charted yet — it reports the scale.
         """
         listed = await run_in_threadpool(
             service.list_fields, scope.case_id, scope.source_ids, scope.field_mappings
@@ -897,7 +921,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 service.compare_time_histogram,
                 primary_query,
                 comparison_query,
-                min(max(buckets, 4), VIZ_COMPARE_MAX_BUCKETS),
+                min(max(buckets, 4), VIZ_MAX_BUCKETS),
             )
         if kind == "terms":
             return await run_in_threadpool(
@@ -905,14 +929,14 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 primary_query,
                 comparison_query,
                 field,
-                max(1, min(limit, VIZ_COMPARE_MAX_TERMS)),
+                max(1, min(limit, VIZ_MAX_TERMS)),
             )
         return await run_in_threadpool(
             service.compare_field_numeric,
             primary_query,
             comparison_query,
             field,
-            max(1, min(limit, VIZ_COMPARE_MAX_BINS)),
+            max(1, min(limit, VIZ_MAX_BINS)),
         )
 
     @server.tool()
@@ -946,7 +970,13 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         (effect-size floor), ngram_size (sequence length, 2-5), min_support
         (sequence_motif), start/end (sequence_motif mining window).
         Returns findings plus a persisted run_id the analyst can open.
+
+        The virtual `time:` fields from list_fields are **not** detector
+        fields — they are for charting and filtering only. Passing one is
+        rejected rather than run.
         """
+        _reject_time_fields(fields, "fields")
+        _reject_time_fields(series_field, "series_field")
         result, resolution = await _run_stat_detector(
             scope.case_id,
             scope.timeline_id,
@@ -1123,7 +1153,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
 
         # ── execute, dispatching on the aggregation the mark needs ───────────
         if data_kind == "terms":
-            applied["top_n"] = _capped(opts.top_n, 30, VIZ_COMPARE_MAX_TERMS, "top_n")
+            applied["top_n"] = _capped(opts.top_n, 30, VIZ_MAX_TERMS, "top_n")
             if comparison_query is not None:
                 result = await run_in_threadpool(
                     service.compare_field_terms,
@@ -1147,7 +1177,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                     "top_values": result["values"][:5],
                 }
         elif data_kind == "numeric":
-            applied["bins"] = _capped(opts.bins, 30, VIZ_COMPARE_MAX_BINS, "bins")
+            applied["bins"] = _capped(opts.bins, 30, VIZ_MAX_BINS, "bins")
             if comparison_query is not None:
                 result = await run_in_threadpool(
                     service.compare_field_numeric,
@@ -1193,9 +1223,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 "interval_seconds": result["interval_seconds"],
             }
         elif data_kind == "time":
-            applied["buckets"] = _capped(
-                opts.buckets, 30, VIZ_COMPARE_MAX_BUCKETS, "buckets", floor=4
-            )
+            applied["buckets"] = _capped(opts.buckets, 30, VIZ_MAX_BUCKETS, "buckets", floor=4)
             if comparison_query is not None:
                 result = await run_in_threadpool(
                     service.compare_time_histogram,
@@ -1247,8 +1275,14 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 )
             summary = {
                 "total": result["total"],
+                # `*_distinct` carries two units — a measured distinct count
+                # the axis may have been truncated against, or the size of a
+                # bounded time domain charted whole. `*_bounded` says which,
+                # so "12 of 400 distinct" and "12 of 12" are not read alike.
                 "x_distinct": result["x_distinct"],
                 "y_distinct": result["y_distinct"],
+                "x_bounded": result["x_bounded"],
+                "y_bounded": result["y_bounded"],
                 # Size of the matrix the model is about to reason over —
                 # what the axes actually resolved to, which for a bounded
                 # time axis is its whole domain rather than a limit.

@@ -1117,8 +1117,14 @@ export interface FieldPivotResponse {
   field_y: string;
   x_values: string[];
   y_values: string[];
+  /** Distinct values on this axis — a *measured* count the axis may have been
+   * truncated against, or, when the matching `*_bounded` is true, the size of
+   * a statically-known `time:` domain that was charted whole. Only the former
+   * can mean "there is more than you are seeing". */
   x_distinct: number;
   y_distinct: number;
+  x_bounded: boolean;
+  y_bounded: boolean;
   cells: FieldPivotCell[];
   total: number;
 }

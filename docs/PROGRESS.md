@@ -1,6 +1,53 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-20 (session 76 — PR142 review fixes: time fields reach the analyst).
+Last updated: 2026-07-20 (session 77 — PR142 second review round, merged to main).
+
+## Session 77 — 2026-07-20: PR142 second review round — the two paths that missed the guard
+
+A second review of PR142 before merge. The PR's whole thesis is that a chart
+request must never succeed *quietly wrong*, and it enforces that in three
+places (`_check_chart_field`, the `count == 0` raise, the scatter raise). Two
+paths had not been given the same treatment:
+
+- **Numeric mark over a `time:` field rendered a blank box.** `time:date` and
+  `time:year_month` are `interval`, so `chartTypesFor` offered `histogram` and
+  `scatter` — but `VisualizePage`'s numeric probe is disabled for time fields,
+  and every render gate is `data && <Chart/>`. No spinner, no message, no
+  chart. New `chartTypesForField(scale, field)` (`viz/lib/chartOptions.ts`)
+  drops the numeric/scatter marks for a `time:` field and now backs the
+  dropdown, the scale-change clamp and `defaultChartTypeForScale`. A saved
+  chart or URL can still carry the pairing (the time-field effect is gated on
+  `field !== autoProbedField.current`, which a restored config never trips), so
+  the canvas also grew an explicit branch saying the field has no numeric
+  values — the same thing `propose_chart` tells the agent.
+- **`time:` tokens silently no-op'd in the detectors.** `anomaly_stats._col_expr`
+  has no `time:` branch, so `run_anomaly_detector(fields="time:hour_of_day")`
+  fell through to `attributes['time:hour_of_day']` — empty for every row. The
+  detector finished clean with zero findings, reading as "nothing anomalous"
+  rather than "never scanned". `list_fields` advertises these tokens (they are
+  real for charts and filters), so the scoping had to be stated: it now says so
+  in the docstring, and `_reject_time_fields` guards `fields`/`series_field`
+  with an error pointing at frequency / interval_periodicity, which bucket time
+  themselves.
+
+Smaller, both naming-honesty rather than behaviour:
+
+- `VIZ_COMPARE_MAX_{TERMS,BINS,BUCKETS}` → `VIZ_MAX_*`. The rebuilt
+  `propose_chart` routes its non-compare paths through them too, so "COMPARE"
+  in the name had stopped being true.
+- `field_pivot`'s `x_distinct`/`y_distinct` carry two units — a *measured*
+  distinct count the axis may have been truncated against, or the size of a
+  bounded `time:` domain charted whole. Added `x_bounded`/`y_bounded` to say
+  which, echoed in `propose_chart`'s summary and used by the caption builder to
+  pass `undefined` for a bounded axis, so "top N of M" can never claim a
+  truncation that did not occur. Additive response change; the hand-mirrored
+  `FieldPivotResponse` was updated alongside (exactly the duplication
+  Milestone 3's `openapi-typescript` item would remove).
+
+Verification: backend 1363 passed (was 1359), frontend 386 passed (was 383),
+ruff + oxlint + `tsc -b --noEmit` clean, `gen_chart_meta.py` still idempotent.
+The pivot test fake derives `*_bounded` the same way the real service does, so
+it cannot drift into claiming a measured count for a static domain.
 
 ## Session 76 — 2026-07-20: PR142 review fixes — virtual time fields reach the analyst
 

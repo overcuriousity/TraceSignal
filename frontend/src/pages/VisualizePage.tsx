@@ -59,8 +59,12 @@ import {
   type Scale,
 } from "@/components/viz/lib/chartConfig";
 import { METRIC_INFO, type Metric } from "@/components/viz/lib/transforms";
-import { CHART_META, chartTypesFor, SCALES } from "@/components/viz/lib/chartMeta";
-import { resolveChartOptions, defaultChartTypeForScale } from "@/components/viz/lib/chartOptions";
+import { CHART_META, SCALES } from "@/components/viz/lib/chartMeta";
+import {
+  resolveChartOptions,
+  defaultChartTypeForScale,
+  chartTypesForField,
+} from "@/components/viz/lib/chartOptions";
 import { fieldTokenLabel } from "@/components/viz/lib/fieldDisplay";
 import { isTimeField, TIME_FIELDS } from "@/components/viz/lib/timeFields";
 import { buildCaptionLines, type CaptionFacts } from "@/components/viz/lib/caption";
@@ -222,6 +226,12 @@ export function VisualizePage() {
   // to report `count: 0` and land the analyst on nominal/bar, contradicting
   // TIME_FIELDS. Never probe one.
   const fieldIsTime = field != null && isTimeField(field);
+  // A pairing the rail never offers but a saved chart or URL can still carry:
+  // a numeric-fed mark over a `time:` field, whose SQL yields strings. Tested
+  // on the data kind rather than on `chartTypesForField`, so a URL with an
+  // inconsistent scale/chartType pair still falls through to its own handling
+  // instead of collecting this (wrong) explanation.
+  const chartTypeUnplottable = fieldIsTime && (dataKind === "numeric" || dataKind === "scatter");
   const numericQuery = useQuery({
     queryKey: ["viz-field-numeric", caseId, timelineId, field, filters, bins],
     queryFn: () => vizApi.fieldNumeric(caseId!, timelineId!, field!, filters, bins),
@@ -252,7 +262,7 @@ export function VisualizePage() {
     autoProbedField.current = field;
     if (fieldFree || requiresSecondField) return;
     const scale = TIME_FIELDS[field].scale;
-    updateConfig({ scale, chartType: defaultChartTypeForScale(scale) });
+    updateConfig({ scale, chartType: defaultChartTypeForScale(scale, field) });
   }, [field, fieldIsTime, fieldFree, requiresSecondField, updateConfig]);
 
   useEffect(() => {
@@ -276,8 +286,10 @@ export function VisualizePage() {
   // time rather than in an effect, so there is never a render with an
   // inconsistent scale/chartType pair.
   const handleScaleChange = (s: Scale) => {
-    if (!CHART_META[chartType].scales.includes(s)) {
-      updateConfig({ scale: s, chartType: defaultChartTypeForScale(s) });
+    // Also re-picks when the type is legal for the new scale but not for the
+    // field — a `time:` field cannot feed a numeric mark at any scale.
+    if (!chartTypesForField(s, field).includes(chartType)) {
+      updateConfig({ scale: s, chartType: defaultChartTypeForScale(s, field) });
     } else {
       updateConfig({ scale: s });
     }
@@ -377,7 +389,7 @@ export function VisualizePage() {
     enabled: !!(caseId && timelineId && field && fieldY) && dataKind === "scatter",
   });
 
-  const availableChartTypes = chartTypesFor(scale);
+  const availableChartTypes = chartTypesForField(scale, field);
 
   // Data-derived caption facts for the active query — totals, grid width,
   // and top-N capping feed the truthful caption/export lines.
@@ -419,9 +431,13 @@ export function VisualizePage() {
     facts.primaryTotal = punchcardQuery.data.total;
   } else if (dataKind === "pivot" && pivotQuery.data) {
     facts.primaryTotal = pivotQuery.data.total;
-    facts.xDistinct = pivotQuery.data.x_distinct;
+    // A bounded `time:` axis reports its domain size, not a measured distinct
+    // count, and was charted whole — there is no "rest in Other" to caption.
+    // Left undefined rather than relying on `distinct > shown` happening to be
+    // false, so the caption cannot claim truncation that did not occur.
+    facts.xDistinct = pivotQuery.data.x_bounded ? undefined : pivotQuery.data.x_distinct;
     facts.xShown = pivotQuery.data.x_values.length;
-    facts.yDistinct = pivotQuery.data.y_distinct;
+    facts.yDistinct = pivotQuery.data.y_bounded ? undefined : pivotQuery.data.y_distinct;
     facts.yShown = pivotQuery.data.y_values.length;
   } else if (dataKind === "scatter" && scatterQuery.data) {
     facts.primaryTotal = scatterQuery.data.total;
@@ -1012,6 +1028,17 @@ export function VisualizePage() {
         ) : requiresSecondField && !fieldY ? (
           <div className="flex h-full items-center justify-center text-sm text-[var(--color-fg-muted)]">
             Choose a second field (Y) to chart {CHART_META[chartType].label.toLowerCase()}.
+          </div>
+        ) : chartTypeUnplottable ? (
+          // The rail cannot offer this pairing, but a saved chart or a URL can
+          // still carry one. Without this branch the numeric probe stays
+          // disabled, `numericQuery.data` never arrives, and every render gate
+          // below is `data && <Chart/>` — a blank canvas with no spinner and
+          // no explanation.
+          <div className="flex h-full items-center justify-center px-6 text-center text-sm text-[var(--color-fg-muted)]">
+            {fieldTokenLabel(field!)} has no numeric values, so{" "}
+            {CHART_META[chartType].label.toLowerCase()} would render empty. Pick a categorical
+            chart type — bar, pie or heatmap.
           </div>
         ) : loading ? (
           <div className="flex h-full items-center justify-center">

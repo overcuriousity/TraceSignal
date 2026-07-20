@@ -14,6 +14,7 @@
  * could have asked for by hand.
  */
 import { CHART_META, chartTypesFor } from "./chartMeta";
+import { isTimeField } from "./timeFields";
 import type { ChartConfig, ChartOptions, ChartType, Scale } from "./chartConfig";
 
 /**
@@ -28,9 +29,31 @@ import type { ChartConfig, ChartOptions, ChartType, Scale } from "./chartConfig"
  */
 const CHART_TYPE_PREFERENCE: ChartType[] = ["bar", "heatmap", "line", "histogram", "time"];
 
-/** The chart type to select when only the scale is known. */
-export function defaultChartTypeForScale(scale: Scale): ChartType {
+/**
+ * Chart types legal for *scale* that could also plot *field*.
+ *
+ * Scale alone is not enough for a virtual `time:` field. Its SQL yields
+ * zero-padded strings and date strings, so `toFloat64OrNull` returns null for
+ * every row and any numeric-fed mark (histogram/box/violin/ecdf) or scatter
+ * renders empty — and the page's render gates are all `data && <Chart/>`, so
+ * "empty" means a blank box with no spinner and no message. `time:date` and
+ * `time:year_month` are `interval`, which makes `histogram` and `scatter`
+ * offered by scale alone; this is what stops them being offered.
+ *
+ * The agent's equivalent guard is `propose_chart` raising on a `count == 0`
+ * numeric field — same rule, stated as an error rather than a shrunk dropdown.
+ */
+export function chartTypesForField(scale: Scale, field: string | null): ChartType[] {
   const legal = chartTypesFor(scale);
+  if (field == null || !isTimeField(field)) return legal;
+  return legal.filter(
+    (c) => CHART_META[c].dataKind !== "numeric" && CHART_META[c].dataKind !== "scatter",
+  );
+}
+
+/** The chart type to select when only the scale and the field are known. */
+export function defaultChartTypeForScale(scale: Scale, field: string | null = null): ChartType {
+  const legal = chartTypesForField(scale, field);
   return CHART_TYPE_PREFERENCE.find((c) => legal.includes(c)) ?? legal[0];
 }
 

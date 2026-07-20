@@ -2348,10 +2348,16 @@ class EventQueryService:
         its terms scan: its domain is known, complete and naturally ordered,
         so ranking it by count would both reorder the axis and drop the empty
         slots that make a temporal heatmap readable — an hour with no events
-        is a finding, not a value to hide. Its ``distinct`` is the domain
-        size, which is honest precisely because nothing was cut off. Unbounded
-        ``time:`` parts (date, year-month) keep the top-N path like any other
-        high-cardinality field.
+        is a finding, not a value to hide. Unbounded ``time:`` parts (date,
+        year-month) keep the top-N path like any other high-cardinality field.
+
+        ``x_distinct``/``y_distinct`` therefore carry two different units, and
+        ``x_bounded``/``y_bounded`` say which: ``False`` (the usual case) means
+        a *measured* distinct count that the axis may have been truncated
+        against, ``True`` means the size of a statically-known domain that was
+        charted whole. A caller comparing "values shown" against "distinct" to
+        caption a truncation has to know the difference — for a bounded axis
+        the two are equal by construction, and nothing was cut off.
         """
         self.store.init_schema()
         spec_x = resolve_time_field(field_x)
@@ -2359,14 +2365,14 @@ class EventQueryService:
 
         def _axis(
             field_token: str, spec: TimeFieldSpec | None, limit: int
-        ) -> tuple[list[str], int]:
-            """One axis's ``(values, distinct)`` — domain verbatim, or top-N by count."""
+        ) -> tuple[list[str], int, bool]:
+            """One axis's ``(values, distinct, bounded)`` — domain, or top-N by count."""
             if spec is not None and spec.domain is not None:
-                return list(spec.domain), len(spec.domain)
+                return list(spec.domain), len(spec.domain), True
             terms = self._field_terms_impl(query, field_token, limit=limit)
-            return [v["value"] for v in terms["values"]], terms["distinct"]
+            return [v["value"] for v in terms["values"]], terms["distinct"], False
 
-        (x_values, x_distinct), (y_values, y_distinct) = self._run_parallel(
+        (x_values, x_distinct, x_bounded), (y_values, y_distinct, y_bounded) = self._run_parallel(
             lambda: _axis(field_x, spec_x, limit_x),
             lambda: _axis(field_y, spec_y, limit_y),
         )
@@ -2378,6 +2384,8 @@ class EventQueryService:
             "y_values": y_values,
             "x_distinct": x_distinct,
             "y_distinct": y_distinct,
+            "x_bounded": x_bounded,
+            "y_bounded": y_bounded,
         }
         if not x_values or not y_values:
             return {**base, "cells": [], "total": 0}

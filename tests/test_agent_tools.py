@@ -16,6 +16,7 @@ from fastmcp.client import Client as FastMCPClient
 from fastmcp.exceptions import ToolError
 
 from vestigo.agent.tools import AgentScope, build_tool_server
+from vestigo.db._time_fields import resolve_time_field
 from vestigo.db.postgres import User
 
 
@@ -363,9 +364,17 @@ class _FakeVizService:
 
     def field_pivot(self, query, field_x, field_y, limit_x, limit_y):
         self.calls.append(("field_pivot", (field_x, field_y, limit_x, limit_y), {}))
+
         # x_values/y_values are part of the real response — the axes the
         # matrix actually resolved to, which a bounded time axis fills from
         # its domain rather than from a top-N scan.
+        # `*_bounded` is derived the same way the real service derives it, so
+        # the fake can't drift into claiming a measured distinct count for an
+        # axis that was charted from a static domain.
+        def _bounded(token: str) -> bool:
+            spec = resolve_time_field(token)
+            return spec is not None and spec.domain is not None
+
         return {
             "kind": "pivot",
             "cells": [],
@@ -374,6 +383,8 @@ class _FakeVizService:
             "y_values": [],
             "x_distinct": 0,
             "y_distinct": 0,
+            "x_bounded": _bounded(field_x),
+            "y_bounded": _bounded(field_y),
         }
 
     def field_scatter(self, query, field_x, field_y, limit):
@@ -453,7 +464,7 @@ async def test_compare_time_dispatches_and_clamps_buckets(store, monkeypatch):
     assert result["kind"] == "time"
     name, args, _ = fake.calls[0]
     assert name == "compare_time_histogram"
-    assert args == (60,)  # clamped to VIZ_COMPARE_MAX_BUCKETS
+    assert args == (60,)  # clamped to VIZ_MAX_BUCKETS
 
 
 async def test_compare_terms_requires_field(store):
@@ -469,7 +480,7 @@ async def test_compare_terms_dispatches_and_clamps_limit(store, monkeypatch):
     assert result["kind"] == "terms"
     name, args, _ = fake.calls[0]
     assert name == "compare_field_terms"
-    assert args == ("attr:status", 30)  # clamped to VIZ_COMPARE_MAX_TERMS
+    assert args == ("attr:status", 30)  # clamped to VIZ_MAX_TERMS
 
 
 async def test_compare_numeric_dispatches_and_clamps_bins(store, monkeypatch):
@@ -481,7 +492,7 @@ async def test_compare_numeric_dispatches_and_clamps_bins(store, monkeypatch):
     assert result["kind"] == "numeric"
     name, args, _ = fake.calls[0]
     assert name == "compare_field_numeric"
-    assert args == ("attr:bytes", 30)  # clamped to VIZ_COMPARE_MAX_BINS
+    assert args == ("attr:bytes", 30)  # clamped to VIZ_MAX_BINS
 
 
 async def test_compare_rejects_unknown_kind(store):
@@ -926,6 +937,45 @@ async def test_clamped_buckets_warn_like_every_other_clamped_option(store, monke
     )
     assert any("buckets" in w and "clamped" in w for w in result["warnings"])
     assert result["resolved"]["options"]["buckets"] < 100_000
+
+
+async def test_pivot_summary_marks_which_distinct_counts_are_domain_sizes(store, monkeypatch):
+    """`x_distinct` carries two units — a measured count the axis may have been
+    truncated against, or a bounded domain charted whole. Without the
+    `*_bounded` flags the model reads "12 of 12" and "12 of 400" alike."""
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {"chart_type": "pivot", "field": "time:hour_of_day", "field_y": "country"},
+        ),
+    )
+    assert result["summary"]["x_bounded"] is True
+    assert result["summary"]["y_bounded"] is False
+
+
+# ── virtual time fields are chart/filter-only, never detector fields ────────
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"fields": "time:hour_of_day"},
+        {"fields": "artifact,time:day_of_week"},
+        {"series_field": "time:month"},
+    ],
+)
+async def test_run_anomaly_detector_rejects_virtual_time_fields(store, kwargs):
+    """`anomaly_stats._col_expr` has no `time:` branch, so such a token falls
+    through to `attributes['time:hour_of_day']` — empty for every row. The
+    detector would finish cleanly with zero findings, which reads as "nothing
+    anomalous" rather than "that field was never scanned"."""
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    with pytest.raises(ToolError) as excinfo:
+        await _call(server, "run_anomaly_detector", {"detector": "value_novelty", **kwargs})
+    assert "virtual time field" in str(excinfo.value)
 
 
 # ── back-compat: persisted conversations still resolve ──────────────────────

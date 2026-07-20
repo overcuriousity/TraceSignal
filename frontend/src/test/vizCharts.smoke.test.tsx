@@ -107,6 +107,8 @@ const PIVOT: FieldPivotResponse = {
   y_values: ["WS01", "WS02"],
   x_distinct: 5,
   y_distinct: 3,
+  x_bounded: false,
+  y_bounded: false,
   cells: [
     { x: "alice", y: "WS01", count: 40 },
     { x: "bob", y: "WS02", count: 12 },
@@ -390,6 +392,8 @@ describe("time-field labelling", () => {
       y_values: ["FILE"],
       x_distinct: 7,
       y_distinct: 1,
+      x_bounded: false,
+      y_bounded: false,
       cells: [
         { x: "1", y: "FILE", count: 40 },
         { x: "7", y: "FILE", count: 12 },
@@ -412,6 +416,8 @@ describe("time-field labelling", () => {
       y_values: ["FILE"],
       x_distinct: 24,
       y_distinct: 1,
+      x_bounded: false,
+      y_bounded: false,
       cells: [
         { x: "09", y: "FILE", count: 40 },
         { x: "10", y: "FILE", count: 12 },
@@ -444,6 +450,8 @@ describe("time-field labelling", () => {
       y_values: ["FILE"],
       x_distinct: 24,
       y_distinct: 1,
+      x_bounded: false,
+      y_bounded: false,
       cells: [{ x: "09", y: "FILE", count: 40 }],
       total: 40,
     };

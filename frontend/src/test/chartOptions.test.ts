@@ -6,8 +6,13 @@
  */
 import { describe, expect, it } from "vitest";
 import { DEFAULT_CHART_CONFIG, type ChartConfig } from "@/components/viz/lib/chartConfig";
-import { resolveChartOptions, defaultChartTypeForScale } from "@/components/viz/lib/chartOptions";
+import {
+  resolveChartOptions,
+  defaultChartTypeForScale,
+  chartTypesForField,
+} from "@/components/viz/lib/chartOptions";
 import { chartTypesFor, SCALES } from "@/components/viz/lib/chartMeta";
+import { TIME_FIELDS } from "@/components/viz/lib/timeFields";
 
 const config = (patch: Partial<ChartConfig>): ChartConfig => ({
   ...DEFAULT_CHART_CONFIG,
@@ -84,5 +89,35 @@ describe("defaultChartTypeForScale", () => {
     // numeric marks would render empty — heatmap plots their strings.
     expect(defaultChartTypeForScale("interval")).toBe("heatmap");
     expect(defaultChartTypeForScale("ratio")).toBe("line");
+  });
+});
+
+describe("chartTypesForField", () => {
+  it("leaves an ordinary field's options untouched", () => {
+    for (const scale of SCALES) {
+      expect(chartTypesForField(scale, "attr:bytes")).toEqual(chartTypesFor(scale));
+      expect(chartTypesForField(scale, null)).toEqual(chartTypesFor(scale));
+    }
+  });
+
+  it("drops the numeric marks for a time field, which are string-valued", () => {
+    // `time:date` is interval, so scale alone offers histogram and scatter —
+    // and both would render an empty box with no spinner and no message,
+    // because the numeric probe is disabled for time fields.
+    expect(chartTypesFor("interval")).toContain("histogram");
+    expect(chartTypesFor("interval")).toContain("scatter");
+    const offered = chartTypesForField("interval", "time:date");
+    expect(offered).not.toContain("histogram");
+    expect(offered).not.toContain("scatter");
+    expect(offered).toContain("heatmap");
+  });
+
+  it("never leaves a time field with nothing to plot", () => {
+    for (const token of Object.keys(TIME_FIELDS)) {
+      const scale = TIME_FIELDS[token].scale;
+      expect(chartTypesForField(scale, token).length).toBeGreaterThan(0);
+      // ...and the default pick is one of them.
+      expect(chartTypesForField(scale, token)).toContain(defaultChartTypeForScale(scale, token));
+    }
   });
 });
