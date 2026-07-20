@@ -521,21 +521,28 @@ it applies identically across providers — the OpenAI profile already strips
 `title`, the Anthropic profile strips nothing — and to the external `/mcp`
 surface too.
 
+The null arm is dropped only on *optional* fields. On a field named in
+`required`, `anyOf[T, null]` is the whole statement that an explicit null is
+admissible, and removing it would advertise a contract narrower than the one
+pydantic validates — which a provider that enforces the advertised schema
+client-side would act on. Nothing required is nullable today; the carve-out
+keeps it that way by construction rather than by luck.
+
 | | chars | ~tokens |
 |---|---|---|
 | 28 tool schemas, before | 69,382 | 17,345 |
 | after mechanical slimming | 53,511 | 13,377 |
-| after prose relocation | **32,994** | **8,248** |
-| system prompt (incl. the 5,348-char spec reference) | 11,266 | 2,816 |
-| **fixed overhead, all tools** | **44,260** | **11,065** |
-| **fixed overhead, core profile** | **26,557** | **6,639** |
+| after prose relocation | **32,863** | **8,216** |
+| system prompt (incl. the 5,348-char spec reference and the 649-char result-format note) | 11,916 | 2,979 |
+| **fixed overhead, all tools** | **44,779** | **11,195** |
+| **fixed overhead, core profile** | **27,141** | **6,785** |
 
 **(b) Tool profiles** — `ToolInfo.tier` (`"core"` | `"extended"`) tags the
 registry and is surfaced on `GET /api/agent/info`. The tool-selector popover
 offers Core / All presets that compute a deny list and flow through the
 existing per-user-defaults path — no new state, no migration. Because a
 disabled tool is *removed* from the request (see the three deny layers above),
-"Core" reclaims context directly: 11 tools, 15,291 chars (~3.8k tokens), enough
+"Core" reclaims context directly: 11 tools, 15,225 chars (~3.8k tokens), enough
 to run the investigation cycle end to end.
 
 **(c) Compact tool-result encoding** — `agent/encoding.py`. Results live in the
@@ -564,11 +571,31 @@ its own terms. The re-encoding happens at the agent boundary (`_columnize` in
 `agent/tools.py`), never inside `db/queries.py` — those methods also serve the
 Explorer and Visualize HTTP APIs, whose response shapes the frontend depends
 on. The frontend reads exactly two tool-result keys (`propose_annotation`'s
-`proposal_id` and `propose_chart`'s `ok`), both left untouched.
+`proposal_id` and `propose_chart`'s `ok`), both left untouched. Two results are
+columnized only on their way out: `run_anomaly_detector` reshapes the copy it
+returns *after* `_persist_detector_run` has stored the dict-row payload the
+Analysis page reads back, and `compare` reshapes whichever of `buckets` /
+`values` / `bins` its `kind` produced.
 
 The metadata list tools (`list_baselines`, `list_saved_views`,
-`list_annotations`, `list_dispositions`, `list_sigma_rules`, `list_sigma_runs`)
-were previously unbounded and now cap at `MAX_LIST_ROWS`.
+`list_annotations`, `get_event_annotations`, `list_dispositions`,
+`list_sigma_rules`, `list_sigma_runs`) were previously unbounded and now go
+through `_listing`, which caps at `MAX_LIST_ROWS` and reports **`returned`
+alongside `total`**. Reporting only `total` would hand the model 200 rows under
+a count of 5,000 with nothing to mark the difference — a silently partial set it
+would then reason over as whole, which is exactly what the system prompt's
+evidence rule forbids.
+
+**Both relocations reach the external `/mcp` surface too.** `mcp_http.py` builds
+its server with the same `build_tool_server`, so an external client sees the
+same prose-free `$defs` and the same columnar results as the in-app agent —
+and `FastMCP(instructions=...)` is the only channel that can tell it how to read
+either. `SPEC_REFERENCE` and `RESULT_FORMAT_NOTE` are therefore appended to
+those instructions, sharing the exact strings `runtime.SYSTEM_PROMPT` composes
+from, so the two surfaces cannot describe the wire format differently. (pydantic-ai's
+`MCPToolset` does not forward instructions — it needs `include_instructions=True`
+— so this costs the in-app path nothing.) Slimming the schemas without this
+would leave external clients with strictly *less* guidance than before A13.
 
 `tests/test_agent_schema.py` holds a **budget guard** asserting the serialized
 tool list stays under 40,000 chars. If a change trips it, that is a real context

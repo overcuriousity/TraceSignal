@@ -88,6 +88,25 @@ async def test_list_baselines_returns_timeline_definitions(store):
     assert b["suspect_windows"][0]["label"] == "incident"
 
 
+async def test_list_tools_report_returned_against_total(store, monkeypatch):
+    """A capped list must be distinguishable from a complete one, or the model
+    reasons over a silently partial set — the evidence rule's whole point."""
+    import vestigo.agent.tools as agent_tools
+
+    await store.init_schema()
+    for i in range(3):
+        await store.create_view("c1", f"v{i}", f"view {i}", f"q{i}", {})
+
+    server = build_tool_server(_scope("c1", "t1"))
+    full = await _call(server, "list_saved_views")
+    assert full["total"] == full["returned"] == 3
+
+    monkeypatch.setattr(agent_tools, "MAX_LIST_ROWS", 2)
+    capped = await _call(server, "list_saved_views")
+    assert capped["total"] == 3 and capped["returned"] == 2
+    assert len(_rows(capped["views"])) == 2
+
+
 async def test_list_dispositions_scoped_and_filtered(store):
     await store.init_schema()
     await store.create_disposition(
@@ -342,6 +361,40 @@ async def test_run_anomaly_detector_passes_tuning_params(store, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_run_anomaly_detector_findings_are_columnar(store, monkeypatch):
+    """One run is one detector, so its findings share their keys — the same
+    header-once win as the other tabular results. The *persisted* payload keeps
+    its dict rows; only the model's copy is reshaped."""
+    import vestigo.api.routers.events as events_router
+
+    findings = [
+        {"type": "value_novelty", "field": "user", "value": "svc-a", "count": 1},
+        {"type": "value_novelty", "field": "user", "value": "svc-b", "count": 2},
+    ]
+    persisted: dict[str, Any] = {}
+
+    async def fake_run(case_id, timeline_id, source_ids, **kwargs):
+        class R:
+            status = "skipped"  # keeps the persistence path out of this test
+
+        return R(), {}
+
+    monkeypatch.setattr(events_router, "_run_stat_detector", fake_run)
+    monkeypatch.setattr(
+        events_router,
+        "_serialize_stat_result",
+        lambda result: persisted.setdefault(
+            "payload", {"status": result.status, "results": findings}
+        ),
+    )
+
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(server, "run_anomaly_detector", {"detector": "value_novelty"})
+    assert _rows(result["results"]) == findings
+    assert persisted["payload"]["results"] == findings  # the stored copy is untouched
+
+
+@pytest.mark.asyncio
 async def test_run_anomaly_detector_rejects_out_of_bounds(store):
     server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
     with pytest.raises(ToolError):
@@ -502,6 +555,37 @@ async def test_compare_numeric_dispatches_and_clamps_bins(store, monkeypatch):
     name, args, _ = fake.calls[0]
     assert name == "compare_field_numeric"
     assert args == ("attr:bytes", 30)  # clamped to VIZ_MAX_BINS
+
+
+@pytest.mark.parametrize(
+    ("args", "key", "row"),
+    [
+        ({"kind": "time"}, "buckets", {"start": "T0", "primary": 1, "comparison": 2}),
+        (
+            {"kind": "terms", "field": "attr:status"},
+            "values",
+            {"value": "404", "primary": 1, "comparison": 2},
+        ),
+        (
+            {"kind": "numeric", "field": "attr:bytes"},
+            "bins",
+            {"x0": 0.0, "x1": 1.0, "primary": 1, "comparison": 2},
+        ),
+    ],
+)
+async def test_compare_rows_are_columnar(store, monkeypatch, args, key, row):
+    """All three compare kinds are dict-per-row and among the heaviest results
+    the agent can request — each one's rows go to the model header-once."""
+    fake = _patch_viz_service(monkeypatch)
+    for name in ("compare_time_histogram", "compare_field_terms", "compare_field_numeric"):
+        setattr(
+            fake,
+            name,
+            lambda *a, _k=key, **kw: {"kind": args["kind"], _k: [row, row]},
+        )
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(server, "compare", args)
+    assert _rows(result[key]) == [row, row]
 
 
 async def test_compare_rejects_unknown_kind(store):

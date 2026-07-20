@@ -9,8 +9,10 @@ Two transforms, both applied in :func:`vestigo.agent.tools.build_tool_server`:
 
 ``slim_schema``
     Drops keys that carry no information for a model: pydantic's generated
-    ``title``, the ``{"type": "null"}`` arm of optional fields, and
-    ``default: null``. Purely mechanical, no semantics lost.
+    ``title``, the ``{"type": "null"}`` arm of *optional* fields, and
+    ``default: null``. Purely mechanical, no semantics lost. The null arm is
+    kept on fields named in ``required``, where dropping it really would
+    narrow the contract — see :func:`slim_schema`.
 
 ``strip_def_descriptions``
     ``FilterSpec``'s schema alone is 3.8k chars and is re-serialized into 12
@@ -29,6 +31,7 @@ left alone — those are what a small model reads to *pick* a tool.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from pydantic import BaseModel
@@ -58,23 +61,45 @@ def slim_schema(node: Any) -> Any:
     ``additionalProperties`` (load-bearing for ``ChartOptionsSpec``'s
     ``extra="forbid"``), and every non-null ``default``.
     """
+    return _slim(node, collapse_null_arm=True)
+
+
+def _slim(node: Any, *, collapse_null_arm: bool) -> Any:
+    """Recursive worker for :func:`slim_schema`.
+
+    ``collapse_null_arm`` is False for a property listed in its parent's
+    ``required``: for those, ``anyOf[T, null]`` is the whole statement that an
+    explicit null is admissible, and dropping the arm would advertise a
+    narrower contract than the pydantic model actually validates. On an
+    optional field the arm says nothing the absence from ``required`` does not
+    already say, so it goes. (Nothing required is nullable today; this keeps
+    it that way by construction rather than by luck, and matters for providers
+    that enforce the advertised schema client-side before the call is made.)
+    """
     if isinstance(node, list):
-        return [slim_schema(item) for item in node]
+        return [_slim(item, collapse_null_arm=True) for item in node]
     if not isinstance(node, dict):
         return node
+
+    required = node.get("required")
+    required_names = set(required) if isinstance(required, list) else set()
 
     out: dict[str, Any] = {}
     for key, value in node.items():
         if key in _NAME_MAPS and isinstance(value, dict):
-            out[key] = {name: slim_schema(sub) for name, sub in value.items()}
+            out[key] = {
+                name: _slim(
+                    sub,
+                    collapse_null_arm=not (key == "properties" and name in required_names),
+                )
+                for name, sub in value.items()
+            }
         elif key != "title":
-            out[key] = slim_schema(value)
+            out[key] = _slim(value, collapse_null_arm=True)
 
-    # `X | None` renders as anyOf[T, null]. The null arm buys nothing: the
-    # field is already optional by virtue of being absent from `required`,
-    # and validation still accepts an explicit null.
+    # `X | None` renders as anyOf[T, null].
     any_of = out.get("anyOf")
-    if isinstance(any_of, list) and len(any_of) == 2 and _NULL in any_of:
+    if collapse_null_arm and isinstance(any_of, list) and len(any_of) == 2 and _NULL in any_of:
         other = next(arm for arm in any_of if arm != _NULL)
         if isinstance(other, dict):
             del out["anyOf"]
@@ -143,7 +168,9 @@ def _type_label(prop: dict[str, Any]) -> str:
         return label
 
     if "enum" in prop:
-        return " | ".join(repr(value) for value in prop["enum"])
+        # JSON literals, not Python reprs — the model reads this next to JSON
+        # schemas and has to be able to copy a value straight out of it.
+        return " | ".join(json.dumps(value) for value in prop["enum"])
 
     kind = prop.get("type")
     if kind == "array":
@@ -160,16 +187,17 @@ def _type_label(prop: dict[str, Any]) -> str:
 
 def _render_model(model: type[BaseModel]) -> list[str]:
     schema = model.model_json_schema(ref_template="#/$defs/{model}")
-    # A nested model's own properties live in $defs, not at the top level.
-    properties = schema.get("properties") or schema.get("$defs", {}).get(model.__name__, {}).get(
-        "properties", {}
-    )
+    # A nested model's own properties can land in $defs rather than at the top
+    # level. Resolve `properties` and `required` from the *same* body — reading
+    # them from different levels would flag every field as optional.
+    body = schema if "properties" in schema else schema.get("$defs", {}).get(model.__name__, {})
+    properties = body.get("properties") or {}
 
     lines = [f"### {model.__name__}"]
     doc = (model.__doc__ or "").strip().split("\n\n")[0]
     if doc:
         lines.append(" ".join(doc.split()))
-    required = set(schema.get("required", []))
+    required = set(body.get("required", []))
     for name, prop in properties.items():
         if not isinstance(prop, dict):
             continue

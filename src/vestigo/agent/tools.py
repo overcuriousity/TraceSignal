@@ -59,6 +59,9 @@ MAX_PROPOSAL_EVENTS = 500
 # Cap for the metadata list tools (baselines, views, annotations, sigma runs,
 # dispositions). These were unbounded: a long-running case could push an
 # arbitrarily large blob into the history, where it is resent every turn.
+# Every capped result reports `returned` alongside `total` (see `_listing`) —
+# a model that cannot tell a capped list from a complete one would reason over
+# a silently partial set, which is exactly what the evidence rule forbids.
 MAX_LIST_ROWS = 200
 
 # A9: viz-tool result caps — tighter than the Visualize page's own bounds
@@ -412,6 +415,24 @@ SPEC_REFERENCE: str = spec_reference_block(
     (FilterSpec, ChartSpec, ChartCompareSpec, ChartOptionsSpec)
 )
 
+# How to read the columnar tool results (A13). Stated once and reused by both
+# consumers of this tool server — `runtime.SYSTEM_PROMPT` for the in-app agent
+# and `FastMCP(instructions=...)` for external /mcp clients — so the two can
+# never describe the wire format differently.
+RESULT_FORMAT_NOTE = """## Reading tabular results
+
+Tables come back column-header-once: `{"columns": ["value", "count"], "rows":
+[["alice", 12], ["bob", 3]]}` means value=alice count=12, value=bob count=3.
+Read each row positionally against `columns`. Nothing is abbreviated — the
+values are exactly what the query returned. `field_timeseries` additionally
+hoists the shared time axis into `bucket_starts`, and each series' `counts`
+array lines up with it index by index.
+
+A list result reports both `total` (how many exist) and `returned` (how many
+are in this payload). When they differ the list was capped — say so rather
+than reasoning as if you had seen all of them.
+"""
+
 
 @dataclass
 class AgentScope:
@@ -476,6 +497,19 @@ def _columnize(result: Any, *keys: str) -> Any:
         if isinstance(rows, list) and rows and all(isinstance(row, dict) for row in rows):
             out[key] = columnar_auto(rows)
     return out
+
+
+def _listing(key: str, rows: list[dict[str, Any]], total: int) -> dict[str, Any]:
+    """Build a capped, columnar list result that admits its own truncation.
+
+    ``total`` is how many rows exist, ``returned`` how many are in this
+    payload. Reporting only ``total`` (the pre-A13 shape) would hand the model
+    ``MAX_LIST_ROWS`` rows under a count of 5,000 with nothing to distinguish
+    that from a complete answer — a silently partial set it would then reason
+    over as if whole.
+    """
+    capped = rows[:MAX_LIST_ROWS]
+    return {"total": total, "returned": len(capped), key: columnar_auto(capped)}
 
 
 def _compact_timeseries(result: Any) -> Any:
@@ -652,12 +686,20 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
     # These instructions reach *external* MCP clients only. pydantic-ai's
     # MCPToolset does not forward them (it needs include_instructions=True),
     # so the in-app agent is steered entirely by runtime.SYSTEM_PROMPT.
+    #
+    # They carry the spec reference and the result-format note because the
+    # schema slimming (A13) applies to this surface too: an external client
+    # sees the same prose-free `$defs` and the same columnar results as the
+    # in-app agent, and this is the only channel that can tell it how to read
+    # either. Slimming without relocating here would silently leave external
+    # clients with less guidance than before A13.
     server = FastMCP(
         "vestigo-investigation",
         instructions=(
             "Read-only forensic log investigation tools, scoped to one case "
             "timeline. Iterate: inspect fields, search, aggregate, then "
-            "return refined filters as findings."
+            "return refined filters as findings.\n\n"
+            f"{RESULT_FORMAT_NOTE}\n{SPEC_REFERENCE}"
         ),
     )
     service = _get_query_service()
@@ -1031,28 +1073,33 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         comparison_spec = _validated(comparison_filters)
         primary_query = await _build_query(scope, primary_spec)
         comparison_query = await _build_query(scope, comparison_spec)
+        # Each kind returns its rows under a different key; all three are
+        # dict-per-row and among the heaviest results the agent can ask for.
         if kind == "time":
-            return await run_in_threadpool(
+            result = await run_in_threadpool(
                 service.compare_time_histogram,
                 primary_query,
                 comparison_query,
                 min(max(buckets, 4), VIZ_MAX_BUCKETS),
             )
+            return _columnize(result, "buckets")
         if kind == "terms":
-            return await run_in_threadpool(
+            result = await run_in_threadpool(
                 service.compare_field_terms,
                 primary_query,
                 comparison_query,
                 field,
                 max(1, min(limit, VIZ_MAX_TERMS)),
             )
-        return await run_in_threadpool(
+            return _columnize(result, "values")
+        result = await run_in_threadpool(
             service.compare_field_numeric,
             primary_query,
             comparison_query,
             field,
             max(1, min(limit, VIZ_MAX_BINS)),
         )
+        return _columnize(result, "bins")
 
     @server.tool()
     async def run_anomaly_detector(
@@ -1128,7 +1175,12 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 source_offsets=scope.source_offsets,
             )
         payload["run_id"] = run_id
-        return payload
+        # Columnize the model's copy only, and only *after* persistence:
+        # `_persist_detector_run` stored `payload` as the run's reproducible
+        # result, and the Analysis page reads that back in its dict-row shape.
+        # Findings from one detector share their keys, so this is the same
+        # header-once win as the other tabular results.
+        return _columnize(payload, "results")
 
     @server.tool()
     async def propose_finding(title: str, description: str, filters: FilterSpec) -> dict[str, Any]:
@@ -1546,20 +1598,19 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         from vestigo.api.deps import get_store
 
         rows = await get_store().list_baseline_definitions(scope.case_id, scope.timeline_id)
-        return {
-            "total": len(rows),
-            "baselines": columnar_auto(
-                [
-                    {
-                        "id": r.id,
-                        "name": r.name,
-                        **r.windows_payload(),
-                        "created_by": r.created_by,
-                    }
-                    for r in rows[:MAX_LIST_ROWS]
-                ]
-            ),
-        }
+        return _listing(
+            "baselines",
+            [
+                {
+                    "id": r.id,
+                    "name": r.name,
+                    **r.windows_payload(),
+                    "created_by": r.created_by,
+                }
+                for r in rows
+            ],
+            len(rows),
+        )
 
     @server.tool()
     async def list_dispositions(
@@ -1581,25 +1632,24 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             kinds=[kind] if kind else None,
             detector=detector,
         )
-        return {
-            "total": len(rows),
-            "dispositions": columnar_auto(
-                [
-                    {
-                        "id": r.id,
-                        "kind": r.kind,
-                        "detector": r.detector,
-                        "field": r.field,
-                        "value": _truncate(r.value, ATTR_VALUE_TRUNCATE),
-                        "source_id": r.source_id,
-                        "event_id": r.event_id,
-                        "note": _truncate(r.note, MESSAGE_TRUNCATE),
-                        "created_by": r.created_by,
-                    }
-                    for r in rows[:MAX_LIST_ROWS]
-                ]
-            ),
-        }
+        return _listing(
+            "dispositions",
+            [
+                {
+                    "id": r.id,
+                    "kind": r.kind,
+                    "detector": r.detector,
+                    "field": r.field,
+                    "value": _truncate(r.value, ATTR_VALUE_TRUNCATE),
+                    "source_id": r.source_id,
+                    "event_id": r.event_id,
+                    "note": _truncate(r.note, MESSAGE_TRUNCATE),
+                    "created_by": r.created_by,
+                }
+                for r in rows[:MAX_LIST_ROWS]
+            ],
+            len(rows),
+        )
 
     @server.tool()
     async def list_saved_views() -> dict[str, Any]:
@@ -1607,33 +1657,31 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         from vestigo.api.deps import get_store
 
         rows = await get_store().list_views(scope.case_id)
-        return {
-            "total": len(rows),
-            "views": columnar_auto(
-                [
-                    {"id": r.id, "name": r.name, "query": r.query, "filter": r.view_filter or {}}
-                    for r in rows[:MAX_LIST_ROWS]
-                ]
-            ),
-        }
+        return _listing(
+            "views",
+            [
+                {"id": r.id, "name": r.name, "query": r.query, "filter": r.view_filter or {}}
+                for r in rows[:MAX_LIST_ROWS]
+            ],
+            len(rows),
+        )
 
     @server.tool()
     async def list_annotations(annotation_type: str | None = None) -> dict[str, Any]:
         """List annotations (tags/comments/system anomaly marks) across this timeline's sources.
 
         `annotation_type` filters to 'tag', 'comment', or 'anomaly'. Results
-        are capped at 200 rows, oldest first — use get_event_annotations for
-        one event's full detail.
+        are capped at 200 rows, oldest first (compare `returned` against
+        `total`) — use get_event_annotations for one event's full detail.
         """
         from vestigo.api.deps import get_store
 
         rows = await get_store().list_source_annotations(scope.case_id, scope.source_ids)
         if annotation_type:
             rows = [r for r in rows if r.annotation_type == annotation_type]
-        return {
-            "total": len(rows),
-            "annotations": columnar_auto([_slim_annotation(r) for r in rows[:MAX_LIST_ROWS]]),
-        }
+        return _listing(
+            "annotations", [_slim_annotation(r) for r in rows[:MAX_LIST_ROWS]], len(rows)
+        )
 
     @server.tool()
     async def get_event_annotations(source_id: str, event_id: str) -> dict[str, Any]:
@@ -1643,10 +1691,9 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         if source_id not in scope.source_ids:
             return {"error": f"source {source_id} is not part of this timeline"}
         rows = await get_store().list_annotations(scope.case_id, source_id, event_id)
-        return {
-            "total": len(rows),
-            "annotations": columnar_auto([_slim_annotation(r) for r in rows[:MAX_LIST_ROWS]]),
-        }
+        return _listing(
+            "annotations", [_slim_annotation(r) for r in rows[:MAX_LIST_ROWS]], len(rows)
+        )
 
     @server.tool()
     async def list_sigma_rules() -> dict[str, Any]:
@@ -1674,7 +1721,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                     "enabled": row.enabled,
                 }
             )
-        return {"total": len(rules), "rules": columnar_auto(rules[:MAX_LIST_ROWS])}
+        return _listing("rules", rules, len(rules))
 
     @server.tool()
     async def get_sigma_rule(rule_id: str) -> dict[str, Any]:
@@ -1692,22 +1739,21 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         from vestigo.api.deps import get_store
 
         rows = await get_store().list_sigma_runs(scope.case_id, timeline_id=scope.timeline_id)
-        return {
-            "total": len(rows),
-            "runs": columnar_auto(
-                [
-                    {
-                        "id": r.id,
-                        "status": r.status,
-                        "created_by": r.created_by,
-                        "created_at": r.created_at.isoformat() if r.created_at else None,
-                        "completed_at": r.completed_at.isoformat() if r.completed_at else None,
-                        "rule_count": len(r.results or []),
-                    }
-                    for r in rows[:MAX_LIST_ROWS]
-                ]
-            ),
-        }
+        return _listing(
+            "runs",
+            [
+                {
+                    "id": r.id,
+                    "status": r.status,
+                    "created_by": r.created_by,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                    "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+                    "rule_count": len(r.results or []),
+                }
+                for r in rows[:MAX_LIST_ROWS]
+            ],
+            len(rows),
+        )
 
     @server.tool()
     async def get_sigma_run(run_id: str) -> dict[str, Any]:

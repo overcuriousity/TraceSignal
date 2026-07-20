@@ -8,8 +8,10 @@ must survive byte-identical, so the round-trip tests here are the point.
 
 from __future__ import annotations
 
+import json
+
 from vestigo.agent.encoding import columnar, columnar_auto
-from vestigo.agent.tools import _columnize, _compact_timeseries
+from vestigo.agent.tools import MAX_LIST_ROWS, _columnize, _compact_timeseries, _listing
 
 
 def _decode(payload: dict) -> list[dict]:
@@ -128,6 +130,27 @@ def test_compact_timeseries_ignores_unexpected_shapes():
 
 def test_encoding_actually_saves_space():
     rows = [{"value": f"host-{i}.example.internal", "count": i} for i in range(100)]
-    import json
-
     assert len(json.dumps(columnar_auto(rows))) < len(json.dumps(rows)) * 0.75
+
+
+# --- capped listings ------------------------------------------------------
+
+
+def test_listing_reports_returned_alongside_total():
+    """A capped list must not read as a complete one — the model would
+    otherwise reason over a silently partial set."""
+    rows = [{"id": str(i)} for i in range(MAX_LIST_ROWS + 50)]
+    out = _listing("things", rows, len(rows))
+    assert out["total"] == MAX_LIST_ROWS + 50
+    assert out["returned"] == MAX_LIST_ROWS
+    assert len(out["things"]["rows"]) == MAX_LIST_ROWS
+
+
+def test_listing_returned_equals_total_when_nothing_was_dropped():
+    out = _listing("things", [{"id": "a"}, {"id": "b"}], 2)
+    assert out["total"] == out["returned"] == 2
+
+
+def test_listing_of_nothing_still_reports_the_key():
+    out = _listing("things", [], 0)
+    assert out == {"total": 0, "returned": 0, "things": {"columns": [], "rows": []}}

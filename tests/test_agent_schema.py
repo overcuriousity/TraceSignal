@@ -134,6 +134,26 @@ def test_slim_schema_preserves_meaningful_keys():
     assert out["properties"]["mode"]["default"] == "a"  # non-null default survives
 
 
+def test_slim_schema_keeps_the_null_arm_on_a_required_field():
+    """Dropping it is only sound because the field is optional. On a required
+    field the arm *is* the statement that an explicit null is accepted, and
+    removing it would advertise a narrower contract than pydantic validates —
+    which a provider enforcing the schema client-side would act on."""
+    out = slim_schema(
+        {
+            "type": "object",
+            "properties": {
+                "must": {"anyOf": [{"type": "string"}, {"type": "null"}], "title": "Must"},
+                "may": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            },
+            "required": ["must"],
+        }
+    )
+    assert out["properties"]["must"]["anyOf"] == [{"type": "string"}, {"type": "null"}]
+    assert "title" not in out["properties"]["must"]  # still slimmed otherwise
+    assert out["properties"]["may"] == {"type": "string"}
+
+
 def test_slim_schema_leaves_multi_arm_unions_alone():
     node = {"anyOf": [{"type": "string"}, {"type": "integer"}, {"type": "null"}]}
     assert slim_schema(node)["anyOf"] == node["anyOf"]
@@ -264,6 +284,27 @@ def test_spec_reference_renders_readable_types():
 
 
 def test_system_prompt_includes_the_reference():
-    from vestigo.agent.runtime import SYSTEM_PROMPT
+    from vestigo.agent.runtime import RESULT_FORMAT_NOTE, SYSTEM_PROMPT
 
     assert SPEC_REFERENCE in SYSTEM_PROMPT
+    assert RESULT_FORMAT_NOTE in SYSTEM_PROMPT
+
+
+def test_spec_reference_renders_enums_as_json_literals():
+    """The block sits next to JSON schemas; a Python repr ('count') is not
+    something the model can copy into a tool call."""
+    assert '- metric ("count" | ' in SPEC_REFERENCE
+    assert "- metric ('count' | " not in SPEC_REFERENCE
+
+
+async def test_external_mcp_instructions_carry_the_relocated_guidance(store):
+    """The slimming applies to the external /mcp surface too, and `instructions`
+    is the only channel that can tell those clients how to read a prose-free
+    $defs or a columnar result. Relocating for the in-app agent alone would
+    leave external clients with strictly less guidance than before A13."""
+    from vestigo.agent.tools import RESULT_FORMAT_NOTE
+
+    await store.init_schema()
+    instructions = build_tool_server(_scope()).instructions or ""
+    assert SPEC_REFERENCE in instructions
+    assert RESULT_FORMAT_NOTE in instructions

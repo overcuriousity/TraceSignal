@@ -19,16 +19,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it is sent once instead of once per tool. Nothing about what the agent can
   do, or how strictly its arguments are checked, has changed.
 - **Tabular tool results are compact** — search hits, value distributions,
-  pivots and time series are handed to the model with their column names stated
-  once instead of repeated on every row, and a time series no longer repeats
-  its time axis per series (−84% on a full one). Every value is preserved
-  exactly; this is a reshaping, not a summary, so results stay reproducible.
-  Because results are replayed on every later turn, this compounds over a long
-  investigation.
+  pivots, comparisons, detector findings and time series are handed to the
+  model with their column names stated once instead of repeated on every row,
+  and a time series no longer repeats its time axis per series (−84% on a full
+  one). Every value is preserved exactly; this is a reshaping, not a summary,
+  so results stay reproducible. Because results are replayed on every later
+  turn, this compounds over a long investigation.
 - **The agent's metadata list tools are capped** at 200 rows (baselines, saved
   views, annotations, dispositions, Sigma rules and runs). They were unbounded,
   so a long-running case could push an arbitrarily large payload into the
-  conversation history.
+  conversation history. Each one now reports how many rows it returned
+  alongside how many exist, so a capped list can never be mistaken for a
+  complete one.
+- **The external `/mcp` tool surface changes shape with it.** Clients of the
+  `/mcp` endpoint get the same slimmed schemas and the same column-header-once
+  results as the built-in agent, rather than a second encoding maintained in
+  parallel. The server's MCP `instructions` now carry the filter/chart field
+  reference and the result-format legend, so an external client has everything
+  it needs to read either. Any client that parsed the old row-per-dict results
+  needs updating; Vestigo has no external MCP consumers in the field, so this
+  is called out for completeness rather than as a migration.
 
 ### Added
 

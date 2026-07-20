@@ -1,6 +1,54 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-20 (session 78 — A13 context-overhead reduction, release 1.4.1).
+Last updated: 2026-07-20 (session 79 — PR144 review round).
+
+## Session 79 — 2026-07-20: PR144 review — what the relocation forgot to relocate
+
+Review of the A13 branch before merge. The three levers held up; five fixes
+landed, one of them a real regression the branch had introduced.
+
+**The external `/mcp` surface lost guidance it used to have.** `mcp_http.py`
+builds its server through the same `build_tool_server`, so external clients were
+getting the slimmed, prose-free `$defs` — but the relocation target was
+`runtime.SYSTEM_PROMPT`, which they never see. They paid the whole cost of the
+transform and received none of the compensation. `FastMCP(instructions=...)` is
+their only channel, and the session-78 note had correctly identified it as such
+without drawing the conclusion. `SPEC_REFERENCE` and the new `RESULT_FORMAT_NOTE`
+are now appended there, sharing the exact strings the system prompt composes
+from, so the two surfaces cannot drift apart. The columnar result encoding
+reaches `/mcp` the same way, for the same reason: one wire format, not two.
+
+**`total` was describing a set the model had not been given.** The new
+`MAX_LIST_ROWS = 200` cap sliced the rows but left `"total": len(rows)`
+untouched, so a case with 5,000 annotations reported 5,000, returned 200, and
+offered nothing to tell the two apart. That is precisely the silently-partial
+set the system prompt's evidence rule exists to prevent. All seven capped list
+tools now go through `_listing`, which reports `returned` next to `total`, and
+the prompt tells the model to say so when they differ.
+
+**The null-arm collapse is now scoped to optional fields.** Dropping the
+`{"type":"null"}` arm is sound because the field is optional; on a *required*
+field the arm is the whole statement that an explicit null is admissible, and
+removing it would advertise a contract narrower than pydantic validates —
+actionable by any provider that enforces the advertised schema client-side.
+Nothing required is nullable today (checked), so this changes no current schema;
+it makes that a property of the transform instead of a coincidence.
+
+Two smaller ones: `compare` (all three kinds) and `run_anomaly_detector` were
+the two dict-per-row results the branch had missed — the detector's copy is
+reshaped *after* `_persist_detector_run` stores the dict-row payload the
+Analysis page reads back. And the spec reference rendered enum values with
+Python's `repr` (`'count'`), sitting in a block otherwise full of JSON the model
+is meant to copy from; now `json.dumps`.
+
+Re-measured after all of it: 28 tool schemas 32,863 chars, core profile 15,225,
+system prompt 11,916 (it grew by the 649-char format note, which is now stated
+once and shared rather than inlined). Fixed overhead ~11.2k tokens for the full
+catalog, ~6.8k for core. Ten new tests; suite green.
+
+Still not verified, unchanged from session 78: no real model has read the
+relocated prose. Both surfaces now need that check — one in-app conversation and
+one external MCP client — before tagging.
 
 ## Session 78 — 2026-07-20: A13 — halving the agent's per-request context (release 1.4.1)
 
