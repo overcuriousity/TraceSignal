@@ -49,6 +49,9 @@ from vestigo.models.embeddings import embeddings_available
 # filters.
 MAX_EVENTS_PER_SEARCH = 50
 MESSAGE_TRUNCATE = 500
+# Tighter body cap for the bulk annotation *list* (200 rows resent every turn);
+# get_event_annotations keeps the fuller MESSAGE_TRUNCATE for one event's detail.
+ANNOTATION_LIST_CONTENT_TRUNCATE = 160
 ATTR_VALUE_TRUNCATE = 200
 MAX_ATTRS_PER_EVENT = 40
 
@@ -499,6 +502,34 @@ def _columnize(result: Any, *keys: str) -> Any:
     return out
 
 
+# The full resolved `event` object each anomaly finding carries — the whole
+# attribute bag, source_file, byte offsets, raw message. The Analysis page
+# renders it inline, so `_serialize_finding` keeps it; but for the agent it was
+# ~85% of a finding's size (one value_novelty result measured 37k chars, 31k of
+# it `event`), and seven detectors in one turn overflowed a 64k model on it
+# alone (2026-07-20). The model keeps `event_id` and can `get_event` for the
+# full record, so drop the inline copy from its view only.
+def _deflate_findings(payload: Any) -> Any:
+    """Strip the heavy inline `event` from a detector result's findings.
+
+    The model's copy only — persistence has already stored the full payload by
+    the time this runs (see ``run_anomaly_detector``). ``event_id`` and
+    ``details`` stay: the id is the handle for ``get_event``, and ``details``
+    is small and carries the surprise/allowlist/method the model reasons on.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    findings = payload.get("results")
+    if not isinstance(findings, list):
+        return payload
+    out = dict(payload)
+    out["results"] = [
+        {k: v for k, v in row.items() if k != "event"} if isinstance(row, dict) else row
+        for row in findings
+    ]
+    return out
+
+
 def _listing(key: str, rows: list[dict[str, Any]], total: int) -> dict[str, Any]:
     """Build a capped, columnar list result that admits its own truncation.
 
@@ -553,13 +584,19 @@ def _compact_timeseries(result: Any) -> Any:
     return out
 
 
-def _slim_annotation(row: Any) -> dict[str, Any]:
-    """Compact an Annotation row for model consumption."""
+def _slim_annotation(row: Any, content_limit: int = MESSAGE_TRUNCATE) -> dict[str, Any]:
+    """Compact an Annotation row for model consumption.
+
+    ``content_limit`` truncates the free-text body. The bulk ``list_annotations``
+    scan passes a tighter limit than the default (200 rows of 500-char bodies is
+    ~7k tokens resent every turn); ``get_event_annotations``, the one-event
+    detail tool, keeps the fuller default.
+    """
     return {
         "event_id": row.event_id,
         "source_id": row.source_id,
         "type": row.annotation_type,
-        "content": _truncate(row.content, MESSAGE_TRUNCATE),
+        "content": _truncate(row.content, content_limit),
         "origin": row.origin,
         "detector": row.detector,
         "created_by": row.created_by,
@@ -1131,7 +1168,9 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         (timestamp_order), fdr_q (BH false-discovery ceiling), min_ratio
         (effect-size floor), ngram_size (sequence length, 2-5), min_support
         (sequence_motif), start/end (sequence_motif mining window).
-        Returns findings plus a persisted run_id the analyst can open.
+        Returns findings plus a persisted run_id the analyst can open. Each
+        finding carries the example's `event_id` (not the full event) — call
+        get_event on it when you need the record's attributes.
 
         The virtual `time:` fields from list_fields are **not** detector
         fields — they are for charting and filtering only. Passing one is
@@ -1175,12 +1214,14 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 source_offsets=scope.source_offsets,
             )
         payload["run_id"] = run_id
-        # Columnize the model's copy only, and only *after* persistence:
-        # `_persist_detector_run` stored `payload` as the run's reproducible
-        # result, and the Analysis page reads that back in its dict-row shape.
-        # Findings from one detector share their keys, so this is the same
-        # header-once win as the other tabular results.
-        return _columnize(payload, "results")
+        # Slim then columnize the model's copy only, and only *after*
+        # persistence: `_persist_detector_run` stored `payload` as the run's
+        # reproducible result, and the Analysis page reads that back in its
+        # full dict-row shape. `_deflate_findings` drops each finding's inline
+        # `event` (the model keeps `event_id` + `get_event`); `_columnize` then
+        # states the shared keys once. Together they take a seven-detector
+        # sweep from tens of thousands of tokens back inside a small window.
+        return _columnize(_deflate_findings(payload), "results")
 
     @server.tool()
     async def propose_finding(title: str, description: str, filters: FilterSpec) -> dict[str, Any]:
@@ -1680,7 +1721,12 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         if annotation_type:
             rows = [r for r in rows if r.annotation_type == annotation_type]
         return _listing(
-            "annotations", [_slim_annotation(r) for r in rows[:MAX_LIST_ROWS]], len(rows)
+            "annotations",
+            [
+                _slim_annotation(r, content_limit=ANNOTATION_LIST_CONTENT_TRUNCATE)
+                for r in rows[:MAX_LIST_ROWS]
+            ],
+            len(rows),
         )
 
     @server.tool()

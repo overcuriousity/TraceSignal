@@ -158,6 +158,28 @@ async def test_annotations_tools(store):
     assert _rows(single["annotations"])[0]["created_by"] == "bob"
 
 
+async def test_list_annotations_truncates_content_harder_than_detail_tool(store):
+    """The bulk list is a scan resent every turn (200 rows of long CVE bodies
+    was ~7k tokens); it truncates the body tighter than get_event_annotations,
+    which is the one-event detail tool and keeps the fuller text."""
+    from vestigo.agent.tools import ANNOTATION_LIST_CONTENT_TRUNCATE, MESSAGE_TRUNCATE
+
+    await store.init_schema()
+    body = "CVE-2024-4577 " + "detail " * 100  # ~700 chars, over both caps
+    await store.create_annotation("c1", "s1", "e1", "a1", "comment", body, created_by="alice")
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+
+    listed = _rows((await _call(server, "list_annotations"))["annotations"])[0]
+    assert len(listed["content"]) <= ANNOTATION_LIST_CONTENT_TRUNCATE + 1  # +1 for the ellipsis
+    detail = _rows(
+        (await _call(server, "get_event_annotations", {"source_id": "s1", "event_id": "e1"}))[
+            "annotations"
+        ]
+    )[0]
+    assert len(detail["content"]) > ANNOTATION_LIST_CONTENT_TRUNCATE
+    assert len(detail["content"]) <= MESSAGE_TRUNCATE + 1
+
+
 async def test_sigma_rules_tools(store, monkeypatch):
     await store.init_schema()
     import vestigo.api.routers.sigma as sigma_router
@@ -361,15 +383,35 @@ async def test_run_anomaly_detector_passes_tuning_params(store, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_run_anomaly_detector_findings_are_columnar(store, monkeypatch):
+async def test_run_anomaly_detector_findings_are_columnar_and_deflated(store, monkeypatch):
     """One run is one detector, so its findings share their keys — the same
-    header-once win as the other tabular results. The *persisted* payload keeps
-    its dict rows; only the model's copy is reshaped."""
+    header-once win as the other tabular results. The model's copy also drops
+    each finding's heavy inline `event` (keeping `event_id`), which was ~85% of
+    a finding's size and overflowed a 64k model across a seven-detector sweep.
+    The *persisted* payload keeps its full dict rows; only the model's copy is
+    reshaped."""
     import vestigo.api.routers.events as events_router
 
+    big_event = {"event_id": "e1", "message": "x" * 4000, "attr": {"k": "y" * 4000}}
     findings = [
-        {"type": "value_novelty", "field": "user", "value": "svc-a", "count": 1},
-        {"type": "value_novelty", "field": "user", "value": "svc-b", "count": 2},
+        {
+            "type": "value_novelty",
+            "field": "user",
+            "value": "svc-a",
+            "count": 1,
+            "event_id": "e1",
+            "event": big_event,
+            "details": {"surprise": 12.7},
+        },
+        {
+            "type": "value_novelty",
+            "field": "user",
+            "value": "svc-b",
+            "count": 2,
+            "event_id": "e2",
+            "event": {"event_id": "e2"},
+            "details": {"surprise": 9.1},
+        },
     ]
     persisted: dict[str, Any] = {}
 
@@ -390,8 +432,14 @@ async def test_run_anomaly_detector_findings_are_columnar(store, monkeypatch):
 
     server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
     result = await _call(server, "run_anomaly_detector", {"detector": "value_novelty"})
-    assert _rows(result["results"]) == findings
-    assert persisted["payload"]["results"] == findings  # the stored copy is untouched
+    model_rows = _rows(result["results"])
+    # event_id + details survive; the fat event is gone from the model's view.
+    assert [r["event_id"] for r in model_rows] == ["e1", "e2"]
+    assert all("event" not in r for r in model_rows)
+    assert model_rows[0]["details"] == {"surprise": 12.7}
+    assert "columns" in result["results"] and "event" not in result["results"]["columns"]
+    # The persisted record is untouched — the full event stays reproducible.
+    assert persisted["payload"]["results"][0]["event"] == big_event
 
 
 @pytest.mark.asyncio

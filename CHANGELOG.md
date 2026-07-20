@@ -28,6 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   phrasing, so an overflow against a proxied local model skipped the
   compact-and-retry escalation entirely and surfaced as a generic model error,
   losing the turn.
+- **A single broad investigation turn no longer overflows a small model.** Each
+  anomaly finding handed to the agent embedded the full resolved example event
+  (~85% of the finding's size); a "find anomalies and visualise" ask that ran
+  seven detectors in one turn piled up ~18k tokens of duplicated event bodies
+  and overflowed a 64k model — a case compaction cannot fix, since there is only
+  one turn to fold. The agent's copy of a finding now carries the example's
+  `event_id` (with `get_event` for the full record) instead of the inline event,
+  and the bulk `list_annotations` scan truncates long bodies harder than the
+  per-event detail tool. The persisted detector run and the Analysis page keep
+  the full data. On the turn that failed, this cut the tool payload from ~34k to
+  ~16k tokens.
 
 ## [1.4.1] — 2026-07-20
 
