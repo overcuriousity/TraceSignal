@@ -1109,7 +1109,7 @@ class AgentMessage(Base):
     # Models that batch parallel tool calls persist N call rows followed by
     # N result rows in *completion* order, so this id is the only reliable
     # way to pair them back up. NULL on pre-migration rows.
-    tool_call_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    tool_call_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # Measured LLM usage for this turn (assistant rows only). NULL = not
     # measured (pre-metering rows, or the endpoint reported no usage) —
     # never an estimate.

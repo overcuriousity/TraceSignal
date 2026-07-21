@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validation consumes only its own slot instead of shifting its batch
   siblings, in both the live stream and the reloaded transcript.
 
+## [1.4.3] — 2026-07-21
+
 ### Fixed
 
 - **Muting a template now actually hides its events.** A mute was recorded

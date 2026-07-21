@@ -23,7 +23,7 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column("agent_messages", sa.Column("tool_call_id", sa.String(64), nullable=True))
+    op.add_column("agent_messages", sa.Column("tool_call_id", sa.String(128), nullable=True))
 
 
 def downgrade() -> None:

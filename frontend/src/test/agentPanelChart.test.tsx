@@ -120,10 +120,11 @@ beforeEach(() => {
   listProposalsMock.mockResolvedValue({ proposals: [] });
 });
 
-/** One call/result row pair sharing a tool_call_id, as persisted rows. */
+/** Parallel-batch persisted rows: N call rows followed by N result rows,
+ * each pair sharing a tool_call_id. `resultIds` overrides result order to
+ * simulate completion-order arrival. */
 function batchRows(
   charts: { id: string | null; title: string; ok: boolean }[],
-  order: "adjacent" | "batched" = "batched",
   resultIds?: string[],
 ): AgentMessage[] {
   const calls: AgentMessage[] = charts.map((c, i) => ({
@@ -153,7 +154,6 @@ function batchRows(
     tool_call_id: id,
     created_at: null,
   }));
-  if (order === "adjacent") return calls.flatMap((call, i) => [call, results[i]]);
   return [...calls, ...results];
 }
 
@@ -205,7 +205,7 @@ describe("AgentPanel propose_chart folding", () => {
     ];
     getConversationMock.mockResolvedValue({
       ...conversation(),
-      messages: batchRows(charts, "batched", ["tc2", "tc1"]),
+      messages: batchRows(charts, ["tc2", "tc1"]),
     });
     renderPanel();
     const cards = await screen.findAllByTestId("chart-proposal-card");
