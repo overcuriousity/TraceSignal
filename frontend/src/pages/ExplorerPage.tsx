@@ -469,7 +469,7 @@ export function ExplorerPage() {
   // collapse. The key is invalidated by useDisposition on every verdict, so a
   // mute lands here and flips `collapseRoutine` on without further wiring.
   // Declared above `effectiveFilters` because that memo consumes it.
-  const { data: dispositionsData } = useQuery({
+  const { data: dispositionsData, isSuccess: dispositionsReady } = useQuery({
     queryKey: ["dispositions", caseId, timelineId],
     queryFn: () => dispositionsApi.list(caseId!, timelineId!),
     enabled: !!(caseId && timelineId),
@@ -594,7 +594,12 @@ export function ExplorerPage() {
       firstPage.has_more_before && firstPage.prev_cursor
         ? { before: cursorParam(firstPage.prev_cursor) }
         : undefined,
-    enabled: !!(caseId && timelineId),
+    // Gated on the disposition set being known: until it loads, collapse
+    // derives to `false`, so an ungated first fetch would render the
+    // uncollapsed superset (the literal #147 flash) and burn a ClickHouse
+    // scan, only to refetch collapsed a moment later. One small Postgres
+    // query before first paint.
+    enabled: !!(caseId && timelineId) && dispositionsReady,
     placeholderData: (prev) => prev,
   });
 
@@ -1066,8 +1071,16 @@ export function ExplorerPage() {
                 }
               >
                 <Button
-                  variant={collapseRoutine ? "accent" : "ghost"}
+                  // `accent` marks the *override* (reveal active), not the
+                  // collapsed default: collapse is the normal state now, and
+                  // the exceptional, self-expiring reveal is what deserves
+                  // the active-filter highlight.
+                  variant={collapseRoutine ? "ghost" : "accent"}
                   size="icon"
+                  // Not the functional-update form: `collapseRoutine` is
+                  // derived per render (never stale state), and the setter
+                  // stamps the override with the current disposition-set
+                  // signature — see lib/routineCollapse.ts.
                   onClick={() => setCollapseRoutine(!collapseRoutine)}
                 >
                   <Repeat size={14} />
@@ -1135,6 +1148,7 @@ export function ExplorerPage() {
             caseId={caseId}
             timelineId={timelineId}
             filters={effectiveFilters}
+            enabled={dispositionsReady}
             onRangeSelect={handleHistogramRange}
             markers={investigatePanelOpen ? anomalyMarkers : []}
             highlightRange={rangeHighlight}

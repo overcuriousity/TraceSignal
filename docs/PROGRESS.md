@@ -1,6 +1,52 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-21 (session 81 — issue #147, muting that muted nothing).
+Last updated: 2026-07-21 (session 82 — #147 blast radius: the charts that ignored the mute).
+
+## Session 82 — 2026-07-21: #147 blast radius — viz endpoints, the Visualize page, and the first-render flash
+
+Review of PR148 asked the question its own doc invariant begged: does *every*
+filter-driven endpoint resolve the routine scope? No — all seven viz endpoints
+(`viz.py::_resolve_event_query`) dropped `collapse_routine` silently. The
+frontend had always sent it (`serializeEventFilterParams`), FastAPI ignored the
+unknown query param — the same silent-drop failure shape as bulk-annotate's
+pydantic `extra="ignore"`, one layer over. Concrete symptom: the field-histogram
+modal's top-value list (viz, uncollapsed) disagreed with its own histogram
+(events endpoint, collapsed) inside one modal. Fixed by threading one
+`collapse_routine` param through `_resolve_event_query`, all six GET routes and
+`CompareFilters`; the compare baseline layer stays deliberately uncollapsed
+("the whole the primary is a part of", preserving the M24c superset invariant),
+and `_is_unfiltered` now treats the scope as a filter so the per-source stats
+cache can't serve the muted superset. Anomaly detectors and similarity are
+confirmed out of scope by design (deliberately unfiltered timeline / no field
+filters).
+
+**The Visualize page could not know about mutes at all.** It inherits filters
+from the URL, and `collapseRoutine` is deliberately never URL-serialized — so
+after #147 the page would have silently charted the uncollapsed superset with
+no indicator. Decision (what does a forensic analyst need and expect): full
+Explorer parity. The analyst pivots Explorer → Visualize expecting the same
+event set; muted templates are high-volume by nature and dominate chart
+y-axes; and nothing may be hidden silently. The page now derives collapse from
+the disposition set via the same `lib/routineCollapse.ts` (single source of
+truth in Postgres — a shared URL shows a teammate the same collapsed charts),
+renders a "routine events collapsed" line with the same self-expiring reveal,
+and gates every chart query on the disposition load. Agent chart proposals
+stay spec-driven only — they must reproduce exactly what the agent ran.
+
+**The first-render race.** Both pages fired their first data query before the
+dispositions query resolved: collapse derives to `false` on an unknown set, so
+every load with mutes present rendered the uncollapsed superset — the literal
+#147 flash — plus a wasted ClickHouse scan, then refetched. Both now gate on
+`dispositionsQuery.isSuccess` (TimelineHistogram grew an `enabled` prop for
+the same reason). One small Postgres query before first paint.
+
+Tests: viz router wiring tests (flag → resolver → EventQuery, both scope
+halves, per-compare-layer), the motif half added to the bulk-annotate
+regression test, serializer contract locks for `collapse_routine`, and two new
+page-level render tests (`explorerRoutineCollapse.test.tsx` — the test that
+would have caught #147 itself, asserting the request is gated and carries the
+flag — and `visualizeRoutineCollapse.test.tsx`). The reveal toggle's accent now
+marks the *override* (reveal active), not the collapsed default.
 
 ## Session 81 — 2026-07-21: #147 — the filter that was recorded but never applied
 

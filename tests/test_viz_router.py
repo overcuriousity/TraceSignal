@@ -311,6 +311,7 @@ _FILTER_KWARGS = {
     "annotated": None,
     "annotation_tag_value": None,
     "run_id": None,
+    "collapse_routine": False,
 }
 
 
@@ -504,3 +505,133 @@ async def test_compare_custom_mode_never_gets_token(monkeypatch):
     )
     await viz.compare_layers("c1", "t1", body, case=None)
     assert svc.calls[0][3] is None
+
+
+# ---------------------------------------------------------------------------
+# Routine collapse (#147 follow-up) — every filter-driven viz endpoint must
+# resolve the routine scope, same as list_events/get_histogram/export/bulk.
+# ---------------------------------------------------------------------------
+
+
+class _CaptureTermsService:
+    """Captures the EventQuery handed to field_terms."""
+
+    def __init__(self) -> None:
+        self.last_query = None
+
+    def field_terms(self, query, field_token, limit=50):
+        self.last_query = query
+        return {"values": [], "other": 0, "total": 0}
+
+
+def _patch_routine_scope(monkeypatch):
+    """Stub _resolve_routine_collapse, recording the flag it was handed.
+
+    The resolver itself is covered by tests/test_events_router.py — what this
+    file guards is the *wiring*: the flag must travel from the route param
+    into the resolver, and the resolved scope into the EventQuery. That
+    wiring being absent is exactly the silent-drop bug (#147's sibling).
+    """
+    from vestigo.api.routers.events import RoutineCollapseScope
+
+    calls: list[bool] = []
+
+    async def fake_resolve(case_id, timeline_id, source_ids, collapse_routine):
+        calls.append(collapse_routine)
+        if collapse_routine:
+            return RoutineCollapseScope(["m1"], [4736])
+        return RoutineCollapseScope(None, None)
+
+    monkeypatch.setattr(viz, "_resolve_routine_collapse", fake_resolve, raising=False)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_field_terms_honors_routine_collapse(monkeypatch):
+    """collapse_routine=True must reach the EventQuery — both scope halves."""
+    calls = _patch_routine_scope(monkeypatch)
+    svc = _CaptureTermsService()
+    monkeypatch.setattr(viz, "_get_query_service", lambda: svc)
+    monkeypatch.setattr(viz, "_resolve_timeline_scope", _fake_scope)
+    monkeypatch.setattr(viz, "_resolve_event_id_filters", _fake_id_filters)
+
+    async def no_cache(*args, **kwargs):
+        raise AssertionError("collapsed query must not be served from the unfiltered cache")
+
+    monkeypatch.setattr(viz, "ensure_source_field_stats", no_cache)
+
+    await viz.get_field_terms(
+        "c1",
+        "t1",
+        field="artifact",
+        case=None,
+        **{**_FILTER_KWARGS, "collapse_routine": True},
+    )
+
+    assert calls == [True]
+    assert svc.last_query.exclude_routine_disposition_ids == ["m1"]
+    assert svc.last_query.exclude_template_hashes == [4736]
+
+
+@pytest.mark.asyncio
+async def test_field_terms_without_flag_keeps_full_scope(monkeypatch):
+    calls = _patch_routine_scope(monkeypatch)
+    svc = _CaptureTermsService()
+    monkeypatch.setattr(viz, "_get_query_service", lambda: svc)
+    monkeypatch.setattr(viz, "_resolve_timeline_scope", _fake_scope)
+    monkeypatch.setattr(viz, "_resolve_event_id_filters", _fake_id_filters)
+    monkeypatch.setattr(viz, "_get_stat_anomaly_service", lambda: _FakeStatService())
+
+    async def fake_ensure(store, clickhouse, case_id, source_ids):
+        return {}
+
+    monkeypatch.setattr(viz, "ensure_source_field_stats", fake_ensure)
+    # Force the live path (cache gap) so the EventQuery is observable.
+    monkeypatch.setattr(viz, "merged_field_terms", lambda stats, field, limit: None)
+
+    await viz.get_field_terms("c1", "t1", field="artifact", limit=50, case=None, **_FILTER_KWARGS)
+
+    assert calls == [False]
+    assert svc.last_query.exclude_routine_disposition_ids is None
+    assert svc.last_query.exclude_template_hashes is None
+
+
+@pytest.mark.asyncio
+async def test_compare_layers_honor_routine_collapse_per_layer(monkeypatch):
+    """Each compare layer carries its own flag; the baseline layer stays the
+    deliberately-unfiltered whole (all filters dropped, collapse included)."""
+    _patch_routine_scope(monkeypatch)
+    svc = _patch_compare(monkeypatch)
+
+    body = viz.CompareRequest(
+        kind="time",
+        primary=viz.CompareFilters(collapse_routine=True),
+        comparison=viz.ComparisonSpec(mode="baseline"),
+    )
+    await viz.compare_layers("c1", "t1", body, case=None)
+
+    _, primary, comparison, _ = svc.calls[0]
+    assert primary.exclude_template_hashes == [4736]
+    assert primary.exclude_routine_disposition_ids == ["m1"]
+    assert comparison.exclude_template_hashes is None
+    assert comparison.exclude_routine_disposition_ids is None
+
+
+@pytest.mark.asyncio
+async def test_compare_custom_layer_honors_its_own_flag(monkeypatch):
+    _patch_routine_scope(monkeypatch)
+    svc = _patch_compare(monkeypatch)
+
+    body = viz.CompareRequest(
+        kind="time",
+        primary=viz.CompareFilters(),
+        comparison=viz.ComparisonSpec(
+            mode="custom", filters=viz.CompareFilters(collapse_routine=True)
+        ),
+    )
+    await viz.compare_layers("c1", "t1", body, case=None)
+
+    _, primary, comparison, _ = svc.calls[0]
+    assert primary.exclude_template_hashes is None
+    assert comparison.exclude_template_hashes == [4736]
+    assert comparison.exclude_routine_disposition_ids == ["m1"]

@@ -1577,13 +1577,23 @@ presentation-only and never enters `dispositions_hash`; deleting the
 disposition restores the events immediately.
 
 **Every filter-driven endpoint must resolve the same scope.** `list_events`,
-`get_histogram`, `export_events` *and* `bulk_annotate_by_filter` all call
-`_resolve_routine_collapse` and pass its scope into their `EventQuery`. The
-bulk-annotate path is the load-bearing one: it writes durable annotations, so
-a missing `collapse_routine` there stamps forensic records onto events the
-analyst never saw while the confirm dialog's count comes from the collapsed
-query (`#147`). A new filter-driven endpoint that skips this resolution is a
-bug of that shape, not a missing feature.
+`get_histogram`, `export_events`, `bulk_annotate_by_filter`, the agent's
+event-query tool *and* all seven viz aggregations (`viz.py`, via
+`_resolve_event_query` and `CompareFilters`) call `_resolve_routine_collapse`
+and pass its scope into their `EventQuery`. The bulk-annotate path is the
+load-bearing one: it writes durable annotations, so a missing
+`collapse_routine` there stamps forensic records onto events the analyst
+never saw while the confirm dialog's count comes from the collapsed query
+(`#147`). The viz gap was the same silent drop one layer over — the frontend
+always sent the flag, FastAPI ignored the unknown param, and every chart
+aggregated the uncollapsed superset the grid was hiding (`viz.py`'s
+`_is_unfiltered` cache check treats the scope as a filter for the same
+reason). A new filter-driven endpoint that skips this resolution is a bug of
+that shape, not a missing feature. Frontend-side, both pages derive collapse
+from the disposition set itself (`frontend/src/lib/routineCollapse.ts`):
+the Explorer *and* the Visualize page (which cannot inherit the flag from the
+URL — it is deliberately never URL-serialized) each query dispositions, gate
+their data queries on that load, and show what is hidden.
 
 **Asymmetry, v1.** Muting only supports `field == "message"` (the indexed
 column the mute predicate binds to) — browsing is field-agnostic, muting

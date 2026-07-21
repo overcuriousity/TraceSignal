@@ -353,6 +353,16 @@ async def test_bulk_annotate_by_filter_honors_routine_collapse(patched_store, mo
         field="template_id",
         value="4736",
     )
+    # The scope's other half: a routine *motif* must be excluded via the
+    # motif_occurrences anti-join ids, not just the template-hash predicate.
+    motif = await patched_store.create_disposition(
+        case_id="c1",
+        timeline_id="t1",
+        kind="routine",
+        detector="sequence_motif",
+        field="motif_id",
+        value="m-1",
+    )
 
     fake_service = _FakeQueryService(refs=[("evt", "s1")])
     monkeypatch.setattr(events, "_get_query_service", lambda: fake_service)
@@ -365,6 +375,7 @@ async def test_bulk_annotate_by_filter_honors_routine_collapse(patched_store, mo
     await events.bulk_annotate_by_filter("c1", "t1", body, case=Case(id="c1"), user=_fake_user())
 
     assert fake_service.last_query.exclude_template_hashes == [4736]
+    assert fake_service.last_query.exclude_routine_disposition_ids == [motif.id]
 
     # And without the flag the muted events stay in scope — collapse is the
     # caller's decision, exactly as on the other three endpoints.
@@ -372,6 +383,7 @@ async def test_bulk_annotate_by_filter_honors_routine_collapse(patched_store, mo
     await events.bulk_annotate_by_filter("c1", "t1", plain, case=Case(id="c1"), user=_fake_user())
 
     assert fake_service.last_query.exclude_template_hashes is None
+    assert fake_service.last_query.exclude_routine_disposition_ids is None
 
 
 # ---------------------------------------------------------------------------
