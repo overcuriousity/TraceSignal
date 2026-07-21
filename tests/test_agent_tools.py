@@ -385,14 +385,14 @@ async def test_run_anomaly_detector_passes_tuning_params(store, monkeypatch):
 @pytest.mark.asyncio
 async def test_run_anomaly_detector_findings_are_columnar_and_deflated(store, monkeypatch):
     """One run is one detector, so its findings share their keys — the same
-    header-once win as the other tabular results. The model's copy also drops
-    each finding's heavy inline `event` (keeping `event_id`), which was ~85% of
+    header-once win as the other tabular results. The model's copy also reduces
+    each finding's heavy inline `event` to its `message` line, which was ~85% of
     a finding's size and overflowed a 64k model across a seven-detector sweep.
     The *persisted* payload keeps its full dict rows; only the model's copy is
     reshaped."""
     import vestigo.api.routers.events as events_router
 
-    big_event = {"event_id": "e1", "message": "x" * 4000, "attr": {"k": "y" * 4000}}
+    big_event = {"event_id": "e1", "message": "login as svc-a", "attr": {"k": "y" * 8000}}
     findings = [
         {
             "type": "value_novelty",
@@ -409,7 +409,7 @@ async def test_run_anomaly_detector_findings_are_columnar_and_deflated(store, mo
             "value": "svc-b",
             "count": 2,
             "event_id": "e2",
-            "event": {"event_id": "e2"},
+            "event": {"event_id": "e2", "message": "login as svc-b"},
             "details": {"surprise": 9.1},
         },
     ]
@@ -433,10 +433,12 @@ async def test_run_anomaly_detector_findings_are_columnar_and_deflated(store, mo
     server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
     result = await _call(server, "run_anomaly_detector", {"detector": "value_novelty"})
     model_rows = _rows(result["results"])
-    # event_id + details survive; the fat event is gone from the model's view.
+    # event_id + message + details survive; the fat attribute bag is gone.
     assert [r["event_id"] for r in model_rows] == ["e1", "e2"]
+    assert [r["message"] for r in model_rows] == ["login as svc-a", "login as svc-b"]
     assert all("event" not in r for r in model_rows)
     assert model_rows[0]["details"] == {"surprise": 12.7}
+    assert "get_event" in result["note"]
     assert "columns" in result["results"] and "event" not in result["results"]["columns"]
     # The persisted record is untouched — the full event stays reproducible.
     assert persisted["payload"]["results"][0]["event"] == big_event
@@ -862,6 +864,22 @@ async def test_missing_field_y_says_why_it_is_needed(store, monkeypatch):
     server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
     message = await _reject(server, {"chart_type": "sankey", "field": "user"})
     assert "field_y" in message
+    # ...and names the one-field alternative, in case that was the intent.
+    assert '"heatmap"' in message
+
+
+async def test_heatmap_with_field_y_is_pointed_at_pivot(store, monkeypatch):
+    """The naming trap that cost a real turn (2026-07-20): our `heatmap` is one
+    field x time, and the field x field grid an analyst also calls a heatmap is
+    `pivot`. Enumerating the two-field types was not enough — the model spent
+    both retries on the same rejection, so the message names the fix."""
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(
+        server, {"chart_type": "heatmap", "field": "country", "field_y": "time:hour_of_day"}
+    )
+    assert "takes no field_y" in message
+    assert 'chart_type="pivot"' in message
 
 
 async def test_field_y_on_a_one_field_chart_is_rejected_not_dropped(store, monkeypatch):

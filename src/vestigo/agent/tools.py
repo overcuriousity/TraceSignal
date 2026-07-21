@@ -52,6 +52,9 @@ MESSAGE_TRUNCATE = 500
 # Tighter body cap for the bulk annotation *list* (200 rows resent every turn);
 # get_event_annotations keeps the fuller MESSAGE_TRUNCATE for one event's detail.
 ANNOTATION_LIST_CONTENT_TRUNCATE = 160
+# The one line of an anomaly finding's example event the agent keeps in place
+# of the whole event object (see `_deflate_findings`).
+FINDING_MESSAGE_TRUNCATE = 200
 ATTR_VALUE_TRUNCATE = 200
 MAX_ATTRS_PER_EVENT = 40
 
@@ -324,8 +327,9 @@ class ChartSpec(BaseModel):
             "The visual mark to draw. Field-free: "
             '"time" (events over time), "punchcard" (day x hour). One field: '
             '"bar", "pie" (nominal/ordinal), "histogram", "box", "violin", "ecdf" '
-            '(numeric), "line", "heatmap" (value over time). Two fields: '
-            '"pivot" (field x field heatmap), "sankey" (flow), "scatter" (numeric x numeric).'
+            '(numeric), "line", "heatmap" (one field over time — NOT field x field). '
+            'Two fields: "pivot" (the field x field heatmap grid), "sankey" (flow), '
+            '"scatter" (numeric x numeric).'
         )
     )
     scale: Scale | None = Field(
@@ -507,26 +511,57 @@ def _columnize(result: Any, *keys: str) -> Any:
 # renders it inline, so `_serialize_finding` keeps it; but for the agent it was
 # ~85% of a finding's size (one value_novelty result measured 37k chars, 31k of
 # it `event`), and seven detectors in one turn overflowed a 64k model on it
-# alone (2026-07-20). The model keeps `event_id` and can `get_event` for the
-# full record, so drop the inline copy from its view only.
+# alone (2026-07-20).
+#
+# Its `message` survives, though, and deliberately: for the value-shaped
+# detectors the message *is* the finding. "username=gitlab-prometheus seen
+# once" is not actionable; "login attempt [gitlab-prometheus/rock] succeeded"
+# is, and succeeded-vs-failed is invisible without it. Dropping it outright
+# would also invert the saving — `get_event` returns the *full* attribute set,
+# more than the inline event it replaced — and every such follow-up spends one
+# of the turn's `request_limit` model requests, so a 25-finding sweep that
+# followed up honestly would trade the overflow for a turn-limit crash.
+_FINDING_NOTE = (
+    "Each finding's example event is reduced to its `message`; call get_event(event_id) "
+    "for the full record (attributes, offsets) before reasoning about one in detail."
+)
+
+
 def _deflate_findings(payload: Any) -> Any:
-    """Strip the heavy inline `event` from a detector result's findings.
+    """Reduce each finding's inline `event` to its truncated `message`.
 
     The model's copy only — persistence has already stored the full payload by
     the time this runs (see ``run_anomaly_detector``). ``event_id`` and
     ``details`` stay: the id is the handle for ``get_event``, and ``details``
     is small and carries the surprise/allowlist/method the model reasons on.
+
+    Adds ``note`` when anything was actually reduced, so the model never
+    believes it saw the whole record — the same self-admitting-truncation
+    contract as :func:`_listing`'s ``returned``/``total``.
     """
     if not isinstance(payload, dict):
         return payload
     findings = payload.get("results")
     if not isinstance(findings, list):
         return payload
+
+    deflated = False
+    rows: list[Any] = []
+    for row in findings:
+        if not isinstance(row, dict) or "event" not in row:
+            rows.append(row)
+            continue
+        deflated = True
+        event = row["event"]
+        slim = {k: v for k, v in row.items() if k != "event"}
+        if isinstance(event, dict) and event.get("message"):
+            slim["message"] = _truncate(event["message"], FINDING_MESSAGE_TRUNCATE)
+        rows.append(slim)
+
     out = dict(payload)
-    out["results"] = [
-        {k: v for k, v in row.items() if k != "event"} if isinstance(row, dict) else row
-        for row in findings
-    ]
+    out["results"] = rows
+    if deflated:
+        out["note"] = _FINDING_NOTE
     return out
 
 
@@ -1169,8 +1204,9 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         (effect-size floor), ngram_size (sequence length, 2-5), min_support
         (sequence_motif), start/end (sequence_motif mining window).
         Returns findings plus a persisted run_id the analyst can open. Each
-        finding carries the example's `event_id` (not the full event) — call
-        get_event on it when you need the record's attributes.
+        finding carries the example's `event_id` and its `message` line, not
+        the full event — call get_event on the id when you need the record's
+        attributes.
 
         The virtual `time:` fields from list_fields are **not** detector
         fields — they are for charting and filtering only. Passing one is
@@ -1283,13 +1319,24 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         if meta.requires_second_field and not spec.field_y:
             raise ValueError(
                 f'chart_type="{chart_type}" requires field_y — it charts '
-                "field x field_y, not a single distribution."
+                "field x field_y, not a single distribution. For one field over "
+                'time use chart_type="heatmap" instead.'
             )
         if spec.field_y and not meta.requires_second_field:
+            # Naming trap worth spelling out rather than only enumerating: our
+            # "heatmap" is one field x time, and the field x field grid an
+            # analyst also calls a heatmap is "pivot". A model that reached for
+            # the word alone burned both its retries on the same rejection.
             two_field = [c for c in CHART_META if CHART_META[c].requires_second_field]
+            hint = (
+                ' chart_type="heatmap" is one field over time; for a field x field '
+                'heatmap grid use chart_type="pivot".'
+                if chart_type == "heatmap"
+                else ""
+            )
             raise ValueError(
                 f'chart_type="{chart_type}" takes no field_y. '
-                f"Two-field chart types: {', '.join(two_field)}."
+                f"Two-field chart types: {', '.join(two_field)}.{hint}"
             )
 
         compare_on = spec.compare.mode != "off"

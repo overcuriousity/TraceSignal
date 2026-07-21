@@ -34,11 +34,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seven detectors in one turn piled up ~18k tokens of duplicated event bodies
   and overflowed a 64k model — a case compaction cannot fix, since there is only
   one turn to fold. The agent's copy of a finding now carries the example's
-  `event_id` (with `get_event` for the full record) instead of the inline event,
-  and the bulk `list_annotations` scan truncates long bodies harder than the
-  per-event detail tool. The persisted detector run and the Analysis page keep
-  the full data. On the turn that failed, this cut the tool payload from ~34k to
-  ~16k tokens.
+  `event_id` and its `message` line — the part that distinguishes a succeeded
+  login from a failed one — instead of the whole event, with `get_event` for the
+  full record and a note saying so; and the bulk `list_annotations` scan
+  truncates long bodies harder than the per-event detail tool. The persisted
+  detector run and the Analysis page keep the full data. On the turn that
+  failed, this cut the tool payload from ~34k to ~16k tokens.
+- **The agent gets more than one attempt to correct a rejected tool call.** Tool
+  legality errors name the legal alternative and exist to be acted on, but the
+  retry budget was one, so a second wrong guess killed the whole turn. A
+  `propose_chart` call asking for a `heatmap` with two fields did exactly that.
+  The budget is now three, and that particular rejection names the fix
+  (`chart_type="pivot"` is the field × field heatmap; `heatmap` is one field over
+  time) rather than only listing the two-field chart types.
+- **A turn that ends early says why.** Exhausting a tool's retries or the turn's
+  step budget surfaced as "Agent turn failed — see server logs", which does not
+  tell the analyst whether to rephrase, narrow the question, or call an admin.
+  Both now end with a named error (`tool_retry_exhausted`, `turn_limit_reached`)
+  carrying the underlying reason.
 
 ## [1.4.1] — 2026-07-20
 

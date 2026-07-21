@@ -646,6 +646,58 @@ async def test_stream_turn_maps_events(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_stream_turn_lets_the_model_correct_a_rejected_tool_call(monkeypatch):
+    """Tool legality errors name the legal alternative and are meant to be
+    acted on. pydantic-ai's default budget of one retry meant a second wrong
+    guess killed the whole turn (propose_chart heatmap/pivot, 2026-07-20)."""
+    from mcp.server.fastmcp import FastMCP
+    from pydantic_ai.messages import ModelMessage
+    from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
+
+    from vestigo.agent import runtime
+
+    stub = FastMCP("stub")
+    attempts = {"n": 0}
+
+    @stub.tool()
+    async def picky(word: str) -> dict:
+        """Accepts only the third guess."""
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise ValueError('word="x" is illegal; use word="right".')
+        return {"ok": True}
+
+    monkeypatch.setattr(runtime, "build_tool_server", lambda scope: stub)
+
+    async def model_stream(messages: list[ModelMessage], info: AgentInfo):
+        if any(getattr(p, "part_kind", "") == "tool-return" for p in messages[-1].parts):
+            yield "done"
+        else:
+            yield {0: DeltaToolCall(name="picky", json_args='{"word": "x"}')}
+
+    scope = AgentScope(
+        case_id="c1",
+        timeline_id="t1",
+        user=None,
+        source_ids=["s1"],
+        field_mappings=None,
+        source_offsets=None,
+    )
+    events = [
+        event
+        async for event in runtime.stream_turn(
+            scope,
+            user_text="try it",
+            history=[],
+            model=FunctionModel(stream_function=model_stream),
+        )
+    ]
+
+    assert attempts["n"] == 3  # two rejections survived, the third call landed
+    assert events[-1]["turn"].output_text == "done"
+
+
+@pytest.mark.asyncio
 async def test_stream_turn_result_carries_measured_token_usage(monkeypatch):
     """FunctionModel reports non-zero fake usage; TurnResult must surface it."""
     from mcp.server.fastmcp import FastMCP
@@ -919,6 +971,67 @@ async def test_cancelled_turn_persists_what_streamed(store, monkeypatch):
     assert len(assistant) == 1
     # Marked, and carrying exactly what streamed before the stop.
     assert assistant[0].content == "partial answer [stopped]"
+
+
+async def _turn_ending_with(store, monkeypatch, exc: Exception) -> tuple[list[dict], list]:
+    """Run one turn whose stream raises *exc* after streaming some text."""
+    from vestigo.api.routers import agent as agent_router
+
+    await store.init_schema()
+    user = await store.create_user("u1", "analyst", is_admin=True)
+    case = await store.create_case("c1", "Case 1", owner_id=user.id)
+    timeline = await store.create_timeline(case.id, "tl1", "Timeline 1", source_ids=[])
+    conversation = await store.create_agent_conversation(
+        case.id, timeline.id, user.id, model_id="stub:stub"
+    )
+
+    async def fake_stream_turn(scope, *, user_text, history, view_filters=None):
+        yield {"type": "text_delta", "text": "partial answer"}
+        raise exc
+
+    monkeypatch.setattr(agent_router, "stream_turn", fake_stream_turn)
+
+    payload = agent_router.SendMessageRequest(content="chart this")
+    chunks = [
+        chunk async for chunk in agent_router._message_stream(case.id, conversation, payload, user)
+    ]
+    events = [json.loads(c.removeprefix("data: ").strip()) for c in chunks]
+    return events, await store.list_agent_messages(conversation.id)
+
+
+@pytest.mark.asyncio
+async def test_tool_retry_exhaustion_is_named_not_generic(store, monkeypatch):
+    """A model that cannot get one tool's arguments right within its retry
+    budget used to kill the turn with 'Agent turn failed — see server logs',
+    which tells the analyst nothing (a propose_chart heatmap/pivot mix-up cost
+    a real turn on 2026-07-20)."""
+    from pydantic_ai.exceptions import UnexpectedModelBehavior
+
+    events, messages = await _turn_ending_with(
+        store, monkeypatch, UnexpectedModelBehavior("Tool 'propose_chart' exceeded max retries")
+    )
+
+    error = next(e for e in events if e["type"] == "error")
+    assert error["code"] == "tool_retry_exhausted"
+    assert "propose_chart" in error["detail"]
+    # What streamed before the failure stays part of the record.
+    assistant = [m for m in messages if m.role == "assistant"]
+    assert assistant[0].content == "partial answer [interrupted]"
+
+
+@pytest.mark.asyncio
+async def test_spent_turn_budget_is_named_not_generic(store, monkeypatch):
+    """Exhausting UsageLimits is a 'ask something narrower' situation, not a
+    server error — and following up on many findings can reach it."""
+    from pydantic_ai.exceptions import UsageLimitExceeded
+
+    events, _ = await _turn_ending_with(
+        store, monkeypatch, UsageLimitExceeded("The next request would exceed the request_limit")
+    )
+
+    error = next(e for e in events if e["type"] == "error")
+    assert error["code"] == "turn_limit_reached"
+    assert "max_turns" in error["detail"]
 
 
 def test_patch_conversation_rejects_unknown_tool(client, admin_bootstrap, agent_on):

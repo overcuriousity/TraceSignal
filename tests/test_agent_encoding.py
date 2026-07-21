@@ -12,6 +12,7 @@ import json
 
 from vestigo.agent.encoding import columnar, columnar_auto
 from vestigo.agent.tools import (
+    FINDING_MESSAGE_TRUNCATE,
     MAX_LIST_ROWS,
     _columnize,
     _compact_timeseries,
@@ -165,28 +166,54 @@ def test_listing_of_nothing_still_reports_the_key():
 # --- detector finding deflation -------------------------------------------
 
 
-def test_deflate_findings_drops_event_keeps_the_rest():
+def test_deflate_findings_keeps_the_message_and_drops_the_rest_of_the_event():
     payload = {
         "status": "ok",
         "results": [
-            {"type": "value_novelty", "event_id": "e1", "event": {"a": "x" * 5000}, "score": 12.7},
-            {"type": "value_novelty", "event_id": "e2", "event": {"a": "y"}, "score": 9.1},
+            {
+                "type": "value_novelty",
+                "event_id": "e1",
+                "event": {
+                    "message": "login attempt [svc/rock] succeeded",
+                    "attr": {"a": "x" * 5000},
+                },
+                "score": 12.7,
+            },
+            {"type": "value_novelty", "event_id": "e2", "event": {"message": "y"}, "score": 9.1},
         ],
     }
     out = _deflate_findings(payload)
     assert [r["event_id"] for r in out["results"]] == ["e1", "e2"]
     assert all("event" not in r for r in out["results"])
+    # succeeded-vs-failed is the finding — it must survive the slimming.
+    assert out["results"][0]["message"] == "login attempt [svc/rock] succeeded"
     assert out["results"][0]["score"] == 12.7
     assert out["status"] == "ok"
     # input untouched — the persisted copy keeps its events
-    assert payload["results"][0]["event"] == {"a": "x" * 5000}
+    assert payload["results"][0]["event"]["attr"] == {"a": "x" * 5000}
+
+
+def test_deflate_findings_truncates_a_long_message():
+    payload = {"results": [{"event_id": "e1", "event": {"message": "m" * 5000}}]}
+    message = _deflate_findings(payload)["results"][0]["message"]
+    assert len(message) == FINDING_MESSAGE_TRUNCATE + 1  # + the ellipsis
+    assert message.endswith("…")
+
+
+def test_deflate_findings_admits_the_omission():
+    """The model must never believe it saw the whole record."""
+    out = _deflate_findings({"results": [{"event_id": "e1", "event": {"message": "m"}}]})
+    assert "get_event" in out["note"]
+    # nothing dropped, nothing claimed
+    assert "note" not in _deflate_findings({"results": [{"event_id": "e1"}]})
 
 
 def test_deflate_findings_saves_the_bulk_of_the_bytes():
     """The event was ~85% of a finding on the real overflow (2026-07-20)."""
     payload = {
         "results": [
-            {"event_id": f"e{i}", "event": {"blob": "z" * 2000}, "score": i} for i in range(15)
+            {"event_id": f"e{i}", "event": {"message": "m" * 80, "blob": "z" * 2000}, "score": i}
+            for i in range(15)
         ]
     }
     before = len(json.dumps(payload))
@@ -200,3 +227,7 @@ def test_deflate_findings_ignores_unexpected_shapes():
     assert _deflate_findings("not a dict") == "not a dict"
     # a finding with no event is passed through unchanged
     assert _deflate_findings({"results": [{"event_id": "e1"}]}) == {"results": [{"event_id": "e1"}]}
+    # an event without a message still loses the event, and says so
+    out = _deflate_findings({"results": [{"event_id": "e1", "event": {"blob": "z"}}]})
+    assert out["results"] == [{"event_id": "e1"}]
+    assert "note" in out

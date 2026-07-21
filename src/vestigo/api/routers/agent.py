@@ -26,7 +26,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
-from pydantic_ai.exceptions import ModelHTTPError
+from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior, UsageLimitExceeded
 
 from vestigo import __version__
 from vestigo.agent.availability import agent_available
@@ -660,6 +660,29 @@ async def _message_stream_inner(
                     "detail": detail,
                 }
             )
+            return
+        except (UnexpectedModelBehavior, UsageLimitExceeded) as exc:
+            # Two ways a turn ends that the analyst can act on: a tool the
+            # model never called correctly within its retry budget, and a turn
+            # that spent every request `UsageLimits` allows. Both used to fall
+            # into the generic branch below and surface as "Agent turn failed —
+            # see server logs", which says nothing about whether to rephrase,
+            # to narrow the question, or to fetch an admin.
+            logger.exception("Agent turn ended early (conversation %s)", conversation_id)
+            if text_parts:
+                await store.add_agent_message(
+                    conversation_id, "assistant", "".join(text_parts) + " [interrupted]"
+                )
+            if isinstance(exc, UsageLimitExceeded):
+                code = "turn_limit_reached"
+                detail = (
+                    f"The agent used every step allowed for one turn ({exc}). Ask a narrower "
+                    "question, or raise the agent's max_turns setting."
+                )
+            else:
+                code = "tool_retry_exhausted"
+                detail = f"The agent could not call a tool correctly: {exc}"
+            yield _sse({"type": "error", "code": code, "detail": detail})
             return
         except Exception:
             logger.exception("Agent turn failed (conversation %s)", conversation_id)

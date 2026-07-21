@@ -227,6 +227,17 @@ force-reset metric. The agent gets them as validation errors that name the
 legal alternatives, e.g. `chart_type="pie" requires scale in {"nominal"}, got
 "ratio". Chart types legal for scale="ratio": …`. The error *is* the dropdown.
 
+**Two marks are called "heatmap" in analyst speech, and only one is here.**
+`heatmap` is *one field × time*; the field × field grid is `pivot` (they differ
+in `data_kind`, so they are not interchangeable). A model reaching for the word
+alone sends `chart_type="heatmap"` with a `field_y` and gets rejected — which
+cost a real turn on 2026-07-20, because merely *enumerating* the two-field
+types left it guessing and it spent its whole retry budget on the same
+mistake. The rejection therefore names the fix (`use chart_type="pivot"`), and
+the same distinction is stated in the `chart_type` field description and in the
+system prompt's charting steps. General rule for this tool: an error the model
+is expected to recover from should say what to do, not only what is wrong.
+
 Rejections happen before any query: illegal scale/chart_type pair, missing or
 superfluous `field`/`field_y`, unsupported comparison, illegal metric, and an
 unknown field token (with `difflib` near-miss suggestions — an unknown
@@ -601,6 +612,46 @@ would leave external clients with strictly *less* guidance than before A13.
 tool list stays under 40,000 chars. If a change trips it, that is a real context
 regression — re-measure and update this table rather than raising the ceiling.
 
+**(d) Bounding one turn's tool payload.** (a)–(c) bound the *fixed* overhead and
+the *replayed* history; neither bounds what a single broad turn pulls in. A
+"find anomalies and visualise" ask ran seven detectors in one turn and
+overflowed a 65,536-token model at 74,673 — a case auto-compaction structurally
+cannot fix, because there is only one turn and nothing older to fold.
+
+The cost was that every finding embedded its full resolved example event: the
+whole attribute bag, `source_file`, byte offsets, raw message. Measured on that
+turn, the inline `event` was ~85% of a finding's size (one `value_novelty`
+result was 37,431 chars, 31,677 of it `event`); seven detectors piled up ~18k
+tokens of them. `_deflate_findings` (`agent/tools.py`) reduces each finding in
+the **model's copy** to `event_id` + the event's `message`, truncated at
+`FINDING_MESSAGE_TRUNCATE`; `_serialize_finding` is untouched, so the persisted
+`DetectorRun` and the Analysis page keep the full event. Applied after
+persistence, at the same agent boundary as `_columnize`. On the failing turn:
+tool payload 33,731 → 15,718 tokens.
+
+The `message` survives deliberately, and the reasoning generalises to any
+future slimming here. For the value-shaped detectors the message *is* the
+finding: "username=gitlab-prometheus seen once" is not actionable, while "login
+attempt [gitlab-prometheus/rock] **succeeded**" is, and succeeded-vs-failed is
+invisible without it. Dropping it would also invert the saving — `get_event`
+returns the *full* attribute set, more than the inline event it replaced — and
+each such follow-up spends one of the turn's `request_limit` model requests, so
+a 25-finding sweep that followed up honestly would trade the overflow for a
+turn-limit crash. Keeping one line costs ~5% of what the event cost.
+
+The reduced payload carries a `note` saying the events were reduced and naming
+`get_event` as the way back to the full record, for the same reason `_listing`
+reports `returned` alongside `total`: a silently partial result the model
+reasons over as whole is exactly what the evidence rule forbids.
+
+The bulk `list_annotations` scan (up to `MAX_LIST_ROWS` rows, resent every
+turn) truncates bodies at `ANNOTATION_LIST_CONTENT_TRUNCATE` (160), while
+`get_event_annotations` — one event's detail, fetched deliberately — keeps the
+fuller `MESSAGE_TRUNCATE`.
+
+Still open, and deliberately not done here: fidelity is a static choice, not a
+budget-aware one. See `docs/ROADMAP.md` for the pre-flight version.
+
 ### Auto-compaction (context-window awareness)
 
 The runtime replays the full conversation `history` every turn, so long
@@ -643,6 +694,31 @@ UI — explicit opt-in, since the right number is model-specific),
   `tool_result`, plus an `agent.compaction` audit row. The chat shows a
   visible "older turns were summarized" item (SSE `compaction` event), and
   the JSON export carries everything.
+
+### How a turn can end early
+
+Every terminal SSE `error` carries a `code`, because "Agent turn failed — see
+server logs" leaves the analyst unable to tell whether to rephrase, narrow, or
+call an admin:
+
+| `code` | Raised by | Means |
+|---|---|---|
+| `context_overflow` | `ModelHTTPError` matching `_is_context_overflow`, nothing left to compact | Start a new conversation |
+| `model_error` | any other 4xx/5xx from the endpoint | Endpoint/config problem — server logs |
+| `tool_retry_exhausted` | `UnexpectedModelBehavior` | The model could not call one tool correctly within its retry budget |
+| `turn_limit_reached` | `UsageLimitExceeded` | The turn spent all `max_turns` requests — ask something narrower or raise the setting |
+
+The retry budget behind `tool_retry_exhausted` is `Agent(..., retries=3)` in
+`stream_turn`. A tool-legality error is the agent's equivalent of the Visualize
+page's dropdown refusing an impossible chart — it names the legal alternative
+and is *meant* to be acted on, so pydantic-ai's default of one correction
+attempt was too tight (a small model burned both attempts on the same
+`propose_chart` heatmap/pivot mix-up and lost the turn). Not more than three:
+every retry is also a model request counted against `UsageLimits(request_limit=
+max_turns)`, so a tool the model cannot get right must not eat the
+investigation's budget. Whatever streamed before any of these is persisted with
+an ` [interrupted]` marker — the record stays truthful about how far the turn
+got.
 
 ### Reasoning effort
 
