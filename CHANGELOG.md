@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.3] — 2026-07-21
+
+### Fixed
+
+- **Muting a template now actually hides its events.** A mute was recorded
+  correctly — it appeared under "Muted templates" with its count — but the grid
+  kept showing every one of its events, because collapsing them was a separate
+  toggle in the top bar that muting never switched on. A mute is a filter, so it
+  now applies the moment you make it, which is what the tab always claimed. The
+  toggle is now a *reveal*: press it to see the routine events again
+  temporarily. The next mute re-applies collapse, so revealing once cannot
+  quietly disable every mute you make afterwards.
+- **"Select all matching → Tag" no longer tags events you cannot see.** With
+  routine events collapsed, bulk-tagging the current filter wrote annotations to
+  the muted events as well — records attached to events that were never on
+  screen, while the confirmation dialog counted only the visible ones. The bulk
+  action now covers exactly the set the grid displays. Exports and histograms
+  were already correct.
+
 ## [1.4.2] — 2026-07-21
 
 ### Added
