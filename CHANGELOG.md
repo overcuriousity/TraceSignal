@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.2] — 2026-07-21
+
 ### Added
 
 - **Tool-result detail is now an agent setting (`tool_fidelity`).** How much of
@@ -80,6 +82,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tell the analyst whether to rephrase, narrow the question, or call an admin.
   Both now end with a named error (`tool_retry_exhausted`, `turn_limit_reached`)
   carrying the underlying reason.
+- **A reduced tool result no longer claims to have dropped something it kept.**
+  An anomaly finding whose example event could not be resolved, or held nothing
+  but a short message, still came back with "call get_event for the full
+  record" attached — an untruth in an exported conversation. The note now
+  appears only when the detail level actually removed something.
+- **A degraded turn is legible in the case record.** A turn re-run at a lower
+  detail level re-executes its tools, so one analyst question could leave
+  several identical detector runs on the Analysis page with nothing to tell them
+  apart; re-runs now carry the attempt that produced them. The estimate that
+  decides whether to summarize older turns also ignores token counts measured
+  before a detail drop, the way it already ignored counts measured before a
+  summarization — they describe a request the conversation no longer sends.
 
 ## [1.4.1] — 2026-07-20
 
