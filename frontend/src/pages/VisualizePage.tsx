@@ -16,11 +16,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowLeft, HelpCircle, Lightbulb, RotateCcw, X } from "lucide-react";
+import { ArrowLeft, HelpCircle, Lightbulb, Repeat, RotateCcw, X } from "lucide-react";
 import { vizApi, type CompareMode } from "@/api/viz";
 import { eventsApi } from "@/api/events";
 import { timelinesApi } from "@/api/timelines";
+import { dispositionsApi } from "@/api/dispositions";
 import { filtersToParams, paramsToFilters } from "@/lib/queryParams";
+import {
+  resolveCollapseRoutine,
+  routineSignature,
+  type RoutineOverride,
+} from "@/lib/routineCollapse";
 import { applyFieldEntries } from "@/lib/fieldFilters";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
@@ -134,8 +140,37 @@ function compareUnavailableReason(chartType: ChartType): string {
 export function VisualizePage() {
   const { caseId, timelineId } = useParams<{ caseId: string; timelineId: string }>();
   const [searchParams, setSearchParams] = useSearchParams();
-  const filters = useMemo(() => paramsToFilters(searchParams), [searchParams]);
+  const urlFilters = useMemo(() => paramsToFilters(searchParams), [searchParams]);
   const config = useMemo(() => paramsToChartConfig(searchParams), [searchParams]);
+
+  // Routine collapse, derived exactly as on ExplorerPage (#147): a mute is a
+  // filter and the charts must aggregate the set the grid displays.
+  // `collapseRoutine` is deliberately never URL-serialized, so it cannot
+  // arrive via `paramsToFilters` — the disposition set in Postgres is the
+  // single source of truth, and deriving from it means a shared URL shows a
+  // teammate the same collapsed charts. lib/routineCollapse.ts owns the
+  // precedence and why the reveal override self-expires.
+  const dispositionsQuery = useQuery({
+    queryKey: ["dispositions", caseId, timelineId],
+    queryFn: () => dispositionsApi.list(caseId!, timelineId!),
+    enabled: !!(caseId && timelineId),
+  });
+  const routineSig = useMemo(
+    () => routineSignature(dispositionsQuery.data?.dispositions ?? []),
+    [dispositionsQuery.data],
+  );
+  const hasRoutineDispositions = routineSig !== "";
+  const [routineOverride, setRoutineOverride] = useState<RoutineOverride>(null);
+  const collapseRoutine = resolveCollapseRoutine(routineSig, routineOverride);
+  // Every chart query waits for the disposition set: an uncollapsed first
+  // fetch would render (then refetch and recompute) the muted superset on
+  // every page load with mutes — the #147 flash, one page over. One small
+  // Postgres query before first paint, usually already warm from Explorer.
+  const scopeReady = !!(caseId && timelineId) && dispositionsQuery.isSuccess;
+  const filters = useMemo(
+    () => (collapseRoutine ? { ...urlFilters, collapseRoutine: true } : urlFilters),
+    [urlFilters, collapseRoutine],
+  );
 
   const updateConfig = useCallback(
     (patch: Partial<ChartConfig>) => {
@@ -245,7 +280,8 @@ export function VisualizePage() {
     // gating only the probe would still fire the scan whenever a numeric
     // chart type happened to be selected.
     enabled:
-      !!(caseId && timelineId && field) &&
+      scopeReady &&
+      !!field &&
       !fieldIsTime &&
       (dataKind === "numeric" ||
         (!fieldFree && !requiresSecondField && field !== autoProbedField.current)),
@@ -315,7 +351,7 @@ export function VisualizePage() {
   const termsQuery = useQuery({
     queryKey: ["viz-field-terms", caseId, timelineId, field, filters, topN],
     queryFn: () => vizApi.fieldTerms(caseId!, timelineId!, field!, filters, topN),
-    enabled: !!(caseId && timelineId && field) && dataKind === "terms" && !compareTermsOn,
+    enabled: scopeReady && !!field && dataKind === "terms" && !compareTermsOn,
   });
 
   const compareTermsQuery = useQuery({
@@ -328,7 +364,7 @@ export function VisualizePage() {
         comparison: compareApiSpec!,
         limit: topN,
       })) as CompareTermsResponse,
-    enabled: !!(caseId && timelineId && field) && compareTermsOn,
+    enabled: scopeReady && !!field && compareTermsOn,
   });
 
   const compareNumericOn = compareOn && chartType === "histogram" && compareApiSpec != null;
@@ -342,13 +378,13 @@ export function VisualizePage() {
         comparison: compareApiSpec!,
         bins,
       })) as CompareNumericResponse,
-    enabled: !!(caseId && timelineId && field) && compareNumericOn,
+    enabled: scopeReady && !!field && compareNumericOn,
   });
 
   const timeseriesQuery = useQuery({
     queryKey: ["viz-field-timeseries", caseId, timelineId, field, filters, buckets, topN],
     queryFn: () => vizApi.fieldTimeseries(caseId!, timelineId!, field!, filters, buckets, topN),
-    enabled: !!(caseId && timelineId && field) && dataKind === "timeseries",
+    enabled: scopeReady && !!field && dataKind === "timeseries",
   });
 
   // Events-over-time: one shared-grid compare call when a comparison layer
@@ -366,13 +402,13 @@ export function VisualizePage() {
       }
       return histogramToCompare(await eventsApi.histogram(caseId!, timelineId!, filters, buckets));
     },
-    enabled: !!(caseId && timelineId) && dataKind === "time",
+    enabled: scopeReady && dataKind === "time",
   });
 
   const punchcardQuery = useQuery({
     queryKey: ["viz-punchcard", caseId, timelineId, filters],
     queryFn: () => vizApi.punchcard(caseId!, timelineId!, filters),
-    enabled: !!(caseId && timelineId) && dataKind === "punchcard",
+    enabled: scopeReady && dataKind === "punchcard",
   });
 
   // Shared by the pivot heatmap AND the sankey (same aggregation, two marks)
@@ -380,13 +416,13 @@ export function VisualizePage() {
   const pivotQuery = useQuery({
     queryKey: ["viz-field-pivot", caseId, timelineId, field, fieldY, filters, limitX, limitY],
     queryFn: () => vizApi.fieldPivot(caseId!, timelineId!, field!, fieldY!, filters, limitX, limitY),
-    enabled: !!(caseId && timelineId && field && fieldY) && dataKind === "pivot",
+    enabled: scopeReady && !!(field && fieldY) && dataKind === "pivot",
   });
 
   const scatterQuery = useQuery({
     queryKey: ["viz-field-scatter", caseId, timelineId, field, fieldY, filters, sampleLimit],
     queryFn: () => vizApi.fieldScatter(caseId!, timelineId!, field!, fieldY!, filters, sampleLimit),
-    enabled: !!(caseId && timelineId && field && fieldY) && dataKind === "scatter",
+    enabled: scopeReady && !!(field && fieldY) && dataKind === "scatter",
   });
 
   const availableChartTypes = chartTypesForField(scale, field);
@@ -969,6 +1005,40 @@ export function VisualizePage() {
 
       {/* Canvas */}
       <div className="flex-1 overflow-auto p-4">
+        {/* Nothing hidden silently: whenever routine dispositions shape the
+            charts (or have been revealed), say so — the grid's collapsed-count
+            stat, one page over. Renders only when the set is non-empty, same
+            as the Explorer's toggle. */}
+        {hasRoutineDispositions && (
+          <div className="mb-2 flex items-center gap-2 text-xs text-[var(--color-fg-secondary)]">
+            <span>
+              {collapseRoutine
+                ? "Routine events collapsed (muted templates and patterns marked routine) — charts match the Explorer grid"
+                : "Routine events shown — charts include events muted in the Explorer"}
+            </span>
+            <Tooltip
+              content={
+                collapseRoutine
+                  ? "Temporarily show routine events — the next mute re-applies collapse"
+                  : "Collapse routine events again"
+              }
+            >
+              <button
+                type="button"
+                onClick={() =>
+                  setRoutineOverride({ value: !collapseRoutine, signature: routineSig })
+                }
+                className={`flex items-center gap-1 rounded border px-1.5 py-0.5 hover:bg-[var(--color-bg-hover)] ${
+                  collapseRoutine
+                    ? "border-[var(--color-border)]"
+                    : "border-[var(--color-accent)] text-[var(--color-accent)]"
+                }`}
+              >
+                <Repeat size={11} /> {collapseRoutine ? "Show routine events" : "Collapse routine"}
+              </button>
+            </Tooltip>
+          </div>
+        )}
         {(filters.start || filters.end) && (
           <div className="mb-2 flex items-center gap-2 text-xs text-[var(--color-fg-secondary)]">
             <span>

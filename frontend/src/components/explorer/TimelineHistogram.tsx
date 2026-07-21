@@ -43,6 +43,9 @@ interface Props {
   onMarkModeChange?: (markMode: boolean) => void;
   /** Called with a brushed [start, end) when marking is active. */
   onMarkRange?: (start: string, end: string) => void;
+  /** Gate the histogram fetch on upstream scope resolution (e.g. the
+   * disposition set that decides routine collapse — see ExplorerPage). */
+  enabled?: boolean;
 }
 
 /** Where a marker's timestamp falls relative to the rendered bars. */
@@ -128,6 +131,7 @@ export function TimelineHistogram({
   markMode = false,
   onMarkModeChange,
   onMarkRange,
+  enabled = true,
 }: Props) {
   const currentPositionTs = useScrollPositionStore((s) => s.currentPositionTs);
   const { data, isLoading, isFetching } = useQuery({
@@ -135,6 +139,7 @@ export function TimelineHistogram({
     queryFn: () => eventsApi.histogram(caseId, timelineId, filters),
     staleTime: 30_000,
     placeholderData: (prev) => prev,
+    enabled,
   });
 
   // Brush indices are kept in refs so handleMouseUp always reads the latest

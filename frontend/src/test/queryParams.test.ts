@@ -256,4 +256,14 @@ describe("serializeEventFilterFields (C17 — shared by list/histogram/bulk-anno
     expect(out.filters).toBeUndefined();
     expect(out.exclusions).toBeUndefined();
   });
+
+  it("emits collapse_routine when set, omits when unset (#147)", () => {
+    // Contract lock: every request built from these serializers (events list,
+    // histogram, export, bulk-annotate, all viz endpoints) carries the flag —
+    // a backend that drops it reproduces the "muted it, still there" bug.
+    expect(serializeEventFilterFields({ collapseRoutine: true }).collapse_routine).toBe(true);
+    expect(serializeEventFilterFields({}).collapse_routine).toBeUndefined();
+    expect(serializeEventFilterFields({ collapseRoutine: false }).collapse_routine).toBeUndefined();
+    expect(serializeEventFilterParams({ collapseRoutine: true }).collapse_routine).toBe(true);
+  });
 });

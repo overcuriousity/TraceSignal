@@ -1,6 +1,93 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-21 (session 80 — PR145/146 review round).
+Last updated: 2026-07-21 (session 82 — #147 blast radius: the charts that ignored the mute).
+
+## Session 82 — 2026-07-21: #147 blast radius — viz endpoints, the Visualize page, and the first-render flash
+
+Review of PR148 asked the question its own doc invariant begged: does *every*
+filter-driven endpoint resolve the routine scope? No — all seven viz endpoints
+(`viz.py::_resolve_event_query`) dropped `collapse_routine` silently. The
+frontend had always sent it (`serializeEventFilterParams`), FastAPI ignored the
+unknown query param — the same silent-drop failure shape as bulk-annotate's
+pydantic `extra="ignore"`, one layer over. Concrete symptom: the field-histogram
+modal's top-value list (viz, uncollapsed) disagreed with its own histogram
+(events endpoint, collapsed) inside one modal. Fixed by threading one
+`collapse_routine` param through `_resolve_event_query`, all six GET routes and
+`CompareFilters`; the compare baseline layer stays deliberately uncollapsed
+("the whole the primary is a part of", preserving the M24c superset invariant),
+and `_is_unfiltered` now treats the scope as a filter so the per-source stats
+cache can't serve the muted superset. Anomaly detectors and similarity are
+confirmed out of scope by design (deliberately unfiltered timeline / no field
+filters).
+
+**The Visualize page could not know about mutes at all.** It inherits filters
+from the URL, and `collapseRoutine` is deliberately never URL-serialized — so
+after #147 the page would have silently charted the uncollapsed superset with
+no indicator. Decision (what does a forensic analyst need and expect): full
+Explorer parity. The analyst pivots Explorer → Visualize expecting the same
+event set; muted templates are high-volume by nature and dominate chart
+y-axes; and nothing may be hidden silently. The page now derives collapse from
+the disposition set via the same `lib/routineCollapse.ts` (single source of
+truth in Postgres — a shared URL shows a teammate the same collapsed charts),
+renders a "routine events collapsed" line with the same self-expiring reveal,
+and gates every chart query on the disposition load. Agent chart proposals
+stay spec-driven only — they must reproduce exactly what the agent ran.
+
+**The first-render race.** Both pages fired their first data query before the
+dispositions query resolved: collapse derives to `false` on an unknown set, so
+every load with mutes present rendered the uncollapsed superset — the literal
+#147 flash — plus a wasted ClickHouse scan, then refetched. Both now gate on
+`dispositionsQuery.isSuccess` (TimelineHistogram grew an `enabled` prop for
+the same reason). One small Postgres query before first paint.
+
+Tests: viz router wiring tests (flag → resolver → EventQuery, both scope
+halves, per-compare-layer), the motif half added to the bulk-annotate
+regression test, serializer contract locks for `collapse_routine`, and two new
+page-level render tests (`explorerRoutineCollapse.test.tsx` — the test that
+would have caught #147 itself, asserting the request is gated and carries the
+flag — and `visualizeRoutineCollapse.test.tsx`). The reveal toggle's accent now
+marks the *override* (reveal active), not the collapsed default.
+
+## Session 81 — 2026-07-21: #147 — the filter that was recorded but never applied
+
+An analyst muted three templates in Templates → Mute, watched all three land in
+"Muted templates (3)" with their counts, and saw the grid keep showing every one
+of their events. The plumbing was never broken: the disposition was written, and
+`_resolve_routine_collapse` → `template_hash NOT IN (...)` was correct and
+tested. The gate was `ExplorerPage`'s `collapseRoutine`, a session `useState`
+defaulting to `false` and flipped only by an unlabeled toggle in the top bar.
+Muting never touched it. So a mute recorded a verdict and changed nothing, while
+the UI copy promised its events "disappear from the grid immediately".
+
+**Mute is a filter, and filters apply on creation.** Collapse is now derived
+from the routine-disposition set rather than opted into; the toggle became a
+*reveal* override. The override is stamped with the disposition-set signature it
+was made against and expires when that set changes — without that stamp, an
+analyst who revealed routine events once would silently defeat every subsequent
+mute, which is the same symptom one step removed. Precedence lives in
+`frontend/src/lib/routineCollapse.ts` (unit tested) rather than inline in the
+page, because the agent's "apply to Explorer" seam depends on it: an agent
+finding that ran *without* collapse must still reproduce uncollapsed when mutes
+exist, so agent applies write an explicit override. The copy needed no
+weakening — the fix made both claims true. Empty scope always resolves to
+`false`, so unmuting the last template cannot leave a stat claiming zero
+collapsed events.
+
+**The sibling this exposed, which was the more serious bug.**
+`bulk_annotate_by_filter` was the only filter-driven endpoint that never
+resolved the routine scope — `list_events`, `get_histogram` and `export_events`
+all did. So Explorer → select all → Tag wrote annotations onto muted events the
+analyst could not see, while the confirm dialog's count came from the collapsed
+query. Durable forensic records for events outside the displayed set. The
+frontend had been correct all along: `BulkActionBar` receives `effectiveFilters`
+and `serializeEventFilterFields` emits `collapse_routine` — pydantic's default
+`extra="ignore"` silently dropped it, so the caller got no error and no effect.
+Latent before (collapse was default-off, few users had a divergence), routine
+after the #147 fix, which is why the two ship together. Exactly the failure
+shape as the earlier `annotated` regression on the same endpoint, so the
+regression test is written as its sibling. `ANOMALY_DETECTION.md` now states the
+invariant: a filter-driven endpoint that skips this resolution is a bug, not a
+missing feature.
 
 ## Session 80 — 2026-07-21: PR145/146 review — the degradation that left no trace
 

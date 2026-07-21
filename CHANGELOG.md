@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.3] — 2026-07-21
+
+### Fixed
+
+- **Muting a template now actually hides its events.** A mute was recorded
+  correctly — it appeared under "Muted templates" with its count — but the grid
+  kept showing every one of its events, because collapsing them was a separate
+  toggle in the top bar that muting never switched on. A mute is a filter, so it
+  now applies the moment you make it, which is what the tab always claimed. The
+  toggle is now a *reveal*: press it to see the routine events again
+  temporarily. The next mute re-applies collapse, so revealing once cannot
+  quietly disable every mute you make afterwards.
+- **"Select all matching → Tag" no longer tags events you cannot see.** With
+  routine events collapsed, bulk-tagging the current filter wrote annotations to
+  the muted events as well — records attached to events that were never on
+  screen, while the confirmation dialog counted only the visible ones. The bulk
+  action now covers exactly the set the grid displays. Exports and histograms
+  were already correct.
+- **Charts now respect muted templates too.** Every visualization endpoint
+  (top values, timeseries, punchcard, pivot, scatter, compare) silently ignored
+  the collapse flag the frontend was already sending, so a chart could disagree
+  with the grid it sat next to — the histogram modal's top-value list included
+  events its own histogram hid. The Visualize page, which cannot inherit the
+  flag from the URL, now derives collapse from the mute list itself, shows a
+  visible "routine events collapsed" indicator, and offers the same temporary
+  reveal as the Explorer.
+- **No more flash of muted events on load.** The Explorer and Visualize pages
+  fired their first data query before the mute list had loaded, briefly showing
+  (and needlessly computing) the uncollapsed event set, then refetching. Both
+  now wait for the mute list — one small metadata read — before the first
+  fetch.
+
 ## [1.4.2] — 2026-07-21
 
 ### Added

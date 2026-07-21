@@ -31,6 +31,7 @@ from vestigo.api.routers.events import (
     _parse_multivalue_object,
     _parse_str_list,
     _resolve_event_id_filters,
+    _resolve_routine_collapse,
     _resolve_timeline_scope,
     _resolve_timeline_source_ids,
     _run_regex_guarded,
@@ -73,14 +74,16 @@ async def _resolve_event_query(
     run_id: str | None,
     filter_modes: str | None,
     exclusion_modes: str | None,
+    collapse_routine: bool,
 ) -> EventQuery:
     """Resolve the shared filter query params into an :class:`EventQuery`.
 
     Mirrors ``events.py::get_histogram``'s param-resolution sequence
     (timeline → source_ids, then the annotated/tags_include/tags_exclude/ids
-    combo via ``_resolve_event_id_filters``) so every viz endpoint below
-    builds an identical ``EventQuery`` from identical inputs — one place to
-    keep in sync with ``list_events``/``get_histogram`` instead of three.
+    combo via ``_resolve_event_id_filters``, then the routine-collapse scope)
+    so every viz endpoint below builds an identical ``EventQuery`` from
+    identical inputs — one place to keep in sync with
+    ``list_events``/``get_histogram`` instead of three.
     """
     _validate_regex(q, q_regex)
     parsed_filters = _parse_multivalue_object(filters)
@@ -100,9 +103,19 @@ async def _resolve_event_query(
         tags_exclude=tags_exclude,
         ids=ids,
     )
+    # A chart must aggregate exactly the set the grid displays (#147): the
+    # frontend has always sent `collapse_routine` here, and FastAPI silently
+    # dropped it — charts summed the uncollapsed superset while the grid
+    # collapsed. Same silent-drop shape as bulk-annotate's pydantic
+    # `extra="ignore"` bug; see the invariant note in ANOMALY_DETECTION.md.
+    routine_scope = await _resolve_routine_collapse(
+        case_id, timeline_id, source_ids, collapse_routine
+    )
     return EventQuery(
         case_id=case_id,
         source_ids=source_ids,
+        exclude_routine_disposition_ids=routine_scope.motif_disposition_ids,
+        exclude_template_hashes=routine_scope.template_hashes,
         q=q,
         q_regex=q_regex,
         artifact=artifact,
@@ -149,6 +162,14 @@ _EXCLUSION_MODES = Query(default=None, description="JSON match-mode map for `exc
 _ANNOTATED = Query(default=None)
 _ANNOTATION_TAG_VALUE = Query(default=None)
 _RUN_ID = Query(default=None)
+_COLLAPSE_ROUTINE = Query(
+    default=False,
+    description=(
+        "Exclude events covered by an active routine disposition (muted "
+        "templates, motifs marked routine), matching what the grid shows. "
+        "Must mirror the flag the caller's event list was rendered with."
+    ),
+)
 
 
 def _is_unfiltered(query: EventQuery) -> bool:
@@ -179,6 +200,11 @@ def _is_unfiltered(query: EventQuery) -> bool:
         )
         and query.event_ids is None
         and query.exclude_event_ids is None
+        # An active routine collapse is a filter: the per-source field_stats
+        # cache aggregates the *uncollapsed* timeline, so serving it here
+        # would resurrect the muted events in the chart (#147).
+        and query.exclude_routine_disposition_ids is None
+        and query.exclude_template_hashes is None
     )
 
 
@@ -207,6 +233,7 @@ async def get_field_terms(
     annotated: str | None = _ANNOTATED,
     annotation_tag_value: str | None = _ANNOTATION_TAG_VALUE,
     run_id: str | None = _RUN_ID,
+    collapse_routine: bool = _COLLAPSE_ROUTINE,
     case: Case = Depends(require_case_read),
 ) -> dict[str, Any]:
     """Return a top-N terms aggregation (value → count) for *field*.
@@ -236,6 +263,7 @@ async def get_field_terms(
         run_id=run_id,
         filter_modes=filter_modes,
         exclusion_modes=exclusion_modes,
+        collapse_routine=collapse_routine,
     )
     # M24a: an unfiltered first load is answerable from the per-source
     # field_stats cache — no ClickHouse scan, no HEAVY_SCAN_GATE slot. A
@@ -284,6 +312,7 @@ async def get_field_numeric_stats(
     annotated: str | None = _ANNOTATED,
     annotation_tag_value: str | None = _ANNOTATION_TAG_VALUE,
     run_id: str | None = _RUN_ID,
+    collapse_routine: bool = _COLLAPSE_ROUTINE,
     case: Case = Depends(require_case_read),
 ) -> dict[str, Any]:
     """Return summary statistics and a fixed-width histogram for a numeric field.
@@ -314,6 +343,7 @@ async def get_field_numeric_stats(
         run_id=run_id,
         filter_modes=filter_modes,
         exclusion_modes=exclusion_modes,
+        collapse_routine=collapse_routine,
     )
     service = _get_query_service()
     return await _run_regex_guarded(
@@ -351,6 +381,7 @@ async def get_field_value_timeseries(
     annotated: str | None = _ANNOTATED,
     annotation_tag_value: str | None = _ANNOTATION_TAG_VALUE,
     run_id: str | None = _RUN_ID,
+    collapse_routine: bool = _COLLAPSE_ROUTINE,
     case: Case = Depends(require_case_read),
 ) -> dict[str, Any]:
     """Return per-value event counts bucketed over time for *field*.
@@ -381,6 +412,7 @@ async def get_field_value_timeseries(
         run_id=run_id,
         filter_modes=filter_modes,
         exclusion_modes=exclusion_modes,
+        collapse_routine=collapse_routine,
     )
     service = _get_query_service()
     return await _run_regex_guarded(
@@ -416,6 +448,7 @@ async def get_time_punchcard(
     annotated: str | None = _ANNOTATED,
     annotation_tag_value: str | None = _ANNOTATION_TAG_VALUE,
     run_id: str | None = _RUN_ID,
+    collapse_routine: bool = _COLLAPSE_ROUTINE,
     case: Case = Depends(require_case_read),
 ) -> dict[str, Any]:
     """Return event counts by (day-of-week × hour-of-day), UTC.
@@ -447,6 +480,7 @@ async def get_time_punchcard(
         run_id=run_id,
         filter_modes=filter_modes,
         exclusion_modes=exclusion_modes,
+        collapse_routine=collapse_routine,
     )
     service = _get_query_service()
     return await _run_regex_guarded(
@@ -483,6 +517,7 @@ async def get_field_pivot(
     annotated: str | None = _ANNOTATED,
     annotation_tag_value: str | None = _ANNOTATION_TAG_VALUE,
     run_id: str | None = _RUN_ID,
+    collapse_routine: bool = _COLLAPSE_ROUTINE,
     case: Case = Depends(require_case_read),
 ) -> dict[str, Any]:
     """Return a top-X × top-Y co-occurrence matrix for two categorical fields.
@@ -515,6 +550,7 @@ async def get_field_pivot(
         run_id=run_id,
         filter_modes=filter_modes,
         exclusion_modes=exclusion_modes,
+        collapse_routine=collapse_routine,
     )
     service = _get_query_service()
     return await _run_regex_guarded(
@@ -554,6 +590,7 @@ async def get_field_scatter(
     annotated: str | None = _ANNOTATED,
     annotation_tag_value: str | None = _ANNOTATION_TAG_VALUE,
     run_id: str | None = _RUN_ID,
+    collapse_routine: bool = _COLLAPSE_ROUTINE,
     case: Case = Depends(require_case_read),
 ) -> dict[str, Any]:
     """Return a uniform random sample of (x, y) numeric pairs for a scatter plot.
@@ -588,6 +625,7 @@ async def get_field_scatter(
         run_id=run_id,
         filter_modes=filter_modes,
         exclusion_modes=exclusion_modes,
+        collapse_routine=collapse_routine,
     )
     service = _get_query_service()
     return await _run_regex_guarded(
@@ -626,6 +664,7 @@ class CompareFilters(BaseModel):
     annotated: str | None = None
     annotation_tag_value: str | None = None
     run_id: str | None = None
+    collapse_routine: bool = False
 
 
 class ComparisonSpec(BaseModel):
@@ -670,6 +709,7 @@ async def _resolve_body_query(case_id: str, timeline_id: str, body: CompareFilte
         run_id=body.run_id,
         filter_modes=body.filter_modes,
         exclusion_modes=body.exclusion_modes,
+        collapse_routine=body.collapse_routine,
     )
 
 
@@ -725,6 +765,10 @@ async def compare_layers(
             run_id=None,
             filter_modes=None,
             exclusion_modes=None,
+            # The baseline layer is "the whole the primary is a part of" —
+            # deliberately uncollapsed like every other dropped filter, so
+            # the superset invariant the M24c cache rests on keeps holding.
+            collapse_routine=False,
         )
         # M24c: freshness fingerprint for the baseline-layer cache. The
         # comparison layer here is a strict superset of the primary (same

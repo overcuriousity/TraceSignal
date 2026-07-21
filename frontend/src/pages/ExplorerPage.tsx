@@ -35,6 +35,11 @@ import { useBaselineStore } from "@/stores/baseline";
 import { baselinesApi } from "@/api/baselines";
 import { paramsToFilters, filtersToParams } from "@/lib/queryParams";
 import { computeEffectiveFilters, overlaysFromApplied } from "@/lib/effectiveFilters";
+import {
+  resolveCollapseRoutine,
+  routineSignature,
+  type RoutineOverride,
+} from "@/lib/routineCollapse";
 import { contextWindow } from "@/lib/time";
 import { useCaseStream } from "@/hooks/useCaseStream";
 
@@ -331,30 +336,6 @@ export function ExplorerPage() {
     [filters, setFilters],
   );
 
-  /**
-   * Wired to the Agent panel's "Apply to Explorer". A finding's filter set may
-   * carry the three session-overlay fields (`anomalyRunId`, `ids`,
-   * `collapseRoutine`) that are deliberately *not* URL-serialized — so plain
-   * `setFilters` (URL only) would silently drop them and the grid would show a
-   * broader set than the agent actually ran, breaking the "apply must match
-   * exactly what the agent saw" invariant (src/vestigo/agent/tools.py). We
-   * drive the overlay setters alongside setFilters rather than URL-encoding the
-   * fields, keeping saved-view/shared-URL semantics unchanged for every
-   * non-agent flow. Each apply fully (re)sets all three overlays so applying a
-   * second finding never inherits the first's run/ids/collapse.
-   */
-  const handleApplyAgentFilters = useCallback(
-    (f: EventFilters) => {
-      const overlays = overlaysFromApplied(f);
-      setAnomalyRunId(overlays.anomalyRunId);
-      setCollapseRoutine(overlays.collapseRoutine);
-      // setFilters clears appliedIds; re-set it after (same React batch → wins).
-      setFilters(f);
-      setAppliedIds(overlays.ids);
-    },
-    [setFilters],
-  );
-
   // ── Panel visibility state ────────────────────────────────────────────
   const filterRailOpen = useUiStore((s) => s.filterRailOpen);
   const setFilterRailOpen = useUiStore((s) => s.setFilterRailOpen);
@@ -379,10 +360,17 @@ export function ExplorerPage() {
   // ids. Cleared by any manual filter change (see setFilters); re-set by
   // handleApplyAgentFilters. `null` = no allowlist active.
   const [appliedIds, setAppliedIds] = useState<string[] | null>(null);
-  // Routine-motif collapse (Patterns tab): hide events belonging to
-  // routine-dispositioned motifs. Session state, never serialized — and the
-  // grid always shows the collapsed count, so nothing is hidden silently.
-  const [collapseRoutine, setCollapseRoutine] = useState(false);
+  // Routine collapse (Patterns → Mark routine, Templates → Mute): hide events
+  // belonging to routine-dispositioned motifs/templates. Session state, never
+  // serialized — and the grid always shows the collapsed count, so nothing is
+  // hidden silently.
+  //
+  // Derived from the disposition set rather than opted into (#147): a mute is
+  // a filter and must apply on creation, which is what the Templates/Patterns
+  // copy promises. This state holds only an *override* of that default (the
+  // top-bar reveal toggle, or an agent apply); `lib/routineCollapse.ts` owns
+  // the precedence and why the override self-expires.
+  const [routineOverride, setRoutineOverride] = useState<RoutineOverride>(null);
   const {
     activeBaselineId,
     markMode: baselineMarkMode,
@@ -477,6 +465,59 @@ export function ExplorerPage() {
     semanticSearchIdsRef.current = semanticSearchIds;
   }, [anomalyRunId, semanticSearchIds]);
 
+  // Feeds the grid's disposition indicator (dispositionMap) and routine
+  // collapse. The key is invalidated by useDisposition on every verdict, so a
+  // mute lands here and flips `collapseRoutine` on without further wiring.
+  // Declared above `effectiveFilters` because that memo consumes it.
+  const { data: dispositionsData, isSuccess: dispositionsReady } = useQuery({
+    queryKey: ["dispositions", caseId, timelineId],
+    queryFn: () => dispositionsApi.list(caseId!, timelineId!),
+    enabled: !!(caseId && timelineId),
+  });
+  const routineSig = useMemo(
+    () => routineSignature(dispositionsData?.dispositions ?? []),
+    [dispositionsData],
+  );
+  // The reveal toggle only renders once at least one routine disposition
+  // exists (Patterns → Mark routine, Templates → Mute).
+  const hasRoutineDispositions = routineSig !== "";
+  const collapseRoutine = resolveCollapseRoutine(routineSig, routineOverride);
+  // Stamping the choice with the current disposition set is what makes it
+  // expire when the next mute lands — see lib/routineCollapse.ts.
+  const setCollapseRoutine = useCallback(
+    (value: boolean) => setRoutineOverride({ value, signature: routineSig }),
+    [routineSig],
+  );
+
+  /**
+   * Wired to the Agent panel's "Apply to Explorer". A finding's filter set may
+   * carry the three session-overlay fields (`anomalyRunId`, `ids`,
+   * `collapseRoutine`) that are deliberately *not* URL-serialized — so plain
+   * `setFilters` (URL only) would silently drop them and the grid would show a
+   * broader set than the agent actually ran, breaking the "apply must match
+   * exactly what the agent saw" invariant (src/vestigo/agent/tools.py). We
+   * drive the overlay setters alongside setFilters rather than URL-encoding the
+   * fields, keeping saved-view/shared-URL semantics unchanged for every
+   * non-agent flow. Each apply fully (re)sets all three overlays so applying a
+   * second finding never inherits the first's run/ids/collapse.
+   *
+   * `collapseRoutine` is applied as an explicit override (rather than left to
+   * the disposition-derived default) precisely so an agent finding that ran
+   * *without* collapse reproduces uncollapsed even when mutes exist. Declared
+   * after `setCollapseRoutine` since it closes over it.
+   */
+  const handleApplyAgentFilters = useCallback(
+    (f: EventFilters) => {
+      const overlays = overlaysFromApplied(f);
+      setAnomalyRunId(overlays.anomalyRunId);
+      setCollapseRoutine(overlays.collapseRoutine);
+      // setFilters clears appliedIds; re-set it after (same React batch → wins).
+      setFilters(f);
+      setAppliedIds(overlays.ids);
+    },
+    [setFilters, setCollapseRoutine],
+  );
+
   // The filter object actually sent to the events/histogram/export queries.
   // `filters` itself stays URL-serializable/shareable — this augments it
   // with the active Analysis tab's persisted run_id and semantic search
@@ -553,7 +594,12 @@ export function ExplorerPage() {
       firstPage.has_more_before && firstPage.prev_cursor
         ? { before: cursorParam(firstPage.prev_cursor) }
         : undefined,
-    enabled: !!(caseId && timelineId),
+    // Gated on the disposition set being known: until it loads, collapse
+    // derives to `false`, so an ungated first fetch would render the
+    // uncollapsed superset (the literal #147 flash) and burn a ClickHouse
+    // scan, only to refetch collapsed a moment later. One small Postgres
+    // query before first paint.
+    enabled: !!(caseId && timelineId) && dispositionsReady,
     placeholderData: (prev) => prev,
   });
 
@@ -564,20 +610,6 @@ export function ExplorerPage() {
     refetchInterval: 30_000,
   });
 
-  // Feeds the grid's disposition indicator (dispositionMap) and the
-  // collapse-routine toggle. The key is invalidated by useDisposition on
-  // every verdict.
-  const { data: dispositionsData } = useQuery({
-    queryKey: ["dispositions", caseId, timelineId],
-    queryFn: () => dispositionsApi.list(caseId!, timelineId!),
-    enabled: !!(caseId && timelineId),
-  });
-  // The collapse-routine toggle only renders once at least one routine
-  // disposition exists (Patterns tab → Mark routine).
-  const hasRoutineDispositions = useMemo(
-    () => (dispositionsData?.dispositions ?? []).some((d) => d.kind === "routine"),
-    [dispositionsData],
-  );
   const routineCollapsedCount = eventsData?.pages?.[0]?.routine_collapsed_count ?? 0;
   // Timeline-wide event total (ready sources only) — denominator for the
   // routine-collapse stat; matches routine_collapsed_count's timeline-wide scope.
@@ -1034,14 +1066,22 @@ export function ExplorerPage() {
               <Tooltip
                 content={
                   collapseRoutine
-                    ? "Show routine events again"
-                    : "Collapse routine events (patterns marked routine in the Patterns tab)"
+                    ? "Temporarily show routine events (muted templates and patterns marked routine) — the next mute re-applies collapse"
+                    : "Collapse routine events again"
                 }
               >
                 <Button
-                  variant={collapseRoutine ? "accent" : "ghost"}
+                  // `accent` marks the *override* (reveal active), not the
+                  // collapsed default: collapse is the normal state now, and
+                  // the exceptional, self-expiring reveal is what deserves
+                  // the active-filter highlight.
+                  variant={collapseRoutine ? "ghost" : "accent"}
                   size="icon"
-                  onClick={() => setCollapseRoutine((v) => !v)}
+                  // Not the functional-update form: `collapseRoutine` is
+                  // derived per render (never stale state), and the setter
+                  // stamps the override with the current disposition-set
+                  // signature — see lib/routineCollapse.ts.
+                  onClick={() => setCollapseRoutine(!collapseRoutine)}
                 >
                   <Repeat size={14} />
                 </Button>
@@ -1108,6 +1148,7 @@ export function ExplorerPage() {
             caseId={caseId}
             timelineId={timelineId}
             filters={effectiveFilters}
+            enabled={dispositionsReady}
             onRangeSelect={handleHistogramRange}
             markers={investigatePanelOpen ? anomalyMarkers : []}
             highlightRange={rangeHighlight}
