@@ -15,6 +15,7 @@ import pytest
 
 from vestigo.agent.fidelity import (
     DEFAULT_FIDELITY,
+    FIDELITY_TIERED_TOOLS,
     FIDELITY_VALUES,
     MAX_FIDELITY_DROPS,
     Fidelity,
@@ -23,9 +24,10 @@ from vestigo.agent.fidelity import (
     resolve_fidelity,
 )
 from vestigo.agent.tools import (
-    FIDELITY_TIERED_TOOLS,
+    FINDING_MESSAGE_TRUNCATE,
     TOOL_NAMES,
     _deflate_findings,
+    _event_reduced,
     _slim_event,
 )
 
@@ -218,6 +220,28 @@ def test_slim_event_never_strips_the_means_of_un_reducing_it(tier):
 def test_slim_event_tiers_are_ordered_by_size():
     sizes = [len(json.dumps(_slim_event(_event(), tier))) for tier in Fidelity]
     assert sizes == sorted(sizes, reverse=True)
+
+
+# --- "was anything actually dropped" --------------------------------------
+
+
+def test_full_never_claims_a_reduction():
+    assert _event_reduced(_event(), Fidelity.FULL) is False
+
+
+def test_a_bare_event_survives_message_intact():
+    """A tier below FULL does not by itself mean data was lost. Claiming a
+    reduction that did not happen puts an untruth in the exported record."""
+    bare = {"event_id": "e1", "source_id": "s1", "message": "short line"}
+    assert _event_reduced(bare, Fidelity.MESSAGE) is False
+    assert _event_reduced({"event_id": "e1"}, Fidelity.MINIMAL) is False
+
+
+def test_dropped_attributes_and_dropped_lines_are_reductions():
+    assert _event_reduced(_event(), Fidelity.MESSAGE) is True  # attributes go
+    assert _event_reduced({"message": "x"}, Fidelity.MINIMAL) is True  # the line goes
+    long = {"message": "m" * (FINDING_MESSAGE_TRUNCATE + 1)}
+    assert _event_reduced(long, Fidelity.MESSAGE) is True  # truncated
 
 
 def test_the_same_call_at_the_same_tier_is_byte_identical():

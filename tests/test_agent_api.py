@@ -1830,6 +1830,23 @@ def test_overflow_drops_fidelity_before_spending_a_summarizer_call(
     # Two requests per attempt (tool call, then answer) across two attempts.
     assert calls["stream"] == 4
 
+    # The SSE event is gone on reload, so the drop is persisted the way a
+    # compaction is: a marker row (which also separates the re-run's tool rows
+    # from the failed attempt's) plus an audit row.
+    async def _record():
+        return (
+            await store.list_agent_messages(conversation["id"]),
+            await store.query_audit(case_id=case_id, action="agent.fidelity_drop"),
+        )
+
+    messages, audit = asyncio.run(_record())
+    markers = [m for m in messages if m.role == "fidelity"]
+    assert [m.tool_result for m in markers] == [
+        {"from": "full", "to": "message", "attempt": 0, "reason": "overflow"}
+    ]
+    assert "context window" in markers[0].content
+    assert [row.detail for row in audit] == [markers[0].tool_result]
+
 
 def test_overflow_without_a_tiered_tool_goes_straight_to_compaction(
     client, admin_bootstrap, agent_on, store, monkeypatch
@@ -1858,6 +1875,17 @@ def test_overflow_without_a_tiered_tool_goes_straight_to_compaction(
     assert not any(e["type"] == "fidelity" for e in events)
     assert next(e for e in events if e["type"] == "compaction")["reason"] == "overflow"
     assert calls["stream"] == 2
+
+    # A drop that never happened must not leave a record saying it did.
+    async def _record():
+        return (
+            await store.list_agent_messages(conversation["id"]),
+            await store.query_audit(case_id=case_id, action="agent.fidelity_drop"),
+        )
+
+    messages, audit = asyncio.run(_record())
+    assert not [m for m in messages if m.role == "fidelity"]
+    assert audit == []
 
 
 def test_send_message_overflow_with_nothing_to_compact(

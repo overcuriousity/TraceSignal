@@ -1076,9 +1076,17 @@ class AgentConversation(Base):
 class AgentMessage(Base):
     """One human-readable step of an agent conversation.
 
-    ``role`` is ``user`` | ``assistant`` | ``tool``. Tool rows carry the tool
-    name, its exact arguments and a result summary — the auditable record of
-    what the agent actually queried. Append-only, like ``AuditLog``.
+    ``role`` is ``user`` | ``assistant`` | ``tool`` | ``thinking`` |
+    ``compaction`` | ``fidelity``. Tool rows carry the tool name, its exact
+    arguments and a result summary — the auditable record of what the agent
+    actually queried. Append-only, like ``AuditLog``.
+
+    ``compaction`` and ``fidelity`` are *marker* rows: each records one
+    degradation the runtime applied mid-turn before re-running it
+    (``api/routers/agent.py``). They also delimit attempts — a tool row
+    repeating after a marker is that same call re-executed by the retry, not a
+    duplicate, which is the distinction the ``attempt`` tag draws on the
+    matching ``agent.tool_call`` audit rows.
     """
 
     __tablename__ = "agent_messages"

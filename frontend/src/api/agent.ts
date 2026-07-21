@@ -252,7 +252,10 @@ export interface AgentConversation {
 export interface AgentMessage {
   id: string;
   conversation_id: string;
-  role: "user" | "assistant" | "tool" | "thinking" | "compaction";
+  /** `compaction` and `fidelity` are marker rows: one degradation the runtime
+   * applied mid-turn before re-running it. They also separate a retry's
+   * re-executed tool rows from the attempt before it. */
+  role: "user" | "assistant" | "tool" | "thinking" | "compaction" | "fidelity";
   content: string;
   tool_name: string | null;
   tool_args: Record<string, unknown> | null;

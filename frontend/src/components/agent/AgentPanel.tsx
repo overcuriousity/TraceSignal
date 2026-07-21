@@ -103,6 +103,11 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
       if (m.content) items.push({ kind: "thinking", content: m.content });
     } else if (m.role === "compaction") {
       items.push({ kind: "compaction", summary: m.content });
+    } else if (m.role === "fidelity") {
+      // The tier the turn was re-run at — the drop row's `to`, same value the
+      // live SSE `fidelity` event carried.
+      const drop = m.tool_result as { to?: AgentFidelity } | null;
+      if (drop?.to) items.push({ kind: "fidelity", fidelity: drop.to });
     } else if (m.role === "assistant") {
       if (m.content) {
         items.push({

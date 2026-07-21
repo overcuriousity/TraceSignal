@@ -175,21 +175,8 @@ TOOL_REGISTRY: tuple[ToolInfo, ...] = (
 
 TOOL_NAMES: frozenset[str] = frozenset(t.name for t in TOOL_REGISTRY)
 
-# The tools whose payloads honour `AgentScope.fidelity` — those that return
-# *many* event records, where a tier drop actually shrinks the prompt. The
-# router consults this before spending an overflow retry on a drop
-# (`agent/fidelity.py::next_tier`): an overflow on a turn that called none of
-# these cannot be helped by one, and must fall through to compaction instead.
-#
-# `get_event` and `get_event_annotations` are deliberately absent. They fetch
-# one record on purpose, and they are the escape hatch every reduced payload's
-# `note` names — tiering them would leave the model looping on a reduction it
-# has no way to undo. `list_annotations` is absent too: annotation bodies are
-# analyst-written evidence, not an illustrative record, and are already bounded
-# by MAX_LIST_ROWS x ANNOTATION_LIST_CONTENT_TRUNCATE.
-FIDELITY_TIERED_TOOLS: frozenset[str] = frozenset(
-    {"search_events", "semantic_search", "similar_events", "run_anomaly_detector"}
-)
+# Which tools honour `AgentScope.fidelity` is a policy fact, so the set lives
+# beside the tiers it selects: `agent/fidelity.py::FIDELITY_TIERED_TOOLS`.
 
 
 class FilterSpec(BaseModel):
@@ -598,7 +585,7 @@ def _stamp_fidelity(
     return out
 
 
-def _deflate_findings(payload: Any, fidelity: Fidelity = Fidelity.MESSAGE) -> Any:
+def _deflate_findings(payload: Any, fidelity: Fidelity) -> Any:
     """Reduce each finding's inline `event` to what *fidelity* admits.
 
     The model's copy only — persistence has already stored the full payload by
@@ -711,12 +698,16 @@ def _slim_annotation(row: Any, content_limit: int = MESSAGE_TRUNCATE) -> dict[st
     }
 
 
-def _slim_event(event: dict[str, Any], fidelity: Fidelity = Fidelity.FULL) -> dict[str, Any]:
+def _slim_event(event: dict[str, Any], fidelity: Fidelity) -> dict[str, Any]:
     """Compact an event row for model consumption, down to what *fidelity* admits.
 
     ``FULL`` is the shape every caller had before tiers existed. ``MESSAGE``
     drops the attribute bag and truncates the message to the tighter
     ``FINDING_MESSAGE_TRUNCATE``; ``MINIMAL`` keeps identity fields only.
+
+    The tier is required rather than defaulted: an exempt caller
+    (``get_event``) states its exemption at the call site, where a reader can
+    see it, instead of inheriting it silently from this signature.
 
     The identity fields survive at every tier on purpose: ``event_id`` is the
     handle for ``get_event``, and ``source_id`` is a required argument of
@@ -746,6 +737,28 @@ def _slim_event(event: dict[str, Any], fidelity: Fidelity = Fidelity.FULL) -> di
             slim_attrs[k] = _truncate(v, ATTR_VALUE_TRUNCATE)
         slim["attributes"] = slim_attrs
     return slim
+
+
+def _event_reduced(event: dict[str, Any], fidelity: Fidelity) -> bool:
+    """Whether *fidelity* actually drops anything from this event.
+
+    Drives the ``note`` on the event-returning tools. A tier below ``FULL``
+    does not by itself mean data was lost — an event with no attributes and a
+    short message survives ``MESSAGE`` intact — and claiming otherwise puts an
+    untruth in the exported record, the same failure ``_listing`` avoids by
+    reporting ``returned`` alongside ``total``.
+    """
+    if fidelity is Fidelity.FULL:
+        return False
+    attrs = event.get("attributes")
+    if isinstance(attrs, dict) and attrs:
+        return True
+    message = event.get("message")
+    if not message:
+        return False
+    if fidelity is Fidelity.MINIMAL:
+        return True
+    return len(str(message)) > FINDING_MESSAGE_TRUNCATE
 
 
 async def _build_query(
@@ -968,7 +981,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             },
             scope.fidelity,
             _EVENT_NOTE,
-            reduced=bool(page.events),
+            reduced=any(_event_reduced(e, scope.fidelity) for e in page.events),
         )
 
     @server.tool()
@@ -984,7 +997,10 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         page = await run_in_threadpool(service.query, query)
         if not page.events:
             return {"error": f"event {event_id} not found in this timeline"}
-        return _slim_event(page.events[0])
+        # FULL regardless of `scope.fidelity`: this tool is absent from
+        # FIDELITY_TIERED_TOOLS precisely so it can un-reduce what the tiered
+        # ones handed back.
+        return _slim_event(page.events[0], Fidelity.FULL)
 
     @server.tool()
     async def list_fields() -> dict[str, Any]:
@@ -1762,7 +1778,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             },
             scope.fidelity,
             _EVENT_NOTE,
-            reduced=bool(result.results),
+            reduced=any(_event_reduced(r.event or {}, scope.fidelity) for r in result.results),
         )
 
     @server.tool()
@@ -1790,7 +1806,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             },
             scope.fidelity,
             _EVENT_NOTE,
-            reduced=bool(result.results),
+            reduced=any(_event_reduced(r.event or {}, scope.fidelity) for r in result.results),
         )
 
     @server.tool()

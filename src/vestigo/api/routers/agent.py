@@ -202,8 +202,8 @@ async def export_conversation(
 ) -> Response:
     """Export the full conversation as a JSON attachment.
 
-    Contains every message row (user/assistant/tool/thinking/compaction,
-    with tool args/results and measured token usage), the proposals, and
+    Contains every message row (user/assistant/tool/thinking/compaction/
+    fidelity, with tool args/results and measured token usage), the proposals, and
     ``raw_history`` — the provider-wire pydantic-ai blob, the only place
     thinking signatures and provider quirks live. Deliberately not gated on
     ``_require_agent``: the record must stay exportable while the LLM
@@ -656,7 +656,34 @@ async def _message_stream_inner(
                 # only delay the compaction that can actually help. Tool rows
                 # already persisted by this attempt stay — the record shows what
                 # actually ran, and each row states the tier that produced it.
+                previous = scope.fidelity
                 scope = replace(scope, fidelity=lower)
+                # Persisted like a compaction, and for the same reason: an SSE
+                # event alone is gone on reload, and the case file has to answer
+                # "why is there less here than there" from itself. The row is
+                # also the marker that separates this attempt's tool rows from
+                # the re-run's.
+                drop = {
+                    "from": previous.value,
+                    "to": lower.value,
+                    "attempt": attempt,
+                    "reason": "overflow",
+                }
+                await store.add_agent_message(
+                    conversation_id,
+                    "fidelity",
+                    f"Tool results did not fit the model's context window — reduced from "
+                    f"{previous.value} to {lower.value} per event record and the turn re-run.",
+                    tool_result=drop,
+                )
+                await store.record_audit(
+                    action="agent.fidelity_drop",
+                    actor=user,
+                    case_id=case_id,
+                    target_type="agent_conversation",
+                    target_id=conversation_id,
+                    detail=drop,
+                )
                 yield _sse({"type": "fidelity", "fidelity": lower.value, "reason": "overflow"})
                 continue
             if overflow and compactions < len(keep_schedule):

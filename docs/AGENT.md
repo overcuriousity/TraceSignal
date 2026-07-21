@@ -668,7 +668,8 @@ the in-app agent and to the external `/mcp` transport alike — it describes wha
 the deployment can afford to hand a model, and an external client is driving
 one just the same.
 
-**Which tools honour it:** `FIDELITY_TIERED_TOOLS` in `agent/tools.py` —
+**Which tools honour it:** `FIDELITY_TIERED_TOOLS` in `agent/fidelity.py` (a
+policy fact, so it lives beside the tiers it selects rather than in `tools.py`) —
 `search_events`, `semantic_search`, `similar_events` (through `_slim_event`)
 and `run_anomaly_detector` (through `_deflate_findings`). Those are the tools
 that return *many* event records, where a tier is the difference between
@@ -687,7 +688,11 @@ Three deliberate exemptions:
   an example. Already bounded by `MAX_LIST_ROWS` × 160.
 
 Every tiered result carries `fidelity`, at `full` too: a result with no marker
-cannot be told apart from one produced before the setting existed.
+cannot be told apart from one produced before the setting existed. The
+accompanying `note` appears only when the tier actually dropped something
+(`_event_reduced`) — an event with no attributes and a short message survives
+`message` intact, and saying otherwise would put an untruth in the export for
+the sake of a uniform shape.
 
 **The default is `full`**, decided 2026-07-21: unset means the operator has
 declared no constraint, which is assumed to be a cloud model with room, and the
@@ -739,13 +744,20 @@ UI — explicit opt-in, since the right number is model-specific),
   1; then a friendly `error{code="context_overflow"}` instead of the generic
   failure. A tier drop emits an SSE `fidelity` event, the sibling of
   `compaction`, so the analyst sees that results were thinned rather than
-  silently getting a shallower investigation. Because the retry re-enters
+  silently getting a shallower investigation — and, for the same reason
+  compaction does, persists an append-only `role="fidelity"` message row
+  (`tool_result = {from, to, attempt, reason}`) plus an
+  `agent.fidelity_drop` audit row: an SSE event alone is gone on reload, and
+  the case file has to answer "why is there less here than there" from
+  itself. Because the retry re-enters
   `stream_turn` with `replace(scope, fidelity=...)` and **re-executes the
   tools**, nothing already in history is rewritten — the record never
   diverges from what the model saw. Tool
   calls re-executed by a retry carry an `attempt` field on their
   `agent.tool_call` audit rows so the custody trail distinguishes re-runs
-  from duplicates.
+  from duplicates; in the *message* log that job belongs to the marker rows —
+  `compaction` and `fidelity` both delimit attempts, so a tool row repeating
+  after one is that call re-executed, not a duplicate.
 - **What compaction does.** `split_history` cuts at *user-turn boundaries
   only* (never between a tool_use and its tool_result), keeping the last
   `KEEP_RECENT_TURNS=2` turns verbatim (1 on the escalated retry); the

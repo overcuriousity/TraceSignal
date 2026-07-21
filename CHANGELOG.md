@@ -16,17 +16,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity fields), or `auto` (derive it from the configured context window).
   The default is `full`: an unset context window means the operator has declared
   no constraint, which is assumed to be a cloud model with room. Admins running
-  a small local model should set `message` or `auto`. Applies to the external
-  `/mcp` transport too. `get_event` always answers in full — it is the escape
-  hatch the reduced results point at.
+  a small local model should set `message` or `auto`. `get_event` always answers
+  in full — it is the escape hatch the reduced results point at.
+  **Note for `/mcp` users:** the setting applies to the external transport too,
+  so setting anything but `full` changes what existing MCP clients receive from
+  `search_events`, `semantic_search`, `similar_events` and `run_anomaly_detector`
+  — each such result names its tier in a `fidelity` field.
 - **An overflow now costs a slower turn, not a shallower one.** When a turn
   overflows the model's context window, the agent first re-runs it handing the
   model less of each event record — no summarizer call, and unlike compaction
   it works on a single broad turn, which has no older turns to fold. It is
   skipped when the turn fetched no event records, since there would be nothing
-  to give up; only once it is exhausted does the agent compact. The chat shows
-  when this happened, and each tool result records the detail level that
-  produced it, so an exported conversation stays explainable.
+  to give up; only once it is exhausted does the agent compact. Each such drop
+  is recorded the way a compaction is — a message row in the conversation and an
+  audit entry — so it survives a reload and reaches the JSON export, and each
+  tool result records the detail level that produced it. An exported
+  conversation states every degradation that was applied to it.
 
 ### Security
 

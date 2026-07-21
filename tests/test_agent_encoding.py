@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 
 from vestigo.agent.encoding import columnar, columnar_auto
+from vestigo.agent.fidelity import Fidelity
 from vestigo.agent.tools import (
     FINDING_MESSAGE_TRUNCATE,
     MAX_LIST_ROWS,
@@ -182,7 +183,7 @@ def test_deflate_findings_keeps_the_message_and_drops_the_rest_of_the_event():
             {"type": "value_novelty", "event_id": "e2", "event": {"message": "y"}, "score": 9.1},
         ],
     }
-    out = _deflate_findings(payload)
+    out = _deflate_findings(payload, Fidelity.MESSAGE)
     assert [r["event_id"] for r in out["results"]] == ["e1", "e2"]
     assert all("event" not in r for r in out["results"])
     # succeeded-vs-failed is the finding — it must survive the slimming.
@@ -195,17 +196,19 @@ def test_deflate_findings_keeps_the_message_and_drops_the_rest_of_the_event():
 
 def test_deflate_findings_truncates_a_long_message():
     payload = {"results": [{"event_id": "e1", "event": {"message": "m" * 5000}}]}
-    message = _deflate_findings(payload)["results"][0]["message"]
+    message = _deflate_findings(payload, Fidelity.MESSAGE)["results"][0]["message"]
     assert len(message) == FINDING_MESSAGE_TRUNCATE + 1  # + the ellipsis
     assert message.endswith("…")
 
 
 def test_deflate_findings_admits_the_omission():
     """The model must never believe it saw the whole record."""
-    out = _deflate_findings({"results": [{"event_id": "e1", "event": {"message": "m"}}]})
+    out = _deflate_findings(
+        {"results": [{"event_id": "e1", "event": {"message": "m"}}]}, Fidelity.MESSAGE
+    )
     assert "get_event" in out["note"]
     # nothing dropped, nothing claimed
-    assert "note" not in _deflate_findings({"results": [{"event_id": "e1"}]})
+    assert "note" not in _deflate_findings({"results": [{"event_id": "e1"}]}, Fidelity.MESSAGE)
 
 
 def test_deflate_findings_saves_the_bulk_of_the_bytes():
@@ -217,20 +220,22 @@ def test_deflate_findings_saves_the_bulk_of_the_bytes():
         ]
     }
     before = len(json.dumps(payload))
-    after = len(json.dumps(_deflate_findings(payload)))
+    after = len(json.dumps(_deflate_findings(payload, Fidelity.MESSAGE)))
     assert after < before * 0.2
 
 
 def test_deflate_findings_ignores_unexpected_shapes():
-    assert _deflate_findings({"results": "nope"}) == {"results": "nope"}
-    assert _deflate_findings({"status": "skipped"}) == {"status": "skipped"}
-    assert _deflate_findings("not a dict") == "not a dict"
+    assert _deflate_findings({"results": "nope"}, Fidelity.MESSAGE) == {"results": "nope"}
+    assert _deflate_findings({"status": "skipped"}, Fidelity.MESSAGE) == {"status": "skipped"}
+    assert _deflate_findings("not a dict", Fidelity.MESSAGE) == "not a dict"
     # a finding with no event keeps its rows — only the tier stamp is added,
     # and no note, since nothing was actually dropped
-    passthrough = _deflate_findings({"results": [{"event_id": "e1"}]})
+    passthrough = _deflate_findings({"results": [{"event_id": "e1"}]}, Fidelity.MESSAGE)
     assert passthrough["results"] == [{"event_id": "e1"}]
     assert passthrough["fidelity"] == "message" and "note" not in passthrough
     # an event without a message still loses the event, and says so
-    out = _deflate_findings({"results": [{"event_id": "e1", "event": {"blob": "z"}}]})
+    out = _deflate_findings(
+        {"results": [{"event_id": "e1", "event": {"blob": "z"}}]}, Fidelity.MESSAGE
+    )
     assert out["results"] == [{"event_id": "e1"}]
     assert "note" in out

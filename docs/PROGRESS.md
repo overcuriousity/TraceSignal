@@ -1,6 +1,41 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-20 (session 79 — PR144 review round).
+Last updated: 2026-07-21 (session 80 — PR145/146 review round).
+
+## Session 80 — 2026-07-21: PR145/146 review — the degradation that left no trace
+
+Review of the tool-result fidelity branch. The feature held up — the overflow
+ladder's attempt bound is exactly tight (two tier drops plus two compactions,
+so no interleaving can exit the loop without a terminal event), and the
+determinism property is real and tested. Six fixes landed.
+
+**A fidelity drop was invisible the moment the page reloaded.** Compaction
+writes a message row *and* an `agent.compaction` audit row; the tier drop only
+yielded an SSE event. So a reopened conversation showed a thinner investigation
+with nothing in it explaining why — the reader would have had to know the
+deployment's `tool_fidelity` at the time of the turn to reconstruct it, which is
+exactly the inference the forensic requirement exists to remove. A drop now
+writes a `role="fidelity"` row (`tool_result = {from, to, attempt, reason}`) and
+an `agent.fidelity_drop` audit row. No migration — `AgentMessage.role` is free
+text. The row also settles the second finding: in the *message* log, marker rows
+(`compaction`, `fidelity`) are what separate a retry's re-executed tool rows
+from the attempt before them, the job `attempt` already does on the audit side.
+
+**A `note` claimed a reduction that had not happened.** The event-returning
+tools passed `reduced=bool(page.events)`, so any non-`full` tier told the model
+"attributes are omitted" even for events that had none — an untruth in an
+exported record, and the same failure mode `_listing` avoids by reporting
+`returned` beside `total`. `_event_reduced` now answers per event: attributes
+dropped, message dropped, or message truncated.
+
+Three consistency fixes: `FIDELITY_TIERED_TOOLS` moved from `tools.py` to
+`fidelity.py` (it is a policy fact, and it was forcing a function-body import to
+dodge the cycle); the tier is now a required argument on `_deflate_findings` and
+`_slim_event`, so `get_event` states its exemption at the call site instead of
+inheriting it from a default; and the two deflators no longer disagree about
+what an omitted tier means. Doc corrections: the design spec's Files table
+listed a `docs/ROADMAP.md` item that was never added, and `CLAUDE.md`'s `docs/`
+map had no line for `docs/superpowers/`.
 
 ## Session 79 — 2026-07-20: PR144 review — what the relocation forgot to relocate
 

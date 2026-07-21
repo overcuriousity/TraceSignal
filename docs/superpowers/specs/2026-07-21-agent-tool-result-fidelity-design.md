@@ -144,7 +144,6 @@ silently getting a thinner investigation.
 | `frontend/src/pages/admin/AdminAgentPage.tsx` | the control, beside reasoning effort |
 | `src/vestigo/api/routers/agent.py` | attempt loop: tier before compaction; `fidelity` SSE event |
 | `docs/AGENT.md` §A13(d), §A7 table | replace "static choice" with the tier table |
-| `docs/ROADMAP.md` | remove the item |
 
 Decided against a `Fidelity` field on the *conversation*: the tier is a
 deployment property, and a per-conversation override would let two conversations
@@ -197,4 +196,16 @@ explaining why.
 5. **Every tiered result stamps `fidelity`, `full` included.** A result with
    no marker at all cannot be told apart from one produced before the setting
    existed, which an exported conversation has to be able to do. `note` still
-   appears only when something was actually dropped.
+   appears only when something was actually dropped — `_event_reduced` decides
+   that per event rather than inferring it from the tier, so a bare event that
+   survives `message` intact is not described as reduced.
+6. **The drop itself is persisted, not just streamed.** §5 covered the
+   *results*; the degradation that produced them was an SSE event only, so a
+   reload lost it entirely — the record could not answer "why is there less
+   here than there" without configuration the reader may not have. A drop now
+   writes an append-only `role="fidelity"` message row
+   (`tool_result = {from, to, attempt, reason}`) and an `agent.fidelity_drop`
+   audit row, exactly mirroring compaction. No migration: `AgentMessage.role`
+   is free text. The marker row doubles as the delimiter between a retried
+   attempt's re-executed tool rows and the previous attempt's, which is what
+   the `attempt` tag does on the audit side.

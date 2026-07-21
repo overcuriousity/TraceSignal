@@ -13,7 +13,7 @@ as three named tiers rather than a pile of per-call byte counts:
     Identity fields alone. The model calls ``get_event`` for anything more.
 
 The tier governs the tools that return *many* event records
-(``FIDELITY_TIERED_TOOLS`` in ``agent/tools.py``). The single-record fetches it
+(:data:`FIDELITY_TIERED_TOOLS`). The single-record fetches it
 points at — ``get_event``, ``get_event_annotations`` — are deliberately exempt:
 they are the escape hatch every reduced payload names, and tiering them would
 leave the model looping on a reduction it cannot undo.
@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "Fidelity",
+    "FIDELITY_TIERED_TOOLS",
     "FIDELITY_VALUES",
     "DEFAULT_FIDELITY",
     "MAX_FIDELITY_DROPS",
@@ -60,6 +61,26 @@ class Fidelity(StrEnum):
     MESSAGE = "message"
     MINIMAL = "minimal"
 
+
+#: The tools whose payloads honour ``AgentScope.fidelity`` — those that return
+#: *many* event records, where a tier drop actually shrinks the prompt. The
+#: router consults this before spending an overflow retry on a drop
+#: (:func:`next_tier`): an overflow on a turn that called none of these cannot
+#: be helped by one, and must fall through to compaction instead.
+#:
+#: ``get_event`` and ``get_event_annotations`` are deliberately absent. They
+#: fetch one record on purpose, and they are the escape hatch every reduced
+#: payload's ``note`` names — tiering them would leave the model looping on a
+#: reduction it has no way to undo. ``list_annotations`` is absent too:
+#: annotation bodies are analyst-written evidence, not an illustrative record,
+#: and are already bounded by ``MAX_LIST_ROWS`` x
+#: ``ANNOTATION_LIST_CONTENT_TRUNCATE``.
+#:
+#: This is a policy fact rather than a tool fact, so it lives here beside the
+#: tiers it selects — ``tools.py`` reads it, not the other way round.
+FIDELITY_TIERED_TOOLS: frozenset[str] = frozenset(
+    {"search_events", "semantic_search", "similar_events", "run_anomaly_detector"}
+)
 
 #: Accepted values of the ``tool_fidelity`` setting. ``"auto"`` is a resolution
 #: *mode*, not a tier — it derives one from the configured context window — so
@@ -129,13 +150,11 @@ def next_tier(current: Fidelity, tools_used: Collection[str]) -> Fidelity | None
 
     ``tools_used`` is the set of tools that actually returned a result during
     the attempt that overflowed. A drop only changes the prompt if one of them
-    honours the tier (``FIDELITY_TIERED_TOOLS``), so an overflow on a turn that
-    called none — a long conversation with no event payloads in it — must fall
-    straight through to compaction rather than burning two provider round trips
-    re-sending a byte-identical request.
+    honours the tier (:data:`FIDELITY_TIERED_TOOLS`), so an overflow on a turn
+    that called none — a long conversation with no event payloads in it — must
+    fall straight through to compaction rather than burning two provider round
+    trips re-sending a byte-identical request.
     """
-    from vestigo.agent.tools import FIDELITY_TIERED_TOOLS
-
     if not FIDELITY_TIERED_TOOLS.intersection(tools_used):
         return None
     return degrade(current)
