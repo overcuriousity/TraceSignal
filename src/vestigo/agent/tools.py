@@ -37,6 +37,7 @@ from vestigo.agent.chart_meta import (
     requires_field,
 )
 from vestigo.agent.encoding import columnar, columnar_auto
+from vestigo.agent.fidelity import DEFAULT_FIDELITY, Fidelity
 from vestigo.agent.schema_slim import slim_tool_schema, spec_reference_block
 from vestigo.db._time_fields import TIME_FIELD_SPECS, resolve_time_field
 from vestigo.db.postgres import User
@@ -173,6 +174,22 @@ TOOL_REGISTRY: tuple[ToolInfo, ...] = (
 )
 
 TOOL_NAMES: frozenset[str] = frozenset(t.name for t in TOOL_REGISTRY)
+
+# The tools whose payloads honour `AgentScope.fidelity` — those that return
+# *many* event records, where a tier drop actually shrinks the prompt. The
+# router consults this before spending an overflow retry on a drop
+# (`agent/fidelity.py::next_tier`): an overflow on a turn that called none of
+# these cannot be helped by one, and must fall through to compaction instead.
+#
+# `get_event` and `get_event_annotations` are deliberately absent. They fetch
+# one record on purpose, and they are the escape hatch every reduced payload's
+# `note` names — tiering them would leave the model looping on a reduction it
+# has no way to undo. `list_annotations` is absent too: annotation bodies are
+# analyst-written evidence, not an illustrative record, and are already bounded
+# by MAX_LIST_ROWS x ANNOTATION_LIST_CONTENT_TRUNCATE.
+FIDELITY_TIERED_TOOLS: frozenset[str] = frozenset(
+    {"search_events", "semantic_search", "similar_events", "run_anomaly_detector"}
+)
 
 
 class FilterSpec(BaseModel):
@@ -455,6 +472,11 @@ class AgentScope:
     # Tools removed from the server after registration (admin hard-deny plus
     # any per-chat restriction) — invisible to the model, not error stubs.
     disabled_tools: frozenset[str] = frozenset()
+    # How much of an example record tool results carry (see agent/fidelity.py).
+    # A deployment property, and on a retry after an overflow one tier lower —
+    # the router rebuilds the scope with `replace(scope, fidelity=...)` rather
+    # than rewriting anything already in history.
+    fidelity: Fidelity = DEFAULT_FIDELITY
 
 
 async def build_scope(
@@ -463,6 +485,7 @@ async def build_scope(
     user: User,
     conversation_id: str | None = None,
     disabled_tools: frozenset[str] = frozenset(),
+    fidelity: Fidelity = DEFAULT_FIDELITY,
 ) -> AgentScope:
     """Resolve the timeline's source scope once for a conversation turn."""
     from vestigo.api.routers.events import _resolve_timeline_scope
@@ -477,6 +500,7 @@ async def build_scope(
         source_offsets=source_offsets,
         conversation_id=conversation_id,
         disabled_tools=disabled_tools,
+        fidelity=fidelity,
     )
 
 
@@ -521,29 +545,79 @@ def _columnize(result: Any, *keys: str) -> Any:
 # more than the inline event it replaced — and every such follow-up spends one
 # of the turn's `request_limit` model requests, so a 25-finding sweep that
 # followed up honestly would trade the overflow for a turn-limit crash.
-_FINDING_NOTE = (
-    "Each finding's example event is reduced to its `message`; call get_event(event_id) "
-    "for the full record (attributes, offsets) before reasoning about one in detail."
-)
+#
+# How far to reduce is `agent/fidelity.py`'s decision, not this function's.
+_FINDING_NOTE = {
+    Fidelity.MESSAGE: (
+        "Each finding's example event is reduced to its `message`; call get_event(event_id) "
+        "for the full record (attributes, offsets) before reasoning about one in detail."
+    ),
+    Fidelity.MINIMAL: (
+        "Each finding's example event is omitted entirely (the model's context is tight); "
+        "call get_event(event_id) for any finding you intend to reason about."
+    ),
+}
+
+# The same contract for the tools that return many whole events rather than
+# findings (`search_events`, `semantic_search`, `similar_events`).
+_EVENT_NOTE = {
+    Fidelity.MESSAGE: (
+        "Each event is reduced to its identity fields and `message` — attributes are omitted; "
+        "call get_event(event_id) for the full record before reasoning about one in detail."
+    ),
+    Fidelity.MINIMAL: (
+        "Each event is reduced to its identity fields (the model's context is tight) — message "
+        "and attributes are omitted; call get_event(event_id) for any event you intend to "
+        "reason about."
+    ),
+}
 
 
-def _deflate_findings(payload: Any) -> Any:
-    """Reduce each finding's inline `event` to its truncated `message`.
+def _stamp_fidelity(
+    payload: dict[str, Any], fidelity: Fidelity, notes: dict[Fidelity, str], *, reduced: bool = True
+) -> dict[str, Any]:
+    """Record which tier produced *payload*, and admit it when data was dropped.
+
+    ``fidelity`` is stamped at *every* tier, ``FULL`` included: a result with no
+    marker at all cannot be told apart from one produced before tiers existed,
+    and an exported conversation has to answer "why is there less here than
+    there" from the record rather than from configuration the reader may not
+    have.
+
+    ``note`` is added only below ``FULL`` and only when something was actually
+    reduced — the same self-admitting-truncation contract as :func:`_listing`'s
+    ``returned``/``total``. The lookup tolerates a tier with no note rather than
+    raising inside a live tool call.
+    """
+    out = dict(payload)
+    out["fidelity"] = fidelity.value
+    if reduced and fidelity is not Fidelity.FULL:
+        note = notes.get(fidelity)
+        if note:
+            out["note"] = note
+    return out
+
+
+def _deflate_findings(payload: Any, fidelity: Fidelity = Fidelity.MESSAGE) -> Any:
+    """Reduce each finding's inline `event` to what *fidelity* admits.
 
     The model's copy only — persistence has already stored the full payload by
     the time this runs (see ``run_anomaly_detector``). ``event_id`` and
-    ``details`` stay: the id is the handle for ``get_event``, and ``details``
-    is small and carries the surprise/allowlist/method the model reasons on.
+    ``details`` always stay: the id is the handle for ``get_event``, and
+    ``details`` is small and carries the surprise/allowlist/method the model
+    reasons on. ``Fidelity.FULL`` keeps every event inline and only stamps the
+    tier.
 
     Adds ``note`` when anything was actually reduced, so the model never
-    believes it saw the whole record — the same self-admitting-truncation
-    contract as :func:`_listing`'s ``returned``/``total``.
+    believes it saw the whole record — see :func:`_stamp_fidelity`.
     """
     if not isinstance(payload, dict):
         return payload
     findings = payload.get("results")
     if not isinstance(findings, list):
         return payload
+    if fidelity is Fidelity.FULL:
+        return _stamp_fidelity(payload, fidelity, _FINDING_NOTE)
 
     deflated = False
     rows: list[Any] = []
@@ -554,15 +628,13 @@ def _deflate_findings(payload: Any) -> Any:
         deflated = True
         event = row["event"]
         slim = {k: v for k, v in row.items() if k != "event"}
-        if isinstance(event, dict) and event.get("message"):
+        if fidelity is Fidelity.MESSAGE and isinstance(event, dict) and event.get("message"):
             slim["message"] = _truncate(event["message"], FINDING_MESSAGE_TRUNCATE)
         rows.append(slim)
 
     out = dict(payload)
     out["results"] = rows
-    if deflated:
-        out["note"] = _FINDING_NOTE
-    return out
+    return _stamp_fidelity(out, fidelity, _FINDING_NOTE, reduced=deflated)
 
 
 def _listing(key: str, rows: list[dict[str, Any]], total: int) -> dict[str, Any]:
@@ -639,14 +711,29 @@ def _slim_annotation(row: Any, content_limit: int = MESSAGE_TRUNCATE) -> dict[st
     }
 
 
-def _slim_event(event: dict[str, Any]) -> dict[str, Any]:
-    """Compact an event row for model consumption."""
+def _slim_event(event: dict[str, Any], fidelity: Fidelity = Fidelity.FULL) -> dict[str, Any]:
+    """Compact an event row for model consumption, down to what *fidelity* admits.
+
+    ``FULL`` is the shape every caller had before tiers existed. ``MESSAGE``
+    drops the attribute bag and truncates the message to the tighter
+    ``FINDING_MESSAGE_TRUNCATE``; ``MINIMAL`` keeps identity fields only.
+
+    The identity fields survive at every tier on purpose: ``event_id`` is the
+    handle for ``get_event``, and ``source_id`` is a required argument of
+    ``get_event_annotations`` — reducing a result must never strip the means of
+    un-reducing it.
+    """
     slim: dict[str, Any] = {}
     for key in ("event_id", "timestamp", "source_id", "artifact", "display_name"):
         if event.get(key) not in (None, ""):
             slim[key] = event[key]
+    if fidelity is Fidelity.MINIMAL:
+        return slim
     if event.get("message"):
-        slim["message"] = _truncate(event["message"], MESSAGE_TRUNCATE)
+        limit = MESSAGE_TRUNCATE if fidelity is Fidelity.FULL else FINDING_MESSAGE_TRUNCATE
+        slim["message"] = _truncate(event["message"], limit)
+    if fidelity is not Fidelity.FULL:
+        return slim
     attrs = event.get("attributes") or {}
     if isinstance(attrs, dict) and attrs:
         slim_attrs = {}
@@ -864,21 +951,34 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         """Search events with Explorer-equivalent filters.
 
         Returns the total match count plus up to `limit` (max 50) compacted
-        events. Iterate by refining `filters` rather than paging deeply —
-        aggregations (field_terms, histogram) summarize better than paging.
+        events. How much of each event comes back depends on the deployment —
+        the result's `fidelity`/`note` say which, and get_event returns the
+        whole record either way. Iterate by refining `filters` rather than
+        paging deeply — aggregations (field_terms, histogram) summarize better
+        than paging.
         """
         spec = _validated(filters)
         query = await _build_query(scope, spec, limit=limit, offset=offset, order=order)
         page = await run_in_threadpool(service.query, query)
-        return {
-            "total": page.total,
-            "returned": len(page.events),
-            "events": columnar_auto([_slim_event(e) for e in page.events]),
-        }
+        return _stamp_fidelity(
+            {
+                "total": page.total,
+                "returned": len(page.events),
+                "events": columnar_auto([_slim_event(e, scope.fidelity) for e in page.events]),
+            },
+            scope.fidelity,
+            _EVENT_NOTE,
+            reduced=bool(page.events),
+        )
 
     @server.tool()
     async def get_event(event_id: str) -> dict[str, Any]:
-        """Fetch a single event by its event_id (full attribute set, truncated values)."""
+        """Fetch a single event by its event_id (full attribute set, truncated values).
+
+        Always the complete record: this is the escape hatch the reduced
+        results point at, so it is exempt from the deployment's tool-result
+        detail setting.
+        """
         query = await _build_query(scope, FilterSpec(), limit=1)
         query.event_ids = [event_id]
         page = await run_in_threadpool(service.query, query)
@@ -1204,9 +1304,9 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         (effect-size floor), ngram_size (sequence length, 2-5), min_support
         (sequence_motif), start/end (sequence_motif mining window).
         Returns findings plus a persisted run_id the analyst can open. Each
-        finding carries the example's `event_id` and its `message` line, not
-        the full event — call get_event on the id when you need the record's
-        attributes.
+        finding carries an example `event_id`; how much of that event comes
+        with it depends on the deployment, and the result's `fidelity`/`note`
+        say which. Call get_event on the id for the full record.
 
         The virtual `time:` fields from list_fields are **not** detector
         fields — they are for charting and filtering only. Passing one is
@@ -1257,7 +1357,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         # `event` (the model keeps `event_id` + `get_event`); `_columnize` then
         # states the shared keys once. Together they take a seven-detector
         # sweep from tens of thousands of tokens back inside a small window.
-        return _columnize(_deflate_findings(payload), "results")
+        return _columnize(_deflate_findings(payload, scope.fidelity), "results")
 
     @server.tool()
     async def propose_finding(title: str, description: str, filters: FilterSpec) -> dict[str, Any]:
@@ -1648,13 +1748,22 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             q,
             limit=max(1, min(limit, 50)),
         )
-        return {
-            "status": result.status,
-            "results": [
-                {"event_id": r.event_id, "score": r.score, "event": _slim_event(r.event or {})}
-                for r in result.results
-            ],
-        }
+        return _stamp_fidelity(
+            {
+                "status": result.status,
+                "results": [
+                    {
+                        "event_id": r.event_id,
+                        "score": r.score,
+                        "event": _slim_event(r.event or {}, scope.fidelity),
+                    }
+                    for r in result.results
+                ],
+            },
+            scope.fidelity,
+            _EVENT_NOTE,
+            reduced=bool(result.results),
+        )
 
     @server.tool()
     async def similar_events(event_id: str, limit: int = 10) -> dict[str, Any]:
@@ -1667,13 +1776,22 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             event_id,
             limit=max(1, min(limit, 50)),
         )
-        return {
-            "status": result.status,
-            "results": [
-                {"event_id": r.event_id, "score": r.score, "event": _slim_event(r.event or {})}
-                for r in result.results
-            ],
-        }
+        return _stamp_fidelity(
+            {
+                "status": result.status,
+                "results": [
+                    {
+                        "event_id": r.event_id,
+                        "score": r.score,
+                        "event": _slim_event(r.event or {}, scope.fidelity),
+                    }
+                    for r in result.results
+                ],
+            },
+            scope.fidelity,
+            _EVENT_NOTE,
+            reduced=bool(result.results),
+        )
 
     @server.tool()
     async def list_baselines() -> dict[str, Any]:
