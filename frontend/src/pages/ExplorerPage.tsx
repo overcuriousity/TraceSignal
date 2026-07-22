@@ -34,7 +34,11 @@ import { useScrollPositionStore } from "@/stores/scrollPosition";
 import { useBaselineStore } from "@/stores/baseline";
 import { baselinesApi } from "@/api/baselines";
 import { paramsToFilters, filtersToParams } from "@/lib/queryParams";
-import { computeEffectiveFilters, overlaysFromApplied } from "@/lib/effectiveFilters";
+import {
+  computeEffectiveFilters,
+  overlaysFromApplied,
+  type ExplorerOverlays,
+} from "@/lib/effectiveFilters";
 import {
   resolveCollapseRoutine,
   routineSignature,
@@ -116,39 +120,75 @@ export function ExplorerPage() {
   const softAnchorSeqRef = useRef(0);
   const softAnchorSeededSeqRef = useRef(0);
 
+  /**
+   * Commit a filter change to the URL and, when the analyst was scrolled into
+   * the result set, seed the post-change query with a page anchored at their
+   * current position (the "soft anchor") so adding a filter doesn't silently
+   * reset the grid to the top.
+   *
+   * `overrides` carries session overlays that are being set in the *same*
+   * React batch as this call: their setters haven't re-rendered yet, so neither
+   * state nor the latest-value refs below hold the new values while this runs,
+   * and the raw `f` can't stand in for them (the URL drops those fields — see
+   * the seed-key comment). Only `handleApplyAgentFilters` needs it today: it sets
+   * `appliedIds`/`collapseRoutine` alongside the filter change, and without
+   * them the seed key would drift from the live query key — the #150 class of
+   * bug. Passing them in keeps "the seed key matches the live key" true by
+   * construction for every overlay rather than for three of four.
+   */
   const setFilters = useCallback(
-    (f: EventFilters) => {
+    (f: EventFilters, overrides?: Partial<ExplorerOverlays>) => {
       // Any new filter change invalidates a previously pending soft-anchor
       // scroll — otherwise it can fire against an unrelated later `events`
       // update (e.g. a subsequent range change or jump-to-time).
       pendingSoftAnchorRef.current = null;
+      // Likewise a pending jump: the filter change moves the live query onto a
+      // new key, so the page that jump seeded (under the pre-change key) can
+      // never arrive. Bumping the seq also makes an in-flight jump's own seed
+      // fail its guard instead of landing on a key nothing reads.
+      pendingJumpRef.current = null;
+      ++jumpSeqRef.current;
+      // A filter change redefines what's visible, so a prior "located hidden"
+      // marker no longer means anything — drop it.
+      setLocatedHiddenId(null);
       // Any manual filter change clears an agent-applied event_id allowlist —
       // the overlay auto-clears like semanticSearchIds does, so a finding's
       // `ids` can never get stranded on the grid with no chip to remove it.
-      // handleApplyAgentFilters re-sets it after this call (same React batch),
-      // so an actual finding-apply survives.
+      // handleApplyAgentFilters re-sets it after this call (same React batch)
+      // and passes it via `overrides`, so an actual finding-apply survives and
+      // still seeds the right key.
       setAppliedIds(null);
       const rangeUnchanged = f.start === filters.start && f.end === filters.end;
       const anchorTs = useScrollPositionStore.getState().currentPositionTs;
-      // A bare `{}` is handleJumpToTime's own clear-and-seek call — it seeds
-      // the same query key itself, so skip here to avoid both racing on it.
-      const isJumpClear = Object.keys(f).length === 0;
-      const shouldAnchor = rangeUnchanged && !isJumpClear && anchorTs && caseId && timelineId;
+      const shouldAnchor = rangeUnchanged && anchorTs && caseId && timelineId;
 
       // Commit the URL/filter change first — matches handleJumpToTime's
       // ordering, so the seed below races the hook's own auto-fetch the same
       // (already-accepted) way a jump-to-time seed does.
-      setSearchParams(filtersToParams(f));
+      const nextParams = filtersToParams(f);
+      setSearchParams(nextParams);
 
       if (shouldAnchor) {
         const seq = ++softAnchorSeqRef.current;
-        let nextEffective = f;
-        if (f.annotated?.includes("anomaly") && anomalyRunIdRef.current) {
-          nextEffective = { ...nextEffective, anomalyRunId: anomalyRunIdRef.current };
-        }
-        if (semanticSearchIdsRef.current !== null) {
-          nextEffective = { ...nextEffective, q: undefined, ids: semanticSearchIdsRef.current };
-        }
+        // Reproduce the post-change live query key exactly, the way the live
+        // query itself builds it: URL-round-tripped filters (`paramsToFilters`
+        // of what we just committed — *not* the raw `f`, which may carry
+        // session-overlay fields like `ids`/`collapseRoutine` that the URL
+        // drops, or fields that don't round-trip) fed through the same
+        // `computeEffectiveFilters` helper. Anything less exact seeds a cache
+        // entry the grid never reads — that is #150, and hand-rolling either
+        // half is how it happened.
+        //
+        // `appliedIds` defaults to null (setAppliedIds(null) above clears it);
+        // a finding-apply overrides it — along with collapse/run id — through
+        // `overrides`, since those setters haven't committed yet at this point.
+        const nextEffective = computeEffectiveFilters(paramsToFilters(nextParams), {
+          anomalyRunId: anomalyRunIdRef.current,
+          appliedIds: null,
+          semanticSearchIds: semanticSearchIdsRef.current,
+          collapseRoutine: collapseRoutineRef.current,
+          ...overrides,
+        });
         const targetKey = ["events", caseId, timelineId, nextEffective, sortDir];
         queryClient.cancelQueries({ queryKey: targetKey }).then(async () => {
           if (softAnchorSeqRef.current !== seq) return;
@@ -191,11 +231,17 @@ export function ExplorerPage() {
     [setSearchParams, filters, caseId, timelineId, queryClient, sortDir],
   );
 
-  // Latest anomalyRunId/semanticSearchIds for setFilters' soft-anchor seek
-  // above, which runs before those states are declared further down this
-  // component — refs sidestep the ordering (and closure-staleness) issue.
+  // Latest anomalyRunId/semanticSearchIds/collapseRoutine for setFilters'
+  // soft-anchor seek above, which runs before those states are declared
+  // further down this component — refs sidestep the ordering (and
+  // closure-staleness) issue. Each is assigned *during render* at its
+  // declaration site rather than in an effect: an effect only lands after
+  // commit, so a setFilters batched with an overlay change would read the
+  // previous value and seed a drifted key. (Latest-value refs are the standard
+  // exception to "no side effects in render" — nothing else observes them.)
   const anomalyRunIdRef = useRef<string | undefined>(undefined);
   const semanticSearchIdsRef = useRef<string[] | null>(null);
+  const collapseRoutineRef = useRef(false);
 
   const removeFilter = useCallback(
     (key: keyof EventFilters | string, fieldKey?: string, value?: string) => {
@@ -396,11 +442,21 @@ export function ExplorerPage() {
   const [saveViewOpen, setSaveViewOpen] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const gridRef = useRef<EventGridHandle>(null);
-  // Snapshot of `filters` taken right before a "jump to time" cleared them —
-  // drives the "back to filtered view" breadcrumb. `rangeHighlight` is purely
-  // visual (a Frequency finding's anomalous window), never a URL filter.
+  // Snapshot of `filters` taken right before a context query replaced them with
+  // its ±window — drives the "back to filtered view" breadcrumb, and is that
+  // breadcrumb's only producer (jump-to-time keeps the analyst's filters now,
+  // so it has nothing to restore). `rangeHighlight` is purely visual (a
+  // Frequency finding's anomalous window), never a URL filter.
   const [preJumpFilters, setPreJumpFilters] = useState<EventFilters | null>(null);
   const [rangeHighlight, setRangeHighlight] = useState<{ start: string; end: string } | null>(null);
+  // When a "locate"/jump target is only visible because we force-included it
+  // (it would otherwise be hidden by the current view — a routine/mute
+  // collapse or an active filter), its id lands here so the grid can render it
+  // visually distinct as "normally hidden". Cleared on any filter change, on
+  // any session-overlay change (the effect below — e.g. revealing routine
+  // events makes the claim false), and whenever a jump targets an event the
+  // current view already shows.
+  const [locatedHiddenId, setLocatedHiddenId] = useState<string | null>(null);
   const pendingJumpRef = useRef<{ ts: string; eventId?: string; seq: number } | null>(null);
   // Bumped on every jump; the pending-jump effect only trusts `events` once
   // `seededSeqRef` catches up, so a stray automatic fetch landing mid-jump
@@ -460,10 +516,9 @@ export function ExplorerPage() {
     return semanticSearchData.results.map((r) => r.event_id);
   }, [filters.q, semanticMode, hasVectors, semanticSearchData]);
 
-  useEffect(() => {
-    anomalyRunIdRef.current = anomalyRunId;
-    semanticSearchIdsRef.current = semanticSearchIds;
-  }, [anomalyRunId, semanticSearchIds]);
+  // Render-time, not an effect — see the ref declarations above.
+  anomalyRunIdRef.current = anomalyRunId;
+  semanticSearchIdsRef.current = semanticSearchIds;
 
   // Feeds the grid's disposition indicator (dispositionMap) and routine
   // collapse. The key is invalidated by useDisposition on every verdict, so a
@@ -482,12 +537,27 @@ export function ExplorerPage() {
   // exists (Patterns → Mark routine, Templates → Mute).
   const hasRoutineDispositions = routineSig !== "";
   const collapseRoutine = resolveCollapseRoutine(routineSig, routineOverride);
+  // Mirror into a ref for setFilters' soft-anchor seek, which is declared
+  // above this and must include collapse in the seed key or it drifts from
+  // the live query key (the #150 class of bug). Render-time, not an effect —
+  // see the ref declarations above.
+  collapseRoutineRef.current = collapseRoutine;
   // Stamping the choice with the current disposition set is what makes it
   // expire when the next mute lands — see lib/routineCollapse.ts.
   const setCollapseRoutine = useCallback(
     (value: boolean) => setRoutineOverride({ value, signature: routineSig }),
     [routineSig],
   );
+
+  // "Normally hidden" is a claim about the *current* view, so it expires when
+  // the view changes. setFilters covers the URL-backed half; the session
+  // overlays change outside it (the top-bar reveal toggle, a semantic search
+  // resolving, an agent apply) and would otherwise leave the marker asserting
+  // something false — e.g. a row still badged "Hidden" after routine events
+  // were revealed.
+  useEffect(() => {
+    setLocatedHiddenId(null);
+  }, [collapseRoutine, appliedIds, semanticSearchIds]);
 
   /**
    * Wired to the Agent panel's "Apply to Explorer". A finding's filter set may
@@ -512,7 +582,15 @@ export function ExplorerPage() {
       setAnomalyRunId(overlays.anomalyRunId);
       setCollapseRoutine(overlays.collapseRoutine);
       // setFilters clears appliedIds; re-set it after (same React batch → wins).
-      setFilters(f);
+      // The overlays also go in as `overrides` because none of the three
+      // setters above have committed yet — without them setFilters' soft-anchor
+      // seek would seed a key the live query never reads and the grid would
+      // snap to the top of the timeline on every finding-apply.
+      setFilters(f, {
+        anomalyRunId: overlays.anomalyRunId,
+        appliedIds: overlays.ids,
+        collapseRoutine: overlays.collapseRoutine,
+      });
       setAppliedIds(overlays.ids);
     },
     [setFilters, setCollapseRoutine],
@@ -768,61 +846,85 @@ export function ExplorerPage() {
 
   /**
    * Wired to the Analysis panel's "jump to time" buttons and the Event
-   * Detail panel's "locate in timeline" button. The finding's timestamp may
-   * not match the currently active filters at all, so this clears them
-   * outright (guaranteeing the target is visible) rather than trying to
-   * merge — the analyst can restore the prior view via the breadcrumb this
-   * leaves behind. Since the target likely isn't in the already-loaded
-   * window, this also seeds the query cache with a fresh page anchored at
-   * the target, so bidirectional scroll continues correctly from there.
+   * Detail panel's "locate in timeline" button. Navigates to the target
+   * *within the current view* — active filters and routine/mute collapse are
+   * deliberately kept, not cleared. Since the target likely isn't in the
+   * already-loaded window, this seeds the query cache with a fresh page
+   * anchored at the target so bidirectional scroll continues from there.
+   *
+   * Crucially the seed lands under the *current* `eventsQueryKey` (built from
+   * `effectiveFilters`), so it always matches the live query by construction —
+   * the previous "clear filters, seed a hand-rolled `{}` key" shape drifted
+   * from the collapse-aware live key and silently dropped the scroll (#150).
    *
    * A plain `before`-cursor seek would exclude the target event itself
-   * (cursors are strict boundaries — that's correct for normal pagination,
-   * where the caller already has the anchor row and wants the *next* batch).
-   * For a seek we need the target row present so it can be scrolled to,
-   * highlighted (via the detail panel's "expanded" row styling), and opened
-   * — so when `eventId` is known, fetch the surrounding pages on both sides
-   * and splice the target event itself (via `getById`) in between.
+   * (cursors are strict boundaries — correct for normal pagination). For a
+   * seek we need the target row present so it can be scrolled to and opened,
+   * so when `eventId` is known we fetch the surrounding pages on both sides
+   * (with the current filters, so neighbours stay filtered) and splice the
+   * target itself (via `getById`, which fetches it raw regardless of the
+   * view) in between. If the current view would hide the target — a
+   * routine/mute collapse or an active filter excludes it — it's still shown,
+   * flagged via `locatedHiddenId` so the grid renders it as "normally hidden".
    */
   const handleJumpToTime = useCallback(
     async (ts: string, eventId?: string, windowEnd?: string) => {
       if (!caseId || !timelineId) return;
-      setPreJumpFilters((prev) => prev ?? filters);
       setRangeHighlight(windowEnd ? { start: ts, end: windowEnd } : null);
+      // A jump and the soft anchor now seed the *same* query key (the jump
+      // keeps the active filters), so an in-flight soft-anchor seek would
+      // otherwise resolve after this seed and clobber the anchor page — and its
+      // pending scroll would drag the grid off the target. Bumping the seq
+      // fails both of its guards; nulling the marker stops an already-seeded
+      // one from firing.
+      pendingSoftAnchorRef.current = null;
+      ++softAnchorSeqRef.current;
       const seq = ++jumpSeqRef.current;
       pendingJumpRef.current = { ts, eventId, seq };
-      setFilters({});
 
-      // `filters` is about to become `{}` (above), so the live query key is
-      // about to become this — not the current-render `eventsQueryKey`
-      // closure, which still reflects the pre-jump filters. Cancel whatever
-      // the automatic refetch triggered by that key change is doing before
-      // seeding the cache, or it can resolve after `setQueryData` below and
-      // silently overwrite the anchor page with the un-jumped top-of-list page.
-      const targetKey = ["events", caseId, timelineId, {}, sortDir];
+      // Seed the *current* key (filters kept). Cancel any in-flight pagination
+      // fetch on it first, or it can resolve after the setQueryData below and
+      // clobber the anchor page.
+      const targetKey = ["events", caseId, timelineId, effectiveFilters, sortDir];
       await queryClient.cancelQueries({ queryKey: targetKey });
 
       let anchorPage: EventPage;
+      let hidden = false;
       if (eventId) {
         const halfBefore = Math.floor(PAGE_SIZE / 2);
         const halfAfter = PAGE_SIZE - halfBefore - 1;
-        const [targetEvent, beforePage, afterPage] = await Promise.all([
+        // Does the target pass the current view? An id-allowlist that doesn't
+        // contain it is itself a hiding filter (short-circuit, no probe);
+        // otherwise a filtered membership probe (ids:[target] intersects with
+        // collapse + field filters) tells us whether to flag it hidden.
+        const inAllowlist =
+          !effectiveFilters.ids || effectiveFilters.ids.includes(eventId);
+        const [targetEvent, beforePage, afterPage, probePage] = await Promise.all([
           eventsApi.getById(caseId, timelineId, eventId),
           eventsApi.list(
             caseId,
             timelineId,
-            { limit: halfBefore, order: sortDir },
+            { ...effectiveFilters, limit: halfBefore, order: sortDir },
             undefined,
             { before: `${ts},${eventId}` },
           ),
           eventsApi.list(
             caseId,
             timelineId,
-            { limit: halfAfter, order: sortDir },
+            { ...effectiveFilters, limit: halfAfter, order: sortDir },
             undefined,
             { after: `${ts},${eventId}` },
           ),
+          inAllowlist
+            ? eventsApi.list(caseId, timelineId, {
+                ...effectiveFilters,
+                ids: [eventId],
+                limit: 1,
+                order: sortDir,
+              })
+            : Promise.resolve(null),
         ]);
+        hidden = inAllowlist ? (probePage?.events.length ?? 0) === 0 : true;
         const combinedEvents = [
           ...beforePage.events,
           ...(targetEvent ? [targetEvent] : []),
@@ -844,7 +946,7 @@ export function ExplorerPage() {
         anchorPage = await eventsApi.list(
           caseId,
           timelineId,
-          { limit: PAGE_SIZE, order: sortDir },
+          { ...effectiveFilters, limit: PAGE_SIZE, order: sortDir },
           undefined,
           { before: `${ts},` },
         );
@@ -852,6 +954,8 @@ export function ExplorerPage() {
 
       // A newer jump started while this one was in flight — let it win.
       if (jumpSeqRef.current !== seq) return;
+
+      setLocatedHiddenId(hidden ? (eventId ?? null) : null);
 
       // The no-eventId branch fetches in `before` mode, and before-mode
       // pagination only ever computes `has_more_before` on the backend —
@@ -868,7 +972,7 @@ export function ExplorerPage() {
       });
       seededSeqRef.current = seq;
     },
-    [caseId, timelineId, filters, setFilters, sortDir, queryClient],
+    [caseId, timelineId, sortDir, queryClient, effectiveFilters],
   );
 
   /**
@@ -878,9 +982,10 @@ export function ExplorerPage() {
    * to the window — grid, histogram, facets, and bulk actions all operate on
    * exactly the neighborhood. All other filters are cleared deliberately:
    * context means "everything that happened around this moment", not
-   * "matching events around this moment". The pre-context filter set lands in
-   * the same breadcrumb `handleJumpToTime` uses; nested context queries keep
-   * the original breadcrumb so "back" always restores the analyst's real view.
+   * "matching events around this moment". The pre-context filter set drives the
+   * "back to filtered view" breadcrumb (this is its only producer); nested
+   * context queries keep the original snapshot so "back" always restores the
+   * analyst's real view.
    */
   const handleContextQuery = useCallback(
     (ts: string, minutes: number) => {
@@ -888,7 +993,7 @@ export function ExplorerPage() {
       if (!window) return;
       setPreJumpFilters((prev) => prev ?? filters);
       setRangeHighlight(null);
-      pendingJumpRef.current = null;
+      // setFilters clears any pending jump.
       setFilters(window);
     },
     [filters, setFilters],
@@ -1071,6 +1176,7 @@ export function ExplorerPage() {
                 }
               >
                 <Button
+                  data-testid="routine-collapse-toggle"
                   // `accent` marks the *override* (reveal active), not the
                   // collapsed default: collapse is the normal state now, and
                   // the exceptional, self-expiring reveal is what deserves
@@ -1162,10 +1268,10 @@ export function ExplorerPage() {
           />
         )}
 
-        {/* "Jumped to time" breadcrumb — shown after a jump-to-time cleared filters */}
+        {/* Context-query breadcrumb — a ±window replaced the analyst's filters */}
         {preJumpFilters && (
           <div className="flex shrink-0 items-center gap-2 bg-[var(--color-accent-dim)] px-3 py-1 text-xs text-[var(--color-fg-primary)]">
-            <span>Jumped to a point in time — filters cleared.</span>
+            <span>Showing a context window around this event — your filters were replaced.</span>
             <button
               className="font-semibold text-[var(--color-accent)] hover:underline"
               onClick={handleBackToFiltered}
@@ -1245,6 +1351,7 @@ export function ExplorerPage() {
                   dispositions={dispositionMap}
                   onVisibleTimestampChange={setCurrentPositionTs}
                   highlightRange={rangeHighlight}
+                  locatedHiddenId={locatedHiddenId}
                 />
 
                 {/* Detail panel */}

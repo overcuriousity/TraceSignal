@@ -1,6 +1,85 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-21 (session 83 — agent chart proposals lost on parallel tool calls).
+Last updated: 2026-07-22 (session 84 — #150 locate-in-timeline regression from routine-collapse).
+
+## Session 84 — 2026-07-22: "locate this event in timeline" no longer scrolled (#150)
+
+Regression from the #147 routine-collapse work (`e8626c4`, `16e4c89`), which
+made collapse auto-on whenever any mute/routine disposition exists. The
+Explorer's live events query is keyed on `effectiveFilters`
+(`computeEffectiveFilters`, which folds the `collapseRoutine` overlay in), but
+both cache-seeding paths in `ExplorerPage.tsx` built that key *by hand* and had
+drifted: `handleJumpToTime` cleared filters and seeded/cancelled a hardcoded
+`["events", …, {}, …]` key, and the `setFilters` soft-anchor seek re-applied
+`anomalyRunId`/`semanticSearchIds` but omitted `collapseRoutine`. Once collapse
+was on, the live key was `{collapseRoutine:true}` — the seeded anchor page (with
+the target spliced in) landed in a cache entry the grid never read, so nothing
+scrolled. Same defect silently reset the soft-anchor "keep scroll position on
+filter change" to the top.
+
+Per the owner's call, locate now **keeps** the active filters instead of
+clearing them: it seeds the *current* `eventsQueryKey`, so the seed can't drift
+from the live query by construction, and the neighbour pages are fetched with
+the same `effectiveFilters` (surrounding rows stay filtered). The target is
+force-included via `getById` (raw, ignores the view); a filtered membership
+probe (`ids:[target]`) decides whether it's hidden, and if so `locatedHiddenId`
+flows to `EventGrid`, which renders that row visually distinct (dashed edge +
+faint tint + an "Hidden" `EyeOff` pill, tooltip explaining it's shown only
+because it was located). Analysis-panel jump-to-time shares the behaviour. The
+soft-anchor seek now composes its key through the same `computeEffectiveFilters`
+helper so it can never drop an overlay again. Detail-panel Locate tooltip copy
+updated. Tests: a locate-under-collapse regression in
+`explorerRoutineCollapse.test.tsx` (target reachable in the grid after the seek,
+`locatedHiddenId` set, every request carries collapse) — it would have caught
+#150.
+
+### Review pass: closing the drift class rather than the instance
+
+Reviewing the above found that "the seed key can't drift from the live key by
+construction" wasn't yet true, plus one race the fix itself introduced. All of
+it is the same seam, so it landed in the same branch:
+
+1. **Seed key built from the raw filter object.** `computeEffectiveFilters(f,
+   …)` starts from whatever the caller passed. `handleApplyAgentFilters` passes
+   a finding's filter set, which carries `ids`/`collapseRoutine` — fields
+   `filtersToParams` deliberately drops. The live query composes from
+   `paramsToFilters(searchParams)`, so the two differ (`{…, collapseRoutine:
+   false}` vs `{…}`) and the seed lands unread. The seek now composes from
+   `paramsToFilters(filtersToParams(f))` — the same round trip the live value
+   goes through — so it matches for *any* caller, including future ones that
+   pass fields the URL doesn't carry.
+2. **Overlays set in the same batch were unreadable.** `handleApplyAgentFilters`
+   calls `setCollapseRoutine`/`setAppliedIds` alongside `setFilters`, so neither
+   state nor the mirror refs hold the new values when the seek composes its key.
+   `setFilters` grew an optional `overrides: Partial<ExplorerOverlays>` second
+   argument that the apply handler fills in. The mirror refs also moved from
+   `useEffect` to render-time assignment, since a post-commit sync is one commit
+   late for exactly this case.
+3. **Jump vs. soft anchor now race on one key.** Locate keeping the analyst's
+   filters means both seed paths write the *same* query key; the old
+   `setFilters({})` inside the jump used to separate them and clear the pending
+   soft anchor. A soft-anchor fetch still in flight would land after the located
+   page and overwrite it. `handleJumpToTime` now invalidates any pending/in-
+   flight soft anchor (and `setFilters` symmetrically invalidates a pending
+   jump, whose key the filter change just orphaned).
+4. **`locatedHiddenId` outlived its claim.** Cleared on filter changes only, so
+   revealing routine events left a row badged "Hidden" while nothing hid it. An
+   effect keyed on the overlays clears it. The row styling was also gated on
+   `!isExpanded && !isSelected` — but a jump auto-expands its target, so the
+   marker was invisible at the one moment it mattered; it is now a dashed edge +
+   inset ring that layers over any row state.
+5. **Leftovers.** The `isJumpClear` guard existed only for the removed
+   `setFilters({})` call and its remaining effect was to skip the soft anchor
+   when clearing the last chip — dropped. The "back to filtered view"
+   breadcrumb still claimed a jump had cleared filters; only `handleContextQuery`
+   produces it now, and the copy says so.
+
+Tests: five more specs in `explorerRoutineCollapse.test.tsx`, each verified to
+fail with its fix reverted — agent-apply seeds a page the grid actually reads,
+a late soft anchor can't overwrite a jump's page, the hidden marker clears on
+reveal, locate fetches neighbours through the active filters, and locate leaves
+`locatedHiddenId` null when the target is already visible. The reveal toggle
+carries a `data-testid` so the overlay-expiry path is drivable.
 
 ## Session 83 — 2026-07-21: agent chart cards lost when the model batches tool calls
 
