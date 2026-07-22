@@ -876,6 +876,9 @@ class _FakeChartService(_FakeVizService):
     scatter_sampled = 25
     #: Non-numeric fields the correlation scan reports back.
     corr_dropped: list[dict[str, str]] = []
+    #: Distinct grouping values a grouped box/violin scan reports back —
+    #: raise it past VIZ_GROUP_CARDINALITY_CAUTION to exercise the caution.
+    grouped_distinct_groups = 5
 
     def list_fields(self, case_id, source_ids, field_mappings=None):
         self.calls.append(("list_fields", (), {}))
@@ -913,6 +916,7 @@ class _FakeChartService(_FakeVizService):
             "quantiles": {"0.25": 25, "0.5": 50, "0.75": 75},
             "bins": [{"x0": i, "x1": i + 1, "count": 1} for i in range(resolved)],
             "bin_rule": "manual" if bins is not None else "fd",
+            "bin_count_clamped": False,
             "bin_width": 1.0,
         }
 
@@ -927,7 +931,7 @@ class _FakeChartService(_FakeVizService):
             "total": self.numeric_count,
             "min": 0,
             "max": 99,
-            "distinct_groups": 5,
+            "distinct_groups": self.grouped_distinct_groups,
             "omitted_groups": 3,
             "omitted_count": 7,
             "groups": [
@@ -982,6 +986,7 @@ class _FakeChartService(_FakeVizService):
                 "regression": {"slope": 1.0, "intercept": 2.0, "r_squared": 0.25},
                 "shapiro": {"x": None, "y": None, "basis": "sample", "n": 0},
                 "recommendation": "spearman",
+                "recommendation_basis": "default",
             },
         }
 
@@ -1914,6 +1919,51 @@ async def test_corr_reports_non_numeric_fields_as_a_warning(store, monkeypatch):
     assert result["ok"] is True
     assert any("no numeric values for attr:user" in w for w in result["warnings"])
     assert result["summary"]["pairs"][0]["n"] == 100
+
+
+async def test_field_correlation_tool_refuses_rather_than_truncates(store, monkeypatch):
+    """The data tool must not quietly chart a subset of what was asked for.
+
+    Truncating to the first eight fields (or de-duplicating in silence)
+    answers a different question and labels it as the answer to this one.
+    """
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+
+    with pytest.raises(ToolError) as too_many:
+        await _call(
+            server,
+            "field_correlation",
+            {"fields": [f"attr:f{i}" for i in range(9)]},
+        )
+    assert "between 2 and 8 fields" in str(too_many.value)
+
+    with pytest.raises(ToolError) as duplicated:
+        await _call(
+            server,
+            "field_correlation",
+            {"fields": ["attr:bytes", "attr:bytes"]},
+        )
+    assert "repeat" in str(duplicated.value)
+
+    with pytest.raises(ToolError) as too_few:
+        await _call(server, "field_correlation", {"fields": ["attr:bytes"]})
+    assert "between 2 and 8 fields" in str(too_few.value)
+
+
+async def test_grouped_chart_warns_about_omission_and_identifier_like_groups(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    fake.grouped_distinct_groups = 400
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart({"chart_type": "box", "field": "attr:bytes", "field_y": "attr:user"}),
+    )
+    assert result["ok"] is True
+    # Omission is a warning, not just a number buried in the summary.
+    assert any("omitted" in w for w in result["warnings"])
+    assert any("identifier" in w for w in result["warnings"])
 
 
 async def test_corr_field_list_is_capped(store, monkeypatch):

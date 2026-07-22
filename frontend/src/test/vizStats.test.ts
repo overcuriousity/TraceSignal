@@ -13,6 +13,7 @@ function makeStats(overrides: Partial<FieldNumericResponse> = {}): FieldNumericR
     skewness: 0,
     points: null,
     bin_rule: "manual",
+    bin_count_clamped: false,
     bin_width: 25,
     quantiles: { "0.25": 25, "0.5": 50, "0.75": 75 },
     bins: [

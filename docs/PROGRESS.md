@@ -1,9 +1,64 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-22 (session 89 — lecture-grade statistical visualizations).
+Last updated: 2026-07-22 (session 90 — review fixes on the statistical visualizations).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 90 — 2026-07-22: review fixes on the statistical visualizations
+
+Code review of the session-89 branch (PR #162) surfaced nine defects. Three were about
+cost at the scale this product targets, three were the PR's own honesty contract being
+broken by a caption or comment, three were parity/coverage gaps. All fixed on the same
+branch; the 1.6.0 changelog entry was amended rather than a new version cut.
+
+**Cost.** `kendall_tau` was the all-pairs O(n²) definition, running on every scatter render
+inside a request holding a heavy-scan slot: measured 1.07 s at the UI's default 5 000-point
+sample and 17.13 s at the API's 20 000-point ceiling. Replaced with Knight's O(n log n)
+formulation (sort by (x, y), count discordant pairs as inversions of the y-sequence via
+merge sort) — 0.056 s at 20 000 points, exact agreement with the brute-force definition
+across a tie-density sweep and with the committed scipy constants. Shapiro–Wilk is now cut
+to the 5 000 points Royston's approximation covers instead of silently returning nothing
+past it. `field_numeric_grouped` runs its four scans as two parallel waves through the
+existing `_run_parallel` rather than sequentially (the extent scan and the per-group
+aggregate scan have no data dependency; the per-group aggregate therefore also runs on an
+empty result set, which is the price of the concurrency).
+
+**Reproducibility.** Every sampling path drew with `ORDER BY rand()`, so rerunning an
+identical query produced a different chart and an exported scatter could not be regenerated
+from the filters that made it — while the point strip's *jitter* was carefully
+deterministic. All three paths now order by `cityHash64(event_id)`: uniform, independent of
+the plotted values, stable across reruns and replicas, and no more expensive (same bounded
+top-N heap). Pinned by a live-server test asserting two identical calls return identical
+points.
+
+**Honesty.** Three places claimed more than the code computed. (1) When Freedman–Diaconis
+was undefined (zero IQR) the fixed 30-bin fallback was still reported as `bin_rule: "fd"`,
+so the caption credited a rule that never ran — a test even pinned that. `bin_rule` is now
+`fd | fd_fallback | manual` with a separate `bin_count_clamped`, and the caption names each
+case exactly. (2) Past 5 000 sample points Shapiro–Wilk returned nothing, `recommendation`
+silently became "spearman", and the UI blamed "sample too small" — the opposite of the
+cause. Beyond the cap fix, the response now carries `recommendation_basis`, and the panel
+labels the chip "default" rather than "recommended" when nothing measured it. (3) Two
+comments claimed a wide grouped violin means "more events here"; `kdeFromBins` normalizes
+by each group's own total, so a 10-event and a 10 000-event group with the same shape draw
+identically wide. The shape scaling stays (it is what a grouped violin is for) and the
+claims were corrected, with a caption line stating the reading and per-group n on the
+tooltip.
+
+**Parity and guards.** The `field_correlation` agent tool silently truncated a too-long
+field list and de-duplicated in silence, so the service's own error could never fire — it
+now raises, with the wording the HTTP 422s use. Grouped charts warn when groups were
+omitted and when the grouping field's cardinality suggests an identifier
+(`VIZ_GROUP_CARDINALITY_CAUTION`). The correlation matrix fades cells with p ≥ 0.05 or
+fewer than 30 pairwise-complete events and puts both p-values in the tooltip — full-strength
+colour on an unsupportable coefficient reads as a finding. `allocateWaffleCells` folds
+categories past the grid's capacity into `Other`, so its "sums to exactly 100" invariant
+holds by construction rather than by the top-N cap happening to be below 100.
+
+**Coverage.** `tests/test_viz_router.py` gained the HTTP-level tests the two new endpoints
+never had (the three 422 guards, plus argument pass-through and the `bins=None` automatic
+path). Backend 1588 pass, frontend 470 pass.
 
 ## Session 89 — 2026-07-22: lecture-grade statistical visualizations
 

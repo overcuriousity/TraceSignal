@@ -87,6 +87,11 @@ VIZ_MAX_BUCKETS = 60
 VIZ_MAX_TERMS = 30
 VIZ_MAX_BINS = 30
 VIZ_GROUPS_MAX = 8
+#: Distinct grouping values past which a grouped box/violin gets a caution.
+#: Not a limit — the top-N cut already bounds the chart; this is the hint that
+#: the chosen field is probably an identifier, where "one box per group" is a
+#: category error rather than a comparison.
+VIZ_GROUP_CARDINALITY_CAUTION = 50
 VIZ_CORR_MAX_FIELDS = 8
 VIZ_FACET_MAX = 12
 VIZ_POINTS_OVERLAY_MAX = 1000
@@ -360,7 +365,7 @@ class ChartOptionsSpec(BaseModel):
     show_points: bool | None = Field(
         default=None,
         description=(
-            "Overlay a uniform random sample of raw data points — box/violin "
+            "Overlay a uniform sample of raw data points — box/violin "
             "(jittered strip) and line (markers at real data points)."
         ),
     )
@@ -1298,12 +1303,23 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         only rules out the relationship it measures (Pearson: straight-line;
         Spearman: monotonic).
         """
+        # Say no rather than quietly charting a subset: silently truncating to
+        # the first eight, or de-duplicating, would answer a question the
+        # model never asked and label it as the answer to the one it did.
+        # Same rule and wording as the HTTP endpoint's 422s and propose_chart.
+        if len(set(fields)) != len(fields):
+            raise ValueError("`fields` must not repeat a field token.")
+        if not 2 <= len(fields) <= VIZ_CORR_MAX_FIELDS:
+            raise ValueError(
+                f"a correlation matrix needs between 2 and {VIZ_CORR_MAX_FIELDS} fields, "
+                f"got {len(fields)}. Correlate the most promising ones, or run several "
+                "matrices."
+            )
         spec_f = _validated(filters)
         query = await _build_query(scope, spec_f)
-        chosen = list(dict.fromkeys(fields))[:VIZ_CORR_MAX_FIELDS]
-        for token in chosen:
+        for token in fields:
             await _check_chart_field(token, "fields")
-        return await run_in_threadpool(service.field_correlation, query, chosen)
+        return await run_in_threadpool(service.field_correlation, query, list(fields))
 
     @server.tool()
     async def field_numeric_grouped(
@@ -1403,7 +1419,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
     async def field_scatter(
         field_x: str, field_y: str, filters: FilterSpec | None = None, limit: int = 300
     ) -> dict[str, Any]:
-        """Uniform random sample of (x, y) numeric value pairs for two fields (capped at 1000 points).
+        """Uniform sample of (x, y) numeric value pairs for two fields (capped at 1000 points).
 
         `sampled`/`total` in the response tell you what fraction of matching
         pairs the sample represents — read correlation cautiously below a
@@ -1803,6 +1819,25 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 "omitted_groups": result["omitted_groups"],
                 "omitted_count": result["omitted_count"],
             }
+            # Omission belongs in `warnings`, not only in the summary the model
+            # may skim: a chart that drops groups has to say so out loud.
+            if result["omitted_groups"]:
+                warnings.append(
+                    f"{result['omitted_groups']} further {spec.field_y} value(s) "
+                    f"({result['omitted_count']} events) fall outside the top "
+                    f"{applied['groups']} and are omitted — not merged into an "
+                    '"Other" box, which would be a distribution of unrelated things.'
+                )
+            # Advisory, like the pie rule: a grouping variable with hundreds of
+            # values is usually an identifier, and a box per identifier is not
+            # a comparison. Never a refusal — the analyst may know better.
+            if result["distinct_groups"] > VIZ_GROUP_CARDINALITY_CAUTION:
+                warnings.append(
+                    f'"{spec.field_y}" has {result["distinct_groups"]} distinct values — '
+                    "that looks like an identifier rather than a grouping variable, and "
+                    "only the top groups are drawn. A categorical field with few values "
+                    "compares more honestly."
+                )
         elif data_kind == "numeric":
             if comparison_query is not None:
                 # The comparison aggregation has no auto-bin path (shared bin
@@ -1980,6 +2015,9 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                     "spearman_p": stats_block["spearman"]["p"],
                     "regression": stats_block["regression"],
                     "recommendation": stats_block["recommendation"],
+                    # "default" means normality was never tested — quote the
+                    # coefficient, not a verdict nothing measured.
+                    "recommendation_basis": stats_block["recommendation_basis"],
                 }
 
         # Facet panels: enumerate the values the grid will draw. Only the

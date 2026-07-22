@@ -293,7 +293,7 @@ async def get_field_numeric_stats(
     timeline_id: str,
     field: str = Query(..., description="Field token, e.g. 'attr:bytes_sent'"),
     bins: int | None = Query(default=None, ge=1, le=200),
-    points: bool = Query(default=False, description="Include a random raw-value sample"),
+    points: bool = Query(default=False, description="Include a reproducible raw-value sample"),
     points_limit: int = Query(default=1000, ge=10, le=1000),
     q: str | None = _Q,
     q_regex: bool = _Q_REGEX,
@@ -450,7 +450,7 @@ async def get_field_numeric_grouped(
     group_field: str = Query(..., description="Categorical grouping field token"),
     groups: int = Query(default=8, ge=2, le=8),
     bins: int = Query(default=30, ge=1, le=200),
-    points: bool = Query(default=False, description="Include a random raw-value sample"),
+    points: bool = Query(default=False, description="Include a reproducible raw-value sample"),
     points_limit: int = Query(default=1000, ge=10, le=1000),
     q: str | None = _Q,
     q_regex: bool = _Q_REGEX,
@@ -479,7 +479,8 @@ async def get_field_numeric_grouped(
     One numeric response field split by a categorical grouping field: top-N
     groups by numeric-value count, per-group quantiles + fixed-width bins
     over the global value range, honest omission counts, and an optional
-    uniform random point sample. 422 when the two fields are the same.
+    uniform point sample (stable across reruns). 422 when the two fields
+    are the same.
     """
     if field == group_field:
         raise HTTPException(
@@ -761,11 +762,13 @@ async def get_field_scatter(
     collapse_routine: bool = _COLLAPSE_ROUTINE,
     case: Case = Depends(require_case_read),
 ) -> dict[str, Any]:
-    """Return a uniform random sample of (x, y) numeric pairs for a scatter plot.
+    """Return a uniform, reproducible sample of (x, y) numeric pairs for a scatter plot.
 
     ``total`` is the full pair count and the per-axis min/max describe the
     full data (not the sample), so the frontend caption can state "showing
-    N of M points (uniform random sample)" truthfully. ``total == 0`` means
+    N of M points (uniform sample)" truthfully. The sample is drawn in a
+    stable hash order, so re-running identical filters redraws identical
+    points. ``total == 0`` means
     one or both fields have no numeric values under the current filters —
     the frontend falls back to a categorical hint, mirroring field-numeric.
     """

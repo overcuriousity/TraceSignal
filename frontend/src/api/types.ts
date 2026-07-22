@@ -1065,11 +1065,17 @@ export interface FieldNumericResponse {
   /** Keyed by quantile, e.g. "0.5" (median), "0.25", "0.95", ... */
   quantiles: Record<string, number>;
   bins: FieldNumericBin[];
-  /** How the bin count was chosen: "fd" (Freedman–Diaconis automatic) or
-   * "manual" (explicit bins request). */
-  bin_rule: "fd" | "manual";
+  /** How the bin count was chosen. "fd": the Freedman–Diaconis rule produced
+   * it. "fd_fallback": the rule was undefined (no interquartile spread) and a
+   * fixed default was used instead — the caption must NOT credit FD for these.
+   * "manual": an explicit bins request. */
+  bin_rule: "fd" | "fd_fallback" | "manual";
+  /** True when an "fd" count hit the allowed bin-count range and was clamped,
+   * so the drawn width is not exactly the width the rule asked for. */
+  bin_count_clamped: boolean;
   bin_width: number | null;
-  /** Uniform random sample of raw values for the strip overlay — only
+  /** Uniform sample of raw values for the strip overlay, drawn in a stable
+   * hash order so an identical query redraws identical points — only
    * present when the request opted in (`points=true`). */
   points: { total: number; shown: number; values: number[] } | null;
 }
@@ -1105,7 +1111,8 @@ export interface FieldNumericGroupedResponse {
   omitted_groups: number;
   omitted_count: number;
   groups: FieldNumericGroup[];
-  /** Uniform random sample across the kept groups: [group, value] pairs. */
+  /** Uniform sample across the kept groups: [group, value] pairs. Stable
+   * across reruns of an identical query. */
   points: { total: number; shown: number; values: [string, number][] } | null;
 }
 
@@ -1201,7 +1208,8 @@ export interface FieldPivotResponse {
 }
 
 /**
- * Uniform random sample of numeric (x, y) pairs from `viz/field-scatter`.
+ * Uniform sample of numeric (x, y) pairs from `viz/field-scatter`, drawn in
+ * a stable hash order so an identical query redraws identical points.
  * Extents describe the FULL data, not the sample; `total === 0` means one or
  * both fields have no numeric values — fall back to a categorical hint.
  */
@@ -1226,6 +1234,11 @@ export interface ScatterStats {
     n: number;
   };
   recommendation: "pearson" | "spearman";
+  /** Where `recommendation` came from. "shapiro": both axes were tested and
+   * the verdict follows. "default": normality could not be tested at all, so
+   * Spearman is the conservative fallback and nothing measured it — the UI
+   * must not present it as a verdict. */
+  recommendation_basis: "shapiro" | "default";
 }
 
 export interface FieldScatterResponse {

@@ -82,6 +82,13 @@ export interface DensityPoint {
  * heights (a lightweight stand-in for full KDE — bins are already a coarse
  * discretization of the underlying values, so a heavy kernel over them adds
  * little; this just removes the blockiness).
+ *
+ * The result is a **relative frequency within this distribution**: counts are
+ * divided by this distribution's own total, so the curve integrates to ~1
+ * regardless of how many events it describes. Two groups of wildly different
+ * size therefore produce comparable *shapes*, not comparable *magnitudes* —
+ * callers drawing several groups must say so rather than let width read as
+ * event count (see `GroupedDistribution`'s caption line).
  */
 export function kdeFromBins(bins: FieldNumericBin[], windowRadius = 2): DensityPoint[] {
   if (bins.length === 0) return [];

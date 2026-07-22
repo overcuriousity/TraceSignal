@@ -34,13 +34,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     stated under the grid. Mutually exclusive with the comparison layer.
   - **Waffle chart**: shares of a whole as a 10×10 grid of countable cells,
     allocated by largest remainder so the cells sum to exactly 100 and no
-    existing category ever rounds away to zero.
+    existing category ever rounds away to zero. More categories than cells
+    (one cell each is the floor) fold into the `Other` row rather than
+    overflowing the grid.
   - **Scatter statistics**: Pearson r, Spearman ρ, Kendall τ-b, their
     p-values, a least-squares regression line with R², and Shapiro–Wilk
     normality checks that decide which coefficient the panel recommends.
+    `recommendation_basis` says whether that recommendation follows a
+    normality verdict or is the conservative default because normality could
+    not be tested — an untested fallback is never presented as a finding.
 - **`vestigo.stats`** — a pure-Python inference module (regularized incomplete
-  beta, Student-t survival, correlation p-values, Kendall τ-b, Shapiro–Wilk
-  after Royston 1995, the Freedman–Diaconis bin rule), pinned against
+  beta, Student-t survival, correlation p-values, Kendall τ-b in O(n log n)
+  via Knight's method, Shapiro–Wilk after Royston 1995, the Freedman–Diaconis
+  bin rule), pinned against
   scipy-computed reference constants. scipy is deliberately not a dependency;
   everything ClickHouse has an aggregate for (`corr`, `rankCorr`,
   `simpleLinearRegression`, `skewPop`, quantiles) is computed there over the
@@ -55,12 +61,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Histograms** default to Freedman–Diaconis bin widths (manual override
   retained) and gained a density curve, mean/median markers, and skewness with
-  its plain-language reading. The response reports `bin_rule` and `bin_width`,
-  and the caption states which rule produced the bins.
-- **Box and violin plots** can overlay a uniform random sample of the raw
-  values as a jittered strip — a violin drawn without its points implies data
-  it never measured. The jitter is deterministic, so an SVG/PNG export
-  reproduces exactly what was on screen.
+  its plain-language reading. The response reports `bin_rule`
+  (`fd` / `fd_fallback` / `manual`), `bin_count_clamped` and `bin_width`, and
+  the caption states exactly which of them produced the bins — a fixed
+  fallback for a distribution with no interquartile spread is never captioned
+  as Freedman–Diaconis.
+- **Box and violin plots** can overlay a uniform sample of the raw values as
+  a jittered strip — a violin drawn without its points implies data it never
+  measured. Both the jitter and the sample itself are deterministic, so an
+  SVG/PNG export reproduces exactly what was on screen and a rerun of the same
+  query redraws the same points. In grouped mode the violin widths encode each
+  group's distribution *shape* (relative frequency within the group), not its
+  size; the caption says so, and each group's n is on its tooltip.
 - **Line charts** mark their actually-measured buckets, so the line is no
   longer read as an assertion about values between them.
 - **Pie charts** warn when they stop being readable — more than four slices,
@@ -74,6 +86,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   truthfulness lines: bin rule, skewness reading, grouped/facet omissions,
   point-overlay sample size, correlation basis, and the
   correlation-is-not-causation caveat.
+- **Chart samples are reproducible.** Every sampling path (scatter points,
+  box/violin strips, grouped strips) draws in a stable hash order over
+  `event_id` instead of `ORDER BY rand()`, so identical filters redraw
+  identical points across reruns, restarts and replicas — the same
+  requirement that already governed the jitter. Costs no extra scan.
+- **Kendall τ-b is computed in O(n log n)** (Knight's method) rather than over
+  all pairs, which took ~17 s at the API's 20 000-point scatter ceiling and
+  ~1 s at the UI default — on every scatter render, inside a request holding a
+  heavy-scan slot. Shapiro–Wilk is capped at the 5 000 points its
+  approximation covers instead of silently returning nothing past it.
+- **Grouped distributions run their scans in two parallel waves** rather than
+  four sequential ones, halving the wall clock of a grouped box/violin on a
+  large timeline.
+- The correlation matrix fades cells whose coefficient is not distinguishable
+  from zero (p ≥ 0.05) or rests on fewer than 30 pairwise-complete events, and
+  puts both p-values in the tooltip — full-strength colour on a coefficient
+  the data cannot support reads as a finding.
+- The `field_correlation` agent tool now rejects a field list that is too long
+  or repeats a token instead of silently truncating it, and grouped charts
+  warn when the grouping field's cardinality suggests an identifier rather
+  than a grouping variable.
 
 ## [1.5.0] — 2026-07-22
 

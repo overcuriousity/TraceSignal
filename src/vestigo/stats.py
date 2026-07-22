@@ -214,24 +214,27 @@ def _corr_p(coef: float, n: int) -> float | None:
 def kendall_tau(xs: Sequence[float], ys: Sequence[float]) -> tuple[float | None, float | None]:
     """Kendall's tau-b with two-sided p-value (normal approximation).
 
-    Tie-corrected tau-b over all pairs — O(n²), acceptable at the <= 1000
-    point sample cap this is used with. The p-value uses the tie-corrected
-    variance of the concordance statistic S (Kendall 1970) with no continuity
-    correction, matching scipy's asymptotic method.
+    Tie-corrected tau-b in **O(n log n)** (Knight 1966): sort the pairs by
+    (x, y), then count discordant pairs as the inversions of the y-sequence
+    with a merge sort. The naive all-pairs loop is O(n²), which at this
+    function's real call site — the scatter chart's drawn sample, up to
+    20 000 points — cost seconds of a request's wall clock (17 s at 20 000)
+    for a statistic the analyst reads as one number.
+
+    ``S = n0 - n1 - n2 + n3 - 2·D`` where ``n0`` is all pairs, ``n1``/``n2``
+    the pairs tied in x/y, ``n3`` the pairs tied in both, and ``D`` the
+    discordant count. The p-value uses the tie-corrected variance of S
+    (Kendall 1970) with no continuity correction, matching scipy's asymptotic
+    method.
     """
     n = min(len(xs), len(ys))
     if n < 3:
         return None, None
-    concordant_minus_discordant = 0
-    for i in range(n):
-        xi, yi = xs[i], ys[i]
-        for j in range(i + 1, n):
-            dx = (xi > xs[j]) - (xi < xs[j])
-            dy = (yi > ys[j]) - (yi < ys[j])
-            concordant_minus_discordant += dx * dy
+    xs, ys = list(xs[:n]), list(ys[:n])
     n0 = n * (n - 1) // 2
     n1 = _tie_pair_count(xs)
     n2 = _tie_pair_count(ys)
+    concordant_minus_discordant = _kendall_s(xs, ys, n0, n1, n2)
     denom = math.sqrt(float(n0 - n1)) * math.sqrt(float(n0 - n2))
     if denom == 0.0:
         return None, None
@@ -243,6 +246,75 @@ def kendall_tau(xs: Sequence[float], ys: Sequence[float]) -> tuple[float | None,
     z = abs(concordant_minus_discordant) / math.sqrt(var_s)
     p = min(1.0, 2.0 * normal_sf(z))
     return tau, p
+
+
+def _kendall_s(xs: list[float], ys: list[float], n0: int, n1: int, n2: int) -> int:
+    """Concordant-minus-discordant count S, via Knight's O(n log n) method.
+
+    With the pairs sorted by (x, y), every inversion of the resulting
+    y-sequence is a discordant pair and every non-inverted, non-tied pair is
+    concordant, so one merge sort replaces the O(n²) comparison loop.
+    Pairs tied in x are never inversions regardless of their y order, which
+    is why they are subtracted through ``n1``/``n3`` rather than counted.
+    """
+    order = sorted(range(len(xs)), key=lambda i: (xs[i], ys[i]))
+    sorted_y = [ys[i] for i in order]
+    joint_ties = _joint_tie_pair_count([(xs[i], ys[i]) for i in order])
+    discordant = _count_inversions(sorted_y)
+    return n0 - n1 - n2 + joint_ties - 2 * discordant
+
+
+def _count_inversions(values: list[float]) -> int:
+    """Number of index pairs i < j with ``values[i] > values[j]``.
+
+    Bottom-up merge sort: each merge counts, for every element taken from the
+    right half, how many elements remain in the left half — those are exactly
+    the pairs it inverts. Equal values are taken from the left first, so ties
+    are not counted as inversions.
+    """
+    work = list(values)
+    buffer: list[float] = [0.0] * len(work)
+    inversions = 0
+    width = 1
+    n = len(work)
+    while width < n:
+        for lo in range(0, n, 2 * width):
+            mid = min(lo + width, n)
+            hi = min(lo + 2 * width, n)
+            i, j, k = lo, mid, lo
+            while i < mid and j < hi:
+                if work[i] <= work[j]:
+                    buffer[k] = work[i]
+                    i += 1
+                else:
+                    buffer[k] = work[j]
+                    j += 1
+                    inversions += mid - i
+                k += 1
+            while i < mid:
+                buffer[k] = work[i]
+                i += 1
+                k += 1
+            while j < hi:
+                buffer[k] = work[j]
+                j += 1
+                k += 1
+        work, buffer = buffer, work
+        width *= 2
+    return inversions
+
+
+def _joint_tie_pair_count(pairs: Sequence[tuple[float, float]]) -> int:
+    """Pairs tied in BOTH coordinates (``n3``), from a (x, y)-sorted sequence."""
+    total = 0
+    run = 1
+    for prev, cur in zip(pairs, pairs[1:], strict=False):
+        if cur == prev:
+            run += 1
+        else:
+            total += run * (run - 1) // 2
+            run = 1
+    return total + run * (run - 1) // 2
 
 
 def _tie_counts(values: Sequence[float]) -> list[int]:

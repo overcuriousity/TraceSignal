@@ -206,6 +206,36 @@ def test_numeric_grouped_quantiles_omission_and_points(service: EventQueryServic
     assert {g for g, _ in points["values"]} == set(_GROUPS)
 
 
+def test_samples_are_reproducible_across_identical_queries(service: EventQueryService) -> None:
+    """Identical filters must redraw identical points, on every sampling path.
+
+    `ORDER BY rand()` samples uniformly but not reproducibly, so the same
+    investigation rerun produced a different chart and an exported scatter
+    could not be regenerated from the filters that made it. The hash order
+    fixes that without costing an extra scan — verified on the real server
+    because it is ClickHouse's ordering, not ours, that has to be stable.
+    """
+    query = EventQuery(case_id=CASE_ID, source_ids=[SRC])
+
+    first = service.field_scatter(query, "attr:x", "attr:y", limit=7)
+    second = service.field_scatter(query, "attr:x", "attr:y", limit=7)
+    assert first["sampled"] == 7
+    assert first["points"] == second["points"]
+
+    strip_a = service.field_numeric_stats(query, "attr:val", points=True, points_limit=11)
+    strip_b = service.field_numeric_stats(query, "attr:val", points=True, points_limit=11)
+    assert strip_a["points"]["shown"] == 11
+    assert strip_a["points"]["values"] == strip_b["points"]["values"]
+
+    grouped_a = service.field_numeric_grouped(
+        query, "attr:lat", "attr:grp", groups=2, points=True, points_limit=5
+    )
+    grouped_b = service.field_numeric_grouped(
+        query, "attr:lat", "attr:grp", groups=2, points=True, points_limit=5
+    )
+    assert grouped_a["points"]["values"] == grouped_b["points"]["values"]
+
+
 def test_numeric_grouped_point_sample_respects_the_cap(service: EventQueryService) -> None:
     query = EventQuery(case_id=CASE_ID, source_ids=[SRC])
     result = service.field_numeric_grouped(

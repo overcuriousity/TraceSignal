@@ -88,6 +88,7 @@ const NUMERIC: FieldNumericResponse = {
   skewness: 0,
   points: null,
   bin_rule: "manual",
+  bin_count_clamped: false,
   bin_width: 50,
   quantiles: {},
   bins: [{ x0: 0, x1: 50, count: 60 }],

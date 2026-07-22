@@ -19,6 +19,10 @@ function fmtP(p: number | null): string {
  * words so a novice knows *which* coefficient to quote and why.
  */
 export function ScatterStatsPanel({ stats }: { stats: ScatterStats }) {
+  // Whether a normality test actually ran. Without it Spearman is still the
+  // safer coefficient, but calling that "recommended" would present a default
+  // as a verdict.
+  const tested = stats.recommendation_basis === "shapiro";
   const rows: {
     label: string;
     explainer: Parameters<typeof ExplainerPopover>[0]["id"];
@@ -26,6 +30,7 @@ export function ScatterStatsPanel({ stats }: { stats: ScatterStats }) {
     p: string | null;
     note?: string;
     highlight?: boolean;
+    tested?: boolean;
   }[] = [
     {
       label: "Pearson r",
@@ -34,6 +39,7 @@ export function ScatterStatsPanel({ stats }: { stats: ScatterStats }) {
       p: fmtP(stats.pearson.p),
       note: `all ${fmtInt(stats.n)} pairs`,
       highlight: stats.recommendation === "pearson",
+      tested,
     },
     {
       label: "Spearman ρ",
@@ -42,6 +48,7 @@ export function ScatterStatsPanel({ stats }: { stats: ScatterStats }) {
       p: fmtP(stats.spearman.p),
       note: `all ${fmtInt(stats.n)} pairs`,
       highlight: stats.recommendation === "spearman",
+      tested,
     },
   ];
   if (stats.kendall) {
@@ -81,8 +88,15 @@ export function ScatterStatsPanel({ stats }: { stats: ScatterStats }) {
               <td>
                 {r.label} <ExplainerPopover id={r.explainer} />
                 {r.highlight && (
-                  <span className="ml-1 rounded bg-[var(--color-bg-hover)] px-1 py-0.5 text-[10px] uppercase tracking-wide text-[var(--color-accent)]">
-                    recommended
+                  <span
+                    className="ml-1 rounded bg-[var(--color-bg-hover)] px-1 py-0.5 text-[10px] uppercase tracking-wide text-[var(--color-accent)]"
+                    title={
+                      r.tested
+                        ? "Shapiro–Wilk tested both axes and this coefficient follows"
+                        : "Normality was not tested — this is the conservative default, not a verdict"
+                    }
+                  >
+                    {r.tested ? "recommended" : "default"}
                   </span>
                 )}
               </td>
@@ -125,7 +139,9 @@ export function ScatterStatsPanel({ stats }: { stats: ScatterStats }) {
               } (Shapiro–Wilk, ${fmtInt(stats.shapiro.n)}-point sample) — quote Spearman's ρ.`
             : swX && swY
               ? `No evidence against normality on either axis (Shapiro–Wilk, ${fmtInt(stats.shapiro.n)}-point sample) — Pearson's r is appropriate.`
-              : "Normality check unavailable (sample too small or degenerate)."}
+              : // Naming the actual cause matters: the old copy blamed a small
+                // sample even when the real reason was a degenerate axis.
+                "Normality could not be tested here (too few points, or an axis with no spread) — Spearman's ρ is shown as the conservative default, not as a verdict."}
         </span>
         <ExplainerPopover id="shapiroWilk" />
       </div>

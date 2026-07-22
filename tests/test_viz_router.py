@@ -279,6 +279,20 @@ class _FakeAggService:
         self.calls.append(("scatter", query, field_x, field_y, limit))
         return {"kind": "scatter"}
 
+    def field_numeric_stats(self, query, field, bins, points, points_limit):
+        self.calls.append(("numeric", query, field, bins, points, points_limit))
+        return {"kind": "numeric"}
+
+    def field_correlation(self, query, fields):
+        self.calls.append(("corr", query, tuple(fields)))
+        return {"kind": "corr"}
+
+    def field_numeric_grouped(self, query, field, group_field, groups, bins, points, points_limit):
+        self.calls.append(
+            ("grouped", query, field, group_field, groups, bins, points, points_limit)
+        )
+        return {"kind": "numeric_grouped"}
+
 
 def _patch_agg(monkeypatch) -> _FakeAggService:
     svc = _FakeAggService()
@@ -393,6 +407,116 @@ async def test_field_scatter_same_field_is_422(monkeypatch):
             field_x="attr:bytes",
             field_y="attr:bytes",
             limit=1000,
+            case=None,
+            **_FILTER_KWARGS,
+        )
+    assert exc.value.status_code == 422
+
+
+# ── GET .../viz/field-numeric-stats / field-correlation / field-numeric-grouped ──
+
+
+@pytest.mark.asyncio
+async def test_field_numeric_stats_omitted_bins_reach_the_service_as_none(monkeypatch):
+    """`bins` unset is the request for automatic (Freedman–Diaconis) binning.
+
+    Substituting a default here would make "auto" unreachable over HTTP.
+    """
+    svc = _patch_agg(monkeypatch)
+    result = await viz.get_field_numeric_stats(
+        "c1",
+        "t1",
+        field="attr:bytes",
+        bins=None,
+        points=True,
+        points_limit=250,
+        case=None,
+        **_FILTER_KWARGS,
+    )
+    assert result == {"kind": "numeric"}
+    _, query, field, bins, points, points_limit = svc.calls[0]
+    assert (field, bins, points, points_limit) == ("attr:bytes", None, True, 250)
+    assert query.source_ids == ["s1", "s2"]
+
+
+@pytest.mark.asyncio
+async def test_field_correlation_passes_distinct_fields(monkeypatch):
+    svc = _patch_agg(monkeypatch)
+    result = await viz.get_field_correlation(
+        "c1",
+        "t1",
+        fields=["attr:bytes", "attr:latency", "attr:retries"],
+        case=None,
+        **_FILTER_KWARGS,
+    )
+    assert result == {"kind": "corr"}
+    _, query, fields = svc.calls[0]
+    assert fields == ("attr:bytes", "attr:latency", "attr:retries")
+    assert query.source_ids == ["s1", "s2"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fields",
+    [
+        pytest.param(["attr:bytes", "attr:bytes"], id="duplicate"),
+        pytest.param(["attr:bytes"], id="too-few"),
+        pytest.param([f"attr:f{i}" for i in range(9)], id="too-many"),
+    ],
+)
+async def test_field_correlation_rejects_bad_field_lists(monkeypatch, fields):
+    from fastapi import HTTPException
+
+    _patch_agg(monkeypatch)
+    with pytest.raises(HTTPException) as exc:
+        await viz.get_field_correlation("c1", "t1", fields=fields, case=None, **_FILTER_KWARGS)
+    assert exc.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_field_numeric_grouped_passes_every_knob(monkeypatch):
+    svc = _patch_agg(monkeypatch)
+    result = await viz.get_field_numeric_grouped(
+        "c1",
+        "t1",
+        field="attr:bytes",
+        group_field="attr:user",
+        groups=4,
+        bins=25,
+        points=True,
+        points_limit=500,
+        case=None,
+        **_FILTER_KWARGS,
+    )
+    assert result == {"kind": "numeric_grouped"}
+    _, query, field, group_field, groups, bins, points, points_limit = svc.calls[0]
+    assert (field, group_field, groups, bins, points, points_limit) == (
+        "attr:bytes",
+        "attr:user",
+        4,
+        25,
+        True,
+        500,
+    )
+    assert query.source_ids == ["s1", "s2"]
+
+
+@pytest.mark.asyncio
+async def test_field_numeric_grouped_same_field_is_422(monkeypatch):
+    """Grouping a field by itself yields one box per value — not a distribution."""
+    from fastapi import HTTPException
+
+    _patch_agg(monkeypatch)
+    with pytest.raises(HTTPException) as exc:
+        await viz.get_field_numeric_grouped(
+            "c1",
+            "t1",
+            field="attr:bytes",
+            group_field="attr:bytes",
+            groups=8,
+            bins=30,
+            points=False,
+            points_limit=1000,
             case=None,
             **_FILTER_KWARGS,
         )

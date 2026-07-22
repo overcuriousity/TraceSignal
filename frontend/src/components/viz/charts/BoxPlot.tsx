@@ -24,7 +24,7 @@ interface BoxPlotProps {
 
 /** Vertical box plot (five-number summary) for a numeric field — median,
  * quartile box, and 1.5*IQR whiskers. Built from the server's quantiles, so
- * only an optional random sample of raw values ever reaches the client. */
+ * only an optional sample of raw values ever reaches the client. */
 export function BoxPlot({
   stats,
   svgRef,

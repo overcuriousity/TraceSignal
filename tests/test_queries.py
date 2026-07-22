@@ -1638,7 +1638,11 @@ def test_field_numeric_stats_auto_bins_uses_freedman_diaconis() -> None:
 
 
 def test_field_numeric_stats_auto_bins_clamps_and_falls_back() -> None:
-    """Zero IQR makes FD undefined → fall back to 30 bins, still reported as fd."""
+    """Zero IQR makes FD undefined → 30 bins, reported as fd_fallback, NOT fd.
+
+    The caption quotes ``bin_rule`` verbatim, so crediting Freedman–Diaconis
+    for a fixed fallback would put a rule in the caption that never ran.
+    """
     svc = _viz_service(
         [
             (
@@ -1667,8 +1671,51 @@ def test_field_numeric_stats_auto_bins_clamps_and_falls_back() -> None:
         ]
     )
     result = svc.field_numeric_stats(EventQuery(case_id="c1", source_ids=["s1"]), "attr:ms")
-    assert result["bin_rule"] == "fd"
+    assert result["bin_rule"] == "fd_fallback"
+    assert result["bin_count_clamped"] is False
     assert len(result["bins"]) == 30
+
+
+def test_field_numeric_stats_auto_bins_report_the_clamp() -> None:
+    """A tight IQR asks FD for far more bins than the UI allows → clamp, and say so.
+
+    ``bin_rule`` stays "fd" (the rule did run), but the caption needs
+    ``bin_count_clamped`` to avoid presenting a clamped count as the width the
+    rule chose.
+    """
+    # IQR = 0.1 over 1000 points → FD width 0.02 over a span of 100 = 5000 bins,
+    # far past the _FD_BIN_RANGE ceiling of 60.
+    svc = _viz_service(
+        [
+            (
+                "stddevPop(v)",
+                FakeQueryResult(
+                    result_rows=[
+                        [
+                            1000,
+                            0.0,
+                            100.0,
+                            50.0,
+                            10.0,
+                            0.0,
+                            1.0,
+                            5.0,
+                            49.95,
+                            50.0,
+                            50.05,
+                            95.0,
+                            99.0,
+                        ]
+                    ]
+                ),
+            ),
+            ("toInt64(floor(", FakeQueryResult(result_rows=[[0, 1000]])),
+        ]
+    )
+    result = svc.field_numeric_stats(EventQuery(case_id="c1", source_ids=["s1"]), "attr:ms")
+    assert result["bin_rule"] == "fd"
+    assert result["bin_count_clamped"] is True
+    assert len(result["bins"]) == 60
 
 
 def test_field_numeric_stats_point_sample_is_opt_in() -> None:
@@ -1691,7 +1738,7 @@ def test_field_numeric_stats_point_sample_is_opt_in() -> None:
         [
             ("stddevPop(v)", FakeQueryResult(result_rows=[rows])),
             ("toInt64(floor(", FakeQueryResult(result_rows=[[0, 10]])),
-            ("ORDER BY rand()", FakeQueryResult(result_rows=[[1.0], [2.0]])),
+            ("ORDER BY ord", FakeQueryResult(result_rows=[[1.0], [2.0]])),
         ]
     )
     result = svc.field_numeric_stats(
@@ -1705,7 +1752,7 @@ def test_field_numeric_stats_point_sample_is_opt_in() -> None:
     sample_sql = next(
         sql
         for sql, _ in svc.store.client.queries  # type: ignore[union-attr]
-        if "ORDER BY rand()" in sql
+        if "ORDER BY ord" in sql
     )
     assert "LIMIT 2" in sample_sql
 
@@ -1757,7 +1804,18 @@ def test_field_numeric_grouped_shares_global_bin_edges_and_reports_omission() ->
 
 
 def test_field_numeric_grouped_no_numeric_values_returns_empty() -> None:
-    svc = _viz_service([("uniqExact(g)", FakeQueryResult(result_rows=[[0, None, None, 0]]))])
+    """No numeric values → empty result, and wave 2 (bins/points) never runs.
+
+    The per-group scan does run: it is wave 1's second half, issued
+    concurrently with the extent scan rather than after it, so there is no
+    result to gate it on yet.
+    """
+    svc = _viz_service(
+        [
+            ("uniqExact(g)", FakeQueryResult(result_rows=[[0, None, None, 0]])),
+            ("GROUP BY g", FakeQueryResult(result_rows=[])),
+        ]
+    )
     result = svc.field_numeric_grouped(
         EventQuery(case_id="c1", source_ids=["s1"]), "attr:user_agent", "attr:user"
     )
@@ -1788,6 +1846,7 @@ def test_field_numeric_stats_non_numeric_field_returns_zero_count() -> None:
         "quantiles": {},
         "bins": [],
         "bin_rule": "manual",
+        "bin_count_clamped": False,
         "bin_width": None,
         "points": None,
     }
@@ -2503,7 +2562,7 @@ def test_field_scatter_samples_points_with_true_extents() -> None:
                 ),
             ),
             (
-                "ORDER BY rand()",
+                "ORDER BY ord",
                 FakeQueryResult(result_rows=[[10.0, 1.0], [500.0, 42.0]]),
             ),
         ]
@@ -2529,18 +2588,45 @@ def test_field_scatter_samples_points_with_true_extents() -> None:
     # Kendall/Shapiro need n >= 3 sample points — with 2, both are absent.
     assert stats_block["kendall"] is None
     assert stats_block["shapiro"]["x"] is None
+    # Spearman without a normality test is a default, not a verdict, and the
+    # response has to distinguish the two.
     assert stats_block["recommendation"] == "spearman"
+    assert stats_block["recommendation_basis"] == "default"
 
     sample_sql = next(
         sql
         for sql, _ in svc.store.client.queries  # type: ignore[union-attr]
-        if "ORDER BY rand()" in sql
+        if "ORDER BY ord" in sql
     )
     assert "LIMIT 2" in sample_sql
     from vestigo.db._scan import HEAVY_SCAN_SETTINGS
 
     assert HEAVY_SCAN_SETTINGS in sample_sql
     assert "toFloat64OrNull(toString(" in sample_sql
+    # Reproducibility: the sample is drawn in a stable hash order, never rand().
+    assert "cityHash64(event_id)" in sample_sql
+    assert "rand()" not in sample_sql
+
+
+def test_scatter_stats_shapiro_is_capped_and_reports_its_verdict() -> None:
+    """Past Royston's n = 5000 the sample is cut, not silently dropped.
+
+    Handing shapiro_wilk more points than its approximation covers returns
+    nothing, which used to leave `recommendation` at "spearman" with no test
+    behind it while the UI blamed a too-small sample.
+    """
+    from vestigo.db.queries import SHAPIRO_SAMPLE_MAX, _scatter_stats
+
+    # Normal-ish x and y, more points than Shapiro's ceiling.
+    points = [[float(i % 997) / 997.0, float((i * 7) % 991) / 991.0] for i in range(12000)]
+    stats_block = _scatter_stats(12000, 0.01, 0.01, None, points)
+
+    assert stats_block["shapiro"]["n"] == SHAPIRO_SAMPLE_MAX
+    assert stats_block["shapiro"]["x"] is not None
+    assert stats_block["shapiro"]["y"] is not None
+    assert stats_block["recommendation_basis"] == "shapiro"
+    # Kendall is O(n log n), so it still covers every drawn point.
+    assert stats_block["kendall"]["n"] == 12000
 
 
 def test_field_scatter_non_numeric_skips_sample_scan() -> None:
@@ -2561,7 +2647,7 @@ def test_field_scatter_non_numeric_skips_sample_scan() -> None:
     assert result["x_min"] is None
     assert result["stats"] is None
     assert not any(
-        "ORDER BY rand()" in sql
+        "ORDER BY ord" in sql
         for sql, _ in svc.store.client.queries  # type: ignore[union-attr]
     )
 

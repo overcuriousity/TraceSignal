@@ -126,7 +126,7 @@ describe("buildCaptionLines", () => {
       facts: { sampledPoints: 5000, totalPoints: 120000 },
     });
     expect(lines).toContain(
-      "showing 5,000 of 120,000 points (uniform random sample; axes span full data)",
+      "showing 5,000 of 120,000 points (uniform sample, stable across reruns; axes span full data)",
     );
   });
 
@@ -217,6 +217,101 @@ describe("lecture-driven caption lines", () => {
     expect(line).toContain('not merged into an "Other" group');
   });
 
+  it("does not credit Freedman–Diaconis for a fallback or a clamped count", () => {
+    const config: ChartConfig = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "histogram",
+      field: "attr:bytes",
+      scale: "ratio",
+    };
+    const fallback = buildCaptionLines({
+      ...base,
+      chartLabel: "Histogram",
+      config,
+      facts: { binCount: 30, valueMin: 0, valueMax: 100, binRule: "fd_fallback" },
+    });
+    expect(fallback).toContain(
+      "30 fixed-width bins over [0, 100] (no interquartile spread — the automatic rule is undefined; fixed default)",
+    );
+    expect(fallback.join(" ")).not.toContain("Freedman–Diaconis automatic width");
+
+    const clamped = buildCaptionLines({
+      ...base,
+      chartLabel: "Histogram",
+      config,
+      facts: { binCount: 60, valueMin: 0, valueMax: 100, binRule: "fd", binCountClamped: true },
+    });
+    expect(clamped).toContain(
+      "60 fixed-width bins over [0, 100] (Freedman–Diaconis, clamped to the allowed bin range)",
+    );
+  });
+
+  it("spells out that grouped violin widths compare shape, not group size", () => {
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Violin plot",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "violin",
+        field: "attr:latency",
+        fieldY: "attr:user",
+        scale: "ratio",
+      },
+      facts: {
+        groupField: "attr:user",
+        groupsShown: 3,
+        groupedViolin: true,
+      },
+    });
+    const line = lines.find((l) => l.startsWith("violin widths"))!;
+    expect(line).toContain("relative frequency");
+    expect(line).toContain("not its size");
+  });
+
+  it("cautions when the grouping field looks like an identifier", () => {
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Box plot",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "box",
+        field: "attr:latency",
+        fieldY: "attr:event_id",
+        scale: "ratio",
+      },
+      facts: { groupField: "attr:event_id", groupsShown: 8, groupDistinct: 4210 },
+    });
+    expect(lines.some((l) => l.includes("usually an identifier"))).toBe(true);
+  });
+
+  it("never presents an untested normality default as a recommendation", () => {
+    const stats = {
+      n: 10,
+      basis: "full" as const,
+      pearson: { r: 0.5, p: 0.1 },
+      spearman: { rho: 0.4, p: 0.2 },
+      kendall: null,
+      regression: null,
+      shapiro: { x: null, y: null, basis: "sample" as const, n: 0 },
+      recommendation: "spearman" as const,
+      recommendation_basis: "default" as const,
+    };
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Scatter",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "scatter",
+        field: "attr:bytes",
+        fieldY: "attr:latency",
+        scale: "ratio",
+      },
+      facts: { scatterStats: stats },
+    });
+    expect(lines.some((l) => l.includes("normality could not be tested here"))).toBe(true);
+    expect(lines.join(" ")).not.toContain("recommended coefficient");
+  });
+
   it("states the point-overlay sample honestly", () => {
     const lines = buildCaptionLines({
       ...base,
@@ -225,7 +320,7 @@ describe("lecture-driven caption lines", () => {
       facts: { overlayShown: 1000, overlayTotal: 52341 },
     });
     expect(lines).toContain(
-      "point overlay: showing 1,000 of 52,341 values (uniform random sample)",
+      "point overlay: showing 1,000 of 52,341 values (uniform sample, stable across reruns)",
     );
   });
 

@@ -630,6 +630,7 @@ export function VisualizePage() {
       facts.valueMin = numericQuery.data.min;
       facts.valueMax = numericQuery.data.max;
       facts.binRule = numericQuery.data.bin_rule;
+      facts.binCountClamped = numericQuery.data.bin_count_clamped;
       facts.skewness = numericQuery.data.skewness;
     }
     if (groupedOn && groupedQuery.data) {
@@ -640,8 +641,11 @@ export function VisualizePage() {
       facts.groupOmittedCount = groupedQuery.data.omitted_count;
       facts.valueMin = groupedQuery.data.min;
       facts.valueMax = groupedQuery.data.max;
+      facts.groupDistinct = groupedQuery.data.distinct_groups;
+      facts.groupedViolin = config.chartType === "violin";
       facts.binCount = undefined;
       facts.binRule = undefined;
+      facts.binCountClamped = undefined;
       facts.skewness = undefined;
       facts.overlayShown = groupedQuery.data.points?.shown;
       facts.overlayTotal = groupedQuery.data.points?.total;

@@ -81,6 +81,28 @@ def _nan_to_none(value: float | None) -> float | None:
     return value
 
 
+#: Ceiling on the point count handed to :func:`vestigo.stats.shapiro_wilk`.
+#: Royston's AS R94 approximation is only defined up to n = 5000, and past it
+#: the test returns nothing — so a larger drawn sample must be cut down rather
+#: than silently losing the normality verdict (which would then read as
+#: "Spearman recommended" with nothing behind it). Cutting is legitimate
+#: because the sample arrives in hash-shuffled order: any prefix of a uniform
+#: sample is itself a uniform sample.
+SHAPIRO_SAMPLE_MAX = 5000
+
+#: Ordering that draws a uniform sample **reproducibly**.
+#:
+#: ``ORDER BY rand()`` also samples uniformly, but re-running an identical
+#: query redraws different points, so two runs of the same investigation
+#: produce two different charts and an exported scatter cannot be reproduced
+#: from the filters that made it. Hashing the primary-key ``event_id``
+#: instead is uniform (a UUID's hash is independent of every plotted value)
+#: and stable across reruns, compactions, and replicas — which is what
+#: forensic reproducibility means here. Costs the same bounded top-N heap as
+#: ``rand()``: no full sort, no extra scan.
+SAMPLE_ORDER_SQL = "cityHash64(event_id)"
+
+
 def _scatter_stats(
     total: int,
     pearson_r: float | None,
@@ -95,6 +117,11 @@ def _scatter_stats(
     algorithms have no ClickHouse aggregate) and say so via ``basis``.
     Every coefficient is nullable — degenerate inputs null the affected
     entries instead of failing the chart.
+
+    ``recommendation_basis`` distinguishes a Shapiro–Wilk *verdict* from the
+    conservative default: when normality could not be tested at all, Spearman
+    is still the safer coefficient to quote, but nothing measured it and the
+    response has to say so.
     """
     r = _nan_to_none(pearson_r)
     rho = _nan_to_none(spearman_rho)
@@ -122,17 +149,19 @@ def _scatter_stats(
 
     xs = [p[0] for p in sample_points]
     ys = [p[1] for p in sample_points]
+    # Kendall is O(n log n) (Knight's method), so it runs over every drawn
+    # point; Shapiro–Wilk is capped at the range its approximation covers.
     tau, tau_p = stats_helpers.kendall_tau(xs, ys)
-    sw_x = stats_helpers.shapiro_wilk(xs)
-    sw_y = stats_helpers.shapiro_wilk(ys)
+    sw_xs, sw_ys = xs[:SHAPIRO_SAMPLE_MAX], ys[:SHAPIRO_SAMPLE_MAX]
+    sw_x = stats_helpers.shapiro_wilk(sw_xs)
+    sw_y = stats_helpers.shapiro_wilk(sw_ys)
 
     def _sw_block(sw: tuple[float | None, float | None]) -> dict[str, Any] | None:
         w, p = sw
         return {"w": w, "p": p} if w is not None else None
 
-    both_normal = (
-        sw_x[1] is not None and sw_y[1] is not None and sw_x[1] >= 0.05 and sw_y[1] >= 0.05
-    )
+    tested = sw_x[1] is not None and sw_y[1] is not None
+    both_normal = tested and sw_x[1] >= 0.05 and sw_y[1] >= 0.05
     recommendation = "pearson" if both_normal else "spearman"
 
     return {
@@ -151,9 +180,10 @@ def _scatter_stats(
             "x": _sw_block(sw_x),
             "y": _sw_block(sw_y),
             "basis": "sample",
-            "n": len(xs),
+            "n": len(sw_xs),
         },
         "recommendation": recommendation,
+        "recommendation_basis": "shapiro" if tested else "default",
     }
 
 
@@ -1771,6 +1801,10 @@ class EventQueryService:
     #: could not have requested by hand.
     _FD_BIN_RANGE = (5, 60)
 
+    #: Bin count used when the Freedman–Diaconis rule is undefined (zero IQR).
+    #: Reported as ``bin_rule: "fd_fallback"``, never as ``"fd"``.
+    _FD_FALLBACK_BINS = 30
+
     @_gated_scan
     def field_numeric_stats(
         self,
@@ -1790,9 +1824,19 @@ class EventQueryService:
 
         ``bins=None`` selects the bin count automatically with the
         Freedman–Diaconis rule (width = 2·IQR·n^(−1/3)), computed from the
-        first scan's quantiles and clamped to ``_FD_BIN_RANGE``; the response
-        reports the decision as ``bin_rule: "fd" | "manual"`` plus the
-        resolved ``bin_width`` so captions can state it verbatim.
+        first scan's quantiles and clamped to ``_FD_BIN_RANGE``. The response
+        reports exactly which of the three things happened, because the
+        caption quotes it and a caption must not credit FD for bins FD did
+        not choose:
+
+        - ``bin_rule: "fd"`` — the rule produced the count. ``bin_count_clamped``
+          says whether that count then hit the ``_FD_BIN_RANGE`` clamp.
+        - ``bin_rule: "fd_fallback"`` — the rule was undefined (no
+          interquartile spread, or too few points), so the manual default of
+          ``_FD_FALLBACK_BINS`` bins was used instead.
+        - ``bin_rule: "manual"`` — the caller passed a count.
+
+        ``bin_width`` is always the resolved width, whichever path ran.
 
         Bins are **fixed-width** (evenly spaced across ``[min, max]``), not
         ClickHouse's adaptive ``histogram()`` function — reproducibility (the
@@ -1841,7 +1885,10 @@ class EventQueryService:
             "skewness": None,
             "quantiles": {},
             "bins": [],
-            "bin_rule": "manual" if bins is not None else "fd",
+            # No data means no rule ran; only a caller-supplied count is a
+            # decision that survives an empty result set.
+            "bin_rule": "manual" if bins is not None else "fd_fallback",
+            "bin_count_clamped": False,
             "bin_width": None,
             "points": None,
         }
@@ -1854,15 +1901,19 @@ class EventQueryService:
         )
 
         span = mx - mn
+        clamped = False
         if bins is not None:
             bin_count = max(1, int(bins))
             bin_rule = "manual"
         else:
             iqr = quantiles["0.75"] - quantiles["0.25"]
             fd = stats_helpers.fd_bin_count(iqr, count, span)
-            lo, hi = self._FD_BIN_RANGE
-            bin_count = max(lo, min(hi, fd)) if fd is not None else 30
-            bin_rule = "fd"
+            if fd is None:
+                bin_count, bin_rule = self._FD_FALLBACK_BINS, "fd_fallback"
+            else:
+                lo, hi = self._FD_BIN_RANGE
+                bin_count, bin_rule = max(lo, min(hi, fd)), "fd"
+                clamped = bin_count != fd
         bin_width = span / bin_count if span > 0 else 1.0
 
         hist_result = self.store.client.query(
@@ -1893,9 +1944,12 @@ class EventQueryService:
             sample_result = self.store.client.query(
                 f"""
                 SELECT v
-                FROM (SELECT {cast_expr} AS v FROM {database}.events WHERE {where}) AS t
+                FROM (
+                    SELECT {cast_expr} AS v, {SAMPLE_ORDER_SQL} AS ord
+                    FROM {database}.events WHERE {where}
+                ) AS t
                 WHERE v IS NOT NULL
-                ORDER BY rand()
+                ORDER BY ord
                 LIMIT {int(points_limit)}
                 {HEAVY_SCAN_SETTINGS}
                 """,
@@ -1915,6 +1969,7 @@ class EventQueryService:
             "quantiles": quantiles,
             "bins": bins_out,
             "bin_rule": bin_rule,
+            "bin_count_clamped": clamped,
             "bin_width": bin_width,
             "points": points_block,
         }
@@ -2051,10 +2106,21 @@ class EventQueryService:
 
         Per-group histogram bins share the **global** ``[min, max]`` so the
         violin silhouettes are directly comparable across groups. The
-        optional ``points`` scan draws one uniform random sample across all
-        kept groups (``ORDER BY rand() LIMIT``), not per-group quotas —
-        so dense groups show proportionally more points, which is the honest
-        reading.
+        optional ``points`` scan draws one sample across all kept groups
+        (:data:`SAMPLE_ORDER_SQL`), not per-group quotas — so dense groups
+        show proportionally more points, which is the honest reading.
+
+        Costs up to four heavy scans, run as **two parallel waves** (the same
+        :py:meth:`_run_parallel` pattern the compare-mode paths use, under
+        the one gate slot this method holds):
+
+        1. the global extent/cardinality scan and the per-group aggregate
+           scan — independent of each other;
+        2. the per-group bin scan and the optional point sample — both need
+           wave 1's bin width and kept-group list.
+
+        On a million-event timeline that is the difference between four
+        sequential full scans and two.
         """
         self.store.init_schema()
         where, parameters = self._build_where(query)
@@ -2078,15 +2144,33 @@ class EventQueryService:
             f"FROM {database}.events WHERE {where}"
         )
         member_where = "v IS NOT NULL AND g != ''"
+        quantile_exprs = ", ".join(f"quantile({q})(v)" for q in self._NUMERIC_QUANTILES)
 
-        global_result = self.store.client.query(
-            f"""
-            SELECT count(v), min(v), max(v), uniqExact(g)
-            FROM ({pairs_subquery}) AS t
-            WHERE {member_where}
-            {HEAVY_SCAN_SETTINGS}
-            """,
-            parameters=parameters,
+        # Wave 1 — the extent scan and the per-group aggregate scan have no
+        # data dependency on each other.
+        global_result, groups_result = self._run_parallel(
+            lambda: self.store.client.query(
+                f"""
+                SELECT count(v), min(v), max(v), uniqExact(g)
+                FROM ({pairs_subquery}) AS t
+                WHERE {member_where}
+                {HEAVY_SCAN_SETTINGS}
+                """,
+                parameters=parameters,
+            ),
+            lambda: self.store.client.query(
+                f"""
+                SELECT g, count(v) AS c, min(v), max(v), avg(v), stddevPop(v), skewPop(v),
+                       {quantile_exprs}
+                FROM ({pairs_subquery}) AS t
+                WHERE {member_where}
+                GROUP BY g
+                ORDER BY c DESC, g ASC
+                LIMIT {int(groups)}
+                {HEAVY_SCAN_SETTINGS}
+                """,
+                parameters=parameters,
+            ),
         )
         grow = global_result.result_rows[0] if global_result.result_rows else None
         total = int(grow[0]) if grow and grow[0] else 0
@@ -2104,39 +2188,50 @@ class EventQueryService:
                 "points": None,
             }
         mn, mx, distinct_groups = grow[1], grow[2], int(grow[3])
-
-        quantile_exprs = ", ".join(f"quantile({q})(v)" for q in self._NUMERIC_QUANTILES)
-        groups_result = self.store.client.query(
-            f"""
-            SELECT g, count(v) AS c, min(v), max(v), avg(v), stddevPop(v), skewPop(v),
-                   {quantile_exprs}
-            FROM ({pairs_subquery}) AS t
-            WHERE {member_where}
-            GROUP BY g
-            ORDER BY c DESC, g ASC
-            LIMIT {int(groups)}
-            {HEAVY_SCAN_SETTINGS}
-            """,
-            parameters=parameters,
-        )
         kept_values = [row[0] for row in groups_result.result_rows]
 
         bin_count = max(1, int(bins))
         span = mx - mn
         bin_width = span / bin_count if span > 0 else 1.0
-        bins_result = self.store.client.query(
-            f"""
-            SELECT g, greatest(0, least({bin_count - 1},
-                   toInt64(floor((v - {{mn:Float64}}) / {{bw:Float64}})))) AS bin_idx,
-                   count() AS c
-            FROM ({pairs_subquery}) AS t
-            WHERE {member_where} AND g IN {{kept:Array(String)}}
-            GROUP BY g, bin_idx
-            ORDER BY g, bin_idx
-            {HEAVY_SCAN_SETTINGS}
-            """,
-            parameters={**parameters, "mn": mn, "bw": bin_width, "kept": kept_values},
-        )
+
+        # Wave 2 — bins and the optional point sample, both keyed on wave 1's
+        # bin width and kept-group list.
+        def _bins_scan() -> Any:
+            return self.store.client.query(
+                f"""
+                SELECT g, greatest(0, least({bin_count - 1},
+                       toInt64(floor((v - {{mn:Float64}}) / {{bw:Float64}})))) AS bin_idx,
+                       count() AS c
+                FROM ({pairs_subquery}) AS t
+                WHERE {member_where} AND g IN {{kept:Array(String)}}
+                GROUP BY g, bin_idx
+                ORDER BY g, bin_idx
+                {HEAVY_SCAN_SETTINGS}
+                """,
+                parameters={**parameters, "mn": mn, "bw": bin_width, "kept": kept_values},
+            )
+
+        def _points_scan() -> Any:
+            if not points or not kept_values:
+                return None
+            return self.store.client.query(
+                f"""
+                SELECT g, v
+                FROM (
+                    SELECT toString({group_expr}) AS g,
+                           toFloat64OrNull(toString({col_expr})) AS v,
+                           {SAMPLE_ORDER_SQL} AS ord
+                    FROM {database}.events WHERE {where}
+                ) AS t
+                WHERE {member_where} AND g IN {{kept:Array(String)}}
+                ORDER BY ord
+                LIMIT {int(points_limit)}
+                {HEAVY_SCAN_SETTINGS}
+                """,
+                parameters={**parameters, "kept": kept_values},
+            )
+
+        bins_result, sample_result = self._run_parallel(_bins_scan, _points_scan)
         bin_counts: dict[str, dict[int, int]] = {}
         for g, bin_idx, c in bins_result.result_rows:
             bin_counts.setdefault(g, {})[int(bin_idx)] = int(c)
@@ -2174,18 +2269,7 @@ class EventQueryService:
 
         kept_count = sum(g["count"] for g in groups_out)
         points_block = None
-        if points and kept_values:
-            sample_result = self.store.client.query(
-                f"""
-                SELECT g, v
-                FROM ({pairs_subquery}) AS t
-                WHERE {member_where} AND g IN {{kept:Array(String)}}
-                ORDER BY rand()
-                LIMIT {int(points_limit)}
-                {HEAVY_SCAN_SETTINGS}
-                """,
-                parameters={**parameters, "kept": kept_values},
-            )
+        if sample_result is not None:
             values = [[r[0], float(r[1])] for r in sample_result.result_rows]
             points_block = {"total": kept_count, "shown": len(values), "values": values}
 
@@ -2846,15 +2930,16 @@ class EventQueryService:
     def field_scatter(
         self, query: EventQuery, field_x: str, field_y: str, limit: int = 5000
     ) -> dict[str, Any]:
-        """Return a uniform random sample of (x, y) numeric value pairs.
+        """Return a uniform, reproducible sample of (x, y) numeric value pairs.
 
         Two scans, same deliberate two-pass policy as
         :py:meth:`field_numeric_stats`: the first computes the total pair
         count and the **true** per-axis extents (axes and caption must
         describe the full data, not the sample); the second draws the sample
-        with ``ORDER BY rand() LIMIT n`` — a bounded partial sort under the
-        heavy-scan settings (the events table declares no SAMPLE key, so
-        table sampling isn't available). Only events where **both** casts
+        with ``ORDER BY`` :data:`SAMPLE_ORDER_SQL` ``LIMIT n`` — a bounded
+        partial sort under the heavy-scan settings (the events table declares
+        no SAMPLE key, so table sampling isn't available), and stable across
+        reruns rather than redrawn each time. Only events where **both** casts
         are numeric participate; ``total == 0`` signals the caller to fall
         back to categorical treatment, mirroring ``field_numeric_stats``.
 
@@ -2923,12 +3008,20 @@ class EventQueryService:
                 "stats": None,
             }
 
+        # The sample repeats the casts rather than reusing `pairs_subquery`:
+        # the ordering key has to be projected alongside them, and only this
+        # scan needs it.
         sample_result = self.store.client.query(
             f"""
             SELECT vx, vy
-            FROM ({pairs_subquery}) AS t
+            FROM (
+                SELECT toFloat64OrNull(toString({col_x})) AS vx,
+                       toFloat64OrNull(toString({col_y})) AS vy,
+                       {SAMPLE_ORDER_SQL} AS ord
+                FROM {self.store.database}.events WHERE {where}
+            ) AS t
             WHERE vx IS NOT NULL AND vy IS NOT NULL
-            ORDER BY rand()
+            ORDER BY ord
             LIMIT {int(limit)}
             {HEAVY_SCAN_SETTINGS}
             """,

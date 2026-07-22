@@ -23,8 +23,11 @@ export interface CaptionFacts {
   binCount?: number;
   valueMin?: number | null;
   valueMax?: number | null;
-  /** kind=numeric: how the bin count was chosen ("fd" = Freedman–Diaconis). */
-  binRule?: "fd" | "manual";
+  /** kind=numeric: how the bin count was chosen ("fd" = Freedman–Diaconis,
+   * "fd_fallback" = the rule was undefined and a fixed default was used). */
+  binRule?: "fd" | "fd_fallback" | "manual";
+  /** kind=numeric: an "fd" count that hit the allowed bin-count clamp. */
+  binCountClamped?: boolean;
   /** kind=numeric: population skewness g₁ (null when degenerate). */
   skewness?: number | null;
   /** Single focused value (e.g. the field-histogram modal's `field = value`
@@ -43,6 +46,12 @@ export interface CaptionFacts {
   scatterStats?: ScatterStats | null;
   /** Grouped box/violin: grouping field and top-N truthfulness. */
   groupField?: string;
+  /** Grouped box/violin: distinct values of the grouping field, for the
+   * "this looks like an identifier" caution. */
+  groupDistinct?: number;
+  /** Grouped box/violin drawn as violins — widths need their reading spelled
+   * out, since they are normalized per group. */
+  groupedViolin?: boolean;
   groupsShown?: number;
   groupsOmitted?: number;
   groupOmittedCount?: number;
@@ -63,6 +72,10 @@ export interface CaptionFacts {
   corrMinPairN?: number;
   corrMaxPairN?: number;
 }
+
+/** Distinct grouping values past which the grouping field reads as an
+ * identifier. Mirrors the agent's VIZ_GROUP_CARDINALITY_CAUTION. */
+const IDENTIFIER_LIKE_GROUP_COUNT = 50;
 
 const fmtInt = (n: number) => n.toLocaleString("en-US");
 
@@ -158,12 +171,19 @@ export function buildCaptionLines(args: {
     lines.push(`${describeInterval(facts.intervalSeconds)} buckets, UTC`);
   }
   if (facts.binCount != null && facts.valueMin != null && facts.valueMax != null) {
+    // Each rule names itself exactly. Crediting Freedman–Diaconis for a fixed
+    // fallback, or for a count the clamp overrode, would put a decision in the
+    // caption that the data never made.
     const rule =
       facts.binRule === "fd"
-        ? " (Freedman–Diaconis automatic width)"
-        : facts.binRule === "manual"
-          ? " (manual)"
-          : "";
+        ? facts.binCountClamped
+          ? " (Freedman–Diaconis, clamped to the allowed bin range)"
+          : " (Freedman–Diaconis automatic width)"
+        : facts.binRule === "fd_fallback"
+          ? " (no interquartile spread — the automatic rule is undefined; fixed default)"
+          : facts.binRule === "manual"
+            ? " (manual)"
+            : "";
     lines.push(
       `${facts.binCount} fixed-width bins over [${facts.valueMin.toLocaleString()}, ${facts.valueMax.toLocaleString()}]${rule}`,
     );
@@ -208,7 +228,7 @@ export function buildCaptionLines(args: {
     facts.totalPoints > facts.sampledPoints
   ) {
     lines.push(
-      `showing ${fmtInt(facts.sampledPoints)} of ${fmtInt(facts.totalPoints)} points (uniform random sample; axes span full data)`,
+      `showing ${fmtInt(facts.sampledPoints)} of ${fmtInt(facts.totalPoints)} points (uniform sample, stable across reruns; axes span full data)`,
     );
   }
   if (facts.groupField != null && facts.groupsShown != null) {
@@ -219,11 +239,24 @@ export function buildCaptionLines(args: {
           : "") +
         " — all groups binned over the same value range",
     );
+    if (facts.groupDistinct != null && facts.groupDistinct > IDENTIFIER_LIKE_GROUP_COUNT) {
+      lines.push(
+        `${facts.groupField} has ${fmtInt(facts.groupDistinct)} distinct values — that is usually an identifier rather than a grouping variable, and only the largest groups are drawn`,
+      );
+    }
+    if (facts.groupedViolin) {
+      // Widths are normalized per group, so they compare shapes, not sizes.
+      // Without this line a narrow violin reads as "fewer events", which is
+      // not what the mark encodes.
+      lines.push(
+        "violin widths show each group's own distribution shape (relative frequency), not its size — group sizes differ and are stated per group",
+      );
+    }
   }
   if (facts.overlayShown != null && facts.overlayTotal != null) {
     lines.push(
       facts.overlayShown < facts.overlayTotal
-        ? `point overlay: showing ${fmtInt(facts.overlayShown)} of ${fmtInt(facts.overlayTotal)} values (uniform random sample)`
+        ? `point overlay: showing ${fmtInt(facts.overlayShown)} of ${fmtInt(facts.overlayTotal)} values (uniform sample, stable across reruns)`
         : `point overlay: all ${fmtInt(facts.overlayShown)} values shown`,
     );
   }
@@ -237,7 +270,11 @@ export function buildCaptionLines(args: {
           : ""),
     );
     lines.push(
-      `recommended coefficient: ${s.recommendation === "pearson" ? "Pearson r" : "Spearman ρ"} (Shapiro–Wilk normality check on the ${s.shapiro.n.toLocaleString("en-US")}-point sample)`,
+      s.recommendation_basis === "shapiro"
+        ? `recommended coefficient: ${s.recommendation === "pearson" ? "Pearson r" : "Spearman ρ"} (Shapiro–Wilk normality check on the ${s.shapiro.n.toLocaleString("en-US")}-point sample)`
+        : // No normality verdict exists — say the coefficient is a fallback
+          // rather than dressing an untested default as a recommendation.
+          `normality could not be tested here; Spearman ρ shown as the conservative default`,
     );
   }
   if (facts.facetField != null && facts.facetPanels != null) {

@@ -25,7 +25,7 @@ interface ScatterChartProps {
 }
 
 /**
- * Numeric × numeric scatter of a server-drawn uniform random sample. Axis
+ * Numeric × numeric scatter of a server-drawn uniform sample. Axis
  * domains come from the FULL data's extents (the response carries them
  * separately), so the frame is truthful even when only a sample of points
  * is drawn — the caption states "showing N of M points". Point hover

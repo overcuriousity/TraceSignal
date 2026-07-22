@@ -65,6 +65,7 @@ const NUMERIC: FieldNumericResponse = {
   skewness: 0,
   points: null,
   bin_rule: "manual",
+  bin_count_clamped: false,
   bin_width: 25,
   quantiles: { "0.25": 25, "0.5": 50, "0.75": 75 },
   bins: [
@@ -140,6 +141,7 @@ const SCATTER: FieldScatterResponse = {
     regression: { slope: 0.5, intercept: 2, r_squared: 0.64 },
     shapiro: { x: { w: 0.98, p: 0.3 }, y: { w: 0.97, p: 0.2 }, basis: "sample", n: 3 },
     recommendation: "pearson",
+    recommendation_basis: "shapiro",
   },
   total: 1000,
   sampled: 3,

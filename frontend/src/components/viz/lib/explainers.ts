@@ -197,7 +197,7 @@ export const EXPLAINERS: Record<ExplainerId, Explainer> = {
   },
   sampledPoints: {
     title: "Sampled points",
-    what: "Only a uniform random sample of events is drawn — plotting every event would be unreadable and slow.",
+    what: "Only a uniform sample of events is drawn — plotting every event would be unreadable and slow. The same query always draws the same points.",
     howToRead:
       "The sample preserves the overall shape. Axes and summary statistics still cover the FULL data unless labeled otherwise.",
     distrust:

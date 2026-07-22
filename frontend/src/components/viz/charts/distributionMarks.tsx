@@ -110,8 +110,12 @@ export function ViolinMark({
   halfWidth,
   y,
   color,
-  /** Density normalizer — pass a shared value across groups so a wide violin
-   * really does mean "more events here" and not just "this group's own peak". */
+  /** Density normalizer. Pass a shared value across groups so each violin is
+   * no longer scaled to its own peak — every group's busiest bin then draws
+   * at a width proportional to the same reference, making the *shapes*
+   * comparable. It does NOT make widths comparable as counts: `kdeFromBins`
+   * already normalized each distribution by its own total, so a 10-event and
+   * a 10 000-event group with the same shape draw the same width. */
   maxDensity,
 }: {
   dist: DistributionLike;

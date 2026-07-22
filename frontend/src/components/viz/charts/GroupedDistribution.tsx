@@ -30,9 +30,12 @@ interface GroupedDistributionProps {
  * (intervallskaliert) × Gruppierungsvariable (kategorial)" plot.
  *
  * Every group shares one y-scale spanning the response's global [min, max],
- * and violins share one density normalizer, so widths and heights are
- * comparable across groups rather than each group being scaled to its own
- * peak. Groups outside the server's top-N are absent, not merged into an
+ * and violins share one density normalizer, so no group is stretched to its
+ * own peak. What that makes comparable is distribution *shape*: densities are
+ * relative frequencies within each group, so a small and a large group with
+ * the same shape draw the same width. Group sizes are read from the tooltip
+ * and the caption, never from width. Groups outside the server's top-N are
+ * absent, not merged into an
  * "Other" box — a box over unrelated categories would be meaningless; the
  * caption reports what was left out.
  */
@@ -56,8 +59,10 @@ export function GroupedDistribution({
   }
 
   const colors = buildSeriesColorMap(data.groups.map((g) => ({ key: g.value })));
-  // One normalizer across groups: a wide violin then means "more events at
-  // this value", not "this group's own busiest value".
+  // One normalizer across groups, so no violin is stretched to its own peak.
+  // Densities are still per-group relative frequencies (see `kdeFromBins`),
+  // so width compares distribution *shape* between groups, never event count
+  // — the caption states that, and each group's n is on its tooltip.
   const globalMaxDensity = Math.max(
     1e-9,
     ...data.groups.flatMap((g) => kdeFromBins(g.bins).map((d) => d.density)),

@@ -9,6 +9,10 @@ de-facto standard without scipy ever becoming a runtime dependency.
 from __future__ import annotations
 
 import json
+import math
+import random
+import time
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -68,6 +72,61 @@ def test_kendall_tau_matches_scipy(xs, ys, tau, p):
 def test_kendall_degenerate():
     assert stats.kendall_tau([1.0, 2.0], [1.0, 2.0]) == (None, None)
     assert stats.kendall_tau([1.0, 1.0, 1.0, 1.0], [1.0, 2.0, 3.0, 4.0]) == (None, None)
+
+
+def _kendall_tau_brute(xs, ys):
+    """O(n²) tau-b straight from the definition — the reference for the fast path."""
+    n = len(xs)
+    s = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = (xs[i] > xs[j]) - (xs[i] < xs[j])
+            dy = (ys[i] > ys[j]) - (ys[i] < ys[j])
+            s += dx * dy
+    n0 = n * (n - 1) // 2
+
+    def tie_pairs(values):
+        return sum(c * (c - 1) // 2 for c in Counter(values).values())
+
+    denom = math.sqrt(n0 - tie_pairs(xs)) * math.sqrt(n0 - tie_pairs(ys))
+    return s / denom if denom else None
+
+
+@pytest.mark.parametrize("distinct_values", [2, 3, 5, 1000])
+def test_kendall_tau_merge_sort_matches_the_definition(distinct_values):
+    """Knight's O(n log n) tau-b must equal the all-pairs definition exactly.
+
+    Swept across tie densities — `distinct_values=2` makes nearly every pair
+    tied, which is where the n1/n2/n3 bookkeeping earns its keep.
+    """
+    rng = random.Random(17 + distinct_values)
+    for _ in range(60):
+        n = rng.randint(3, 60)
+        xs = [float(rng.randint(0, distinct_values)) for _ in range(n)]
+        ys = [float(rng.randint(0, distinct_values)) for _ in range(n)]
+        got, _ = stats.kendall_tau(xs, ys)
+        expected = _kendall_tau_brute(xs, ys)
+        if expected is None:
+            assert got is None
+        else:
+            assert got == pytest.approx(expected, abs=1e-12)
+
+
+def test_kendall_tau_stays_cheap_at_the_scatter_sample_ceiling():
+    """20 000 points — the API's scatter cap — must not cost seconds.
+
+    The O(n²) predecessor took ~17 s here, on every scatter render, inside a
+    request holding a heavy-scan slot.
+    """
+    rng = random.Random(3)
+    n = 20_000
+    xs = [rng.random() for _ in range(n)]
+    ys = [rng.random() for _ in range(n)]
+    started = time.perf_counter()
+    tau, p = stats.kendall_tau(xs, ys)
+    elapsed = time.perf_counter() - started
+    assert tau is not None and p is not None
+    assert elapsed < 2.0, f"kendall_tau took {elapsed:.2f}s at n={n}"
 
 
 @pytest.mark.parametrize(

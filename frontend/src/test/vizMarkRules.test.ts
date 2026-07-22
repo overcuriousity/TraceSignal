@@ -5,6 +5,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { allocateWaffleCells, WAFFLE_CELLS } from "@/components/viz/lib/waffle";
+import { OTHER_KEY, OTHER_LABEL } from "@/components/viz/lib/colors";
 import { pieReadabilityWarning } from "@/components/viz/lib/pieReadability";
 import { jitterOffset } from "@/components/viz/lib/jitter";
 import type { FieldTermsResponse } from "@/api/types";
@@ -46,6 +47,32 @@ describe("allocateWaffleCells", () => {
   it("gives the larger share more cells", () => {
     const [big, small] = allocateWaffleCells(rows(90, 10));
     expect(big.cells).toBeGreaterThan(small.cells);
+  });
+
+  it("keeps the 100-cell invariant when there are more categories than cells", () => {
+    // One cell per category is the floor, so 150 categories cannot all be
+    // drawn — the tail folds into Other instead of overflowing the grid.
+    const counts = Array.from({ length: 150 }, (_, i) => 150 - i);
+    const allocated = allocateWaffleCells(rows(...counts));
+    expect(allocated.reduce((s, r) => s + r.cells, 0)).toBe(WAFFLE_CELLS);
+    expect(allocated.every((r) => r.cells >= 1)).toBe(true);
+    expect(allocated.length).toBeLessThanOrEqual(WAFFLE_CELLS);
+    // Nothing is lost: the folded categories' events live in Other.
+    const total = counts.reduce((a, b) => a + b, 0);
+    expect(allocated.reduce((s, r) => s + r.count, 0)).toBe(total);
+  });
+
+  it("merges the overflow into an existing Other row rather than adding a second", () => {
+    const counts = Array.from({ length: 150 }, () => 10);
+    // The largest row IS the Other bucket, so it survives the cut and the
+    // folded tail must merge into it instead of creating a duplicate.
+    const input = rows(...counts).map((r, i) =>
+      i === 0 ? { ...r, key: OTHER_KEY, label: OTHER_LABEL, count: 9999 } : r,
+    );
+    const allocated = allocateWaffleCells(input);
+    expect(allocated.filter((r) => r.key === OTHER_KEY)).toHaveLength(1);
+    expect(allocated.find((r) => r.key === OTHER_KEY)!.count).toBeGreaterThan(9999);
+    expect(allocated.reduce((s, r) => s + r.cells, 0)).toBe(WAFFLE_CELLS);
   });
 });
 
