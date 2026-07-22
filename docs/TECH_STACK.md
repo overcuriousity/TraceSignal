@@ -3,29 +3,29 @@
 ## 1. Guiding Principles
 - **Local-first / airgap-friendly**: No mandatory cloud services; models download once and run offline.
 - **Container-first, low ops overhead**: Single-node Docker Compose deployment for small teams.
-- **Python-native ML**: Reuse the ecosystem that already works for ScalarForensic (PyTorch, transformers, Qdrant).
+- **Python-native ML**: Reuse the proven local-inference ecosystem (PyTorch, sentence-transformers, Qdrant).
 - **Swappable embedding models**: Design the pipeline so a general model ships first and a log-specific model can be dropped in later.
 
-## 2. Proposed Stack
+## 2. Stack
 
 | Layer | Choice | Version / Notes |
 |-------|--------|-----------------|
 | **Language & packaging** | Python | 3.13, managed with `uv` (3.14 support planned as deps mature) |
-| **Web backend** | FastAPI + Uvicorn | Async API server; same stack as ScalarForensic web UI |
+| **Web backend** | FastAPI + Uvicorn | Async API server |
 | **CLI ingestion** | Typer + Python stdlib | `vestigo ingest ...` command, streaming parser |
 | **Frontend** | React 19 + Vite 8 + TypeScript | Zustand (client state) + TanStack Query/Table/Virtual (server state, grid); served as a static build from `frontend/dist`, API-first backend |
-| **Metadata store** | PostgreSQL | Cases, sources, timelines, timeline-source membership, views, annotations, users |
+| **Metadata store** | PostgreSQL | Cases, sources, timelines, timeline-source membership, views, annotations, users; schema managed by Alembic |
 | **Event store** | ClickHouse | Columnar log store for 80 GiB+ filtering and aggregation |
 | **Vector store** | Qdrant | Embeddings + neighbor search; local disk mode supported |
 | **Embedding runtime** | sentence-transformers + ONNX Runtime | Local inference, CPU-friendly, optional GPU |
-| **Task queue (later)** | Celery + Redis | Only if background ingestion/analytics jobs become necessary |
+| **Background jobs** | In-process `JobStore` (`core/jobs.py`) | In-memory and ephemeral by design — a deliberate choice for the single-process deployment model, not a placeholder for Celery |
 | **Deployment** | Native `uv` workflow | Application runs via `uv`; databases are external services provided by the operator |
 
 ## 3. Rationale by Layer
 
 ### 3.1 Backend — Python + FastAPI
 - **Python 3.13** is the active target; `requires-python` is pinned to `>=3.13,<3.14` until upstream wheels (especially PyTorch CPU) reliably support 3.14.
-- Aligns with ScalarForensic and the broader ML/Python tooling ecosystem.
+- Aligns with the broader ML/Python tooling ecosystem.
 - FastAPI gives async request handling and auto-generated OpenAPI docs with minimal boilerplate.
 - `uv` provides fast dependency resolution and lockfiles; supports PyTorch ROCm/CUDA index overrides.
 - CPU-only PyTorch is the default in `pyproject.toml` (`tool.uv.index`/`tool.uv.sources`), so
@@ -34,7 +34,7 @@
   GPU acceleration is opt-in and is the recommended path for **production use of the
   embedding features** (`vestigo embed`, semantic search, similarity) — embedding large
   timelines on CPU is significantly slower:
-  - **AMD ROCm 6.4** is the primary GPU target (mirrors ScalarForensic).
+  - **AMD ROCm 6.4** is the primary GPU target.
   - **NVIDIA CUDA 12.8** is also supported.
   - To switch, uncomment the matching index block in `pyproject.toml` and comment out the
     CPU block, then `uv lock && uv sync`. See the comments in `pyproject.toml` for the
@@ -83,7 +83,7 @@ which `vestigo-web` serves directly (auto-built on first run if missing).
   environments that can't install pyarrow.
 
 ### 3.5 Vector Store — Qdrant
-- Already proven in ScalarForensic for forensic vector search.
+- Proven for forensic vector search workloads.
 - Runs as an external service; also supports a local/embedded mode via the Python client for single-user deployments.
 - Airgapped operation and efficient neighbor search.
 - One collection per `(case_id, embedding_config_hash)` keeps isolation simple; source-level filtering is done via Qdrant payload filters on `source_id`. A case can have multiple collections if different embedding models or field selections are used.
@@ -95,7 +95,7 @@ which `vestigo-web` serves directly (auto-built on first run if missing).
 
 ## 4. Deployment Model — Application vs. Services
 
-Vestigo itself is **only the Python application**. The databases are external services that the operator provides, exactly like ScalarForensic expects an external Qdrant.
+Vestigo itself is **only the Python application**. The databases are external services that the operator provides.
 
 ```
 ┌─────────────────────────────────────────┐
@@ -139,12 +139,14 @@ For a lone analyst on one machine, Qdrant can run in **local mode** through the 
 
 ## 6. Offline / Airgapped Operation
 
-- All model downloads happen once via an `--allow-online` flag during first setup.
-- After download, the app blocks HuggingFace and other external network calls at runtime (mirroring ScalarForensic).
-- Model weights can be pre-bundled for fully offline deployment.
+- All model downloads happen once with `VESTIGO_ALLOW_ONLINE=true` during first setup.
+- With `VESTIGO_ALLOW_ONLINE=false` (the default), the embedding-model loader forces
+  `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` (`models/embeddings.py`) so no HuggingFace or
+  other model-download call can leave the machine at runtime.
+- Model weights can be pre-bundled for fully offline deployment (see the airgapped
+  install procedure in `docs/DEPLOYMENT.md`).
 - Docker images can also be pre-bundled, but Docker is not required for airgapped use.
 - Telemetry and cloud APIs are disabled by default and not required.
-- `allow_online`/`VESTIGO_ALLOW_ONLINE` is not yet checked at any network call site.
 - The Sigma runner's `pysigma` dependency transitively installs `requests` (pySigma uses it
   only for optional rule-collection fetching we never call); no Vestigo Sigma code path
   touches the network — rules come from the local `VESTIGO_SIGMA_RULES_PATH` drop and
@@ -160,34 +162,5 @@ For a lone analyst on one machine, Qdrant can run in **local mode** through the 
 
 - Kubernetes manifests (can be added later).
 - Managed cloud database services.
-- Real-time streaming ingestion infrastructure.
-
-## 8. Open Implementation Decisions
-
-1. ✅ Exact default embedding model and vector dimension — default is `all-MiniLM-L6-v2` (384-dim), swappable via config.
-2. ✅ ClickHouse table schema — implemented; `events` table uses `tokenbf_v1` for full-text and is partitioned by `(case_id, source_id)`.
-3. ✅ Frontend tech stack — React 19 + Vite, served as a static build directly from Uvicorn (no Nginx sidecar).
-4. ✅ Authentication backend — session-cookie auth for local users, plus optional OIDC SSO;
-   implemented alongside case-RBAC, teams, an append-only audit trail, and an SSE
-   live-collaboration stream (see §6 for the OIDC/airgap interaction).
-
-## 9. Completed Steps
-
-- ✅ Tech stack approved and recorded.
-- ✅ Project skeleton (`uv`, FastAPI, Docker Compose reference) implemented.
-- ✅ Ingestion CLI prototype implemented and refactored to the Source/Timeline model.
-- ✅ Backend API complete for the current MVP scope.
-- ✅ Frontend built (React 19 + Vite + TypeScript) and wired to the full API surface.
-- ✅ Statistical anomaly engine (`value_novelty` + `frequency` detectors) added, replacing
-  the original embedding-distance-only anomaly panel described in §5.
-- ✅ Authentication, RBAC, teams, audit trail, and live collaboration implemented
-  (session-cookie auth + optional OIDC, case-RBAC dependency layer, append-only audit-log
-  middleware, SSE invalidation stream) and hardened against a full security review — see
-  `docs/archive/PR7_REVIEW_FINDINGS.md`.
-
-## 10. Next Steps
-
-1. ⬜ Implement strict offline-mode enforcement — `allow_online` flag exists
-   (`core/config.py`) but is not checked at any network call site yet (OIDC is a deliberate,
-   documented exception — see §6).
-2. ⬜ GPU acceleration (ROCm/CUDA) — still aspirational; no GPU-specific code exists.
+- Real-time streaming ingestion infrastructure (streaming *ingest* is a roadmap
+  milestone, but built on plain HTTP batch pushes — no Kafka-class infrastructure).
