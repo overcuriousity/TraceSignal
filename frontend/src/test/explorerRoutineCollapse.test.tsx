@@ -15,14 +15,22 @@
  * have their own tests, and this test's subject is the page's query wiring.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, waitFor } from "@testing-library/react";
+import { act, render, waitFor } from "@testing-library/react";
 import { MemoryRouter, Routes, Route } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/Tooltip";
-import type { Disposition, EventPage } from "@/api/types";
+import type { Disposition, Event, EventPage } from "@/api/types";
 
 const eventsListMock = vi.fn();
+const getByIdMock = vi.fn();
 const dispositionsListMock = vi.fn();
+
+// Latest props the (stubbed) grid and detail panel were rendered with — lets a
+// test drive onExpand/onJumpToTime and read back what the grid received.
+const captures = vi.hoisted(() => ({
+  grid: null as null | Record<string, unknown>,
+  detail: null as null | Record<string, unknown>,
+}));
 
 vi.mock("@/api/events", async () => {
   const actual = await vi.importActual<typeof import("@/api/events")>("@/api/events");
@@ -31,6 +39,7 @@ vi.mock("@/api/events", async () => {
     eventsApi: {
       ...actual.eventsApi,
       list: (...args: unknown[]) => eventsListMock(...args),
+      getById: (...args: unknown[]) => getByIdMock(...args),
       mergedTags: async () => [],
       artifacts: async () => [],
       fields: async () => ({ top_level: [], attributes: [] }),
@@ -91,8 +100,13 @@ vi.mock("@/hooks/useCaseStream", () => ({
 }));
 
 // Presentational children stubbed — the page's query wiring is the subject.
+// The grid/detail stubs capture their latest props so a test can drive
+// onExpand/onJumpToTime and read back what the grid was handed.
 vi.mock("@/components/explorer/EventGrid", () => ({
-  EventGrid: () => null,
+  EventGrid: (props: Record<string, unknown>) => {
+    captures.grid = props;
+    return null;
+  },
 }));
 vi.mock("@/components/explorer/TimelineHistogram", () => ({
   TimelineHistogram: () => null,
@@ -104,7 +118,10 @@ vi.mock("@/components/explorer/FilterChips", () => ({
   FilterChips: () => null,
 }));
 vi.mock("@/components/explorer/EventDetailPanel", () => ({
-  EventDetailPanel: () => null,
+  EventDetailPanel: (props: Record<string, unknown>) => {
+    captures.detail = props;
+    return null;
+  },
 }));
 vi.mock("@/components/analysis/InvestigatePanel", () => ({
   InvestigatePanel: () => null,
@@ -167,8 +184,23 @@ function renderPage() {
 
 beforeEach(() => {
   eventsListMock.mockReset().mockResolvedValue(PAGE);
+  getByIdMock.mockReset();
   dispositionsListMock.mockReset();
+  captures.grid = null;
+  captures.detail = null;
 });
+
+function event(id: string, ts: string): Event {
+  return {
+    event_id: id,
+    timestamp: ts,
+    source_id: "s1",
+    message: id,
+    artifact: null,
+    tags: [],
+    attributes: {},
+  } as unknown as Event;
+}
 
 describe("ExplorerPage routine-collapse wiring", () => {
   it("waits for the disposition set, then queries collapsed — never the uncollapsed superset first", async () => {
@@ -201,6 +233,70 @@ describe("ExplorerPage routine-collapse wiring", () => {
     await waitFor(() => expect(eventsListMock).toHaveBeenCalled());
     for (const call of eventsListMock.mock.calls) {
       expect((call[2] as Record<string, unknown>).collapseRoutine).toBeFalsy();
+    }
+  });
+
+  // #150: with collapse on, "locate this event" seeded the cache under a
+  // hardcoded `{}` key that no longer matched the collapse-aware live key, so
+  // the anchor page never reached the grid and nothing scrolled. The fix seeds
+  // the *current* key. Here the located event E0 is muted (the filtered probe
+  // returns it hidden), its "after" neighbour E2 comes only from the seek — so
+  // E2 appearing in the grid proves the seed landed on the key the grid reads.
+  it("locate under collapse seeds the grid (target reachable) and flags it hidden", async () => {
+    const E0 = event("E0", "2026-01-01T00:00:00Z");
+    const E2 = event("E2", "2026-01-01T00:00:02Z");
+    dispositionsListMock.mockResolvedValue({ dispositions: [routineDisposition("d1")] });
+    getByIdMock.mockResolvedValue(E0);
+    eventsListMock.mockImplementation(
+      (
+        _c: string,
+        _t: string,
+        filters: Record<string, unknown> | undefined,
+        _signal: unknown,
+        cursor: { before?: string; after?: string } | undefined,
+      ) => {
+        const f = filters ?? {};
+        if (cursor?.after) return Promise.resolve({ ...PAGE, events: [E2] });
+        if (cursor?.before) return Promise.resolve({ ...PAGE, events: [] });
+        // Filtered membership probe for the target → empty means "hidden".
+        if (Array.isArray(f.ids) && (f.ids as string[]).includes("E0")) {
+          return Promise.resolve({ ...PAGE, events: [] });
+        }
+        return Promise.resolve({ ...PAGE, events: [E0] });
+      },
+    );
+
+    renderPage();
+
+    // Initial collapsed page loaded, grid shows just E0.
+    await waitFor(() => {
+      expect(captures.grid).not.toBeNull();
+      expect((captures.grid!.events as Event[]).map((e) => e.event_id)).toEqual(["E0"]);
+    });
+
+    // Open the detail panel for E0, then trigger its "locate".
+    await act(async () => {
+      (captures.grid!.onExpand as (e: Event) => void)(E0);
+    });
+    await waitFor(() => expect(captures.detail).not.toBeNull());
+    await act(async () => {
+      await (captures.detail!.onJumpToTime as (ts: string, id: string) => Promise<void>)(
+        E0.timestamp!,
+        "E0",
+      );
+    });
+
+    // The seeked anchor page (E0 spliced from getById + E2 from the "after"
+    // neighbour) reached the grid, and E0 is flagged as normally hidden.
+    await waitFor(() => {
+      expect((captures.grid!.events as Event[]).map((e) => e.event_id)).toContain("E2");
+      expect(captures.grid!.locatedHiddenId).toBe("E0");
+    });
+
+    // Every events request in this flow carried collapse — no seek ever
+    // silently dropped it (the key-parity guarantee).
+    for (const call of eventsListMock.mock.calls) {
+      expect((call[2] as Record<string, unknown>).collapseRoutine).toBe(true);
     }
   });
 });

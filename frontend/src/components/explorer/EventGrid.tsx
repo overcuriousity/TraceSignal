@@ -70,6 +70,13 @@ interface Props {
   onVisibleTimestampChange?: (ts: string | null) => void;
   /** Soft visual highlight for a time window (e.g. a Frequency finding's anomalous window). */
   highlightRange?: { start: string; end: string } | null;
+  /**
+   * A "located" event that is only present because the user jumped to it — the
+   * current view (routine/mute collapse or an active filter) would otherwise
+   * hide it. Rendered visually distinct so the analyst sees it is normally
+   * hidden here. `null` when the located event is a normal, visible row.
+   */
+  locatedHiddenId?: string | null;
 }
 
 export interface EventGridHandle {
@@ -371,6 +378,7 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
   dispositions,
   onVisibleTimestampChange,
   highlightRange,
+  locatedHiddenId,
 }, ref) {
   const parentRef = useRef<HTMLDivElement>(null);
   const density = useUiStore((s) => s.density);
@@ -845,6 +853,11 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
             const event = row.original;
             const isExpanded = expandedId === event.event_id;
             const isSelected = selectedIds.has(event.event_id);
+            // Present only because the analyst located it — the current view
+            // (routine/mute collapse or an active filter) would otherwise hide
+            // this row. Rendered distinct so that's unmistakable.
+            const isLocatedHidden =
+              locatedHiddenId != null && event.event_id === locatedHiddenId;
             const eventAnns = annotations.get(event.event_id) ?? [];
             const hasAnomaly =
               eventAnns.some((a) => a.annotation_type === "anomaly") ||
@@ -885,8 +898,24 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
                         : "hover:bg-[var(--color-bg-hover)]",
                   hasAnomaly && !isSelected && !isExpanded &&
                     "border-l-2 border-l-[var(--color-anomaly)]/50",
+                  // "Normally hidden" located row: a dashed edge + faint tint
+                  // marks it as an exception to the current view. Kept subtle
+                  // so it doesn't compete with the expanded/selection styling.
+                  isLocatedHidden && !isExpanded && !isSelected &&
+                    "border-l-2 border-dashed border-l-[var(--color-fg-muted)] bg-[var(--color-fg-muted)]/10",
                 )}
               >
+                {isLocatedHidden && (
+                  <Tooltip
+                    content="Normally hidden by the current view (a mute/routine collapse or an active filter) — shown here because you located it"
+                    side="top"
+                  >
+                    <span className="absolute right-2 top-1/2 z-10 flex -translate-y-1/2 items-center gap-1 rounded-full border border-[var(--color-border)] bg-[var(--color-bg-surface)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--color-fg-muted)]">
+                      <EyeOff size={10} />
+                      Hidden
+                    </span>
+                  </Tooltip>
+                )}
                 {row.getVisibleCells().map((cell) => (
                   <div
                     key={cell.id}

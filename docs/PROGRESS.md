@@ -1,6 +1,37 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-21 (session 83 — agent chart proposals lost on parallel tool calls).
+Last updated: 2026-07-22 (session 84 — #150 locate-in-timeline regression from routine-collapse).
+
+## Session 84 — 2026-07-22: "locate this event in timeline" no longer scrolled (#150)
+
+Regression from the #147 routine-collapse work (`e8626c4`, `16e4c89`), which
+made collapse auto-on whenever any mute/routine disposition exists. The
+Explorer's live events query is keyed on `effectiveFilters`
+(`computeEffectiveFilters`, which folds the `collapseRoutine` overlay in), but
+both cache-seeding paths in `ExplorerPage.tsx` built that key *by hand* and had
+drifted: `handleJumpToTime` cleared filters and seeded/cancelled a hardcoded
+`["events", …, {}, …]` key, and the `setFilters` soft-anchor seek re-applied
+`anomalyRunId`/`semanticSearchIds` but omitted `collapseRoutine`. Once collapse
+was on, the live key was `{collapseRoutine:true}` — the seeded anchor page (with
+the target spliced in) landed in a cache entry the grid never read, so nothing
+scrolled. Same defect silently reset the soft-anchor "keep scroll position on
+filter change" to the top.
+
+Per the owner's call, locate now **keeps** the active filters instead of
+clearing them: it seeds the *current* `eventsQueryKey`, so the seed can't drift
+from the live query by construction, and the neighbour pages are fetched with
+the same `effectiveFilters` (surrounding rows stay filtered). The target is
+force-included via `getById` (raw, ignores the view); a filtered membership
+probe (`ids:[target]`) decides whether it's hidden, and if so `locatedHiddenId`
+flows to `EventGrid`, which renders that row visually distinct (dashed edge +
+faint tint + an "Hidden" `EyeOff` pill, tooltip explaining it's shown only
+because it was located). Analysis-panel jump-to-time shares the behaviour. The
+soft-anchor seek now composes its key through the same `computeEffectiveFilters`
+helper so it can never drop an overlay again. Detail-panel Locate tooltip copy
+updated. Tests: a locate-under-collapse regression in
+`explorerRoutineCollapse.test.tsx` (target reachable in the grid after the seek,
+`locatedHiddenId` set, every request carries collapse) — it would have caught
+#150.
 
 ## Session 83 — 2026-07-21: agent chart cards lost when the model batches tool calls
 

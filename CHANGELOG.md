@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **"Locate this event in the timeline" scrolls again — and now surfaces
+  events the current view hides (#150).** After routine-collapse became
+  auto-on-with-mutes (#147), locate stopped scrolling: it seeded the query
+  cache under a hardcoded `{}` key while the live events query is keyed on
+  `effectiveFilters` (which carries `collapseRoutine`), so the anchor page
+  landed in a cache entry the grid never read. Locate now keeps the active
+  filters and seeds the *current* key, so the seed can't drift from the live
+  query. If the target would otherwise be hidden by the current view (a
+  routine/mute collapse or an active filter) it is force-included at its
+  correct position and rendered visually distinct as "normally hidden". The
+  same seek path drove the "preserve scroll position when adding a filter"
+  soft-anchor, which silently reset the grid to the top under collapse for the
+  same reason — both now compose the seed key through the shared
+  `computeEffectiveFilters` helper. Analysis-panel jump-to-time shares the new
+  behaviour.
+
 ## [1.4.4] — 2026-07-21
 
 ### Fixed

@@ -122,6 +122,9 @@ export function ExplorerPage() {
       // scroll — otherwise it can fire against an unrelated later `events`
       // update (e.g. a subsequent range change or jump-to-time).
       pendingSoftAnchorRef.current = null;
+      // A filter change redefines what's visible, so a prior "located hidden"
+      // marker no longer means anything — drop it.
+      setLocatedHiddenId(null);
       // Any manual filter change clears an agent-applied event_id allowlist —
       // the overlay auto-clears like semanticSearchIds does, so a finding's
       // `ids` can never get stranded on the grid with no chip to remove it.
@@ -142,13 +145,18 @@ export function ExplorerPage() {
 
       if (shouldAnchor) {
         const seq = ++softAnchorSeqRef.current;
-        let nextEffective = f;
-        if (f.annotated?.includes("anomaly") && anomalyRunIdRef.current) {
-          nextEffective = { ...nextEffective, anomalyRunId: anomalyRunIdRef.current };
-        }
-        if (semanticSearchIdsRef.current !== null) {
-          nextEffective = { ...nextEffective, q: undefined, ids: semanticSearchIdsRef.current };
-        }
+        // Build the post-change effective filters through the *same* helper the
+        // live query uses (computeEffectiveFilters), so the seed key can never
+        // drift from it. Hand-rolling this list is what dropped `collapseRoutine`
+        // and broke the soft-anchor under collapse (#150 blast radius).
+        // `appliedIds` is null here: setAppliedIds(null) above clears it (a real
+        // finding-apply re-sets it in the same batch, after this seek is skipped).
+        const nextEffective = computeEffectiveFilters(f, {
+          anomalyRunId: anomalyRunIdRef.current,
+          appliedIds: null,
+          semanticSearchIds: semanticSearchIdsRef.current,
+          collapseRoutine: collapseRoutineRef.current,
+        });
         const targetKey = ["events", caseId, timelineId, nextEffective, sortDir];
         queryClient.cancelQueries({ queryKey: targetKey }).then(async () => {
           if (softAnchorSeqRef.current !== seq) return;
@@ -191,11 +199,13 @@ export function ExplorerPage() {
     [setSearchParams, filters, caseId, timelineId, queryClient, sortDir],
   );
 
-  // Latest anomalyRunId/semanticSearchIds for setFilters' soft-anchor seek
-  // above, which runs before those states are declared further down this
-  // component — refs sidestep the ordering (and closure-staleness) issue.
+  // Latest anomalyRunId/semanticSearchIds/collapseRoutine for setFilters'
+  // soft-anchor seek above, which runs before those states are declared
+  // further down this component — refs sidestep the ordering (and
+  // closure-staleness) issue.
   const anomalyRunIdRef = useRef<string | undefined>(undefined);
   const semanticSearchIdsRef = useRef<string[] | null>(null);
+  const collapseRoutineRef = useRef(false);
 
   const removeFilter = useCallback(
     (key: keyof EventFilters | string, fieldKey?: string, value?: string) => {
@@ -401,6 +411,12 @@ export function ExplorerPage() {
   // visual (a Frequency finding's anomalous window), never a URL filter.
   const [preJumpFilters, setPreJumpFilters] = useState<EventFilters | null>(null);
   const [rangeHighlight, setRangeHighlight] = useState<{ start: string; end: string } | null>(null);
+  // When a "locate"/jump target is only visible because we force-included it
+  // (it would otherwise be hidden by the current view — a routine/mute
+  // collapse or an active filter), its id lands here so the grid can render it
+  // visually distinct as "normally hidden". Cleared on any filter change and
+  // whenever a jump targets an event the current view already shows.
+  const [locatedHiddenId, setLocatedHiddenId] = useState<string | null>(null);
   const pendingJumpRef = useRef<{ ts: string; eventId?: string; seq: number } | null>(null);
   // Bumped on every jump; the pending-jump effect only trusts `events` once
   // `seededSeqRef` catches up, so a stray automatic fetch landing mid-jump
@@ -482,6 +498,12 @@ export function ExplorerPage() {
   // exists (Patterns → Mark routine, Templates → Mute).
   const hasRoutineDispositions = routineSig !== "";
   const collapseRoutine = resolveCollapseRoutine(routineSig, routineOverride);
+  // Mirror into a ref for setFilters' soft-anchor seek, which is declared
+  // above this and must include collapse in the seed key or it drifts from
+  // the live query key (the #150 class of bug).
+  useEffect(() => {
+    collapseRoutineRef.current = collapseRoutine;
+  }, [collapseRoutine]);
   // Stamping the choice with the current disposition set is what makes it
   // expire when the next mute lands — see lib/routineCollapse.ts.
   const setCollapseRoutine = useCallback(
@@ -768,61 +790,77 @@ export function ExplorerPage() {
 
   /**
    * Wired to the Analysis panel's "jump to time" buttons and the Event
-   * Detail panel's "locate in timeline" button. The finding's timestamp may
-   * not match the currently active filters at all, so this clears them
-   * outright (guaranteeing the target is visible) rather than trying to
-   * merge — the analyst can restore the prior view via the breadcrumb this
-   * leaves behind. Since the target likely isn't in the already-loaded
-   * window, this also seeds the query cache with a fresh page anchored at
-   * the target, so bidirectional scroll continues correctly from there.
+   * Detail panel's "locate in timeline" button. Navigates to the target
+   * *within the current view* — active filters and routine/mute collapse are
+   * deliberately kept, not cleared. Since the target likely isn't in the
+   * already-loaded window, this seeds the query cache with a fresh page
+   * anchored at the target so bidirectional scroll continues from there.
+   *
+   * Crucially the seed lands under the *current* `eventsQueryKey` (built from
+   * `effectiveFilters`), so it always matches the live query by construction —
+   * the previous "clear filters, seed a hand-rolled `{}` key" shape drifted
+   * from the collapse-aware live key and silently dropped the scroll (#150).
    *
    * A plain `before`-cursor seek would exclude the target event itself
-   * (cursors are strict boundaries — that's correct for normal pagination,
-   * where the caller already has the anchor row and wants the *next* batch).
-   * For a seek we need the target row present so it can be scrolled to,
-   * highlighted (via the detail panel's "expanded" row styling), and opened
-   * — so when `eventId` is known, fetch the surrounding pages on both sides
-   * and splice the target event itself (via `getById`) in between.
+   * (cursors are strict boundaries — correct for normal pagination). For a
+   * seek we need the target row present so it can be scrolled to and opened,
+   * so when `eventId` is known we fetch the surrounding pages on both sides
+   * (with the current filters, so neighbours stay filtered) and splice the
+   * target itself (via `getById`, which fetches it raw regardless of the
+   * view) in between. If the current view would hide the target — a
+   * routine/mute collapse or an active filter excludes it — it's still shown,
+   * flagged via `locatedHiddenId` so the grid renders it as "normally hidden".
    */
   const handleJumpToTime = useCallback(
     async (ts: string, eventId?: string, windowEnd?: string) => {
       if (!caseId || !timelineId) return;
-      setPreJumpFilters((prev) => prev ?? filters);
       setRangeHighlight(windowEnd ? { start: ts, end: windowEnd } : null);
       const seq = ++jumpSeqRef.current;
       pendingJumpRef.current = { ts, eventId, seq };
-      setFilters({});
 
-      // `filters` is about to become `{}` (above), so the live query key is
-      // about to become this — not the current-render `eventsQueryKey`
-      // closure, which still reflects the pre-jump filters. Cancel whatever
-      // the automatic refetch triggered by that key change is doing before
-      // seeding the cache, or it can resolve after `setQueryData` below and
-      // silently overwrite the anchor page with the un-jumped top-of-list page.
-      const targetKey = ["events", caseId, timelineId, {}, sortDir];
+      // Seed the *current* key (filters kept). Cancel any in-flight pagination
+      // fetch on it first, or it can resolve after the setQueryData below and
+      // clobber the anchor page.
+      const targetKey = ["events", caseId, timelineId, effectiveFilters, sortDir];
       await queryClient.cancelQueries({ queryKey: targetKey });
 
       let anchorPage: EventPage;
+      let hidden = false;
       if (eventId) {
         const halfBefore = Math.floor(PAGE_SIZE / 2);
         const halfAfter = PAGE_SIZE - halfBefore - 1;
-        const [targetEvent, beforePage, afterPage] = await Promise.all([
+        // Does the target pass the current view? An id-allowlist that doesn't
+        // contain it is itself a hiding filter (short-circuit, no probe);
+        // otherwise a filtered membership probe (ids:[target] intersects with
+        // collapse + field filters) tells us whether to flag it hidden.
+        const inAllowlist =
+          !effectiveFilters.ids || effectiveFilters.ids.includes(eventId);
+        const [targetEvent, beforePage, afterPage, probePage] = await Promise.all([
           eventsApi.getById(caseId, timelineId, eventId),
           eventsApi.list(
             caseId,
             timelineId,
-            { limit: halfBefore, order: sortDir },
+            { ...effectiveFilters, limit: halfBefore, order: sortDir },
             undefined,
             { before: `${ts},${eventId}` },
           ),
           eventsApi.list(
             caseId,
             timelineId,
-            { limit: halfAfter, order: sortDir },
+            { ...effectiveFilters, limit: halfAfter, order: sortDir },
             undefined,
             { after: `${ts},${eventId}` },
           ),
+          inAllowlist
+            ? eventsApi.list(caseId, timelineId, {
+                ...effectiveFilters,
+                ids: [eventId],
+                limit: 1,
+                order: sortDir,
+              })
+            : Promise.resolve(null),
         ]);
+        hidden = inAllowlist ? (probePage?.events.length ?? 0) === 0 : true;
         const combinedEvents = [
           ...beforePage.events,
           ...(targetEvent ? [targetEvent] : []),
@@ -844,7 +882,7 @@ export function ExplorerPage() {
         anchorPage = await eventsApi.list(
           caseId,
           timelineId,
-          { limit: PAGE_SIZE, order: sortDir },
+          { ...effectiveFilters, limit: PAGE_SIZE, order: sortDir },
           undefined,
           { before: `${ts},` },
         );
@@ -852,6 +890,8 @@ export function ExplorerPage() {
 
       // A newer jump started while this one was in flight — let it win.
       if (jumpSeqRef.current !== seq) return;
+
+      setLocatedHiddenId(hidden ? (eventId ?? null) : null);
 
       // The no-eventId branch fetches in `before` mode, and before-mode
       // pagination only ever computes `has_more_before` on the backend —
@@ -868,7 +908,7 @@ export function ExplorerPage() {
       });
       seededSeqRef.current = seq;
     },
-    [caseId, timelineId, filters, setFilters, sortDir, queryClient],
+    [caseId, timelineId, sortDir, queryClient, effectiveFilters],
   );
 
   /**
@@ -1245,6 +1285,7 @@ export function ExplorerPage() {
                   dispositions={dispositionMap}
                   onVisibleTimestampChange={setCurrentPositionTs}
                   highlightRange={rangeHighlight}
+                  locatedHiddenId={locatedHiddenId}
                 />
 
                 {/* Detail panel */}

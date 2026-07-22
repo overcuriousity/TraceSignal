@@ -441,7 +441,7 @@ export function EventDetailPanel({
           </Tooltip>
         )}
         {onJumpToTime && event.timestamp && (
-          <Tooltip content="Locate this event in the timeline — clears active filters">
+          <Tooltip content="Locate this event in the timeline — keeps active filters; if it's normally hidden it's shown here, marked distinct">
             <Button
               variant="ghost"
               size="icon"
