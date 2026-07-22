@@ -1,9 +1,30 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-22 (session 86 — PR #152 review fixes).
+Last updated: 2026-07-22 (session 87 — docs cleanup + 2timesketch re-vendor).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 87 — 2026-07-22: docs cleanup + 2timesketch re-vendor
+
+Docs pass (PR #153): PROGRESS sessions 1–70 archived; stale point-in-time sections
+stripped from `CONCEPT.md`/`TECH_STACK.md`/`MODEL_REFINEMENT.md` (incl. correcting the
+false "allow_online not enforced" claim); new `docs/DEPLOYMENT.md` absorbs
+`DEPLOYMENT_NGINX.md` plus the README's airgapped/compose/upgrade sections; `ROADMAP.md`
+re-verified against the codebase and given an explicit priority order; `README.md`
+rewritten lean (detector count 9 → 12, GeoIP enricher mentioned, Parquet-native vs.
+stdlib converter variants distinguished); `AGENT.md` rewritten 968 → 528 lines with the
+tool catalog as a 28-row table from `TOOL_REGISTRY` (prose said 27).
+
+Re-vendored the 2timesketch converter suite at upstream `920767a` (was `53a1fb1`),
+picking up the `--split N|SIZE` multi-file output flag across all converters and the new
+generic Zeek NSM converter (`zeek2timesketch`, header-described TSV parsing — any log
+type incl. rotated/gzip, 4-tuple promoted to the shared `src_ip`/`dst_ip`/`src_port`/
+`dst_port` columns). Added the `zeek` entry to `scripts/vendor_converters.py`'s
+`CONVERTERS` dict; the script already inlined the new shared `terminal.py` module.
+Verified: all 13 vendored scripts `py_compile`, `tests/test_converters_api.py` green
+(25 passed), and a functional zeek run over a sample `conn.log` produced the expected
+Timesketch CSV.
 
 ## Session 86 — 2026-07-22: sliding-window review fixes (PR #152)
 
