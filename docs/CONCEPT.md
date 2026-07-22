@@ -1,5 +1,10 @@
 # Vestigo — Application Concept
 
+The concept below is implemented. The open backlog lives in
+[`docs/ROADMAP.md`](./ROADMAP.md); the chronological change log is
+[`docs/PROGRESS.md`](./PROGRESS.md); stack decisions are recorded in
+[`docs/TECH_STACK.md`](./TECH_STACK.md).
+
 ## 1. Vision (one-liner)
 A local-first, forensic-grade log investigation platform for small security teams: ingest Timesketch-compatible timelines at scale, explore them through an ELK-like web interface, and detect anomalies with statistical detectors running directly over ClickHouse plus embedding-based semantic search — with an optional AI investigation agent as analysis companion.
 
@@ -42,7 +47,7 @@ The current vocabulary is defined and implemented in
 
 ## 6. Core Feature Set (shipped)
 
-### 6.1 Ingestion (CLI-first, like ScalarForensic)
+### 6.1 Ingestion
 - Ingest directories or single files in Timesketch-compatible formats:
   - Plaso CSV / JSONL
   - Generic CSV with configurable column mapping
@@ -83,7 +88,7 @@ The current vocabulary is defined and implemented in
 - Backing services (PostgreSQL, ClickHouse, Qdrant) are external; the operator provides them via Docker, native packages, managed services, etc.
 - Optional reference `docker-compose.yml` for one-command setup.
 - Airgapped mode by default: no outbound network calls for model downloads or telemetry.
-- Optional `--allow-online` flag for first-time model download, mirroring ScalarForensic.
+- Optional `VESTIGO_ALLOW_ONLINE` setting for first-time model download.
 - Simple multi-user auth (basic or OIDC) for team access.
 - Optional GPU acceleration: AMD ROCm 6.4 primary, NVIDIA CUDA 12.8 secondary; CPU is the default.
 
@@ -101,29 +106,6 @@ Formerly listed here but since promoted to roadmap milestones: streaming ingest
 `docs/ROADMAP.md`.
 
 ## 8. Differentiation
-- **Scale + simplicity**: Designed from the start for 80 GiB+ timelines while staying container-first and easy to operate.
+- **Scale + simplicity**: Designed from the start for 80 GiB+ timelines while staying a single native app that's easy to operate.
 - **Embedding-native investigation**: Vectors are not an afterthought; they power anomaly detection and semantic search inside the same UI used for filtering.
 - **Forensic rigor by default**: Immutable sources, provenance metadata, model-config stability checks, offline-first operation.
-
-## 9. Success Criteria (initial release — met)
-- Install with `uv sync` on Python >=3.13 in < 15 minutes (assuming backing services are available).
-- Ingest an 80 GiB timeline file on commodity hardware without OOM.
-- Open a case, run a full-text filter, and add an annotation in < 30 seconds.
-- Compute embeddings and surface the top-N anomalous events without leaving the app.
-- Run fully offline after initial model download.
-
-## 10. Tech-Stack Selection (resolved)
-
-Decisions are recorded in [`docs/TECH_STACK.md`](./TECH_STACK.md):
-
-1. ✅ Primary event store: **ClickHouse**.
-2. ✅ Backend language/framework: **Python 3.13 + FastAPI/Uvicorn**.
-3. ✅ Frontend stack: **React 19 + Vite 8 + TypeScript** (Zustand + TanStack Query/Table/Virtual).
-4. ✅ Embedding model: general sentence-transformer baseline (`all-MiniLM-L6-v2`), with a swappable registry and an OpenAI-compatible remote endpoint option.
-5. ✅ Deployment target: single-node Docker Compose reference deployment; application runs via `uv`.
-
-## 11. Where development happens now
-
-The concept above is implemented. Current direction and the open backlog live in
-[`docs/ROADMAP.md`](./ROADMAP.md) (active phase only); completed phases are archived under
-`docs/archive/`. The chronological change log is [`docs/PROGRESS.md`](./PROGRESS.md).
