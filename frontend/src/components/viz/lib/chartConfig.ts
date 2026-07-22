@@ -58,13 +58,6 @@ export interface ChartOptions {
   showPoints?: boolean;
 }
 
-/** Small multiples: one panel per top value of a categorical field. */
-export interface FacetSpec {
-  field: string;
-  /** Panels to draw (top values by event count). Clamped to 2–12. */
-  limit: number;
-}
-
 export interface ChartConfig {
   v: 1;
   /** Field token, or null for pure event-count charts ("time"/"punchcard"). */
@@ -80,9 +73,6 @@ export interface ChartConfig {
   chartType: ChartType;
   metric: Metric;
   compare: CompareSpec;
-  /** Facet grid, or null. Mutually exclusive with a comparison layer: one
-   * splits the data into panels, the other overlays two layers in one. */
-  facet: FacetSpec | null;
   options: ChartOptions;
 }
 
@@ -98,7 +88,6 @@ export const DEFAULT_CHART_CONFIG: ChartConfig = {
   chartType: "time",
   metric: "count",
   compare: { mode: "off" },
-  facet: null,
   options: {},
 };
 
@@ -146,10 +135,6 @@ export function chartConfigToParams(
       params.set("c_compare_filters", JSON.stringify(filtersToViewPayload(config.compare.filters)));
     }
   }
-  if (config.facet) {
-    params.set("c_facet", config.facet.field);
-    params.set("c_facet_n", String(config.facet.limit));
-  }
   if (Object.keys(config.options).length > 0) {
     params.set("c_opts", JSON.stringify(config.options));
   }
@@ -195,15 +180,8 @@ export function paramsToChartConfig(params: URLSearchParams): ChartConfig {
     }
   }
 
-  const facetField = params.get("c_facet");
-  if (facetField) {
-    const limit = Number(params.get("c_facet_n"));
-    config.facet = {
-      field: facetField,
-      limit: Number.isFinite(limit) ? Math.min(12, Math.max(2, limit)) : 6,
-    };
-  }
-
+  // `c_facet`/`c_facet_n` (the retired facet grid) are deliberately not read:
+  // an old URL still parses, and renders the unfacetted chart.
   const rawOpts = params.get("c_opts");
   if (rawOpts) {
     try {
@@ -254,14 +232,8 @@ export function parseStoredChartConfig(stored: unknown): ChartConfig | null {
       filters: viewPayloadToFilters(compare.filters as Record<string, unknown>),
     };
   }
-  const facet = raw.facet as Record<string, unknown> | undefined;
-  if (facet && typeof facet.field === "string" && facet.field) {
-    const limit = Number(facet.limit);
-    config.facet = {
-      field: facet.field,
-      limit: Number.isFinite(limit) ? Math.min(12, Math.max(2, limit)) : 6,
-    };
-  }
+  // A `facet` key from a chart saved before the facet grid was retired is
+  // ignored, not rejected — the chart still loads, minus its panels.
   if (raw.options && typeof raw.options === "object") {
     config.options = raw.options as ChartOptions;
   }

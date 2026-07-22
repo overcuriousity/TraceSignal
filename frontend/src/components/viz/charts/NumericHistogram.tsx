@@ -30,8 +30,6 @@ interface NumericHistogramProps {
   showDensity?: boolean;
   /** Dashed mean + solid median marker lines (single-layer mode only). */
   showMarkers?: boolean;
-  /** Pin the count axis to a shared maximum — see `BarChart.countMax`. */
-  countMax?: number;
 }
 
 /** Fixed-width value histogram for a numeric (interval/ratio) field —
@@ -45,7 +43,6 @@ export function NumericHistogram({
   logScale = false,
   showDensity = false,
   showMarkers = false,
-  countMax,
 }: NumericHistogramProps) {
   const [hover, setHover] = useState<{
     x: number;
@@ -73,7 +70,6 @@ export function NumericHistogram({
 
   const maxCount = Math.max(
     1,
-    countMax ?? 0,
     ...bins.map((b) => b.count),
     ...bins.map((b) => b.comparison ?? 0),
   );

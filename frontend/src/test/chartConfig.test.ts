@@ -14,7 +14,6 @@ const fullConfig: ChartConfig = {
   field: "attr:src_ip",
   fieldY: null,
   fields: null,
-  facet: null,
   scale: "nominal",
   chartType: "time",
   metric: "ratio",
@@ -161,23 +160,32 @@ describe("stored (saved chart) round-trip", () => {
   });
 });
 
-describe("facet and multi-field serialization", () => {
-  it("round-trips a facet spec through the URL", () => {
-    const config: ChartConfig = {
-      ...DEFAULT_CHART_CONFIG,
+describe("multi-field serialization", () => {
+  // The facet grid was retired; a bookmark or saved chart from before that
+  // must still open — as the unfacetted chart, not as an error.
+  it("ignores the retired facet params instead of failing to parse the URL", () => {
+    const params = new URLSearchParams({
+      c_type: "bar",
+      c_field: "attr:status",
+      c_facet: "attr:user",
+      c_facet_n: "99",
+    });
+    const parsed = paramsToChartConfig(params);
+    expect(parsed.chartType).toBe("bar");
+    expect(parsed.field).toBe("attr:status");
+    expect("facet" in parsed).toBe(false);
+  });
+
+  it("ignores a retired facet key on a stored chart config", () => {
+    const parsed = parseStoredChartConfig({
+      v: 1,
       chartType: "histogram",
       field: "attr:bytes",
       scale: "ratio",
-      facet: { field: "attr:status", limit: 4 },
-    };
-    const params = chartConfigToParams(config);
-    expect(params.get("c_facet")).toBe("attr:status");
-    expect(paramsToChartConfig(params).facet).toEqual({ field: "attr:status", limit: 4 });
-  });
-
-  it("clamps a facet panel count arriving from a hand-edited URL", () => {
-    const params = new URLSearchParams({ c_type: "bar", c_facet: "attr:user", c_facet_n: "99" });
-    expect(paramsToChartConfig(params).facet).toEqual({ field: "attr:user", limit: 12 });
+      facet: { field: "attr:user", limit: 6 },
+    });
+    expect(parsed?.chartType).toBe("histogram");
+    expect(parsed && "facet" in parsed).toBe(false);
   });
 
   it("round-trips a correlation field list, commas and all", () => {

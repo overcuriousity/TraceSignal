@@ -107,4 +107,22 @@ describe("jitterOffset", () => {
       expect(Math.abs(jitterOffset(i))).toBeLessThanOrEqual(1);
     }
   });
+
+  // A strip feeds this consecutive indices, so neighbours must scatter rather
+  // than drift together — the failure mode of the smooth sin-based hash this
+  // replaced, which banded visibly instead of jittering.
+  it("decorrelates neighbouring indices", () => {
+    const xs: number[] = [];
+    for (let i = 0; i < 200; i++) xs.push(jitterOffset(i));
+    const mean = xs.reduce((a, b) => a + b, 0) / xs.length;
+    // Lag-1 autocorrelation of an independent sequence sits near zero.
+    let cov = 0;
+    let varr = 0;
+    for (let i = 0; i < xs.length - 1; i++) cov += (xs[i] - mean) * (xs[i + 1] - mean);
+    for (const x of xs) varr += (x - mean) ** 2;
+    expect(Math.abs(cov / varr)).toBeLessThan(0.2);
+    // ...and spread over the full range rather than clustering in one band.
+    const octants = new Set(xs.map((x) => Math.floor(((x + 1) / 2) * 8)));
+    expect(octants.size).toBe(8);
+  });
 });

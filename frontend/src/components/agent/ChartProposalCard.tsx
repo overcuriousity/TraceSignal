@@ -17,7 +17,7 @@
  */
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { useQueries, useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { BarChart3, ExternalLink, Save } from "lucide-react";
 import { vizApi, savedChartsApi, type CompareMode } from "@/api/viz";
 import { eventsApi } from "@/api/events";
@@ -45,18 +45,14 @@ import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
 import { ScatterChart } from "@/components/viz/charts/ScatterChart";
 import { CorrMatrix } from "@/components/viz/charts/CorrMatrix";
 import { ScatterStatsPanel } from "@/components/viz/ScatterStatsPanel";
-import { FacetGrid } from "@/components/viz/FacetGrid";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Spinner } from "@/components/ui/Spinner";
 import { Markdown } from "./Markdown";
 import { specToChartConfig, specToEventFilters, type AgentChartSpec } from "@/api/agent";
 import { filtersToParams } from "@/lib/queryParams";
-import { applyFieldEntries } from "@/lib/fieldFilters";
 import type {
   CompareNumericResponse,
-  FieldNumericResponse,
-  FieldTermsResponse,
   CompareTermsResponse,
   CompareTimeResponse,
 } from "@/api/types";
@@ -98,47 +94,6 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
         : dataKind === "pivot" || dataKind === "scatter"
           ? !!(config.field && config.fieldY)
           : !!config.field;
-
-  // A facetted proposal is orchestrated exactly as on the Visualize page:
-  // one terms query names the panels, then each panel re-runs the mark's own
-  // endpoint with an added equality filter. Without this the card would draw
-  // the unfacetted chart under a title promising panels — the silent-wrong-
-  // chart failure this whole contract exists to prevent.
-  const facet = CHART_META[config.chartType].supportsFacet ? config.facet : null;
-  const facetValuesQuery = useQuery({
-    queryKey: ["agent-facet-values", caseId, timelineId, facet?.field, filters, facet?.limit],
-    queryFn: () => vizApi.fieldTerms(caseId, timelineId, facet!.field, filters, facet!.limit),
-    enabled: !!facet && specComplete,
-  });
-  const facetValues = facetValuesQuery.data?.values ?? [];
-  const facetPanelQueries = useQueries({
-    queries: facetValues.map((v) => {
-      const panelFilters = applyFieldEntries(filters, [[facet!.field, v.value]], true);
-      return {
-        queryKey: ["agent-facet-panel", caseId, timelineId, config, panelFilters],
-        queryFn: async () => {
-          switch (dataKind) {
-            case "terms":
-              return vizApi.fieldTerms(caseId, timelineId, config.field!, panelFilters, opts.topN);
-            case "numeric":
-              return vizApi.fieldNumeric(
-                caseId,
-                timelineId,
-                config.field!,
-                panelFilters,
-                opts.bins,
-                opts.showPoints,
-              );
-            default:
-              return histogramToCompare(
-                await eventsApi.histogram(caseId, timelineId, panelFilters, opts.buckets),
-              );
-          }
-        },
-        enabled: !!facet,
-      };
-    }),
-  });
 
   const chartQuery = useQuery({
     queryKey: ["agent-chart", caseId, timelineId, config, filters],
@@ -270,7 +225,7 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
           };
       }
     },
-    enabled: specComplete && !facet,
+    enabled: specComplete,
   });
 
   const qc = useQueryClient();
@@ -309,72 +264,6 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
           <p className="py-2 text-[var(--color-fg-muted)]">
             This chart proposal is missing a field, so there is nothing to plot.
           </p>
-        )}
-        {facet && (
-          <FacetGrid
-            field={facet.field}
-            omittedValues={Math.max(
-              0,
-              (facetValuesQuery.data?.distinct ?? 0) - facetValues.length,
-            )}
-            omittedCount={facetValuesQuery.data?.other_count}
-            panels={facetValues.map((v, i) => {
-              const panel = facetPanelQueries[i];
-              const data = panel?.data;
-              return {
-                value: v.value,
-                count: v.count,
-                isLoading: !!panel?.isLoading,
-                chart:
-                  data == null ? null : dataKind === "terms" ? (
-                    config.chartType === "pie" ? (
-                      <PieChart terms={data as FieldTermsResponse} height={160} />
-                    ) : config.chartType === "waffle" ? (
-                      <WaffleChart terms={data as FieldTermsResponse} height={160} />
-                    ) : (
-                      <BarChart
-                        terms={data as FieldTermsResponse}
-                        height={160}
-                        orientation={opts.orientation}
-                        sort={opts.sort}
-                        logScale={opts.logScale}
-                      />
-                    )
-                  ) : dataKind === "numeric" ? (
-                    config.chartType === "box" ? (
-                      <BoxPlot
-                        stats={data as FieldNumericResponse}
-                        height={160}
-                        showPoints={opts.showPoints}
-                      />
-                    ) : config.chartType === "violin" ? (
-                      <ViolinPlot
-                        stats={data as FieldNumericResponse}
-                        height={160}
-                        showPoints={opts.showPoints}
-                      />
-                    ) : config.chartType === "ecdf" ? (
-                      <EcdfChart stats={data as FieldNumericResponse} height={160} />
-                    ) : (
-                      <NumericHistogram
-                        stats={data as FieldNumericResponse}
-                        height={160}
-                        logScale={opts.logScale}
-                        showDensity={opts.showDensity}
-                        showMarkers
-                      />
-                    )
-                  ) : (
-                    <CompareHistogram
-                      data={data as CompareTimeResponse}
-                      height={160}
-                      metric={config.metric}
-                      hasComparison={false}
-                    />
-                  ),
-              };
-            })}
-          />
         )}
         {chartQuery.isLoading && (
           <div className="flex items-center justify-center py-6">

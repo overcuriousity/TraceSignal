@@ -116,8 +116,6 @@ def render_chart_meta() -> str:
         "    acceptsSecondField: boolean;\n"
         "    /** Charts a LIST of fields (correlation matrix) instead of field/fieldY. */\n"
         "    multiField: boolean;\n"
-        "    /** Can be drawn once per value of a categorical field (small multiples). */\n"
-        "    supportsFacet: boolean;\n"
         "  }\n"
         "> = {\n",
     ]
@@ -136,7 +134,6 @@ def render_chart_meta() -> str:
             f"    requiresSecondField: {str(meta.requires_second_field).lower()},\n"
             f"    acceptsSecondField: {str(meta.accepts_second_field).lower()},\n"
             f"    multiField: {str(meta.multi_field).lower()},\n"
-            f"    supportsFacet: {str(meta.supports_facet).lower()},\n"
             f"  }},\n"
         )
     out.append("};\n\n")

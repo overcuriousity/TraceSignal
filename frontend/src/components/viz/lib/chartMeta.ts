@@ -28,8 +28,6 @@ export const CHART_META: Record<
     acceptsSecondField: boolean;
     /** Charts a LIST of fields (correlation matrix) instead of field/fieldY. */
     multiField: boolean;
-    /** Can be drawn once per value of a categorical field (small multiples). */
-    supportsFacet: boolean;
   }
 > = {
   // Event count over time needs no field, so it is meaningful whatever scale the
@@ -44,7 +42,6 @@ export const CHART_META: Record<
     requiresSecondField: false,
     acceptsSecondField: false,
     multiField: false,
-    supportsFacet: true,
   },
   bar: {
     label: "Bar",
@@ -56,7 +53,6 @@ export const CHART_META: Record<
     requiresSecondField: false,
     acceptsSecondField: false,
     multiField: false,
-    supportsFacet: true,
   },
   // pie/box/violin/ecdf have no honest two-layer encoding, so they are left without
   // supportsCompare — the rail hides Compare for them.
@@ -70,7 +66,6 @@ export const CHART_META: Record<
     requiresSecondField: false,
     acceptsSecondField: false,
     multiField: false,
-    supportsFacet: true,
   },
   // Same terms aggregation as bar/pie — switching between them refetches nothing. Preferred
   // over pie once there are five or more categories: counting cells beats judging angles.
@@ -84,7 +79,6 @@ export const CHART_META: Record<
     requiresSecondField: false,
     acceptsSecondField: false,
     multiField: false,
-    supportsFacet: true,
   },
   heatmap: {
     label: "Heatmap (value × time)",
@@ -96,7 +90,6 @@ export const CHART_META: Record<
     requiresSecondField: false,
     acceptsSecondField: false,
     multiField: false,
-    supportsFacet: false,
   },
   // show_points marks the actual measured buckets. Graphical integrity (Tufte): a line between
   // two points asserts values that were never measured — markers show where the data really is.
@@ -110,7 +103,6 @@ export const CHART_META: Record<
     requiresSecondField: false,
     acceptsSecondField: false,
     multiField: false,
-    supportsFacet: false,
   },
   histogram: {
     label: "Histogram",
@@ -122,7 +114,6 @@ export const CHART_META: Record<
     requiresSecondField: false,
     acceptsSecondField: false,
     multiField: false,
-    supportsFacet: true,
   },
   // box/violin accept an OPTIONAL second field (accepts_second_field): a categorical grouping
   // variable, giving one box/violin per top group.
@@ -136,7 +127,6 @@ export const CHART_META: Record<
     requiresSecondField: false,
     acceptsSecondField: true,
     multiField: false,
-    supportsFacet: true,
   },
   violin: {
     label: "Violin plot",
@@ -148,7 +138,6 @@ export const CHART_META: Record<
     requiresSecondField: false,
     acceptsSecondField: true,
     multiField: false,
-    supportsFacet: true,
   },
   ecdf: {
     label: "ECDF",
@@ -160,7 +149,6 @@ export const CHART_META: Record<
     requiresSecondField: false,
     acceptsSecondField: false,
     multiField: false,
-    supportsFacet: true,
   },
   // Field-free like `time` — meaningful whatever the picked field's scale is.
   punchcard: {
@@ -173,7 +161,6 @@ export const CHART_META: Record<
     requiresSecondField: false,
     acceptsSecondField: false,
     multiField: false,
-    supportsFacet: false,
   },
   // pivot and sankey are two marks over the SAME field×field aggregation — switching between
   // them refetches nothing.
@@ -187,7 +174,6 @@ export const CHART_META: Record<
     requiresSecondField: true,
     acceptsSecondField: false,
     multiField: false,
-    supportsFacet: false,
   },
   sankey: {
     label: "Flow / Sankey (field × field)",
@@ -199,7 +185,6 @@ export const CHART_META: Record<
     requiresSecondField: true,
     acceptsSecondField: false,
     multiField: false,
-    supportsFacet: false,
   },
   scatter: {
     label: "Scatter (numeric × numeric)",
@@ -211,7 +196,6 @@ export const CHART_META: Record<
     requiresSecondField: true,
     acceptsSecondField: false,
     multiField: false,
-    supportsFacet: false,
   },
   // Takes `fields` (2-8 numeric tokens) instead of field/field_y — the one mark that charts
   // more than two fields at once. Preferred over reading scatter plots one pair at a time past
@@ -226,7 +210,6 @@ export const CHART_META: Record<
     requiresSecondField: false,
     acceptsSecondField: false,
     multiField: true,
-    supportsFacet: false,
   },
 };
 

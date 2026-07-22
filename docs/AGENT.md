@@ -187,8 +187,7 @@ frontend renders an "Apply to Explorer" card (`run_id` maps onto
 
 `propose_chart(title, description, spec)` mirrors the Visualize page's
 `ChartConfig` field for field (`chart_type`, `scale`, `field`, `field_y`,
-`fields`, `metric`, `filters`, `compare{mode, filters}`, `facet{field, limit}`,
-`options{…}`) — anything an analyst can build by hand the agent can propose.
+`fields`, `metric`, `filters`, `compare{mode, filters}`, `options{…}`) — anything an analyst can build by hand the agent can propose.
 It replaced a flattened `kind` enum that could address only 7 chart types and
 silently rendered a requested pie as a bar.
 
@@ -197,10 +196,7 @@ takes: `field_y` is **required** by pivot/sankey/scatter (`requires_second
 _field`) and **optional** on box/violin (`accepts_second_field`), where it is
 a categorical grouping variable producing one distribution per group;
 `fields` is a 2–8 token list used only by the correlation matrix
-(`multi_field`); `facet` draws the same mark once per top value of a
-categorical field (`supports_facet`) and is mutually exclusive with
-`compare` — one splits the data across panels, the other overlays two layers
-in one panel.
+(`multi_field`).
 
 - **Legality is enforced from one table.** `agent/chart_meta.py` is the
   source of truth (which scales each mark admits, comparison support, second

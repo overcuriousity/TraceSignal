@@ -93,7 +93,6 @@ VIZ_GROUPS_MAX = 8
 #: category error rather than a comparison.
 VIZ_GROUP_CARDINALITY_CAUTION = 50
 VIZ_CORR_MAX_FIELDS = 8
-VIZ_FACET_MAX = 12
 VIZ_POINTS_OVERLAY_MAX = 1000
 
 
@@ -288,23 +287,6 @@ class ChartCompareSpec(BaseModel):
     )
 
 
-class ChartFacetSpec(BaseModel):
-    """Small multiples: draw the chart once per value of a categorical field.
-
-    Tufte's small-multiple layout — the same mark repeated across subsets, so
-    differences between subsets are read as position rather than remembered
-    across chart switches. The facet values are the field's top *limit*
-    values by event count; the rest are reported as omitted, never merged.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    field: str = Field(description="Categorical field token to facet by.")
-    limit: int = Field(
-        default=6, ge=2, description="How many top values to draw panels for (max 12)."
-    )
-
-
 class ChartOptionsSpec(BaseModel):
     """Presentation and sizing knobs, mirroring the Visualize page's controls.
 
@@ -446,14 +428,6 @@ class ChartSpec(BaseModel):
     filters: FilterSpec | None = Field(default=None, description="Primary layer filters.")
     compare: ChartCompareSpec = Field(
         default_factory=ChartCompareSpec, description="Optional comparison layer."
-    )
-    facet: ChartFacetSpec | None = Field(
-        default=None,
-        description=(
-            "Draw one panel per value of a categorical field (small multiples). "
-            "Not combinable with `compare`, and only on the single-layer marks "
-            "(time, bar, pie, waffle, histogram, box, violin, ecdf)."
-        ),
     )
     options: ChartOptionsSpec = Field(
         default_factory=ChartOptionsSpec, description="Presentation and sizing options."
@@ -1676,22 +1650,6 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 f"Charts that do: {', '.join(multi)}."
             )
 
-        if spec.facet is not None:
-            if not meta.supports_facet:
-                faceted = [c for c in CHART_META if CHART_META[c].supports_facet]
-                raise ValueError(
-                    f'chart_type="{chart_type}" cannot be facetted. Facettable '
-                    f"chart types: {', '.join(faceted)}."
-                )
-            if spec.compare.mode != "off":
-                raise ValueError(
-                    "facet and compare cannot both be set — one splits the data into "
-                    "panels, the other overlays two layers in one panel. Pick one."
-                )
-            # A virtual `time:` token is a perfectly good facet (one panel
-            # per weekday), so unlike the detectors this does not reject them.
-            await _check_chart_field(spec.facet.field, "facet.field")
-
         compare_on = spec.compare.mode != "off"
         if compare_on and not meta.supports_compare:
             raise ValueError(
@@ -2020,31 +1978,6 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                     "recommendation_basis": stats_block["recommendation_basis"],
                 }
 
-        # Facet panels: enumerate the values the grid will draw. Only the
-        # value list is fetched here, not one aggregation per panel — the
-        # analyst's card re-queries every panel itself, and running K heavy
-        # scans to validate a proposal would spend the scan budget K times
-        # over for a number the model never reads. The single aggregation
-        # above already proves the mark works against these filters.
-        if spec.facet is not None:
-            facet_limit = _capped(spec.facet.limit, 6, VIZ_FACET_MAX, "facet.limit", floor=2)
-            facet_terms = await run_in_threadpool(
-                service.field_terms, primary_query, spec.facet.field, facet_limit
-            )
-            shown = [v["value"] for v in facet_terms["values"]]
-            summary["facet"] = {
-                "field": spec.facet.field,
-                "panels": shown,
-                "distinct": facet_terms["distinct"],
-                "omitted_values": max(0, facet_terms["distinct"] - len(shown)),
-                "omitted_count": facet_terms["other_count"],
-            }
-            if not shown:
-                raise ValueError(
-                    f'facet field "{spec.facet.field}" has no values under these '
-                    "filters, so the facet grid would be empty."
-                )
-
         # Presentation options don't reach the query, but belong in the echo —
         # they are part of what the analyst will see.
         for key in meta.reads_options:
@@ -2065,9 +1998,6 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 "field": spec.field,
                 "field_y": spec.field_y,
                 "fields": spec.fields,
-                "facet": (
-                    {"field": spec.facet.field, "limit": spec.facet.limit} if spec.facet else None
-                ),
                 "options": applied,
             },
             "warnings": warnings,

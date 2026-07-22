@@ -28,7 +28,6 @@ import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
 import { ScatterChart } from "@/components/viz/charts/ScatterChart";
 import { WaffleChart } from "@/components/viz/charts/WaffleChart";
 import { CorrMatrix } from "@/components/viz/charts/CorrMatrix";
-import { FacetGrid } from "@/components/viz/FacetGrid";
 import { GroupedDistribution } from "@/components/viz/charts/GroupedDistribution";
 import type {
   FieldCorrelationResponse,
@@ -654,30 +653,5 @@ describe("correlation matrix", () => {
     // frame's margin <g>.
     fireEvent.click(container.querySelector("svg rect")!.parentElement!);
     expect(opened).toEqual([["attr:bytes", "attr:latency"]]);
-  });
-});
-
-describe("FacetGrid", () => {
-  it("draws one panel per value and states what was left out", () => {
-    render(
-      <FacetGrid
-        field="attr:status"
-        omittedValues={3}
-        omittedCount={120}
-        panels={[
-          { value: "200", count: 90, isLoading: false, chart: <div>panel-200</div> },
-          { value: "500", count: 10, isLoading: false, chart: <div>panel-500</div> },
-        ]}
-      />,
-    );
-    expect(screen.getByText("panel-200")).toBeTruthy();
-    expect(screen.getByText("panel-500")).toBeTruthy();
-    expect(screen.getByText(/3 further values/)).toBeTruthy();
-    expect(screen.getByText(/not merged into an "Other" panel/)).toBeTruthy();
-  });
-
-  it("says so when no value matches instead of drawing an empty grid", () => {
-    render(<FacetGrid field="attr:status" panels={[]} />);
-    expect(screen.getByText(/No values of/)).toBeTruthy();
   });
 });

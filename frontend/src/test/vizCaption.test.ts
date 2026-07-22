@@ -312,6 +312,46 @@ describe("lecture-driven caption lines", () => {
     expect(lines.join(" ")).not.toContain("recommended coefficient");
   });
 
+  // The test's power grows with n, so at the API's sample ceiling it rejects
+  // deviations too small to change which coefficient to quote. The caption is
+  // the export text — without this it reads as a finding about the data.
+  it("qualifies a Shapiro–Wilk verdict drawn from a large sample", () => {
+    const stats = (n: number) => ({
+      n: 50_000,
+      basis: "full" as const,
+      pearson: { r: 0.5, p: 1e-9 },
+      spearman: { rho: 0.4, p: 1e-8 },
+      kendall: null,
+      regression: null,
+      shapiro: {
+        x: { w: 0.98, p: 0.001 },
+        y: { w: 0.99, p: 0.2 },
+        basis: "sample" as const,
+        n,
+      },
+      recommendation: "spearman" as const,
+      recommendation_basis: "shapiro" as const,
+    });
+    const captionFor = (n: number) =>
+      buildCaptionLines({
+        ...base,
+        chartLabel: "Scatter",
+        config: {
+          ...DEFAULT_CHART_CONFIG,
+          chartType: "scatter",
+          field: "attr:bytes",
+          fieldY: "attr:latency",
+          scale: "ratio",
+        },
+        facts: { scatterStats: stats(n) },
+      })
+        .find((l) => l.startsWith("recommended coefficient"))!;
+
+    expect(captionFor(5000)).toContain("flags even slight departures from normality");
+    // A small sample carries no such caveat — the verdict stands on its own.
+    expect(captionFor(120)).not.toContain("flags even slight departures");
+  });
+
   it("states the point-overlay sample honestly", () => {
     const lines = buildCaptionLines({
       ...base,
@@ -343,18 +383,6 @@ describe("lecture-driven caption lines", () => {
     );
     expect(lines.some((l) => l.includes("no numeric values under these filters"))).toBe(true);
     expect(lines.some((l) => l.includes("correlation is not causation"))).toBe(true);
-  });
-
-  it("states what a facet grid leaves out", () => {
-    const lines = buildCaptionLines({
-      ...base,
-      chartLabel: "Bar",
-      config: { ...DEFAULT_CHART_CONFIG, chartType: "bar", field: "attr:status" },
-      facts: { facetField: "attr:user", facetPanels: 6, facetOmittedValues: 14, facetOmittedCount: 220 },
-    });
-    const line = lines.find((l) => l.startsWith("split into"))!;
-    expect(line).toContain("6 panels by attr:user");
-    expect(line).toContain("14 further values (220 events)");
   });
 
   it("carries the pie readability caution into the export", () => {

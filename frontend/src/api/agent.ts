@@ -47,7 +47,6 @@ export interface AgentChartSpecV2 {
   field?: string | null;
   field_y?: string | null;
   fields?: string[] | null;
-  facet?: { field: string; limit?: number | null } | null;
   metric?: Metric | null;
   filters?: AgentFilterSpec | null;
   compare?: {
@@ -163,7 +162,6 @@ export function specToChartConfig(spec: AgentChartSpec): ChartConfig {
     field: spec.field ?? null,
     fieldY: spec.field_y ?? null,
     fields: spec.fields ?? null,
-    facet: spec.facet ? { field: spec.facet.field, limit: spec.facet.limit ?? 6 } : null,
     // An omitted scale takes the chart type's default — the same value the
     // backend resolved and echoed in `resolved.scale`.
     scale: spec.scale ?? CHART_META[spec.chart_type].defaultScale,
@@ -211,9 +209,8 @@ function specToChartConfigLegacy(spec: AgentChartSpecLegacy): ChartConfig {
     v: 1,
     field: spec.field ?? null,
     fieldY: spec.field_y ?? null,
-    // The retired shape had no multi-field chart and no facetting.
+    // The retired shape had no multi-field chart.
     fields: null,
-    facet: null,
     scale: SCALE_BY_KIND[spec.kind],
     chartType: CHART_TYPE_BY_KIND[spec.kind],
     metric: "count",

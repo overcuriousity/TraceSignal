@@ -33,11 +33,6 @@ interface BarChartProps {
   /** Row height in px (horizontal) — total chart height grows with the value count. */
   rowHeight?: number;
   orientation?: "horizontal" | "vertical";
-  /** Pin the count axis to a shared maximum. Small multiples pass the max
-   * across all panels — without it each panel autoscales and bars of
-   * different heights encode the same count, which is the one thing a
-   * facet grid must not do. */
-  countMax?: number;
   /** "count" keeps the server's count-descending order; "value" sorts
    * lexicographically by the *canonical* value — never by the display label,
    * which may be relabelled ("1" renders as "Mon") or padded. The virtual
@@ -73,7 +68,6 @@ export function BarChart({
   orientation = "horizontal",
   sort = "count",
   logScale = false,
-  countMax,
   onValueClick,
 }: BarChartProps) {
   const [hover, setHover] = useState<{
@@ -141,7 +135,6 @@ export function BarChart({
   );
   const maxCount = Math.max(
     1,
-    countMax ?? 0,
     ...rows.map((r) => r.count),
     ...rows.map((r) => r.comparison ?? 0),
   );

@@ -5,6 +5,7 @@ import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
 import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
 import { Legend } from "@/components/viz/primitives/Legend";
 import { useChartRef } from "@/components/viz/primitives/useChartRef";
+import { ExplainerPopover } from "@/components/viz/primitives/ExplainerPopover";
 import { buildSeriesColorMap, OTHER_KEY, OTHER_LABEL } from "@/components/viz/lib/colors";
 import { fieldValueLabel } from "@/components/viz/lib/fieldDisplay";
 import type { ChartValueClickHandler } from "@/components/viz/lib/interaction";
@@ -118,6 +119,9 @@ export function WaffleChart({ terms, svgRef, height = 280, onValueClick }: Waffl
           );
         }}
       </ChartFrame>
+      <div className="flex items-center gap-1 text-xs text-[var(--color-fg-muted)]">
+        One cell = one percent <ExplainerPopover id="waffle" />
+      </div>
       <Legend
         entries={allocated.map((r) => ({
           label: `${r.label} — ${fmtCount(r.count)} (${r.cells} ${r.cells === 1 ? "cell" : "cells"})`,

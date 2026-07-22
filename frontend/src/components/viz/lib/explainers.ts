@@ -28,6 +28,7 @@ export interface Explainer {
 export type ExplainerId =
   | "mean"
   | "median"
+  | "stddev"
   | "quartiles"
   | "iqr"
   | "whiskers"
@@ -62,6 +63,15 @@ export const EXPLAINERS: Record<ExplainerId, Explainer> = {
     distrust:
       "It says nothing about spread or shape. Two very different distributions can share a median.",
     formula: "sort the values; take the middle one (or the mean of the two middle ones)",
+  },
+  stddev: {
+    title: "Standard deviation (σ)",
+    what: "The typical distance of a value from the mean, in the field's own units.",
+    howToRead:
+      "Larger σ = values spread further from the mean. For roughly bell-shaped data about two thirds of values fall within one σ of the mean.",
+    distrust:
+      "It is built from the mean, so a single outlier inflates it as much as it inflates the mean. On the skewed fields logs are full of (bytes, durations) the IQR describes spread more honestly — check the skewness beside it before quoting σ.",
+    formula: "σ = √( Σ(xᵢ − x̄)² / n )",
   },
   quartiles: {
     title: "Quartiles (Q1 / Q3)",

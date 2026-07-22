@@ -17,10 +17,6 @@ interface ViolinPlotProps {
   /** Overlay the response's sampled raw values as a jittered strip — the
    * lecture's fix for violins that imply data where there is none. */
   showPoints?: boolean;
-  /** Pin the value axis to a shared [min, max]. Facet panels pass the range
-   * across all panels, so a box drawn higher really does mean larger values
-   * rather than a differently-scaled axis. */
-  domain?: [number, number];
 }
 
 /** Violin plot — the numeric field's distribution shape, from a smoothed
@@ -32,7 +28,6 @@ export function ViolinPlot({
   height = 260,
   color = "var(--color-accent)",
   showPoints = false,
-  domain,
 }: ViolinPlotProps) {
   const density = kdeFromBins(stats.bins);
   if (stats.count === 0 || density.length === 0 || stats.min == null || stats.max == null) {
@@ -47,8 +42,8 @@ export function ViolinPlot({
     <NumericPlotFrame
       svgRef={svgRef}
       height={height}
-      min={domain?.[0] ?? stats.min}
-      max={domain?.[1] ?? stats.max}
+      min={stats.min}
+      max={stats.max}
       yTickFormat={(v) => fmtValue(v)}
     >
       {({ innerHeight, margin, y, cx, setHover }) => (

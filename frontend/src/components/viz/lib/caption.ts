@@ -60,11 +60,6 @@ export interface CaptionFacts {
   overlayTotal?: number;
   /** Mark-choice caution (e.g. a pie with too many/near-equal slices). */
   readabilityWarning?: string;
-  /** Facet grid: the splitting field and its top-N truthfulness. */
-  facetField?: string;
-  facetPanels?: number;
-  facetOmittedValues?: number;
-  facetOmittedCount?: number;
   /** kind=corr: which fields were correlated, and over how many events. */
   corrFields?: string[];
   corrPairs?: number;
@@ -76,6 +71,12 @@ export interface CaptionFacts {
 /** Distinct grouping values past which the grouping field reads as an
  * identifier. Mirrors the agent's VIZ_GROUP_CARDINALITY_CAUTION. */
 const IDENTIFIER_LIKE_GROUP_COUNT = 50;
+
+/** Shapiro–Wilk sample size past which "normality rejected" says more about
+ * the sample size than about the data — the test's power grows with n, so it
+ * starts flagging departures too small to change which coefficient to quote.
+ * Matches the `shapiroWilk` explainer's "distrust" section. */
+const SHAPIRO_LARGE_SAMPLE = 1000;
 
 const fmtInt = (n: number) => n.toLocaleString("en-US");
 
@@ -271,22 +272,17 @@ export function buildCaptionLines(args: {
     );
     lines.push(
       s.recommendation_basis === "shapiro"
-        ? `recommended coefficient: ${s.recommendation === "pearson" ? "Pearson r" : "Spearman ρ"} (Shapiro–Wilk normality check on the ${s.shapiro.n.toLocaleString("en-US")}-point sample)`
+        ? `recommended coefficient: ${s.recommendation === "pearson" ? "Pearson r" : "Spearman ρ"} (Shapiro–Wilk normality check on the ${s.shapiro.n.toLocaleString("en-US")}-point sample)` +
+            // The test's power grows with n, so at these sample sizes it
+            // rejects deviations too small to affect which coefficient to
+            // quote. The explainer says so on screen; the export has to say
+            // it too, or the caption reads as a finding about the data.
+            (s.shapiro.n >= SHAPIRO_LARGE_SAMPLE
+              ? ` — at this sample size Shapiro–Wilk flags even slight departures from normality, so read the verdict alongside the scatter's shape`
+              : "")
         : // No normality verdict exists — say the coefficient is a fallback
           // rather than dressing an untested default as a recommendation.
           `normality could not be tested here; Spearman ρ shown as the conservative default`,
-    );
-  }
-  if (facts.facetField != null && facts.facetPanels != null) {
-    lines.push(
-      `split into ${fmtInt(facts.facetPanels)} panel${facts.facetPanels === 1 ? "" : "s"} by ${facts.facetField}` +
-        (facts.facetOmittedValues
-          ? `; ${fmtInt(facts.facetOmittedValues)} further value${facts.facetOmittedValues === 1 ? "" : "s"}` +
-            (facts.facetOmittedCount
-              ? ` (${fmtInt(facts.facetOmittedCount)} events)`
-              : "") +
-            ' omitted, not merged into an "Other" panel'
-          : ""),
     );
   }
   if (facts.corrFields?.length) {

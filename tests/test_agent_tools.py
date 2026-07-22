@@ -1086,7 +1086,6 @@ async def test_propose_chart_echoes_what_will_be_drawn(store, monkeypatch):
         "field": "country",
         "field_y": None,
         "fields": None,
-        "facet": None,
         "options": {"top_n": 30},
     }
     assert result["warnings"] == []
@@ -1983,36 +1982,18 @@ async def test_corr_field_list_is_capped(store, monkeypatch):
     assert any("truncated" in w for w in result["warnings"])
 
 
-# ── facetting (small multiples) ─────────────────────────────────────────────
+# ── retired facet spec ──────────────────────────────────────────────────────
 
 
-async def test_facet_reports_the_panels_the_grid_will_draw(store, monkeypatch):
-    fake = _patch_chart_service(monkeypatch)
-    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
-    result = await _call(
-        server,
-        "propose_chart",
-        _chart(
-            {
-                "chart_type": "histogram",
-                "field": "attr:bytes",
-                "facet": {"field": "attr:status", "limit": 4},
-            }
-        ),
-    )
-    assert result["ok"] is True
-    assert result["resolved"]["facet"] == {"field": "attr:status", "limit": 4}
-    facet = result["summary"]["facet"]
-    assert facet["field"] == "attr:status"
-    assert facet["panels"] == ["a", "b"]
-    # The fake reports 4 distinct values with 5 events outside the top-N.
-    assert facet["omitted_values"] == 2
-    assert facet["omitted_count"] == 5
-    # One terms call for the panel list; the mark itself was validated once.
-    assert _called(fake, "field_numeric_stats")[0] == "attr:bytes"
+async def test_stale_facet_key_is_ignored_and_absent_from_the_resolved_echo(store, monkeypatch):
+    """A conversation holding the pre-removal tool schema must not hard-fail.
 
-
-async def test_facet_limit_is_clamped(store, monkeypatch):
+    `ChartSpec` is `extra="ignore"` on purpose (same reason as
+    `_accept_legacy_kind`): a model whose context still carries the old schema
+    keeps working. What it must NOT do is quietly promise panels — `resolved`
+    is the contract, and it no longer mentions facetting at all, so the model
+    reading it learns the chart is unfacetted.
+    """
     _patch_chart_service(monkeypatch)
     server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
     result = await _call(
@@ -2022,61 +2003,10 @@ async def test_facet_limit_is_clamped(store, monkeypatch):
             {
                 "chart_type": "bar",
                 "field": "attr:status",
-                "facet": {"field": "attr:user", "limit": 40},
+                "facet": {"field": "attr:user", "limit": 4},
             }
         ),
     )
-    assert any("facet.limit=40 clamped to 12" in w for w in result["warnings"])
-
-
-async def test_facet_is_rejected_for_marks_that_cannot_be_facetted(store, monkeypatch):
-    _patch_chart_service(monkeypatch)
-    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
-    with pytest.raises(ToolError, match="cannot be facetted"):
-        await _call(
-            server,
-            "propose_chart",
-            _chart(
-                {
-                    "chart_type": "scatter",
-                    "field": "attr:bytes",
-                    "field_y": "attr:latency",
-                    "facet": {"field": "attr:status"},
-                }
-            ),
-        )
-
-
-async def test_facet_and_compare_are_mutually_exclusive(store, monkeypatch):
-    _patch_chart_service(monkeypatch)
-    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
-    with pytest.raises(ToolError, match="cannot both be set"):
-        await _call(
-            server,
-            "propose_chart",
-            _chart(
-                {
-                    "chart_type": "bar",
-                    "field": "attr:status",
-                    "compare": {"mode": "baseline"},
-                    "facet": {"field": "attr:user"},
-                }
-            ),
-        )
-
-
-async def test_facet_field_must_exist(store, monkeypatch):
-    _patch_chart_service(monkeypatch)
-    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
-    with pytest.raises(ToolError, match="not a field in this timeline"):
-        await _call(
-            server,
-            "propose_chart",
-            _chart(
-                {
-                    "chart_type": "bar",
-                    "field": "attr:status",
-                    "facet": {"field": "attr:nope"},
-                }
-            ),
-        )
+    assert result["ok"] is True
+    assert "facet" not in result["resolved"]
+    assert "facet" not in result["summary"]

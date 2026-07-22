@@ -95,9 +95,21 @@ click-through to the pair's scatter); grouped box/violin (`field_numeric_grouped
 groups by count, per-group quantiles binned over the *global* range so silhouettes compare,
 omitted groups reported and never merged into an "Other" box); waffle chart (reuses the
 terms aggregation, largest-remainder allocation so cells sum to exactly 100 and no existing
-category rounds to zero); facetting (client-orchestrated small multiples — one terms query
-names the panels, each panel re-runs the same endpoint with an added equality filter, so no
-new server aggregation and no new failure mode).
+category rounds to zero).
+
+**Facetting was built and then cut in review.** Client-orchestrated small multiples (one
+terms query names the panels, each panel re-runs the same endpoint with an added equality
+filter) shipped in the first pass and was removed before merge. The reason is worth
+keeping: each panel asked the server independently, so each got Freedman–Diaconis bin
+edges from *its own* subset, while the grid pinned a shared count axis across panels.
+Equal bar heights then meant different densities — the precise misreading small multiples
+exist to prevent. Making it honest needs the bin range threaded through
+`field_numeric_stats` (a shared ruler for every panel), which is a design round rather
+than a review fix; deferred with that requirement recorded in `ROADMAP.md`. Removing it
+also took with it the caption bug it caused (facet captions were filled from the
+*unfacetted* query, so bin rule, skewness and overlay counts described data no panel
+showed) and the streaming shared-scale bug (the count max was a max over *loaded* panels,
+so an export taken mid-load captured non-comparable panels).
 
 **Honesty fixes the lectures are blunt about.** Violin/box gained an optional jittered
 overlay of sampled raw values (deterministic jitter, so an export reproduces the strip)
@@ -114,8 +126,18 @@ when to distrust it* plus the formula, and every chart type a one-line "how to r
 The distrust section is mandatory (a test enforces it) — a statistic explained without its
 failure mode teaches overconfidence, which is worse than not explaining it.
 
+**Review fixes.** The scatter caption now carries the caveat its own explainer already
+stated — past ~1000 sampled points Shapiro–Wilk rejects departures too small to change
+which coefficient to quote, and the caption is the forensic export, so it has to say so
+rather than read as a finding about the data. σ and the waffle grid were rendering without
+explainers despite the "every statistic carries one" invariant; both got copy, and
+`vizExplainers.test.ts` gained the converse check (every defined explainer is rendered by
+some component) that would have caught it. `jitter.ts` swapped the smooth
+`sin(i·12.9898)` GLSL hash for an integer bit-mix: the old one is continuous in `i`, so
+the consecutive indices a point strip feeds it came out correlated and banded.
+
 `docs/AGENT.md` documents the new tools, the field-slot rules (`field_y` required vs.
-optional, `fields`, `facet`), and the statistics contract.
+optional, `fields`), and the statistics contract.
 
 ## Session 88 — 2026-07-22: --split ported to native Parquet converters
 

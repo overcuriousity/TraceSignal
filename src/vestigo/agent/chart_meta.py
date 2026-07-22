@@ -99,13 +99,8 @@ class ChartMeta:
     supports_compare: bool = False
     requires_second_field: bool = False
     #: Charts a LIST of fields (``fields``) rather than field/field_y — the
-    #: correlation matrix. Mutually exclusive with the two flags below.
+    #: correlation matrix. Mutually exclusive with the flag below.
     multi_field: bool = False
-    #: Can be drawn once per value of a categorical field (small multiples).
-    #: Restricted to the cheap single-layer aggregations: a facet grid runs
-    #: one query per facet value, so a mark whose single query is already a
-    #: heavy multi-scan would multiply that cost by the facet count.
-    supports_facet: bool = False
     #: Single-field chart that ALSO accepts an optional grouping field
     #: (box/violin: numeric response × categorical group via ``field_y``).
     #: Mutually exclusive with ``requires_second_field``.
@@ -120,7 +115,6 @@ CHART_META: dict[ChartType, ChartMeta] = {
         scales=("nominal", "ordinal", "interval", "ratio"),
         data_kind="time",
         default_scale="nominal",
-        supports_facet=True,
         reads_options=("buckets",),
         supports_compare=True,
         note=(
@@ -133,7 +127,6 @@ CHART_META: dict[ChartType, ChartMeta] = {
         scales=("nominal", "ordinal"),
         data_kind="terms",
         default_scale="nominal",
-        supports_facet=True,
         reads_options=("top_n", "orientation", "sort", "log_scale"),
         supports_compare=True,
     ),
@@ -142,7 +135,6 @@ CHART_META: dict[ChartType, ChartMeta] = {
         scales=("nominal",),
         data_kind="terms",
         default_scale="nominal",
-        supports_facet=True,
         reads_options=("top_n",),
         note=(
             "pie/box/violin/ecdf have no honest two-layer encoding, so they are "
@@ -154,7 +146,6 @@ CHART_META: dict[ChartType, ChartMeta] = {
         scales=("nominal",),
         data_kind="terms",
         default_scale="nominal",
-        supports_facet=True,
         reads_options=("top_n",),
         note=(
             "Same terms aggregation as bar/pie — switching between them refetches "
@@ -186,7 +177,6 @@ CHART_META: dict[ChartType, ChartMeta] = {
         scales=("interval", "ratio"),
         data_kind="numeric",
         default_scale="ratio",
-        supports_facet=True,
         reads_options=("bins", "log_scale", "show_density"),
         supports_compare=True,
     ),
@@ -195,7 +185,6 @@ CHART_META: dict[ChartType, ChartMeta] = {
         scales=("ratio",),
         data_kind="numeric",
         default_scale="ratio",
-        supports_facet=True,
         reads_options=("bins", "groups", "show_points"),
         accepts_second_field=True,
         note=(
@@ -208,7 +197,6 @@ CHART_META: dict[ChartType, ChartMeta] = {
         scales=("ratio",),
         data_kind="numeric",
         default_scale="ratio",
-        supports_facet=True,
         reads_options=("bins", "groups", "show_points"),
         accepts_second_field=True,
     ),
@@ -217,7 +205,6 @@ CHART_META: dict[ChartType, ChartMeta] = {
         scales=("ratio",),
         data_kind="numeric",
         default_scale="ratio",
-        supports_facet=True,
         reads_options=("bins",),
     ),
     "punchcard": ChartMeta(

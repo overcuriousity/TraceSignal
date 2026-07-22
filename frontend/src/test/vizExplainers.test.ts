@@ -46,15 +46,43 @@ describe("explainer copy", () => {
   });
 
   it("has an entry for every id a component asks for", () => {
-    const used = new Set<string>();
-    for (const source of Object.values(VIZ_SOURCES)) {
-      for (const match of source.matchAll(/ExplainerPopover\s+id="([^"]+)"/g)) {
-        used.add(match[1]);
-      }
-    }
-    expect(used.size).toBeGreaterThan(0);
-    for (const id of used) {
+    expect(usedExplainerIds().size).toBeGreaterThan(0);
+    for (const id of usedExplainerIds()) {
       expect(EXPLAINERS[id as ExplainerId], `${id} is used but has no copy`).toBeTruthy();
     }
   });
+
+  // The converse direction, and the one that actually bites: σ shipped with
+  // no explainer beside it while mean/median/skewness all had one. Copy that
+  // nothing renders teaches nobody — an unreferenced entry means either a
+  // statistic is displayed bare, or the copy is dead weight.
+  it("renders every explainer it defines", () => {
+    const used = usedExplainerIds();
+    for (const id of Object.keys(EXPLAINERS)) {
+      expect(used.has(id), `${id} has copy but no component shows it`).toBe(true);
+    }
+  });
 });
+
+/**
+ * Ids a component actually shows. Literal `id="mean"` is the common form, but
+ * `ScatterStatsPanel` and `CorrMatrix` pass the id through a variable
+ * (`id={r.explainer}`, `id={corrMethod}`), so a literal-only scan would call
+ * pearson/spearman/kendall unrendered when they are on screen. Any quoted
+ * occurrence of a known id in a viz source counts as a reference — loose on
+ * purpose: this guards against copy nothing displays, not against typos,
+ * which the `ExplainerId` type already catches at compile time.
+ */
+function usedExplainerIds(): Set<string> {
+  const used = new Set<string>();
+  const known = Object.keys(EXPLAINERS);
+  for (const source of Object.values(VIZ_SOURCES)) {
+    for (const match of source.matchAll(/ExplainerPopover\s+id="([^"]+)"/g)) {
+      used.add(match[1]);
+    }
+    for (const id of known) {
+      if (source.includes(`"${id}"`)) used.add(id);
+    }
+  }
+  return used;
+}

@@ -16,10 +16,6 @@ interface BoxPlotProps {
   /** Overlay the response's sampled raw values as a jittered strip — only
    * drawn when the request asked for `points` (see `vizApi.fieldNumeric`). */
   showPoints?: boolean;
-  /** Pin the value axis to a shared [min, max]. Facet panels pass the range
-   * across all panels, so a box drawn higher really does mean larger values
-   * rather than a differently-scaled axis. */
-  domain?: [number, number];
 }
 
 /** Vertical box plot (five-number summary) for a numeric field — median,
@@ -31,7 +27,6 @@ export function BoxPlot({
   height = 260,
   color = "var(--color-accent)",
   showPoints = false,
-  domain,
 }: BoxPlotProps) {
   const box = boxPlotStats(stats);
   if (!box) {
@@ -46,8 +41,8 @@ export function BoxPlot({
     <NumericPlotFrame
       svgRef={svgRef}
       height={height}
-      min={domain?.[0] ?? box.min}
-      max={domain?.[1] ?? box.max}
+      min={box.min}
+      max={box.max}
       yTickFormat={(v) => fmtValue(v)}
     >
       {({ margin, y, cx, setHover }) => (

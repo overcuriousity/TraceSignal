@@ -28,10 +28,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     quantiles are binned over the *global* value range so the silhouettes are
     directly comparable; groups outside the top-N are reported as omitted and
     never merged into an "Other" box.
-  - **Small multiples (facetting)**: any single-layer mark can be drawn once
-    per top value of a categorical field. Panels share one scale — a bar twice
-    as tall really does mean twice the count — and the omitted values are
-    stated under the grid. Mutually exclusive with the comparison layer.
   - **Waffle chart**: shares of a whole as a 10×10 grid of countable cells,
     allocated by largest remainder so the cells sum to exactly 100 and no
     existing category ever rounds away to zero. More categories than cells
@@ -78,14 +74,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Pie charts** warn when they stop being readable — more than four slices,
   or two slices within 10% of each other — and offer bar or waffle instead.
   Advisory, never a refusal, and `propose_chart` applies the identical rule.
-- `propose_chart` gained `fields` (correlation matrix), `facet`, and the
+- `propose_chart` gained `fields` (correlation matrix) and the
   `groups`/`show_points`/`show_density` options; `field_y` is now optional on
   box/violin. New agent data tools: `field_correlation`,
   `field_numeric_grouped`.
 - Chart captions — which are also the SVG/PNG export captions — carry the new
-  truthfulness lines: bin rule, skewness reading, grouped/facet omissions,
-  point-overlay sample size, correlation basis, and the
-  correlation-is-not-causation caveat.
+  truthfulness lines: bin rule, skewness reading, grouped-distribution
+  omissions, point-overlay sample size, correlation basis, the
+  correlation-is-not-causation caveat, and — where the sample is large enough
+  for it to matter — the caveat that Shapiro–Wilk's power grows with n.
 - **Chart samples are reproducible.** Every sampling path (scatter points,
   box/violin strips, grouped strips) draws in a stable hash order over
   `event_id` instead of `ORDER BY rand()`, so identical filters redraw

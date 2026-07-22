@@ -15,7 +15,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { useQueries, useQuery } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { ArrowLeft, HelpCircle, Lightbulb, Repeat, RotateCcw, X } from "lucide-react";
 import { vizApi, type CompareMode } from "@/api/viz";
 import { eventsApi } from "@/api/events";
@@ -40,7 +40,6 @@ import {
 import { ExportControls } from "@/components/viz/ExportControls";
 import { CompareFilterEditor } from "@/components/viz/CompareFilterEditor";
 import { SavedChartsRail } from "@/components/viz/SavedChartsRail";
-import { FacetGrid } from "@/components/viz/FacetGrid";
 import { ChartActionPopover } from "@/components/viz/ChartActionPopover";
 import type { ChartValueClick } from "@/components/viz/lib/interaction";
 import { BarChart } from "@/components/viz/charts/BarChart";
@@ -87,8 +86,6 @@ import { NumericStatStrip } from "@/components/viz/NumericStatStrip";
 import { ScatterStatsPanel } from "@/components/viz/ScatterStatsPanel";
 import type {
   CompareNumericResponse,
-  FieldNumericResponse,
-  FieldTermsResponse,
   CompareTermsResponse,
   CompareTimeResponse,
   EventFilters,
@@ -225,11 +222,6 @@ export function VisualizePage() {
   const acceptsSecondField = !!CHART_META[chartType].acceptsSecondField;
   // The correlation matrix charts a LIST of fields instead of field/fieldY.
   const multiField = !!CHART_META[chartType].multiField;
-  const supportsFacet = !!CHART_META[chartType].supportsFacet;
-  // Facet and compare are mutually exclusive (one splits into panels, the
-  // other overlays layers), so a chart type that lost facet support drops
-  // the spec rather than rendering a grid it cannot draw.
-  const facet = supportsFacet ? config.facet : null;
   const selectedFields = config.fields ?? [];
   const groupedOn = acceptsSecondField && !!fieldY;
   // "time" and "punchcard" chart the whole event count — no field involved.
@@ -506,95 +498,6 @@ export function VisualizePage() {
 
   const availableChartTypes = chartTypesForField(scale, field);
 
-  // ── facetting (small multiples) ───────────────────────────────────────
-  // Client-orchestrated: one terms query names the panels, then each panel
-  // re-runs the SAME endpoint with an added equality filter. No new server
-  // aggregation, and each panel's data is the honest answer to "this chart,
-  // restricted to this value" — which is exactly what the grid claims.
-  const facetValuesQuery = useQuery({
-    queryKey: ["viz-facet-values", caseId, timelineId, facet?.field, filters, facet?.limit],
-    queryFn: () =>
-      vizApi.fieldTerms(caseId!, timelineId!, facet!.field, filters, facet!.limit),
-    enabled: scopeReady && !!facet,
-  });
-  const facetValues = facetValuesQuery.data?.values ?? [];
-
-  const facetPanelQueries = useQueries({
-    queries: facetValues.map((v) => {
-      const panelFilters = applyFieldEntries(filters, [[facet!.field, v.value]], true);
-      return {
-        queryKey: [
-          "viz-facet-panel",
-          caseId,
-          timelineId,
-          chartType,
-          field,
-          panelFilters,
-          topN,
-          bins,
-          buckets,
-          showPoints,
-        ],
-        queryFn: async () => {
-          switch (dataKind) {
-            case "terms":
-              return vizApi.fieldTerms(caseId!, timelineId!, field!, panelFilters, topN);
-            case "numeric":
-              return vizApi.fieldNumeric(
-                caseId!,
-                timelineId!,
-                field!,
-                panelFilters,
-                bins,
-                showPoints,
-              );
-            default:
-              return histogramToCompare(
-                await eventsApi.histogram(caseId!, timelineId!, panelFilters, buckets),
-              );
-          }
-        },
-        enabled: scopeReady && !!facet && (fieldFree || !!field),
-      };
-    }),
-  });
-
-  // Small multiples are only comparable if every panel shares a scale —
-  // otherwise two bars of equal height mean different counts, which is the
-  // one failure a facet grid must not have. Computed across the loaded
-  // panels and passed down; each panel still draws its own axis.
-  const facetPanelData = facetPanelQueries.map((q) => q.data);
-  const facetCountMax = facet
-    ? Math.max(
-        1,
-        ...facetPanelData.flatMap((d) => {
-          if (d == null) return [];
-          if ("values" in d) return d.values.map((v) => v.count);
-          if ("bins" in d && Array.isArray(d.bins)) {
-            return (d.bins as { count?: number; primary?: number }[]).map(
-              (b) => b.count ?? b.primary ?? 0,
-            );
-          }
-          if ("buckets" in d) {
-            return (d.buckets as { primary: number }[]).map((b) => b.primary);
-          }
-          return [];
-        }),
-      )
-    : undefined;
-  const facetValueDomain: [number, number] | undefined = (() => {
-    if (!facet || dataKind !== "numeric") return undefined;
-    const mins = facetPanelData.flatMap((d) =>
-      d != null && "min" in d && typeof d.min === "number" ? [d.min] : [],
-    );
-    const maxes = facetPanelData.flatMap((d) =>
-      d != null && "max" in d && typeof d.max === "number" ? [d.max] : [],
-    );
-    return mins.length && maxes.length
-      ? [Math.min(...mins), Math.max(...maxes)]
-      : undefined;
-  })();
-
   // Data-derived caption facts for the active query — totals, grid width,
   // and top-N capping feed the truthful caption/export lines.
   const facts: CaptionFacts = {};
@@ -681,16 +584,6 @@ export function VisualizePage() {
     facts.sampledPoints = scatterQuery.data.sampled;
     facts.totalPoints = scatterQuery.data.total;
     facts.scatterStats = scatterQuery.data.stats;
-  }
-
-  if (facet) {
-    facts.facetField = facet.field;
-    facts.facetPanels = facetValues.length;
-    facts.facetOmittedValues = Math.max(
-      0,
-      (facetValuesQuery.data?.distinct ?? 0) - facetValues.length,
-    );
-    facts.facetOmittedCount = facetValuesQuery.data?.other_count;
   }
 
   // Advisory only — the pie still renders; the same rule runs in
@@ -969,9 +862,6 @@ export function VisualizePage() {
                         opt.mode === "custom"
                           ? { mode: "custom", filters: {} }
                           : { mode: opt.mode },
-                      // Comparison and facetting are mutually exclusive —
-                      // turning one on clears the other, in both directions.
-                      ...(opt.mode !== "off" ? { facet: null } : {}),
                     })
                   }
                   className="accent-[var(--color-accent)]"
@@ -983,12 +873,6 @@ export function VisualizePage() {
           {!compareSupported && (
             <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
               {compareUnavailableReason(chartType)}
-            </p>
-          )}
-          {compareSupported && facet && (
-            <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
-              Turning on a comparison layer clears the panel split — one overlays two
-              layers in a single chart, the other splits the data across charts.
             </p>
           )}
           {compareSupported && config.compare.mode === "custom" && (
@@ -1186,59 +1070,6 @@ export function VisualizePage() {
               )}
             </div>
           </details>
-        )}
-
-        {/* Facet — small multiples */}
-        {supportsFacet && (
-          <div>
-            <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-              Split into panels by (optional)
-            </label>
-            <Select
-              value={facet?.field ?? undefined}
-              onValueChange={(v) =>
-                updateConfig(
-                  v === CLEAR_GROUP
-                    ? { facet: null }
-                    : // A facet grid and a comparison layer are mutually
-                      // exclusive, so picking one clears the other.
-                      { facet: { field: v, limit: facet?.limit ?? 6 }, compare: { mode: "off" } },
-                )
-              }
-            >
-              <SelectTrigger className="text-sm">
-                <SelectValue placeholder="No panels" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={CLEAR_GROUP}>No panels</SelectItem>
-                {(fieldsQuery.data?.fields ?? [])
-                  .filter((f) => f.token !== field)
-                  .map((f) => (
-                    <SelectItem key={f.token} value={f.token}>
-                      {fieldOptionText(f)}
-                    </SelectItem>
-                  ))}
-              </SelectContent>
-            </Select>
-            {facet && (
-              <div className="mt-1">
-                <label className="mb-1 block text-xs text-[var(--color-fg-secondary)]">
-                  Panels: {facet.limit}
-                </label>
-                <input
-                  type="range"
-                  min={2}
-                  max={12}
-                  step={1}
-                  value={facet.limit}
-                  onChange={(e) =>
-                    updateConfig({ facet: { ...facet, limit: Number(e.target.value) } })
-                  }
-                  className="w-full accent-[var(--color-accent)]"
-                />
-              </div>
-            )}
-          </div>
         )}
 
         {/* Options */}
@@ -1696,77 +1527,7 @@ export function VisualizePage() {
                 onValueClick={handleChartValueClick}
               />
             )}
-            {facet ? (
-              <FacetGrid
-                field={facet.field}
-                omittedValues={Math.max(
-                  0,
-                  (facetValuesQuery.data?.distinct ?? 0) - facetValues.length,
-                )}
-                omittedCount={facetValuesQuery.data?.other_count}
-                panels={facetValues.map((v, i) => {
-                  const panel = facetPanelQueries[i];
-                  const data = panel?.data;
-                  return {
-                    value: v.value,
-                    count: v.count,
-                    isLoading: !!panel?.isLoading,
-                    chart:
-                      data == null ? null : dataKind === "terms" ? (
-                        chartType === "pie" ? (
-                          <PieChart terms={data as FieldTermsResponse} height={180} />
-                        ) : chartType === "waffle" ? (
-                          <WaffleChart terms={data as FieldTermsResponse} height={180} />
-                        ) : (
-                          <BarChart
-                            terms={data as FieldTermsResponse}
-                            height={180}
-                            countMax={facetCountMax}
-                            orientation={resolved.orientation}
-                            sort={resolved.sort}
-                            logScale={resolved.logScale}
-                          />
-                        )
-                      ) : dataKind === "numeric" ? (
-                        chartType === "box" ? (
-                          <BoxPlot
-                            stats={data as FieldNumericResponse}
-                            height={180}
-                            showPoints={showPoints}
-                            domain={facetValueDomain}
-                          />
-                        ) : chartType === "violin" ? (
-                          <ViolinPlot
-                            stats={data as FieldNumericResponse}
-                            height={180}
-                            showPoints={showPoints}
-                            domain={facetValueDomain}
-                          />
-                        ) : chartType === "ecdf" ? (
-                          <EcdfChart stats={data as FieldNumericResponse} height={180} />
-                        ) : (
-                          <NumericHistogram
-                            stats={data as FieldNumericResponse}
-                            height={180}
-                            logScale={resolved.logScale}
-                            showDensity={resolved.showDensity}
-                            showMarkers
-                            countMax={facetCountMax}
-                          />
-                        )
-                      ) : (
-                        <CompareHistogram
-                          data={data as CompareTimeResponse}
-                          height={180}
-                          metric={metric}
-                          hasComparison={false}
-                        />
-                      ),
-                  };
-                })}
-              />
-            ) : null}
-            {!facet && multiField && correlationQuery.data && (
+            {multiField && correlationQuery.data && (
               <CorrMatrix
                 data={correlationQuery.data}
                 method={corrMethod}

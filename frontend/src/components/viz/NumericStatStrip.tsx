@@ -48,6 +48,7 @@ export function NumericStatStrip({ stats }: { stats: FieldNumericResponse }) {
       {stats.stddev != null && (
         <span className={item}>
           <span className={label}>σ</span> <span className={value}>{fmtValue(stats.stddev)}</span>
+          <ExplainerPopover id="stddev" />
         </span>
       )}
       {g1 != null && (
