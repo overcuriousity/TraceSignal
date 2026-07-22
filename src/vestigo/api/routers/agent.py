@@ -517,9 +517,23 @@ async def _message_stream_inner(
     # failed request's size and the turn is re-run exactly once. It replaced
     # the fidelity overflow ladder and LLM compaction (see
     # docs/superpowers/specs/2026-07-22-agent-sliding-window-design.md).
+    #
+    # With no configured window, an earlier turn of this conversation may
+    # already have learned one the hard way — reuse it, or every turn repeats
+    # the same failed round trip. Configuration always wins over the learned
+    # value: an operator who set context_window has said what the model is.
     window_budget = (
         budget_for(config.context_window, SYSTEM_PROMPT) if config.context_window else None
     )
+    if window_budget is None:
+        window_budget = await store.get_last_window_budget(conversation_id)
+        if window_budget is not None:
+            logger.info(
+                "No context_window configured — reusing the %d-token budget an earlier "
+                "overflow on conversation %s derived.",
+                window_budget,
+                conversation_id,
+            )
 
     async def _persist_window(detail: dict[str, Any], sentence: str) -> None:
         """A window action is persisted the way the fidelity drop was: an SSE
@@ -557,6 +571,7 @@ async def _message_stream_inner(
             "attempt": attempt,
             "budget": window_stats.budget,
             "results_elided": window_stats.results_elided,
+            "results_truncated": window_stats.results_truncated,
             "turns_dropped": window_stats.turns_dropped,
             "estimated_before": window_stats.estimated_before,
             "estimated_after": window_stats.estimated_after,
@@ -564,6 +579,7 @@ async def _message_stream_inner(
         await _persist_window(
             detail,
             f"Older tool results ({window_stats.results_elided} elided, "
+            f"{window_stats.results_truncated} truncated, "
             f"{window_stats.turns_dropped} turns dropped) were reduced to fit "
             "the model's context window — the full record is preserved here.",
         )

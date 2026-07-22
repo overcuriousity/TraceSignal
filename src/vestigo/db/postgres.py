@@ -3293,6 +3293,38 @@ class PostgresStore:
             )
             return list(result.scalars().all())
 
+    async def get_last_window_budget(self, conversation_id: str) -> int | None:
+        """The budget an earlier turn learned from a provider context overflow.
+
+        Only ``reason="overflow"`` window rows carry a learned budget — a
+        ``"fit"`` row just reports what an already-known budget did. Returning
+        the newest one lets a deployment that configured no ``context_window``
+        pay the failed round trip once per conversation instead of once per
+        turn (``api/routers/agent.py``); a budget that overflowed again is
+        itself tightened and re-persisted, so the value converges.
+
+        The reason lives inside a JSON column, and JSON-path predicates are not
+        portable across Postgres and the SQLite the tests run on, so a bounded
+        slice of recent window rows is filtered here instead.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(AgentMessage.tool_result)
+                .where(
+                    AgentMessage.conversation_id == conversation_id,
+                    AgentMessage.role == "window",
+                )
+                .order_by(AgentMessage.created_at.desc(), AgentMessage.id.desc())
+                .limit(20)
+            )
+            for (detail,) in result.all():
+                if not isinstance(detail, dict) or detail.get("reason") != "overflow":
+                    continue
+                budget = detail.get("budget")
+                if isinstance(budget, int) and not isinstance(budget, bool) and budget > 0:
+                    return budget
+            return None
+
     # ------------------------------------------------------------------
     # Agent proposals (A1)
     # ------------------------------------------------------------------

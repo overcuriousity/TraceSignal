@@ -15,7 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Applied before *every* model request — mid-turn included — via pydantic-ai's
   `ProcessHistory` capability: oldest tool-result contents are replaced by
   visible elision stubs until the estimated prompt fits the budget, then whole
-  oldest turns are replaced by a marker pair. Deterministic (pure function of
+  oldest turns are replaced by a marker pair, and — last resort — the newest
+  request's oversized results are truncated to a leading slice, the one case
+  neither other pass can touch. Deterministic (pure function of
   history + budget, so replays reproduce it exactly), transparent to the model
   (the system prompt explains recovery via `get_event` / narrower re-runs),
   and applied at send time only — the stored transcript stays complete.
@@ -23,8 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window reactively and re-runs the turn once — the budget comes from the
   window the provider names in its error body when present (OpenAI /
   Anthropic / llama.cpp phrasings), else from the estimated pre-turn history
-  size. Every reduced turn — finished, stopped, or interrupted — persists a
-  `role="window"` transcript row plus an `agent.window` audit row.
+  size. A budget learned that way is reused by the conversation's next turn
+  (`PostgresStore.get_last_window_budget`), so an unconfigured deployment pays
+  the failed round trip once rather than every turn. Every reduced turn —
+  finished, stopped, or interrupted — persists a `role="window"` transcript
+  row plus an `agent.window` audit row, carrying the turn's single largest
+  reduction.
 
 ### Removed
 

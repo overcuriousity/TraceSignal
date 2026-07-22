@@ -138,6 +138,26 @@ describe("AgentPanel window marker rows", () => {
     ).toBeTruthy();
   });
 
+  it("names truncated results when the last-resort pass ran", async () => {
+    getConversationMock.mockResolvedValue({
+      ...conversation(),
+      messages: [
+        markerRow("window", {
+          reason: "fit",
+          attempt: 0,
+          budget: 3000,
+          results_elided: 2,
+          results_truncated: 1,
+          turns_dropped: 0,
+          estimated_before: 9000,
+          estimated_after: 2900,
+        }),
+      ],
+    });
+    renderPanel();
+    expect(await screen.findByText(/\(2 elided, 1 truncated\)/)).toBeTruthy();
+  });
+
   it("renders the overflow-retry notice", async () => {
     getConversationMock.mockResolvedValue({
       ...conversation(),

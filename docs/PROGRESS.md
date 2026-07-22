@@ -1,6 +1,36 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-22 (session 85 — agent sliding context window, 1.5.0).
+Last updated: 2026-07-22 (session 86 — PR #152 review fixes).
+
+## Session 86 — 2026-07-22: sliding-window review fixes (PR #152)
+
+Review of PR #152 found no blockers but five real defects; all folded into the
+unreleased 1.5.0.
+
+**Truncation pass.** A single tool result larger than the whole budget was
+reducible by neither pass — elision protects the newest request, turn dropping
+cannot reach inside it — so the turn overflowed, retried identically and died:
+the exact failure shape the window was built for, one degree worse. Pass 3
+(`_truncate_newest`) now cuts the newest request's returns to a leading slice
+(`{"truncated": true, note, head}`, floor `MIN_KEEP_CHARS = 500`) rather than
+stubbing them, so the model keeps the shape of its own result. When even that
+leaves the history over budget, `apply_window` warns — the analyst-facing
+`context_overflow` error reads as "conversation too long", which that case is
+not.
+
+**A learned budget outlives its turn.** The reactive budget was a local, so a
+deployment with no `context_window` burned a failed provider round trip *every*
+turn. `PostgresStore.get_last_window_budget` reads the newest
+`reason="overflow"` window row and seeds the next turn; a budget that overflows
+again is tightened and re-persisted, so it converges. Configuration still wins.
+
+**Honest stats.** `make_window_processor` kept per-field maxima, which could
+pair one request's `estimated_before` with another's `estimated_after` — a
+delta that never happened, in a record meant to stand up as evidence. It now
+keeps the single largest-reduction request wholesale. Also: `_drop_turns`
+measured a span as a sum of per-message estimates (each re-serialized with its
+own JSON brackets) instead of one slice estimate; and `.env.example` still
+documented the retired `VESTIGO_AGENT_COMPACT_THRESHOLD`.
 
 ## Session 85 — 2026-07-22: sliding context window replaces fidelity ladder + compaction (1.5.0)
 

@@ -304,6 +304,8 @@ export interface AgentInfo {
 export interface AgentWindowStats {
   budget: number;
   results_elided: number;
+  /** Newest-request results cut to a leading slice — the last-resort pass. */
+  results_truncated: number;
   turns_dropped: number;
   estimated_before: number;
   estimated_after: number;

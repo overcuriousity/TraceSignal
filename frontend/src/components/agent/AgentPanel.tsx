@@ -73,7 +73,13 @@ type ChatItem =
   | { kind: "fidelity"; fidelity: string }
   /** The sliding context window acted: elided older results mid-turn ("fit")
    * or re-ran an overflowed turn under a derived budget ("overflow"). */
-  | { kind: "window"; reason: "fit" | "overflow"; resultsElided: number; turnsDropped: number }
+  | {
+      kind: "window";
+      reason: "fit" | "overflow";
+      resultsElided: number;
+      resultsTruncated: number;
+      turnsDropped: number;
+    }
   | {
       kind: "finding";
       title: string;
@@ -126,12 +132,15 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
       const stats = m.tool_result as {
         reason?: "fit" | "overflow";
         results_elided?: number;
+        results_truncated?: number;
         turns_dropped?: number;
       } | null;
       items.push({
         kind: "window",
         reason: stats?.reason === "overflow" ? "overflow" : "fit",
         resultsElided: stats?.results_elided ?? 0,
+        // Absent on rows written before the truncation pass existed.
+        resultsTruncated: stats?.results_truncated ?? 0,
         turnsDropped: stats?.turns_dropped ?? 0,
       });
     } else if (m.role === "assistant") {
@@ -256,7 +265,13 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
         ...s,
         items: [
           ...flushed,
-          { kind: "window", reason: "overflow", resultsElided: 0, turnsDropped: 0 },
+          {
+            kind: "window",
+            reason: "overflow",
+            resultsElided: 0,
+            resultsTruncated: 0,
+            turnsDropped: 0,
+          },
         ],
         liveText: "",
         liveThinking: "",
@@ -272,6 +287,7 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
           kind: "window",
           reason: "fit",
           resultsElided: e.stats.results_elided,
+          resultsTruncated: e.stats.results_truncated ?? 0,
           turnsDropped: e.stats.turns_dropped,
         },
       ],
@@ -854,7 +870,7 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
                 <span>
                   {item.reason === "overflow"
                     ? "The request exceeded the model's context window — retrying with older tool results elided."
-                    : `Older tool results were elided to fit the model's context window (${item.resultsElided} elided${item.turnsDropped ? `, ${item.turnsDropped} turns dropped` : ""}). The full record is preserved in the transcript.`}
+                    : `Older tool results were elided to fit the model's context window (${item.resultsElided} elided${item.resultsTruncated ? `, ${item.resultsTruncated} truncated` : ""}${item.turnsDropped ? `, ${item.turnsDropped} turns dropped` : ""}). The full record is preserved in the transcript.`}
                 </span>
               </div>
             );

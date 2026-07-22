@@ -18,6 +18,7 @@ from pydantic_ai.messages import (
 )
 
 from vestigo.agent.window import (
+    MIN_KEEP_CHARS,
     TURN_DROP_MARKER,
     WindowStats,
     apply_window,
@@ -55,6 +56,10 @@ def _big_turn(question: str, cycles: int, prefix: str) -> list:
 
 def _elided(part: ToolReturnPart) -> bool:
     return isinstance(part.content, dict) and part.content.get("elided") is True
+
+
+def _truncated(part: ToolReturnPart) -> bool:
+    return isinstance(part.content, dict) and part.content.get("truncated") is True
 
 
 def _tool_returns(messages) -> list[ToolReturnPart]:
@@ -245,17 +250,86 @@ def test_last_turn_is_never_dropped():
 
 
 # ---------------------------------------------------------------------------
+# apply_window: pass 3 (truncate the newest returns)
+# ---------------------------------------------------------------------------
+
+
+def test_truncates_newest_result_when_nothing_else_can_help():
+    """One tool result bigger than the whole budget: elision protects it and
+    turn dropping cannot reach inside it, so without truncation the turn
+    overflows, retries identically, and dies."""
+    history: list = [ModelRequest(parts=[UserPromptPart(content="q1")])]
+    history += _tool_cycle("search_events", {"data": "y" * 40_000}, "huge0")
+    out, stats = apply_window(history, budget=2_000)
+    part = _tool_returns(out)[0]
+    assert _truncated(part)
+    assert not _elided(part)
+    assert stats.results_truncated == 1
+    assert stats.results_elided == 0
+    assert "get_event" in part.content["note"]
+    # The head is a real slice of the original, and the pairing survives.
+    assert part.content["head"].startswith('{"data": "yyy')
+    assert part.tool_call_id == "huge0"
+    assert stats.estimated_after < stats.estimated_before
+
+
+def test_truncation_keeps_a_floor_of_content():
+    """Even an unsatisfiable budget leaves the model the shape of its result —
+    a bare note reads the same as an empty result."""
+    history: list = [ModelRequest(parts=[UserPromptPart(content="q1")])]
+    history += _tool_cycle("search_events", {"data": "y" * 40_000}, "huge0")
+    out, stats = apply_window(history, budget=1)
+    head = _tool_returns(out)[0].content["head"]
+    assert len(head) == MIN_KEEP_CHARS
+    assert stats.results_truncated == 1
+
+
+def test_truncation_only_fires_when_elision_is_not_enough():
+    """A history elision alone can fit leaves the newest result byte-identical."""
+    history = _big_turn("q1", cycles=4, prefix="a")
+    out, stats = apply_window(history, budget=3_600)
+    assert stats.results_truncated == 0
+    assert not _truncated(_tool_returns(out)[-1])
+
+
+def test_truncation_is_pure_and_deterministic():
+    history: list = [ModelRequest(parts=[UserPromptPart(content="q1")])]
+    history += _tool_cycle("search_events", {"data": "y" * 40_000}, "huge0")
+    snapshot = copy.deepcopy(history)
+    first = apply_window(history, budget=2_000)
+    second = apply_window(history, budget=2_000)
+    assert history == snapshot
+    assert first == second
+
+
+# ---------------------------------------------------------------------------
 # processor factory
 # ---------------------------------------------------------------------------
 
 
-def test_processor_applies_window_and_accumulates_stats():
+def test_processor_applies_window_and_keeps_the_largest_reduction():
     stats = WindowStats(budget=3_600)
     processor = make_window_processor(3_600, stats)
     history = _big_turn("q1", cycles=4, prefix="a")
     out = processor(history)
     assert stats.results_elided == 2
     assert _tool_returns(out)[0].content["elided"] is True
-    # A later, smaller request must not shrink the recorded maxima.
+    # A later, smaller request must not replace the recorded reduction.
     processor(_big_turn("q1", cycles=1, prefix="z"))
     assert stats.results_elided == 2
+
+
+def test_processor_stats_describe_one_real_request():
+    """before/after must come from the same request — a field-wise maximum
+    would report a reduction that never happened."""
+    stats = WindowStats()
+    processor = make_window_processor(3_600, stats)
+    small = _big_turn("q1", cycles=4, prefix="a")
+    large = _big_turn("q1", cycles=9, prefix="b")
+    processor(large)
+    processor(small)
+    _, large_stats = apply_window(large, budget=3_600)
+    assert stats.estimated_before == large_stats.estimated_before
+    assert stats.estimated_after == large_stats.estimated_after
+    assert stats.results_elided == large_stats.results_elided
+    assert stats.budget == 3_600

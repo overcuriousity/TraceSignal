@@ -1913,6 +1913,120 @@ def test_second_overflow_gives_up_with_friendly_error(
     assert calls["stream"] == 2
 
 
+def test_oversized_newest_result_is_truncated_not_lost(
+    client, admin_bootstrap, agent_on, store, monkeypatch
+):
+    """A single tool result larger than the whole budget sits in the request
+    the window may not elide — it is truncated to a leading slice instead, so
+    the turn finishes rather than overflowing twice."""
+    monkeypatch.setenv("VESTIGO_AGENT_CONTEXT_WINDOW", "8000")
+    get_settings.cache_clear()
+    seen = _big_tool_model(monkeypatch, result_chars=60_000, tool_calls=1)
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
+        json={"content": "find anomalies"},
+    )
+    assert resp.status_code == 200
+    events = _sse_events(resp)
+    assert next(e for e in events if e["type"] == "done")["content"] == "windowed answer"
+    window = next(e for e in events if e["type"] == "window")
+    assert window["stats"]["results_truncated"] >= 1
+
+    # The model saw the beginning of its own result, not a bare stub.
+    from pydantic_ai.messages import ToolReturnPart
+
+    contents = [
+        part.content
+        for message in seen[-1]
+        for part in message.parts
+        if isinstance(part, ToolReturnPart)
+    ]
+    truncated = [c for c in contents if isinstance(c, dict) and c.get("truncated") is True]
+    assert truncated and truncated[0]["head"]
+
+    async def _rows():
+        return await store.list_agent_messages(conversation["id"])
+
+    rows = [m for m in asyncio.run(_rows()) if m.role == "window"]
+    assert rows[0].tool_result["results_truncated"] >= 1
+    assert "truncated" in rows[0].content
+
+
+def test_learned_budget_is_reused_by_the_next_turn(
+    client, admin_bootstrap, agent_on, store, monkeypatch
+):
+    """With no context_window configured, the budget an overflow taught the
+    first turn seeds the next one — otherwise every turn repeats the same
+    failed round trip."""
+    calls = _tool_free_model(monkeypatch, fail_first_stream="maximum context length exceeded")
+
+    budgets: list[int | None] = []
+    from vestigo.api.routers import agent as agent_router
+
+    real_stream_turn = agent_router.stream_turn
+
+    def _spy(*args, window_budget=None, **kwargs):
+        budgets.append(window_budget)
+        return real_stream_turn(*args, window_budget=window_budget, **kwargs)
+
+    monkeypatch.setattr(agent_router, "stream_turn", _spy)
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+    _seed_long_history(store, conversation["id"])
+
+    url = f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages"
+    first = _sse_events(client.post(url, json={"content": "keep going"}))
+    learned = next(e for e in first if e["type"] == "window")["budget"]
+
+    second = _sse_events(client.post(url, json={"content": "and again"}))
+    assert any(e["type"] == "done" for e in second)
+    # No second failed round trip: the retry attempt happened only in turn one.
+    assert calls["stream"] == 3
+    assert not any(e["type"] == "window" and e["reason"] == "overflow" for e in second)
+    # Turn 1 started unwindowed, retried with the derived budget, and turn 2
+    # started from that same budget.
+    assert budgets == [None, learned, learned]
+
+
+def test_get_last_window_budget_reads_only_overflow_rows(client, admin_bootstrap, agent_on, store):
+    """``fit`` rows report what a known budget did; only an ``overflow`` row
+    carries a budget learned from the provider."""
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+
+    async def _exercise():
+        conversation_id = conversation["id"]
+        assert await store.get_last_window_budget(conversation_id) is None
+        await store.add_agent_message(
+            conversation_id, "window", "fit", tool_result={"reason": "fit", "budget": 999}
+        )
+        assert await store.get_last_window_budget(conversation_id) is None
+        await store.add_agent_message(
+            conversation_id, "window", "overflow", tool_result={"reason": "overflow", "budget": 100}
+        )
+        await store.add_agent_message(
+            conversation_id, "window", "overflow", tool_result={"reason": "overflow", "budget": 60}
+        )
+        # Newest overflow wins — the budget converges downwards as it retries.
+        return await store.get_last_window_budget(conversation_id)
+
+    assert asyncio.run(_exercise()) == 60
+
+
 def test_is_context_overflow_matches_known_phrasings_only():
     """The overflow heuristic must not fire on unrelated 400s — a false
     positive burns a retry and shows a misleading error."""

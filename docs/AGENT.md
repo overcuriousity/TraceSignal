@@ -750,7 +750,7 @@ possibly-small model and its output was nondeterministic). Decision record:
   `apply_window(messages, budget)` before **every model request — mid-turn
   included**, which is what the failing case needed: the 2026-07-21 export
   overflowed twice inside its first turn, where compaction had nothing to
-  fold and the tier-drop re-run just re-issued the same broad plan. Two
+  fold and the tier-drop re-run just re-issued the same broad plan. Three
   passes, cheapest first:
   1. *Elide*: oldest-first, each `ToolReturnPart`'s content is replaced with
      `{"elided": true, "note": …}` until the estimate fits. Message structure
@@ -759,11 +759,22 @@ possibly-small model and its output was nondeterministic). Decision record:
   2. *Drop turns*: if elision is not enough, the oldest user turns are
      replaced with one marker pair. Cuts land on user-turn boundaries only —
      never between a tool_use and its tool_result.
+  3. *Truncate the newest returns*: last resort, and the only pass that
+     touches the request the model is about to reason over. One tool result
+     larger than the whole budget is invisible to the first two passes —
+     elision protects that request, turn dropping cannot reach inside it — so
+     without this the turn overflows, retries identically and dies. The
+     content becomes `{"truncated": true, "note": …, "head": …}`, keeping a
+     leading slice (never below `MIN_KEEP_CHARS`, 500) so the model can see
+     what the tool answered and narrow the re-run itself.
 
-  Never touched: the first user request (case/timeline context), the most
-  recent request's tool returns, the last user turn, and all assistant prose
-  (the findings narrative). The budget is
-  `context_window × 0.8 − est(system prompt)`; estimates are chars/4.
+  Never elided: the first user request (case/timeline context), the most
+  recent request's tool returns (pass 3 may still truncate them), the last
+  user turn, and all assistant prose (the findings narrative). The budget is
+  `context_window × 0.8 − est(system prompt)`; estimates are chars/4. When
+  even all three passes leave the history over budget, `apply_window` logs a
+  warning naming the residual — the analyst-facing `context_overflow` error
+  reads as "conversation too long", which that case is not.
 - **Transparent to the model.** The stubs sit in the replayed history and the
   system prompt explains them, so the model can adapt — re-run a tool with
   narrower filters, or `get_event` for the records it still needs — instead
@@ -787,9 +798,19 @@ possibly-small model and its output was nondeterministic). Decision record:
   router. If the window was already active, the retry tightens the budget
   (×0.6) instead. A second overflow surfaces the friendly
   `error{code="context_overflow"}`. One retry, not a ladder.
+- **A learned budget outlives its turn.** With no `context_window` configured,
+  the next turn of the same conversation starts from the budget the last
+  overflow derived (`PostgresStore.get_last_window_budget`, reading the newest
+  `reason="overflow"` window row) instead of repeating the failed round trip
+  every turn. A seeded budget that overflows again is tightened and
+  re-persisted, so the value converges. Configuration always wins: an operator
+  who set `context_window` has said what the model is.
 - **Forensic trail.** A turn the window reduced persists one append-only
   `role="window"` message row — `tool_result = {reason: "fit", attempt,
-  budget, results_elided, turns_dropped, estimated_before, estimated_after}`
+  budget, results_elided, results_truncated, turns_dropped, estimated_before,
+  estimated_after}`, the turn's single largest reduction rather than
+  field-wise maxima (which would pair one request's `estimated_before` with
+  another's `estimated_after` — a delta that never happened)
   — plus an `agent.window` audit row; the reactive retry persists the same
   pair with `reason: "overflow"` (and `window_hint` when the provider named
   its window) before re-running. The row is written on *every* exit — done,

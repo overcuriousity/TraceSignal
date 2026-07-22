@@ -13,11 +13,16 @@ as it grows instead of dying on the provider's 400. Two passes, cheapest first:
 2. **Drop turns** — if elision is not enough, whole oldest user turns are
    replaced by one marker pair. Splitting only at user-prompt boundaries keeps
    tool exchanges intact (same invariant the retired compaction held).
+3. **Truncate the newest returns** — last resort, for the case the first two
+   passes cannot touch at all: one tool result larger than the whole budget,
+   sitting in the request the model is about to reason over. Its content is
+   cut to a leading slice rather than stubbed, so the model keeps the shape of
+   its own result instead of overflowing twice and losing the turn.
 
-Never touched: the first user request (it carries the case/timeline context),
+Never elided: the first user request (it carries the case/timeline context),
 tool returns of the most recent request (what the model is about to reason
-over), the last user turn, and all assistant prose (the findings narrative —
-small, high value).
+over — pass 3 may still truncate them), the last user turn, and all assistant
+prose (the findings narrative — small, high value).
 
 **Determinism is the design constraint**, inherited from ``agent/fidelity.py``:
 :func:`apply_window` is a pure function of (messages, budget), so replaying a
@@ -31,7 +36,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from typing import Any
 
 from pydantic_ai.messages import (
@@ -48,6 +53,8 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ELISION_NOTE",
+    "MIN_KEEP_CHARS",
+    "TRUNCATION_NOTE",
     "TURN_DROP_MARKER",
     "WindowStats",
     "apply_window",
@@ -64,9 +71,23 @@ ELISION_NOTE = (
     "filters or use get_event to recover specifics."
 )
 
+#: What replaces a *truncated* tool result — pass 3's stub keeps a leading
+#: slice of the original under ``head``, so the model can still see what the
+#: tool answered even when the whole result does not fit anywhere.
+TRUNCATION_NOTE = (
+    "Result truncated to fit the context window — only the beginning is shown; "
+    "re-run the tool with narrower filters or use get_event for full records."
+)
+
 #: Prefix of the stub user message standing in for dropped turns — also what an
 #: analyst sees when inspecting raw_history in exports.
 TURN_DROP_MARKER = "[Older turns dropped to fit the context window]"
+
+#: Leading characters a truncated result keeps no matter how tight the budget.
+#: A bare note is worse than useless — the model cannot tell an empty result
+#: from a reduced one — so pass 3 stops shrinking here and lets the router's
+#: overflow backstop handle a budget that small.
+MIN_KEEP_CHARS = 500
 
 #: Share of the context window the prompt may use; the rest is headroom for the
 #: completion and the estimate's error (chars/4 is a heuristic, not a tokenizer).
@@ -75,17 +96,29 @@ MARGIN = 0.8
 
 @dataclass
 class WindowStats:
-    """What the window did across one turn's requests (maxima, see processor)."""
+    """What the window did to *one* model request.
+
+    Across a turn the processor keeps the single largest reduction rather than
+    per-field maxima, so the persisted row's ``estimated_before``/``after``
+    always describe the same request — a synthetic pair would report a delta
+    that never happened.
+    """
 
     budget: int = 0
     results_elided: int = 0
+    results_truncated: int = 0
     turns_dropped: int = 0
     estimated_before: int = 0
     estimated_after: int = 0
 
     @property
     def reduced(self) -> bool:
-        return self.results_elided > 0 or self.turns_dropped > 0
+        return self.results_elided > 0 or self.results_truncated > 0 or self.turns_dropped > 0
+
+    @property
+    def saved(self) -> int:
+        """Estimated tokens this request's reduction removed."""
+        return self.estimated_before - self.estimated_after
 
 
 def _serialized_size(value: Any) -> int:
@@ -124,6 +157,10 @@ def _stub() -> dict[str, Any]:
 
 def _is_stub(content: Any) -> bool:
     return isinstance(content, dict) and content.get("elided") is True
+
+
+def _is_truncated(content: Any) -> bool:
+    return isinstance(content, dict) and content.get("truncated") is True
 
 
 def _user_turn_boundaries(messages: list[ModelMessage]) -> list[int]:
@@ -183,6 +220,52 @@ def _elide(messages: list[ModelMessage], budget: int, running: int) -> tuple[int
     return elided, running
 
 
+def _truncate_newest(messages: list[ModelMessage], budget: int, running: int) -> tuple[int, int]:
+    """Pass 3: cut the newest request's tool returns down to a leading slice.
+
+    The last resort, and the only pass that touches the request the model is
+    about to reason over. One tool result larger than the whole budget is
+    invisible to both other passes — elision protects this request and turn
+    dropping cannot reach inside it — so without this the turn overflows,
+    retries identically, and dies. Truncating instead of stubbing keeps the
+    beginning of the result: the model can see what the tool answered and
+    narrow the re-run itself.
+
+    Oldest part first (a request's parts are in call order), stopping as soon
+    as the estimate fits. Same private-copy contract as :func:`_elide`.
+    """
+    index = _last_request_index(messages)
+    if index < 0:
+        return 0, running
+    message = messages[index]
+    if not isinstance(message, ModelRequest):
+        return 0, running
+    parts = list(message.parts)
+    truncated = 0
+    for j, part in enumerate(parts):
+        if running <= budget:
+            break
+        if not isinstance(part, ToolReturnPart) or _is_stub(part.content):
+            continue
+        if _is_truncated(part.content):
+            continue
+        text = json.dumps(part.content, default=str)
+        keep = max(MIN_KEEP_CHARS, len(text) - (running - budget) * 4)
+        if keep >= len(text):
+            continue
+        content = {"truncated": True, "note": TRUNCATION_NOTE, "head": text[:keep]}
+        saving = len(text) // 4 - _serialized_size(content) // 4
+        if saving <= 0:
+            # The wrapper costs more than the cut saves — leave the original.
+            continue
+        parts[j] = replace(part, content=content)
+        truncated += 1
+        running -= saving
+    if truncated:
+        messages[index] = replace(message, parts=parts)
+    return truncated, running
+
+
 def _drop_turns(messages: list[ModelMessage], budget: int, running: int) -> tuple[int, int]:
     """Pass 2: replace the oldest droppable turns with one marker pair.
 
@@ -201,7 +284,7 @@ def _drop_turns(messages: list[ModelMessage], budget: int, running: int) -> tupl
         if running <= budget:
             break
         span_end = boundaries[k + 1]
-        running -= sum(estimate_tokens([m]) for m in messages[boundaries[k] : span_end])
+        running -= estimate_tokens(messages[boundaries[k] : span_end])
         end = span_end
         dropped += 1
     if not dropped:
@@ -243,34 +326,55 @@ def apply_window(
     stats.results_elided, running = _elide(out, budget, before)
     if running > budget:
         stats.turns_dropped, running = _drop_turns(out, budget, running)
+    if running > budget:
+        stats.results_truncated, running = _truncate_newest(out, budget, running)
     stats.estimated_after = estimate_tokens(out)
     if stats.reduced:
         logger.info(
-            "Context window applied: %d results elided, %d turns dropped (est. %d -> %d, budget %d)",
+            "Context window applied: %d results elided, %d truncated, %d turns dropped "
+            "(est. %d -> %d, budget %d)",
             stats.results_elided,
+            stats.results_truncated,
             stats.turns_dropped,
             stats.estimated_before,
             stats.estimated_after,
             budget,
         )
+    if stats.estimated_after > budget:
+        # Every pass has run and the history still does not fit — a single
+        # protected payload dominates the budget. Said out loud here because
+        # the analyst-facing symptom (the router's context_overflow error)
+        # reads as "conversation too long", which this is not.
+        logger.warning(
+            "Context window could not fit the history: est. %d tokens still over budget %d "
+            "after eliding %d results, dropping %d turns and truncating %d — the newest "
+            "request's payload alone exceeds the budget.",
+            stats.estimated_after,
+            budget,
+            stats.results_elided,
+            stats.turns_dropped,
+            stats.results_truncated,
+        )
     return out, stats
 
 
 def make_window_processor(budget: int, stats: WindowStats):
-    """History processor for ``ProcessHistory``, accumulating turn maxima.
+    """History processor for ``ProcessHistory``, keeping the turn's worst request.
 
-    The processor runs once per model request; ``stats`` keeps the largest
-    reduction seen so the router can persist one honest row per turn rather
-    than one per request.
+    The processor runs once per model request; ``stats`` is overwritten
+    wholesale by the request with the largest reduction, so the router can
+    persist one honest row per turn rather than one per request. Field-wise
+    maxima would be cheaper but would pair one request's ``estimated_before``
+    with another's ``estimated_after`` — a delta that never happened, in a
+    record that has to stand up as evidence.
     """
 
     def process(messages: list[ModelMessage]) -> list[ModelMessage]:
         out, request_stats = apply_window(messages, budget)
+        if not stats.reduced or request_stats.saved > stats.saved:
+            for f in fields(WindowStats):
+                setattr(stats, f.name, getattr(request_stats, f.name))
         stats.budget = budget
-        stats.results_elided = max(stats.results_elided, request_stats.results_elided)
-        stats.turns_dropped = max(stats.turns_dropped, request_stats.turns_dropped)
-        stats.estimated_before = max(stats.estimated_before, request_stats.estimated_before)
-        stats.estimated_after = max(stats.estimated_after, request_stats.estimated_after)
         return out
 
     return process
