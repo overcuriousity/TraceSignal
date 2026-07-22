@@ -35,7 +35,7 @@ lightweight, explainable detection, without needing a cluster to run it.
   handle tens of gigabytes without loading everything into memory; also scriptable via
   `vestigo ingest` for huge files (no upload cap, live progress). Downloadable converter
   scripts parse vendor logs (nginx, suricata, cloudtrail, pcap, evtx, apache, cowrie,
-  and more) client-side; the native converters emit typed Parquet that the server
+  zeek, and more) client-side; the native converters emit typed Parquet that the server
   bulk-inserts via Arrow — an order of magnitude faster than row-by-row CSV, with
   per-row raw-file provenance — and stdlib-only Timesketch-format variants exist for
   every format.

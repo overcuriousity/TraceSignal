@@ -104,6 +104,13 @@ CONVERTERS = {
         "reverse-proxy X-Forwarded-For/X-Real-Ip client resolution and matched signature metadata.",
         ["webhoneypot_YYYY-MM-DD.json"],
     ),
+    "zeek2timesketch": (
+        "zeek",
+        "zeek2timesketch.py",
+        "Zeek (Bro) NSM TSV logs (conn.log, dns.log, http.log, and any other header-described "
+        "log type, incl. rotated/gzip) to Timesketch timeline.",
+        ["conn.log", "dns.log", "http.log", "*.log", "*.log.gz"],
+    ),
 }
 
 # Sibling converter modules a module imports from (beyond common/terminal).
