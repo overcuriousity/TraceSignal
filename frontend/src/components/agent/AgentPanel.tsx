@@ -44,6 +44,7 @@ import { ChartProposalCard } from "./ChartProposalCard";
 import { ProposalCard } from "./ProposalCard";
 import { ToolSelectorPopover } from "./ToolSelector";
 import { Markdown } from "./Markdown";
+import { capPersistedForStream, type TurnBaseline } from "./transcript";
 import type { EventFilters } from "@/api/types";
 
 interface Props {
@@ -427,6 +428,9 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  // Message count at send time — see capPersistedForStream for why mid-stream
+  // refetches must not render this turn's persisted rows a second time.
+  const turnBaselineRef = useRef<TurnBaseline | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // Same query key the tool popover uses — dedupes onto one request and
@@ -503,7 +507,14 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
 
   // Auto-scroll to the newest content while streaming or after a reload.
   const persistedItems = conversationQuery.data
-    ? itemsFromMessages(conversationQuery.data.messages)
+    ? itemsFromMessages(
+        capPersistedForStream(
+          conversationQuery.data.messages,
+          streaming,
+          activeId,
+          turnBaselineRef.current,
+        ),
+      )
     : [];
   const liveItems = itemsFromStream(stream);
   useEffect(() => {
@@ -511,10 +522,11 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
   }, [persistedItems.length, liveItems.length, stream.liveText.length]);
 
   const sendTo = useCallback(
-    async (conversationId: string) => {
+    async (conversationId: string, persistedCount: number) => {
       const content = input.trim();
       if (!content || streaming) return;
       setInput("");
+      turnBaselineRef.current = { conversationId, messageCount: persistedCount };
       setPendingUserText(content);
       setStream(EMPTY_STREAM);
       setStreaming(true);
@@ -584,7 +596,7 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
       const conversation = await agentApi.createConversation(caseId, timelineId, disabledTools);
       queryClient.invalidateQueries({ queryKey: ["agent-conversations", caseId, timelineId] });
       setActiveConversation(storeKey, conversation.id);
-      void sendTo(conversation.id);
+      void sendTo(conversation.id, 0);
     } catch (err) {
       setCreateError(err instanceof Error ? err.message : "Could not start the conversation.");
     } finally {
@@ -600,8 +612,17 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
       void createAndSend();
       return;
     }
-    void sendTo(activeId);
-  }, [input, streaming, creating, remoteTurnActive, activeId, createAndSend, sendTo]);
+    void sendTo(activeId, conversationQuery.data?.messages.length ?? 0);
+  }, [
+    input,
+    streaming,
+    creating,
+    remoteTurnActive,
+    activeId,
+    createAndSend,
+    sendTo,
+    conversationQuery.data,
+  ]);
 
   const exportThread = useCallback(async () => {
     if (!activeId) return;
