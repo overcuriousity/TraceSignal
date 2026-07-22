@@ -776,16 +776,25 @@ possibly-small model and its output was nondeterministic). Decision record:
 - **Reactive backstop.** With `context_window` unset there is no proactive
   window; a provider 400/413 matching `_is_context_overflow` (deliberately
   narrow phrasings — "maximum context", "prompt is too long" — so unrelated
-  400s never trigger it) derives a budget from the failed request's estimated
-  size (×0.8), enables the window, and re-runs the turn **once**. If the
-  window was already active, the retry tightens the budget (×0.6) instead. A
-  second overflow surfaces the friendly `error{code="context_overflow"}`.
-  One retry, not a ladder.
+  400s never trigger it) enables the window and re-runs the turn **once**.
+  The budget comes from the best source available: when the error body names
+  the model's window (`_overflow_window_hint` — OpenAI's "maximum context
+  length is N tokens", Anthropic's "X tokens > N maximum", llama.cpp's
+  "available context size (N tokens)"), the budget is `budget_for(N)`;
+  otherwise it falls back to the estimated size of the pre-turn history +
+  prompts (×0.8) — conservative by necessity, since the mid-turn tool results
+  that actually overflowed live inside `agent.run` and are invisible to the
+  router. If the window was already active, the retry tightens the budget
+  (×0.6) instead. A second overflow surfaces the friendly
+  `error{code="context_overflow"}`. One retry, not a ladder.
 - **Forensic trail.** A turn the window reduced persists one append-only
   `role="window"` message row — `tool_result = {reason: "fit", attempt,
   budget, results_elided, turns_dropped, estimated_before, estimated_after}`
   — plus an `agent.window` audit row; the reactive retry persists the same
-  pair with `reason: "overflow"` before re-running. The chat renders both
+  pair with `reason: "overflow"` (and `window_hint` when the provider named
+  its window) before re-running. The row is written on *every* exit — done,
+  stop, overflow retry, error — so even a turn that never finished explains
+  its reduced requests. The chat renders both
   (SSE `window` event), because an SSE event alone is gone on reload and the
   case file has to answer "why is there less here than there" from itself.
   Historical transcripts may still carry `compaction`/`fidelity` marker rows

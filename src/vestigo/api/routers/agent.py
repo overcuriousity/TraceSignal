@@ -365,9 +365,39 @@ def _is_context_overflow(exc: ModelHTTPError) -> bool:
 
 #: Reactive-retry budget levers (see the ModelHTTPError branch of
 #: `_message_stream_inner`). With a window already active the estimate proved
-#: too generous — tighten it; with none, size one from the request that failed.
+#: too generous — tighten it; with none, size one from the provider's reported
+#: window when the error body names it, else from the pre-turn history.
 _RETRY_SHRINK = 0.6
 _DERIVED_BUDGET_FACTOR = 0.8
+
+# Overflow bodies that name the model's actual window, per provider phrasing.
+# OpenAI / vLLM / LiteLLM passthrough: "This model's maximum context length is
+# 65536 tokens"; Anthropic: "prompt is too long: 123456 tokens > 64000 maximum";
+# llama.cpp behind LiteLLM (the 2026-07-20 phrasing): "request (81855 tokens)
+# exceeds the available context size (65536 tokens)". Ordered — first match
+# wins. Extend alongside _CONTEXT_OVERFLOW_RE (with a test) when a provider
+# invents another one.
+_WINDOW_HINT_RES = (
+    re.compile(r"maximum context length is (\d+)", re.IGNORECASE),
+    re.compile(r"\d+ tokens? > (\d+) maximum", re.IGNORECASE),
+    re.compile(r"available context size \((\d+) tokens?\)", re.IGNORECASE),
+)
+
+
+def _overflow_window_hint(exc: ModelHTTPError) -> int | None:
+    """The model's context window as reported by the overflow error, if any.
+
+    Best source for the reactive budget: the router cannot see the mid-turn
+    messages that overflowed (they live inside ``agent.run``), so without this
+    hint the derived budget can only come from the much smaller pre-turn
+    history. Hints below the config floor (1024) are treated as garbage.
+    """
+    body = str(exc.body or "")
+    for pattern in _WINDOW_HINT_RES:
+        if (match := pattern.search(body)) is not None:
+            hint = int(match.group(1))
+            return hint if hint >= 1024 else None
+    return None
 
 
 @dataclass(frozen=True)
@@ -510,6 +540,35 @@ async def _message_stream_inner(
         return reservation is not None and reservation.cancel.is_set()
 
     text_parts: list[str] = []
+    window_stats = WindowStats()
+
+    async def _persist_window_stats(attempt: int) -> dict[str, Any] | None:
+        """Persist the attempt's window-reduction row, if the window acted.
+
+        Called on *every* exit — success, stop, overflow retry, error — so the
+        case file explains reduced requests even for turns that never
+        finished. Returns the detail dict (for the SSE `window` event) or
+        None when there is nothing to record.
+        """
+        if not window_stats.reduced:
+            return None
+        detail = {
+            "reason": "fit",
+            "attempt": attempt,
+            "budget": window_stats.budget,
+            "results_elided": window_stats.results_elided,
+            "turns_dropped": window_stats.turns_dropped,
+            "estimated_before": window_stats.estimated_before,
+            "estimated_after": window_stats.estimated_after,
+        }
+        await _persist_window(
+            detail,
+            f"Older tool results ({window_stats.results_elided} elided, "
+            f"{window_stats.turns_dropped} turns dropped) were reduced to fit "
+            "the model's context window — the full record is preserved here.",
+        )
+        return detail
+
     for attempt in range(2):
         text_parts = []
         window_stats = WindowStats()
@@ -544,6 +603,8 @@ async def _message_stream_inner(
                         await store.add_agent_message(
                             conversation_id, "assistant", "".join(text_parts) + " [stopped]"
                         )
+                    if (stats_detail := await _persist_window_stats(attempt)) is not None:
+                        yield _sse({"type": "window", "reason": "fit", "stats": stats_detail})
                     yield _sse({"type": "cancelled"})
                     return
                 if event["type"] == "result":
@@ -558,24 +619,9 @@ async def _message_stream_inner(
                     await store.update_agent_conversation(
                         conversation_id, history=dump_history(history + turn.new_messages)
                     )
-                    if window_stats.reduced:
-                        # One honest row per turn (the stats are the turn's
-                        # maxima across its requests), not one per request.
-                        stats_detail = {
-                            "reason": "fit",
-                            "attempt": attempt,
-                            "budget": window_stats.budget,
-                            "results_elided": window_stats.results_elided,
-                            "turns_dropped": window_stats.turns_dropped,
-                            "estimated_before": window_stats.estimated_before,
-                            "estimated_after": window_stats.estimated_after,
-                        }
-                        await _persist_window(
-                            stats_detail,
-                            f"Older tool results ({window_stats.results_elided} elided, "
-                            f"{window_stats.turns_dropped} turns dropped) were reduced to fit "
-                            "the model's context window — the full record is preserved here.",
-                        )
+                    # One honest row per turn (the stats are the turn's
+                    # maxima across its requests), not one per request.
+                    if (stats_detail := await _persist_window_stats(attempt)) is not None:
                         yield _sse({"type": "window", "reason": "fit", "stats": stats_detail})
                     yield _sse(
                         {
@@ -634,10 +680,14 @@ async def _message_stream_inner(
                 # One reactive retry, not a ladder. The estimate is chars/4,
                 # so a provider can still overflow a windowed request; and an
                 # unconfigured deployment has no proactive window at all. In
-                # both cases: pick a budget the failed request tells us about,
-                # enable/tighten the window, and re-run the turn once. Tool
-                # rows already persisted by this attempt stay — the record
-                # shows what actually ran.
+                # both cases: enable/tighten the window and re-run the turn
+                # once. Tool rows already persisted by this attempt stay — the
+                # record shows what actually ran. The failed attempt's own
+                # window stats are recorded first — the overflow marker then
+                # delimits them from the re-run's.
+                if (stats_detail := await _persist_window_stats(attempt)) is not None:
+                    yield _sse({"type": "window", "reason": "fit", "stats": stats_detail})
+                hint: int | None = None
                 if window_budget is not None:
                     window_budget = max(int(window_budget * _RETRY_SHRINK), 1)
                     sentence = (
@@ -645,7 +695,23 @@ async def _message_stream_inner(
                         f"window was tightened to a budget of {window_budget} tokens and the "
                         "turn re-run."
                     )
+                elif (hint := _overflow_window_hint(exc)) is not None:
+                    # The provider named its window in the error — the best
+                    # budget source there is: the router never sees the
+                    # mid-turn messages that actually overflowed.
+                    window_budget = budget_for(hint, SYSTEM_PROMPT)
+                    sentence = (
+                        "The request exceeded the model's context window (no context_window "
+                        f"is configured) — the provider reported a window of {hint} tokens, "
+                        f"so a sliding window with a budget of {window_budget} tokens was "
+                        "enabled and the turn re-run. Configure the agent's context_window "
+                        "to avoid the failed round trip."
+                    )
                 else:
+                    # No hint in the error body. The mid-turn tool results
+                    # that overflowed are invisible here (inside agent.run),
+                    # so the pre-turn history is the only size available —
+                    # deliberately conservative.
                     estimated = (
                         estimate_tokens(history)
                         + len(SYSTEM_PROMPT) // 4
@@ -655,10 +721,12 @@ async def _message_stream_inner(
                     sentence = (
                         "The request exceeded the model's context window (no context_window "
                         f"is configured) — a sliding window with a budget of {window_budget} "
-                        "tokens was derived from the failed request and the turn re-run. "
+                        "tokens was derived from the conversation so far and the turn re-run. "
                         "Configure the agent's context_window to avoid the failed round trip."
                     )
                 detail = {"reason": "overflow", "attempt": attempt, "budget": window_budget}
+                if hint is not None:
+                    detail["window_hint"] = hint
                 await _persist_window(detail, sentence)
                 yield _sse({"type": "window", "reason": "overflow", "budget": window_budget})
                 continue
@@ -667,6 +735,8 @@ async def _message_stream_inner(
                 await store.add_agent_message(
                     conversation_id, "assistant", "".join(text_parts) + " [interrupted]"
                 )
+            if (stats_detail := await _persist_window_stats(attempt)) is not None:
+                yield _sse({"type": "window", "reason": "fit", "stats": stats_detail})
             if overflow:
                 detail = (
                     "The conversation no longer fits the model's context window "
@@ -694,6 +764,8 @@ async def _message_stream_inner(
                 await store.add_agent_message(
                     conversation_id, "assistant", "".join(text_parts) + " [interrupted]"
                 )
+            if (stats_detail := await _persist_window_stats(attempt)) is not None:
+                yield _sse({"type": "window", "reason": "fit", "stats": stats_detail})
             if isinstance(exc, UsageLimitExceeded):
                 code = "turn_limit_reached"
                 detail = (
@@ -713,6 +785,8 @@ async def _message_stream_inner(
                 await store.add_agent_message(
                     conversation_id, "assistant", "".join(text_parts) + " [interrupted]"
                 )
+            if (stats_detail := await _persist_window_stats(attempt)) is not None:
+                yield _sse({"type": "window", "reason": "fit", "stats": stats_detail})
             yield _sse({"type": "error", "detail": "Agent turn failed — see server logs."})
             return
 

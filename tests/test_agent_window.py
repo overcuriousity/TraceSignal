@@ -83,6 +83,16 @@ def test_budget_for_reserves_headroom_and_system_prompt():
     assert budget_for(10_000, "s" * 4000) == 8_000 - 1_000
 
 
+def test_budget_for_clamps_to_floor_and_warns(caplog):
+    """A system prompt that eats the whole margin must not yield a budget <= 0
+    (which would silently maximally elide every request)."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="vestigo.agent.window"):
+        assert budget_for(1024, "s" * 100_000) == 1
+    assert "context_window" in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # apply_window: pass 1 (elision)
 # ---------------------------------------------------------------------------
@@ -106,6 +116,21 @@ def test_elides_oldest_tool_results_first():
     assert not _elided(returns[3])
     assert stats.results_elided == 2
     assert stats.estimated_after <= stats.budget
+
+
+def test_tiny_results_are_not_stubbed():
+    """A tool return smaller than the elision stub is left alone — replacing
+    it would grow the prompt and count a no-op elision."""
+    history: list = [ModelRequest(parts=[UserPromptPart(content="q1")])]
+    history += _tool_cycle("get_event", "ok", "tiny0")  # smaller than the stub
+    history += _tool_cycle("search_events", {"data": BIG}, "big0")
+    history += _tool_cycle("search_events", {"data": BIG}, "big1")
+    history.append(ModelResponse(parts=[TextPart(content="answer")]))
+    out, stats = apply_window(history, budget=1_200)
+    returns = _tool_returns(out)
+    assert returns[0].content == "ok"
+    assert _elided(returns[1])
+    assert stats.results_elided == 1
 
 
 def test_newest_request_cycle_is_protected():

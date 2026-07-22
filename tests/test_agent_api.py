@@ -1944,3 +1944,144 @@ def test_is_context_overflow_matches_known_phrasings_only():
     assert not _is_context_overflow(_exc("field 'length' is required"))
     # Overflow wording on a non-overflow status stays a model_error.
     assert not _is_context_overflow(_exc("maximum context length exceeded", status=500))
+
+
+def test_overflow_window_hint_parses_provider_phrasings():
+    """The reactive budget's best source is the window the provider names in
+    its overflow error — per-provider phrasings, garbage numbers ignored."""
+    from pydantic_ai.exceptions import ModelHTTPError
+
+    from vestigo.api.routers.agent import _overflow_window_hint
+
+    def _exc(body: str) -> ModelHTTPError:
+        return ModelHTTPError(status_code=400, model_name="m", body=body)
+
+    # OpenAI / vLLM.
+    assert _overflow_window_hint(_exc("This model's maximum context length is 8192 tokens")) == 8192
+    # Anthropic.
+    assert (
+        _overflow_window_hint(_exc("prompt is too long: 210000 tokens > 200000 maximum")) == 200000
+    )
+    # llama.cpp behind LiteLLM (2026-07-20 phrasing).
+    assert (
+        _overflow_window_hint(
+            _exc(
+                "litellm.BadRequestError: Custom_openaiException - request (81855 tokens) "
+                "exceeds the available context size (65536 tokens), try increasing it."
+            )
+        )
+        == 65536
+    )
+    # No number in the body: no hint.
+    assert _overflow_window_hint(_exc("maximum context length exceeded")) is None
+    # A hint below the config floor is garbage, not a window.
+    assert _overflow_window_hint(_exc("This model's maximum context length is 12 tokens")) is None
+
+
+def test_overflow_with_provider_hint_derives_budget_from_reported_window(
+    client, admin_bootstrap, agent_on, store, monkeypatch
+):
+    """When the overflow error names the model's window, the retry budget
+    comes from it (budget_for), not from the much smaller pre-turn history."""
+    calls = _tool_free_model(
+        monkeypatch,
+        fail_first_stream=(
+            "request (81855 tokens) exceeds the available context size (65536 tokens)"
+        ),
+    )
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+    _seed_long_history(store, conversation["id"])
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
+        json={"content": "keep going"},
+    )
+    assert resp.status_code == 200
+    events = _sse_events(resp)
+    from vestigo.agent.runtime import SYSTEM_PROMPT
+    from vestigo.agent.window import budget_for
+
+    window = next(e for e in events if e["type"] == "window")
+    assert window["reason"] == "overflow"
+    assert window["budget"] == budget_for(65536, SYSTEM_PROMPT)
+    assert any(e["type"] == "done" for e in events)
+    assert calls["stream"] == 2
+
+    async def _record():
+        return await store.list_agent_messages(conversation["id"])
+
+    rows = [m for m in asyncio.run(_record()) if m.role == "window"]
+    assert len(rows) == 1
+    assert rows[0].tool_result["window_hint"] == 65536
+    assert rows[0].tool_result["budget"] == budget_for(65536, SYSTEM_PROMPT)
+
+
+def test_interrupted_turn_still_persists_window_row(
+    client, admin_bootstrap, agent_on, store, monkeypatch
+):
+    """A turn whose requests were reduced but that then dies mid-turn must
+    still leave the role="window" row — the case file has to answer "why is
+    there less here" even for turns that never finished."""
+    from mcp.server.fastmcp import FastMCP
+    from pydantic_ai.messages import ToolReturnPart
+    from pydantic_ai.models.function import DeltaToolCall, FunctionModel
+
+    from vestigo.agent import runtime
+
+    monkeypatch.setenv("VESTIGO_AGENT_CONTEXT_WINDOW", "8000")
+    get_settings.cache_clear()
+
+    server = FastMCP("stub")
+
+    @server.tool()
+    def run_anomaly_detector(detector: str = "value_novelty") -> dict:
+        return {"status": "ok", "blob": "x" * 8000}
+
+    monkeypatch.setattr(runtime, "build_tool_server", lambda scope: server)
+
+    async def model_stream(messages, info):
+        returns = sum(
+            isinstance(part, ToolReturnPart) for message in messages for part in message.parts
+        )
+        if returns < 2:
+            yield {0: DeltaToolCall(name="run_anomaly_detector", json_args="{}")}
+            return
+        # By now the window has elided the first bulky result — then the turn
+        # dies on something unrelated to context.
+        raise RuntimeError("model backend fell over")
+
+    monkeypatch.setattr(
+        runtime,
+        "build_model",
+        lambda config=None, http_client=None: FunctionModel(stream_function=model_stream),
+    )
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
+        json={"content": "find anomalies"},
+    )
+    assert resp.status_code == 200
+    events = _sse_events(resp)
+    assert any(e["type"] == "error" for e in events)
+    window = next(e for e in events if e["type"] == "window")
+    assert window["reason"] == "fit"
+    assert window["stats"]["results_elided"] >= 1
+
+    async def _record():
+        return await store.list_agent_messages(conversation["id"])
+
+    rows = [m for m in asyncio.run(_record()) if m.role == "window"]
+    assert len(rows) == 1
+    assert rows[0].tool_result["reason"] == "fit"
+    assert rows[0].tool_result["results_elided"] >= 1

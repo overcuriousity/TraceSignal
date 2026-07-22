@@ -101,9 +101,21 @@ def budget_for(context_window: int, system_prompt: str) -> int:
     """Token budget for the message history, from the configured window.
 
     ``MARGIN`` leaves completion headroom; the system prompt rides outside the
-    message list, so its estimated share is subtracted here once.
+    message list, so its estimated share is subtracted here once. Clamped to a
+    floor of 1: a non-positive budget would silently maximally elide every
+    request, which is a misconfiguration worth a warning, not a quiet default.
     """
-    return int(context_window * MARGIN) - len(system_prompt) // 4
+    budget = int(context_window * MARGIN) - len(system_prompt) // 4
+    if budget < 1:
+        logger.warning(
+            "Configured context_window %d leaves no room for messages after the "
+            "system prompt (~%d tokens) — every request will be maximally elided. "
+            "Raise context_window.",
+            context_window,
+            len(system_prompt) // 4,
+        )
+        return 1
+    return budget
 
 
 def _stub() -> dict[str, Any]:
@@ -158,10 +170,14 @@ def _elide(messages: list[ModelMessage], budget: int, running: int) -> tuple[int
             if not isinstance(part, ToolReturnPart) or _is_stub(part.content):
                 continue
             saving = _serialized_size(part.content) // 4 - stub_cost
+            if saving <= 0:
+                # The stub would be no smaller than the content — replacing it
+                # grows the prompt and burns an "elided" count on a no-op.
+                continue
             parts[j] = replace(part, content=_stub())
             changed = True
             elided += 1
-            running -= max(saving, 0)
+            running -= saving
         if changed:
             messages[i] = replace(message, parts=parts)
     return elided, running

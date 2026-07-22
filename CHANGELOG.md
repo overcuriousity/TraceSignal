@@ -19,9 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   history + budget, so replays reproduce it exactly), transparent to the model
   (the system prompt explains recovery via `get_event` / narrower re-runs),
   and applied at send time only — the stored transcript stays complete.
-  Driven by `context_window`; with it unset, a provider overflow derives a
-  budget from the failed request and re-runs the turn once. Every reduced turn
-  persists a `role="window"` transcript row plus an `agent.window` audit row.
+  Driven by `context_window`; with it unset, a provider overflow enables the
+  window reactively and re-runs the turn once — the budget comes from the
+  window the provider names in its error body when present (OpenAI /
+  Anthropic / llama.cpp phrasings), else from the estimated pre-turn history
+  size. Every reduced turn — finished, stopped, or interrupted — persists a
+  `role="window"` transcript row plus an `agent.window` audit row.
 
 ### Removed
 
