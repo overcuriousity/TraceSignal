@@ -2158,8 +2158,8 @@ tooltip anchor/clamping fix)
 9 cleanup/design items) is resolved; see `docs/archive/PR8_REVIEW_FINDINGS.md`.
 
 This document tracks implementation progress against the MVP defined in
-[`CONCEPT.md`](./CONCEPT.md) and the tech-stack decisions in [`TECH_STACK.md`](./TECH_STACK.md).
-See [`ROADMAP.md`](./ROADMAP.md) for the detailed scope breakdown and remaining work.
+[`CONCEPT.md`](../CONCEPT.md) and the tech-stack decisions in [`TECH_STACK.md`](../TECH_STACK.md).
+See [`ROADMAP.md`](../ROADMAP.md) for the detailed scope breakdown and remaining work.
 
 ## Overall completion
 

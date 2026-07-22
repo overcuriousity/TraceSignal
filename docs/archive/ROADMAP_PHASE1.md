@@ -3,8 +3,8 @@
 This document tracks the agreed scope for the TraceSignal API and UI.
 
 > **Current model:** Case / Source / Timeline / Artifact.
-> See [`docs/MODEL_REFINEMENT.md`](./MODEL_REFINEMENT.md) for the design rationale
-> (implementation complete). See [`docs/PROGRESS.md`](./PROGRESS.md) for the overall
+> See [`docs/MODEL_REFINEMENT.md`](../MODEL_REFINEMENT.md) for the design rationale
+> (implementation complete). See [`docs/PROGRESS.md`](../PROGRESS.md) for the overall
 > completion snapshot.
 
 ## Out of scope
