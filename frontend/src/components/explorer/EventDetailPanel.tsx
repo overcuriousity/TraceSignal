@@ -173,7 +173,7 @@ function FieldRow({
               </Tooltip>
             )}
             {onMarkNormal && (
-              <Tooltip content={`Mark normal: treat ${label} = ${value} as normal — no detector flags it again`} side="top">
+              <Tooltip content={`Mark normal: treat ${label} = ${value} as expected — detectors stop flagging this exact value. Combinations and sequences containing it are still scored.`} side="top">
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
@@ -649,7 +649,7 @@ export function EventDetailPanel({
                     </span>
                   </Tooltip>
                 )}
-                <Tooltip content="Delete annotation" side="top">
+                <Tooltip content="Delete annotation — permanent, removed for all analysts" side="top">
                   <button
                     onClick={() =>
                       remove.mutate({ eventId: event.event_id, annotationId: a.id })

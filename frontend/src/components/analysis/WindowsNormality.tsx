@@ -337,7 +337,7 @@ const KIND_META: Record<
 > = {
   normal: {
     heading: "Normal",
-    hint: "Expected behavior — extends the baseline; hidden from future scans.",
+    hint: "Expected behavior — on the known-normal list; matching findings suppressed in future scans.",
     removeTitle: "Remove — becomes flaggable again",
   },
   dismissed: {
@@ -381,7 +381,7 @@ export function NormalValuesList({ caseId, timelineId }: Props) {
   return (
     <div className="space-y-2 text-sm">
       <p className="text-[10px] text-[var(--color-fg-muted)]">
-        Your verdicts on findings. <strong>Normal</strong> extends the baseline,{" "}
+        Your verdicts on findings. <strong>Normal</strong> suppresses matching findings in future scans,{" "}
         <strong>Dismissed</strong> hides noise without changing detection,{" "}
         <strong>Confirmed</strong> pins escalated findings.
       </p>

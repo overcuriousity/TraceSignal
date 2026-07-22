@@ -32,7 +32,7 @@ export function FrameBar({ caseId, timelineId }: Props) {
 
   const status =
     frame === "self"
-      ? "Every detector scans all events."
+      ? "All events scanned. Temporal-only detectors (proportion shift, interval cadence, sequences, distribution drift) need a baseline and stay empty here."
       : active
         ? `Comparing ${active.suspect_windows.length} suspect window${active.suspect_windows.length === 1 ? "" : "s"} against “${active.name}”.`
         : "No baseline selected — open Manage baselines to pick or build one.";

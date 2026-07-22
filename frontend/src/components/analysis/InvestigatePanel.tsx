@@ -241,10 +241,11 @@ export function InvestigatePanel({
                     selection and tuning.
                   </li>
                   <li>
-                    Disposition a finding: <strong>Normal</strong> extends the
-                    baseline (stops surfacing in future scans),{" "}
-                    <strong>Dismiss</strong> hides it as noise without changing
-                    detection, <strong>Confirm</strong> escalates it durably.
+                    Disposition a finding: <strong>Normal</strong> adds it to the
+                    known-normal list (that exact value or pattern stops surfacing
+                    in future scans), <strong>Dismiss</strong> hides it as noise
+                    without changing detection, <strong>Confirm</strong> escalates
+                    it durably.
                   </li>
                 </ol>
               </GuidancePanel>

@@ -456,7 +456,7 @@ export function FindingRowActions({
         <button
           title={
             canNormalOrDismiss
-              ? `Normal: treat ${scopeLabel} as expected behavior — extends the baseline, no longer flagged by ${disposition.detector}`
+              ? `Normal: treat ${scopeLabel} as expected behavior — added to the known-normal list, no longer flagged by ${disposition.detector}`
               : noScopeReason
           }
           className={cn(

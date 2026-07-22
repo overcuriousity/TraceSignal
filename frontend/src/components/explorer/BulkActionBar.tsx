@@ -153,10 +153,20 @@ export function BulkActionBar({
 
           {mode === null ? (
             <>
-              <Button variant="outline" size="sm" onClick={() => setMode("tag")}>
+              <Button
+                variant="outline"
+                size="sm"
+                title={`Add a tag annotation to ${selectionMode === "all" ? "every event matching the current filter" : "each selected event"}`}
+                onClick={() => setMode("tag")}
+              >
                 <Tag size={13} /> Tag
               </Button>
-              <Button variant="outline" size="sm" onClick={() => setMode("comment")}>
+              <Button
+                variant="outline"
+                size="sm"
+                title={`Add a comment annotation to ${selectionMode === "all" ? "every event matching the current filter" : "each selected event"}`}
+                onClick={() => setMode("comment")}
+              >
                 <MessageSquare size={13} /> Comment
               </Button>
               <Button

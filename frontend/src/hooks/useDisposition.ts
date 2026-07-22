@@ -111,7 +111,7 @@ function markFindingsConfirmed(data: AnomaliesResponse, t: DispositionTarget): A
 const TOAST_BY_KIND: Record<DispositionKind, { title: (label: string) => string; hint: string }> = {
   normal: {
     title: (label) => `Marked normal — ${label}`,
-    hint: "No longer flagged; the baseline now includes it. Manage under Windows & normality.",
+    hint: "Added to the known-normal list — matching findings suppressed in future scans. Manage under Windows & normality.",
   },
   dismissed: {
     title: (label) => `Dismissed — ${label}`,
@@ -131,7 +131,7 @@ const TOAST_BY_KIND: Record<DispositionKind, { title: (label: string) => string;
  * Declare a disposition on a finding — the single mutation behind the
  * Normal / Dismiss / Confirm row actions (see docs/ANOMALY_DETECTION.md):
  *
- * - `normal` extends the baseline: value-shaped targets become a value-scoped
+ * - `normal` adds to the known-normal list: value-shaped targets become a value-scoped
  *   disposition (suppressed on every event), positional ones an event-scoped
  *   one. Suppression is a post-detection filter on the backend, so the same
  *   filter is applied *optimistically* to every cached anomalies result here —

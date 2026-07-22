@@ -7,7 +7,7 @@
  */
 export const GLOSSARY = {
   scanAllEvents:
-    "Score every event against the whole corpus (self-baseline). No reference window needed — good for a first pass over unfamiliar data.",
+    "Score every event against the whole corpus (self-baseline). No reference window needed — good for a first pass over unfamiliar data. Temporal-only detectors need a baseline and stay empty here.",
   compareBaseline:
     "Score one or more suspect windows against a baseline you trust as normal. Surfaces what changed relative to known-good activity.",
   baseline:
@@ -19,7 +19,7 @@ export const GLOSSARY = {
   temporal:
     "The detector learns 'normal' from a baseline window, then flags deviations in each suspect window scored against it. Suspect windows need not be adjacent to the baseline.",
   normalValues:
-    "Your verdicts on findings. Normal = expected behavior, extends the baseline and suppresses detection. Dismissed = noise, hidden from view only. Confirmed = escalated, survives re-scans.",
+    "Your verdicts on findings. Normal = expected behavior, added to the known-normal list — findings matching that exact value or combination are suppressed on future scans. Dismissed = noise, hidden from view only. Confirmed = escalated, survives re-scans.",
 } as const;
 
 export type GlossaryKey = keyof typeof GLOSSARY;
