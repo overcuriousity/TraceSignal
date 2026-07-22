@@ -1,6 +1,40 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-22 (session 84 — #150 locate-in-timeline regression from routine-collapse).
+Last updated: 2026-07-22 (session 85 — agent sliding context window, 1.5.0).
+
+## Session 85 — 2026-07-22: sliding context window replaces fidelity ladder + compaction (1.5.0)
+
+Driven by a real failure: an exported conversation (`ornith:9b`, 64k window)
+overflowed **twice inside its first turn** — the fidelity ladder dropped a tier
+and re-ran the whole turn (the model re-issued the same broad plan, doubling
+the work), compaction had nothing to fold (first turn), and the analyst got
+`[interrupted]` instead of a report. The failing class is *mid-turn* overflow:
+tool results accumulating inside one `agent.run`, which neither mechanism
+addressed.
+
+New `agent/window.py`: a deterministic sliding window applied via pydantic-ai's
+`ProcessHistory` capability before **every model request** (mid-turn included).
+Pass 1 elides the oldest `ToolReturnPart` contents to `{"elided": true, note}`
+stubs (structure untouched — tool pairing/alternation survive all protocols);
+pass 2 replaces the oldest whole user turns with one marker pair. Protected:
+first user request (case context), the newest request's returns, the last turn,
+all assistant prose. Pure function of (messages, budget) — replay under the
+same config elides the same bytes; the stored history blob stays complete
+(window applies at send time). Transparent to the model: stubs are visible and
+the system prompt explains recovery (`get_event`, narrower re-runs).
+
+Retired: the fidelity overflow ladder (`degrade`/`next_tier` — static
+`tool_fidelity` shaping stays) and `agent/compaction.py` entirely (summarizer
+ran on the same weak model, nondeterministic output, and its niche is covered
+by pass 2 + "start a new conversation"); `compact_threshold` dropped everywhere
+(migration 0015), `get_last_agent_usage` deleted. Router: proactive budget from
+`context_window` (`×0.8 − est(system prompt)`); on overflow one reactive retry
+(derive budget ×0.8 from the failed request, or tighten ×0.6 if already
+windowed), then the friendly `context_overflow` error. Forensics: one
+`role="window"` row + `agent.window` audit per reduced turn (reasons `fit` /
+`overflow`); old `compaction`/`fidelity` rows still render read-only in the
+panel. Version 1.5.0; net-negative LOC in `src/`. Spec:
+`docs/superpowers/specs/2026-07-22-agent-sliding-window-design.md`.
 
 ## Session 84 — 2026-07-22: "locate this event in timeline" no longer scrolled (#150)
 

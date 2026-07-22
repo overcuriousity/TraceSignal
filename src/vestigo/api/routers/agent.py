@@ -30,15 +30,17 @@ from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior, Usag
 
 from vestigo import __version__
 from vestigo.agent.availability import agent_available
-from vestigo.agent.compaction import (
-    compact_history,
-    estimate_next_prompt_tokens,
-    should_compact,
-)
 from vestigo.agent.config import DEFAULT_MAX_TURNS, resolve_agent_config
-from vestigo.agent.fidelity import MAX_FIDELITY_DROPS, next_tier, resolve_fidelity
-from vestigo.agent.runtime import LLM_TIMEOUT, dump_history, load_history, stream_turn
+from vestigo.agent.fidelity import resolve_fidelity
+from vestigo.agent.runtime import (
+    LLM_TIMEOUT,
+    SYSTEM_PROMPT,
+    dump_history,
+    load_history,
+    stream_turn,
+)
 from vestigo.agent.tools import TOOL_NAMES, TOOL_REGISTRY, build_scope
+from vestigo.agent.window import WindowStats, budget_for, estimate_tokens
 from vestigo.api.deps import (
     get_current_user,
     get_store,
@@ -202,8 +204,9 @@ async def export_conversation(
 ) -> Response:
     """Export the full conversation as a JSON attachment.
 
-    Contains every message row (user/assistant/tool/thinking/compaction/
-    fidelity, with tool args/results and measured token usage), the proposals, and
+    Contains every message row (user/assistant/tool/thinking/window — plus
+    historical compaction/fidelity rows — with tool args/results and measured
+    token usage), the proposals, and
     ``raw_history`` — the provider-wire pydantic-ai blob, the only place
     thinking signatures and provider quirks live. Deliberately not gated on
     ``_require_agent``: the record must stay exportable while the LLM
@@ -360,6 +363,13 @@ def _is_context_overflow(exc: ModelHTTPError) -> bool:
     return exc.status_code in (400, 413) and bool(_CONTEXT_OVERFLOW_RE.search(str(exc.body or "")))
 
 
+#: Reactive-retry budget levers (see the ModelHTTPError branch of
+#: `_message_stream_inner`). With a window already active the estimate proved
+#: too generous — tighten it; with none, size one from the request that failed.
+_RETRY_SHRINK = 0.6
+_DERIVED_BUDGET_FACTOR = 0.8
+
+
 @dataclass(frozen=True)
 class _ActiveTurn:
     """A reserved in-flight turn: its cancel signal and when it started."""
@@ -470,92 +480,39 @@ async def _message_stream_inner(
         fidelity=resolve_fidelity(config.tool_fidelity, config.context_window),
     )
     history = load_history(conversation.history)
-    last_prompt, last_completion = await store.get_last_agent_usage(conversation_id)
 
-    async def _run_compaction(
-        current: list[Any], reason: str, keep_turns: int
-    ) -> tuple[list[Any], dict[str, Any]] | None:
-        """Compact, persist the forensic record, return (new_history, sse_event).
+    # Sliding context window (agent/window.py): the one context-management
+    # mechanism. Proactive when the operator configured context_window;
+    # reactive otherwise — a provider overflow derives a budget from the
+    # failed request's size and the turn is re-run exactly once. It replaced
+    # the fidelity overflow ladder and LLM compaction (see
+    # docs/superpowers/specs/2026-07-22-agent-sliding-window-design.md).
+    window_budget = (
+        budget_for(config.context_window, SYSTEM_PROMPT) if config.context_window else None
+    )
 
-        None means compaction wasn't possible (nothing old enough to fold,
-        or the summarizer call itself failed) — the caller falls through to
-        its error path.
-        """
-        try:
-            outcome = await compact_history(config, current, keep_turns=keep_turns)
-        except Exception:
-            logger.exception("History compaction failed (conversation %s)", conversation_id)
-            return None
-        if outcome is None:
-            return None
-        estimated = estimate_next_prompt_tokens(
-            last_prompt, last_completion, current, payload.content
-        )
-        # The append-only row keeps the summary AND the exact pre-compaction
-        # wire blob: the original full context stays reconstructible (and
-        # exportable) even though future turns replay the compacted history.
-        await store.add_agent_message(
-            conversation_id,
-            "compaction",
-            outcome.summary,
-            tool_result={
-                "reason": reason,
-                "keep_turns": keep_turns,
-                "messages_summarized": outcome.messages_summarized,
-                "estimated_tokens_before": estimated,
-                "pre_compaction_history": dump_history(current),
-            },
-        )
-        await store.update_agent_conversation(
-            conversation_id, history=dump_history(outcome.new_history)
-        )
+    async def _persist_window(detail: dict[str, Any], sentence: str) -> None:
+        """A window action is persisted the way the fidelity drop was: an SSE
+        event alone is gone on reload, and the case file has to answer "why is
+        there less here than there" from itself. The row also separates a
+        failed attempt's tool rows from the re-run's."""
+        await store.add_agent_message(conversation_id, "window", sentence, tool_result=detail)
         await store.record_audit(
-            action="agent.compaction",
+            action="agent.window",
             actor=user,
             case_id=case_id,
             target_type="agent_conversation",
             target_id=conversation_id,
-            detail={"reason": reason, "messages_summarized": outcome.messages_summarized},
+            detail=detail,
         )
-        return outcome.new_history, {
-            "type": "compaction",
-            "summary": outcome.summary,
-            "reason": reason,
-        }
-
-    # Escalation on overflow, cheapest lever first:
-    #
-    #   1. drop one tool-result fidelity tier and re-run the turn. No LLM call,
-    #      and it is the only lever that helps a *single* broad turn — the case
-    #      that actually overflowed a 64k model (2026-07-20). The turn is
-    #      re-run through a fresh `build_tool_server`, so nothing already in
-    #      history is rewritten and the record never diverges from what the
-    #      model saw. Skipped when the attempt called no tier-honouring tool
-    #      (`fidelity.next_tier`) — a drop that cannot change the prompt is not
-    #      a lever, just a wasted round trip.
-    #   2. compact: the first keeps 2 recent turns verbatim, a second folds
-    #      down to 1. Costs a summarizer call, and can only help when there is
-    #      an older turn to fold.
-    #   3. give up with the friendly context_overflow error.
-    keep_schedule = (2, 1)
-    # Every fidelity drop (full -> message -> minimal) at most, then compaction.
-    max_attempts = MAX_FIDELITY_DROPS + len(keep_schedule) + 1
-    compactions = 0
-    estimated = estimate_next_prompt_tokens(last_prompt, last_completion, history, payload.content)
-    if should_compact(config, estimated):
-        compaction = await _run_compaction(history, "threshold", keep_schedule[0])
-        if compaction is not None:
-            history, compaction_event = compaction
-            compactions = 1
-            yield _sse(compaction_event)
 
     def _cancelled() -> bool:
         return reservation is not None and reservation.cancel.is_set()
 
     text_parts: list[str] = []
-    for attempt in range(max_attempts):
+    for attempt in range(2):
         text_parts = []
-        tools_used: set[str] = set()
+        window_stats = WindowStats()
         if _cancelled():
             yield _sse({"type": "cancelled"})
             return
@@ -564,13 +521,13 @@ async def _message_stream_inner(
                 # The attempt number rides the scope so the two tools that
                 # *write* can stamp it: a re-run turn re-executes every tool the
                 # model calls, and a second DetectorRun for one analyst question
-                # has to be distinguishable from a second scan. Both retry paths
-                # (fidelity drop and compaction) go through here, so neither can
-                # forget it.
+                # has to be distinguishable from a second scan.
                 replace(scope, attempt=attempt),
                 user_text=payload.content,
                 history=history,
                 view_filters=payload.view_filters,
+                window_budget=window_budget,
+                window_stats=window_stats,
             ):
                 # A stop lands here, between streamed events — so the partial
                 # turn is persisted the same way the interrupt paths below do
@@ -601,6 +558,25 @@ async def _message_stream_inner(
                     await store.update_agent_conversation(
                         conversation_id, history=dump_history(history + turn.new_messages)
                     )
+                    if window_stats.reduced:
+                        # One honest row per turn (the stats are the turn's
+                        # maxima across its requests), not one per request.
+                        stats_detail = {
+                            "reason": "fit",
+                            "attempt": attempt,
+                            "budget": window_stats.budget,
+                            "results_elided": window_stats.results_elided,
+                            "turns_dropped": window_stats.turns_dropped,
+                            "estimated_before": window_stats.estimated_before,
+                            "estimated_after": window_stats.estimated_after,
+                        }
+                        await _persist_window(
+                            stats_detail,
+                            f"Older tool results ({window_stats.results_elided} elided, "
+                            f"{window_stats.turns_dropped} turns dropped) were reduced to fit "
+                            "the model's context window — the full record is preserved here.",
+                        )
+                        yield _sse({"type": "window", "reason": "fit", "stats": stats_detail})
                     yield _sse(
                         {
                             "type": "done",
@@ -643,9 +619,6 @@ async def _message_stream_inner(
                         detail=audit_detail,
                     )
                 elif event["type"] == "tool_result":
-                    # Which tools actually returned data this attempt decides
-                    # whether a fidelity drop could change anything at all.
-                    tools_used.add(event["tool"])
                     await store.add_agent_message(
                         conversation_id,
                         "tool",
@@ -657,54 +630,38 @@ async def _message_stream_inner(
             return
         except ModelHTTPError as exc:
             overflow = _is_context_overflow(exc)
-            if overflow and (lower := next_tier(scope.fidelity, tools_used)) is not None:
-                # Cheapest lever: hand the model less of each example record
-                # and re-run. Skipped when this attempt called no tool that
-                # honours the tier — re-sending a byte-identical request would
-                # only delay the compaction that can actually help. Tool rows
-                # already persisted by this attempt stay — the record shows what
-                # actually ran, and each row states the tier that produced it.
-                previous = scope.fidelity
-                scope = replace(scope, fidelity=lower)
-                # Persisted like a compaction, and for the same reason: an SSE
-                # event alone is gone on reload, and the case file has to answer
-                # "why is there less here than there" from itself. The row is
-                # also the marker that separates this attempt's tool rows from
-                # the re-run's.
-                drop = {
-                    "from": previous.value,
-                    "to": lower.value,
-                    "attempt": attempt,
-                    "reason": "overflow",
-                }
-                await store.add_agent_message(
-                    conversation_id,
-                    "fidelity",
-                    f"Tool results did not fit the model's context window — reduced from "
-                    f"{previous.value} to {lower.value} per event record and the turn re-run.",
-                    tool_result=drop,
-                )
-                await store.record_audit(
-                    action="agent.fidelity_drop",
-                    actor=user,
-                    case_id=case_id,
-                    target_type="agent_conversation",
-                    target_id=conversation_id,
-                    detail=drop,
-                )
-                yield _sse({"type": "fidelity", "fidelity": lower.value, "reason": "overflow"})
+            if overflow and attempt == 0:
+                # One reactive retry, not a ladder. The estimate is chars/4,
+                # so a provider can still overflow a windowed request; and an
+                # unconfigured deployment has no proactive window at all. In
+                # both cases: pick a budget the failed request tells us about,
+                # enable/tighten the window, and re-run the turn once. Tool
+                # rows already persisted by this attempt stay — the record
+                # shows what actually ran.
+                if window_budget is not None:
+                    window_budget = max(int(window_budget * _RETRY_SHRINK), 1)
+                    sentence = (
+                        "The request still exceeded the model's context window — the sliding "
+                        f"window was tightened to a budget of {window_budget} tokens and the "
+                        "turn re-run."
+                    )
+                else:
+                    estimated = (
+                        estimate_tokens(history)
+                        + len(SYSTEM_PROMPT) // 4
+                        + len(payload.content) // 4
+                    )
+                    window_budget = max(int(estimated * _DERIVED_BUDGET_FACTOR), 1)
+                    sentence = (
+                        "The request exceeded the model's context window (no context_window "
+                        f"is configured) — a sliding window with a budget of {window_budget} "
+                        "tokens was derived from the failed request and the turn re-run. "
+                        "Configure the agent's context_window to avoid the failed round trip."
+                    )
+                detail = {"reason": "overflow", "attempt": attempt, "budget": window_budget}
+                await _persist_window(detail, sentence)
+                yield _sse({"type": "window", "reason": "overflow", "budget": window_budget})
                 continue
-            if overflow and compactions < len(keep_schedule):
-                # The threshold estimate lagged behind (tool-heavy turn) —
-                # compact and retry, escalating down the keep schedule on a
-                # repeat overflow. Tool rows already persisted by this
-                # attempt stay: the record shows what actually ran.
-                compaction = await _run_compaction(history, "overflow", keep_schedule[compactions])
-                if compaction is not None:
-                    history, compaction_event = compaction
-                    compactions += 1
-                    yield _sse(compaction_event)
-                    continue
             logger.exception("Agent turn failed (conversation %s)", conversation_id)
             if text_parts:
                 await store.add_agent_message(
@@ -713,7 +670,7 @@ async def _message_stream_inner(
             if overflow:
                 detail = (
                     "The conversation no longer fits the model's context window "
-                    "and could not be compacted further — start a new conversation."
+                    "even with older results elided — start a new conversation."
                 )
             else:
                 detail = f"The model endpoint rejected the request (HTTP {exc.status_code}) — see server logs."
@@ -948,7 +905,6 @@ async def agent_info(user: User = Depends(get_current_user)) -> dict[str, Any]:
         "provider": config.provider,
         "api_base_url": config.api_base_url,
         "context_window": config.context_window,
-        "compact_threshold": config.compact_threshold,
         "tools": [
             {
                 "name": t.name,
