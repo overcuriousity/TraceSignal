@@ -2993,6 +2993,7 @@ class EventQueryService:
             f"{_finite_float_cast(col_y)} AS vy "
             f"FROM {self.store.database}.events WHERE {where}"
         )
+
         # assumeNotNull under the IS NOT NULL guard is load-bearing, not
         # cosmetic: Nullable arguments to the tuple-returning
         # simpleLinearRegression corrupt clickhouse-connect's native-format
@@ -3010,7 +3011,9 @@ class EventQueryService:
         # what the server returned (see ``degenerate`` after the query).
         def _run_stats(with_rank: bool) -> Any:
             rank_expr = (
-                "rankCorr(assumeNotNull(vx), assumeNotNull(vy))" if with_rank else "CAST(NULL, 'Nullable(Float64)')"
+                "rankCorr(assumeNotNull(vx), assumeNotNull(vy))"
+                if with_rank
+                else "CAST(NULL, 'Nullable(Float64)')"
             )
             return self.store.client.query(
                 f"""

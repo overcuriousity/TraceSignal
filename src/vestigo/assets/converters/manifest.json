@@ -186,8 +186,8 @@
       "requires": [
         "pyarrow"
       ],
-      "size_bytes": 39290,
-      "sha256": "dcaca6964125c13a608c8542042635a3799374c8c37336591518a0fb0d9ebd3e"
+      "size_bytes": 39268,
+      "sha256": "a3a40f854b1e95dc9bb80cdaf6ee64f09a99b0d080f94ed66ff8d797280c1e5d"
     },
     {
       "name": "syslog2timesketch",

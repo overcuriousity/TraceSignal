@@ -240,9 +240,7 @@ def test_time_window_filter(converter, tmp_path):
     converter.convert(str(src), str(dropped), 1, False, since="2099-01-01T00:00:00Z")
     pf = pq.ParquetFile(dropped)
     footer = {
-        k.decode(): v.decode()
-        for k, v in pf.metadata.metadata.items()
-        if k != b"ARROW:schema"
+        k.decode(): v.decode() for k, v in pf.metadata.metadata.items() if k != b"ARROW:schema"
     }
     counts = json.loads(footer["vestigo.row_counts"])
     assert counts["skipped_by_time"] > 0

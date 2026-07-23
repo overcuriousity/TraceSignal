@@ -954,9 +954,7 @@ def convert(
         META_CONVERTER_VERSION: CONVERTER_VERSION,
         META_ORIGINAL_FILES: json.dumps(provenance, sort_keys=True),
         META_CONVERTED_AT: datetime.datetime.now(datetime.UTC).isoformat(),
-        META_TIMEZONE_ASSUMPTION: (
-            "event timestamps honor their own offset (naive assumed UTC)"
-        ),
+        META_TIMEZONE_ASSUMPTION: ("event timestamps honor their own offset (naive assumed UTC)"),
         META_PARSE_DECISIONS: json.dumps({"since": since, "until": until}, sort_keys=True),
     }
 
