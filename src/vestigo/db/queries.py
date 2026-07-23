@@ -103,6 +103,21 @@ SHAPIRO_SAMPLE_MAX = 5000
 SAMPLE_ORDER_SQL = "cityHash64(event_id)"
 
 
+def _finite_float_cast(col_expr: str) -> str:
+    """Cast *col_expr* to Float64, mapping non-numeric AND non-finite to NULL.
+
+    ``toFloat64OrNull`` maps un-parseable strings to NULL, but the literal
+    attribute values ``"nan"``/``"inf"`` parse to ClickHouse ``NaN``/``Inf``
+    floats that slip past every ``IS NOT NULL`` guard — poisoning aggregates
+    (``corr``/``rankCorr`` return NaN, an FD-rule span becomes Inf → a
+    ``bin_width: Infinity`` in the JSON). Folding non-finite values back to
+    NULL here means the callers' existing ``IS NOT NULL`` guards drop them
+    too, so no separate ``isFinite`` clause is needed at each aggregate.
+    """
+    inner = f"toFloat64OrNull(toString({col_expr}))"
+    return f"if(isFinite({inner}), {inner}, NULL)"
+
+
 def _scatter_stats(
     total: int,
     pearson_r: float | None,
@@ -1816,9 +1831,10 @@ class EventQueryService:
     ) -> dict[str, Any]:
         """Return summary statistics and a fixed-width histogram for a numeric field.
 
-        Values are cast with ``toFloat64OrNull(toString(...))`` since dynamic
-        attributes are stored as strings; non-numeric values are silently
-        dropped from the cast (become NULL) rather than erroring. ``count ==
+        Values are cast with :func:`_finite_float_cast` since dynamic
+        attributes are stored as strings; non-numeric *and* non-finite values
+        (``"nan"``/``"inf"``) are silently dropped from the cast (become NULL)
+        rather than erroring. ``count ==
         0`` is the signal callers use to fall back to treating the field as
         categorical instead.
 
@@ -1859,7 +1875,7 @@ class EventQueryService:
             field_mappings=query.field_mappings,
             source_offsets=query.source_offsets,
         )
-        cast_expr = f"toFloat64OrNull(toString({col_expr}))"
+        cast_expr = _finite_float_cast(col_expr)
 
         quantile_exprs = ", ".join(f"quantile({q})(v)" for q in self._NUMERIC_QUANTILES)
         stats_result = self.store.client.query(
@@ -2015,7 +2031,7 @@ class EventQueryService:
                 field_mappings=query.field_mappings,
                 source_offsets=query.source_offsets,
             )
-            casts.append(f"toFloat64OrNull(toString({col})) AS v{i}")
+            casts.append(f"{_finite_float_cast(col)} AS v{i}")
         values_subquery = f"SELECT {', '.join(casts)} FROM {database}.events WHERE {where}"
 
         selects = ["count() AS total"]
@@ -2142,7 +2158,7 @@ class EventQueryService:
             source_offsets=query.source_offsets,
         )
         pairs_subquery = (
-            f"SELECT toString({group_expr}) AS g, toFloat64OrNull(toString({col_expr})) AS v "
+            f"SELECT toString({group_expr}) AS g, {_finite_float_cast(col_expr)} AS v "
             f"FROM {database}.events WHERE {where}"
         )
         member_where = "v IS NOT NULL AND g != ''"
@@ -2221,7 +2237,7 @@ class EventQueryService:
                 SELECT g, v
                 FROM (
                     SELECT toString({group_expr}) AS g,
-                           toFloat64OrNull(toString({col_expr})) AS v,
+                           {_finite_float_cast(col_expr)} AS v,
                            {SAMPLE_ORDER_SQL} AS ord
                     FROM {database}.events WHERE {where}
                 ) AS t
@@ -2664,7 +2680,7 @@ class EventQueryService:
             field_mappings=query.field_mappings,
             source_offsets=query.source_offsets,
         )
-        cast_expr = f"toFloat64OrNull(toString({col_expr}))"
+        cast_expr = _finite_float_cast(col_expr)
         result = self.store.client.query(
             f"""
             SELECT count(v), min(v), max(v)
@@ -2689,7 +2705,7 @@ class EventQueryService:
             field_mappings=query.field_mappings,
             source_offsets=query.source_offsets,
         )
-        cast_expr = f"toFloat64OrNull(toString({col_expr}))"
+        cast_expr = _finite_float_cast(col_expr)
         result = self.store.client.query(
             f"""
             SELECT greatest(0, least({bin_count - 1},
@@ -2973,8 +2989,8 @@ class EventQueryService:
             source_offsets=query.source_offsets,
         )
         pairs_subquery = (
-            f"SELECT toFloat64OrNull(toString({col_x})) AS vx, "
-            f"toFloat64OrNull(toString({col_y})) AS vy "
+            f"SELECT {_finite_float_cast(col_x)} AS vx, "
+            f"{_finite_float_cast(col_y)} AS vy "
             f"FROM {self.store.database}.events WHERE {where}"
         )
         # assumeNotNull under the IS NOT NULL guard is load-bearing, not
@@ -3017,8 +3033,8 @@ class EventQueryService:
             f"""
             SELECT vx, vy
             FROM (
-                SELECT toFloat64OrNull(toString({col_x})) AS vx,
-                       toFloat64OrNull(toString({col_y})) AS vy,
+                SELECT {_finite_float_cast(col_x)} AS vx,
+                       {_finite_float_cast(col_y)} AS vy,
                        {SAMPLE_ORDER_SQL} AS ord
                 FROM {self.store.database}.events WHERE {where}
             ) AS t
