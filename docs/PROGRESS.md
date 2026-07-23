@@ -1,9 +1,143 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-22 (session 88 — --split ported to native Parquet converters).
+Last updated: 2026-07-22 (session 90 — review fixes on the statistical visualizations).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 90 — 2026-07-22: review fixes on the statistical visualizations
+
+Code review of the session-89 branch (PR #162) surfaced nine defects. Three were about
+cost at the scale this product targets, three were the PR's own honesty contract being
+broken by a caption or comment, three were parity/coverage gaps. All fixed on the same
+branch; the 1.6.0 changelog entry was amended rather than a new version cut.
+
+**Cost.** `kendall_tau` was the all-pairs O(n²) definition, running on every scatter render
+inside a request holding a heavy-scan slot: measured 1.07 s at the UI's default 5 000-point
+sample and 17.13 s at the API's 20 000-point ceiling. Replaced with Knight's O(n log n)
+formulation (sort by (x, y), count discordant pairs as inversions of the y-sequence via
+merge sort) — 0.056 s at 20 000 points, exact agreement with the brute-force definition
+across a tie-density sweep and with the committed scipy constants. Shapiro–Wilk is now cut
+to the 5 000 points Royston's approximation covers instead of silently returning nothing
+past it. `field_numeric_grouped` runs its four scans as two parallel waves through the
+existing `_run_parallel` rather than sequentially (the extent scan and the per-group
+aggregate scan have no data dependency; the per-group aggregate therefore also runs on an
+empty result set, which is the price of the concurrency).
+
+**Reproducibility.** Every sampling path drew with `ORDER BY rand()`, so rerunning an
+identical query produced a different chart and an exported scatter could not be regenerated
+from the filters that made it — while the point strip's *jitter* was carefully
+deterministic. All three paths now order by `cityHash64(event_id)`: uniform, independent of
+the plotted values, stable across reruns and replicas, and no more expensive (same bounded
+top-N heap). Pinned by a live-server test asserting two identical calls return identical
+points.
+
+**Honesty.** Three places claimed more than the code computed. (1) When Freedman–Diaconis
+was undefined (zero IQR) the fixed 30-bin fallback was still reported as `bin_rule: "fd"`,
+so the caption credited a rule that never ran — a test even pinned that. `bin_rule` is now
+`fd | fd_fallback | manual` with a separate `bin_count_clamped`, and the caption names each
+case exactly. (2) Past 5 000 sample points Shapiro–Wilk returned nothing, `recommendation`
+silently became "spearman", and the UI blamed "sample too small" — the opposite of the
+cause. Beyond the cap fix, the response now carries `recommendation_basis`, and the panel
+labels the chip "default" rather than "recommended" when nothing measured it. (3) Two
+comments claimed a wide grouped violin means "more events here"; `kdeFromBins` normalizes
+by each group's own total, so a 10-event and a 10 000-event group with the same shape draw
+identically wide. The shape scaling stays (it is what a grouped violin is for) and the
+claims were corrected, with a caption line stating the reading and per-group n on the
+tooltip.
+
+**Parity and guards.** The `field_correlation` agent tool silently truncated a too-long
+field list and de-duplicated in silence, so the service's own error could never fire — it
+now raises, with the wording the HTTP 422s use. Grouped charts warn when groups were
+omitted and when the grouping field's cardinality suggests an identifier
+(`VIZ_GROUP_CARDINALITY_CAUTION`). The correlation matrix fades cells with p ≥ 0.05 or
+fewer than 30 pairwise-complete events and puts both p-values in the tooltip — full-strength
+colour on an unsupportable coefficient reads as a finding. `allocateWaffleCells` folds
+categories past the grid's capacity into `Other`, so its "sums to exactly 100" invariant
+holds by construction rather than by the top-N cap happening to be below 100.
+
+**Coverage.** `tests/test_viz_router.py` gained the HTTP-level tests the two new endpoints
+never had (the three 422 guards, plus argument pass-through and the `bins=None` automatic
+path). Backend 1588 pass, frontend 470 pass.
+
+## Session 89 — 2026-07-22: lecture-grade statistical visualizations
+
+Audited the visualization stack against the HS Mittweida "Datenanalyse und -visualisierung"
+lecture set (anatomy of a graphic, histograms, box/violin, bar, pie/waffle, line, scatter,
+correlation/multipanel, descriptive statistics) and closed every identified gap except
+geographic charts (deferred with its blockers named in `ROADMAP.md` Milestone 2). The
+existing core held up: Stevens-scale legality per mark, zero-baseline bars, no dual-axis
+charts anywhere, and captions that state top-N capping and sampling. What was missing was
+analysis depth, so this round added it — for the analyst and the agent in the same commit,
+since `agent/chart_meta.py` generates the frontend's table.
+
+**New statistics, computed server-side.** `src/vestigo/stats.py` is a new pure-Python
+inference module (no scipy — airgapped installs stay slim): regularized incomplete beta →
+Student-t survival → Pearson/Spearman p-values, Kendall's tau-b with tie correction,
+Shapiro–Wilk after Royston (1995) AS R94, and the Freedman–Diaconis bin rule. It is pinned
+against scipy-computed reference constants committed as `tests/data/stats_reference_scipy.json`.
+Everything ClickHouse *can* do is left to ClickHouse (`corr`, `rankCorr`,
+`simpleLinearRegression`, `skewPop`, `quantile`) over the full filtered data; Python only
+fills the gaps, and the response labels which numbers came from a sample.
+
+Two ClickHouse behaviours were settled empirically against the live dev server (26.6) and
+are now pinned by `tests/test_viz_stats_clickhouse.py`: multi-argument aggregates skip a
+row when *any* argument is NULL, which is exactly pairwise-complete deletion and is why the
+correlation matrix does not use `corrMatrix` (listwise) — and `assumeNotNull` must **not**
+be used to "fix" the Nullable arguments, because it turns NULL into 0.0 and folds
+non-numeric rows into the coefficient. `simpleLinearRegression` is the exception: its
+tuple return corrupts clickhouse-connect's native parsing with Nullable inputs, so it (and
+only it) gets `assumeNotNull` under an `IS NOT NULL` guard.
+
+**New marks and aggregations.** Correlation matrix (`corr`, new `field_correlation`
+aggregation + endpoint + agent tool; lower-triangle diverging grid, per-cell coefficient,
+click-through to the pair's scatter); grouped box/violin (`field_numeric_grouped`: top-N
+groups by count, per-group quantiles binned over the *global* range so silhouettes compare,
+omitted groups reported and never merged into an "Other" box); waffle chart (reuses the
+terms aggregation, largest-remainder allocation so cells sum to exactly 100 and no existing
+category rounds to zero).
+
+**Facetting was built and then cut in review.** Client-orchestrated small multiples (one
+terms query names the panels, each panel re-runs the same endpoint with an added equality
+filter) shipped in the first pass and was removed before merge. The reason is worth
+keeping: each panel asked the server independently, so each got Freedman–Diaconis bin
+edges from *its own* subset, while the grid pinned a shared count axis across panels.
+Equal bar heights then meant different densities — the precise misreading small multiples
+exist to prevent. Making it honest needs the bin range threaded through
+`field_numeric_stats` (a shared ruler for every panel), which is a design round rather
+than a review fix; deferred with that requirement recorded in `ROADMAP.md`. Removing it
+also took with it the caption bug it caused (facet captions were filled from the
+*unfacetted* query, so bin rule, skewness and overlay counts described data no panel
+showed) and the streaming shared-scale bug (the count max was a max over *loaded* panels,
+so an export taken mid-load captured non-comparable panels).
+
+**Honesty fixes the lectures are blunt about.** Violin/box gained an optional jittered
+overlay of sampled raw values (deterministic jitter, so an export reproduces the strip)
+— a violin without points implies data it never measured. Pie gained a readability warning
+past four slices or when two slices differ by under 10%, offering bar/waffle instead;
+advisory, never a refusal, and the same rule runs in `propose_chart`. Line charts mark
+their actual measured buckets (Tufte's graphical integrity). Histograms default to
+Freedman–Diaconis bin widths with a manual override, and carry a density curve, mean/median
+markers and skewness with its plain-language reading.
+
+**Teaching mode.** `viz/lib/explainers.ts` is a single copy module and
+`ExplainerPopover.tsx` its one renderer: every statistic gets *what it is / how to read it /
+when to distrust it* plus the formula, and every chart type a one-line "how to read this".
+The distrust section is mandatory (a test enforces it) — a statistic explained without its
+failure mode teaches overconfidence, which is worse than not explaining it.
+
+**Review fixes.** The scatter caption now carries the caveat its own explainer already
+stated — past ~1000 sampled points Shapiro–Wilk rejects departures too small to change
+which coefficient to quote, and the caption is the forensic export, so it has to say so
+rather than read as a finding about the data. σ and the waffle grid were rendering without
+explainers despite the "every statistic carries one" invariant; both got copy, and
+`vizExplainers.test.ts` gained the converse check (every defined explainer is rendered by
+some component) that would have caught it. `jitter.ts` swapped the smooth
+`sin(i·12.9898)` GLSL hash for an integer bit-mix: the old one is continuous in `i`, so
+the consecutive indices a point strip feeds it came out correlated and banded.
+
+`docs/AGENT.md` documents the new tools, the field-slot rules (`field_y` required vs.
+optional, `fields`), and the statistics contract.
 
 ## Session 88 — 2026-07-22: --split ported to native Parquet converters
 

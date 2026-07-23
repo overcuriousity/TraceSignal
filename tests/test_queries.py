@@ -1553,7 +1553,7 @@ def test_field_numeric_stats_returns_stats_and_fixed_width_bins() -> None:
                 "stddevPop(v)",
                 FakeQueryResult(
                     result_rows=[
-                        [10, 0.0, 100.0, 50.0, 10.0, 1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0]
+                        [10, 0.0, 100.0, 50.0, 10.0, 0.4, 1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0]
                     ]
                 ),
             ),
@@ -1571,6 +1571,9 @@ def test_field_numeric_stats_returns_stats_and_fixed_width_bins() -> None:
     assert result["max"] == 100.0
     assert result["mean"] == 50.0
     assert result["stddev"] == 10.0
+    assert result["skewness"] == 0.4
+    assert result["bin_rule"] == "manual"
+    assert result["bin_width"] == 50.0
     assert result["quantiles"]["0.5"] == 50.0
     assert result["quantiles"]["0.99"] == 99.0
     assert len(result["bins"]) == 2
@@ -1584,7 +1587,9 @@ def test_field_numeric_stats_fills_empty_bins_with_zero() -> None:
             (
                 "stddevPop(v)",
                 FakeQueryResult(
-                    result_rows=[[4, 0.0, 40.0, 20.0, 5.0, 0.0, 0.0, 10.0, 20.0, 30.0, 38.0, 39.0]]
+                    result_rows=[
+                        [4, 0.0, 40.0, 20.0, 5.0, 0.0, 0.0, 0.0, 10.0, 20.0, 30.0, 38.0, 39.0]
+                    ]
                 ),
             ),
             # Only bin 0 has data — bins 1-3 must still appear, count 0.
@@ -1595,6 +1600,231 @@ def test_field_numeric_stats_fills_empty_bins_with_zero() -> None:
         EventQuery(case_id="c1", source_ids=["s1"]), "attr:latency_ms", bins=4
     )
     assert [b["count"] for b in result["bins"]] == [4, 0, 0, 0]
+
+
+def test_field_numeric_stats_auto_bins_uses_freedman_diaconis() -> None:
+    """bins=None → FD rule from IQR: width = 2·10·1000^(−1/3) = 2 → 50 bins over span 100."""
+    svc = _viz_service(
+        [
+            (
+                "stddevPop(v)",
+                FakeQueryResult(
+                    result_rows=[
+                        [
+                            1000,
+                            0.0,
+                            100.0,
+                            50.0,
+                            10.0,
+                            0.0,
+                            1.0,
+                            5.0,
+                            45.0,
+                            50.0,
+                            55.0,
+                            95.0,
+                            99.0,
+                        ]
+                    ]
+                ),
+            ),
+            ("toInt64(floor(", FakeQueryResult(result_rows=[[0, 1000]])),
+        ]
+    )
+    result = svc.field_numeric_stats(EventQuery(case_id="c1", source_ids=["s1"]), "attr:ms")
+    assert result["bin_rule"] == "fd"
+    assert len(result["bins"]) == 50
+    assert result["bin_width"] == 2.0
+
+
+def test_field_numeric_stats_auto_bins_clamps_and_falls_back() -> None:
+    """Zero IQR makes FD undefined → 30 bins, reported as fd_fallback, NOT fd.
+
+    The caption quotes ``bin_rule`` verbatim, so crediting Freedman–Diaconis
+    for a fixed fallback would put a rule in the caption that never ran.
+    """
+    svc = _viz_service(
+        [
+            (
+                "stddevPop(v)",
+                FakeQueryResult(
+                    result_rows=[
+                        [
+                            1000,
+                            0.0,
+                            100.0,
+                            50.0,
+                            10.0,
+                            0.0,
+                            1.0,
+                            5.0,
+                            50.0,
+                            50.0,
+                            50.0,
+                            95.0,
+                            99.0,
+                        ]
+                    ]
+                ),
+            ),
+            ("toInt64(floor(", FakeQueryResult(result_rows=[[0, 1000]])),
+        ]
+    )
+    result = svc.field_numeric_stats(EventQuery(case_id="c1", source_ids=["s1"]), "attr:ms")
+    assert result["bin_rule"] == "fd_fallback"
+    assert result["bin_count_clamped"] is False
+    assert len(result["bins"]) == 30
+
+
+def test_field_numeric_stats_auto_bins_report_the_clamp() -> None:
+    """A tight IQR asks FD for far more bins than the UI allows → clamp, and say so.
+
+    ``bin_rule`` stays "fd" (the rule did run), but the caption needs
+    ``bin_count_clamped`` to avoid presenting a clamped count as the width the
+    rule chose.
+    """
+    # IQR = 0.1 over 1000 points → FD width 0.02 over a span of 100 = 5000 bins,
+    # far past the _FD_BIN_RANGE ceiling of 60.
+    svc = _viz_service(
+        [
+            (
+                "stddevPop(v)",
+                FakeQueryResult(
+                    result_rows=[
+                        [
+                            1000,
+                            0.0,
+                            100.0,
+                            50.0,
+                            10.0,
+                            0.0,
+                            1.0,
+                            5.0,
+                            49.95,
+                            50.0,
+                            50.05,
+                            95.0,
+                            99.0,
+                        ]
+                    ]
+                ),
+            ),
+            ("toInt64(floor(", FakeQueryResult(result_rows=[[0, 1000]])),
+        ]
+    )
+    result = svc.field_numeric_stats(EventQuery(case_id="c1", source_ids=["s1"]), "attr:ms")
+    assert result["bin_rule"] == "fd"
+    assert result["bin_count_clamped"] is True
+    assert len(result["bins"]) == 60
+
+
+def test_field_numeric_stats_point_sample_is_opt_in() -> None:
+    """The raw-value sample costs a third scan — only drawn when asked for."""
+    rows = [10, 0.0, 100.0, 50.0, 10.0, 0.0, 1.0, 5.0, 25.0, 50.0, 75.0, 95.0, 99.0]
+    svc = _viz_service(
+        [
+            ("stddevPop(v)", FakeQueryResult(result_rows=[rows])),
+            ("toInt64(floor(", FakeQueryResult(result_rows=[[0, 10]])),
+        ]
+    )
+    assert (
+        svc.field_numeric_stats(EventQuery(case_id="c1", source_ids=["s1"]), "attr:bytes", bins=2)[
+            "points"
+        ]
+        is None
+    )
+
+    svc = _viz_service(
+        [
+            ("stddevPop(v)", FakeQueryResult(result_rows=[rows])),
+            ("toInt64(floor(", FakeQueryResult(result_rows=[[0, 10]])),
+            ("ORDER BY ord", FakeQueryResult(result_rows=[[1.0], [2.0]])),
+        ]
+    )
+    result = svc.field_numeric_stats(
+        EventQuery(case_id="c1", source_ids=["s1"]),
+        "attr:bytes",
+        bins=2,
+        points=True,
+        points_limit=2,
+    )
+    assert result["points"] == {"total": 10, "shown": 2, "values": [1.0, 2.0]}
+    sample_sql = next(
+        sql
+        for sql, _ in svc.store.client.queries  # type: ignore[union-attr]
+        if "ORDER BY ord" in sql
+    )
+    assert "LIMIT 2" in sample_sql
+
+
+def test_field_numeric_grouped_shares_global_bin_edges_and_reports_omission() -> None:
+    quantiles_a = [1.0, 2.0, 10.0, 20.0, 30.0, 90.0, 99.0]
+    quantiles_b = [5.0, 6.0, 40.0, 50.0, 60.0, 95.0, 99.0]
+    svc = _viz_service(
+        [
+            # Global stats: 100 values over [0, 100] across 5 distinct groups.
+            ("uniqExact(g)", FakeQueryResult(result_rows=[[100, 0.0, 100.0, 5]])),
+            (
+                "GROUP BY g\n",
+                FakeQueryResult(
+                    result_rows=[
+                        ["alice", 40, 0.0, 90.0, 25.0, 8.0, 0.3, *quantiles_a],
+                        ["bob", 30, 5.0, 100.0, 50.0, 9.0, -0.2, *quantiles_b],
+                    ]
+                ),
+            ),
+            (
+                "GROUP BY g, bin_idx",
+                FakeQueryResult(result_rows=[["alice", 0, 40], ["bob", 1, 30]]),
+            ),
+        ]
+    )
+    result = svc.field_numeric_grouped(
+        EventQuery(case_id="c1", source_ids=["s1"]),
+        "attr:latency_ms",
+        "attr:user",
+        groups=2,
+        bins=2,
+    )
+    assert result["kind"] == "numeric_grouped"
+    assert result["total"] == 100
+    assert result["distinct_groups"] == 5
+    # 5 distinct, 2 kept → 3 omitted groups holding 100 - 70 = 30 values.
+    assert result["omitted_groups"] == 3
+    assert result["omitted_count"] == 30
+    assert [g["value"] for g in result["groups"]] == ["alice", "bob"]
+    assert result["groups"][0]["quantiles"]["0.5"] == 20.0
+    assert result["groups"][1]["skewness"] == -0.2
+    # Both groups binned over the GLOBAL [0, 100] range so violins compare.
+    for group in result["groups"]:
+        assert [(b["x0"], b["x1"]) for b in group["bins"]] == [(0.0, 50.0), (50.0, 100.0)]
+    assert [b["count"] for b in result["groups"][0]["bins"]] == [40, 0]
+    assert [b["count"] for b in result["groups"][1]["bins"]] == [0, 30]
+    assert result["points"] is None
+
+
+def test_field_numeric_grouped_no_numeric_values_returns_empty() -> None:
+    """No numeric values → empty result, and wave 2 (bins/points) never runs.
+
+    The per-group scan does run: it is wave 1's second half, issued
+    concurrently with the extent scan rather than after it, so there is no
+    result to gate it on yet.
+    """
+    svc = _viz_service(
+        [
+            ("uniqExact(g)", FakeQueryResult(result_rows=[[0, None, None, 0]])),
+            ("GROUP BY g", FakeQueryResult(result_rows=[])),
+        ]
+    )
+    result = svc.field_numeric_grouped(
+        EventQuery(case_id="c1", source_ids=["s1"]), "attr:user_agent", "attr:user"
+    )
+    assert result["total"] == 0
+    assert result["groups"] == []
+    assert not any(
+        "GROUP BY g, bin_idx" in sql
+        for sql, _ in svc.store.client.queries  # type: ignore[union-attr]
+    )
 
 
 def test_field_numeric_stats_non_numeric_field_returns_zero_count() -> None:
@@ -1612,8 +1842,13 @@ def test_field_numeric_stats_non_numeric_field_returns_zero_count() -> None:
         "max": None,
         "mean": None,
         "stddev": None,
+        "skewness": None,
         "quantiles": {},
         "bins": [],
+        "bin_rule": "manual",
+        "bin_count_clamped": False,
+        "bin_width": None,
+        "points": None,
     }
     # No histogram bin query should have been attempted for a non-numeric field.
     assert not any("toInt64(floor(" in q for q, _ in svc.store.client.queries)  # type: ignore[union-attr]
@@ -1992,7 +2227,7 @@ def test_viz_aggregations_carry_memory_settings() -> None:
 
     terms_row = FakeQueryResult(result_rows=[["a", 1, 1, 1]])
     stats_row = FakeQueryResult(
-        result_rows=[[4, 0.0, 40.0, 20.0, 5.0, 0.0, 0.0, 10.0, 20.0, 30.0, 38.0, 39.0]]
+        result_rows=[[4, 0.0, 40.0, 20.0, 5.0, 0.0, 0.0, 0.0, 10.0, 20.0, 30.0, 38.0, 39.0]]
     )
 
     services = {
@@ -2320,9 +2555,14 @@ def test_field_pivot_acquires_scan_gate_once(monkeypatch: Any) -> None:
 def test_field_scatter_samples_points_with_true_extents() -> None:
     svc = _viz_service(
         [
-            ("min(vx)", FakeQueryResult(result_rows=[[120000, 0.0, 1000.0, -5.0, 99.0]])),
             (
-                "ORDER BY rand()",
+                "min(vx)",
+                FakeQueryResult(
+                    result_rows=[[120000, 0.0, 1000.0, -5.0, 99.0, 0.8, 0.75, (0.09, 0.5)]]
+                ),
+            ),
+            (
+                "ORDER BY ord",
                 FakeQueryResult(result_rows=[[10.0, 1.0], [500.0, 42.0]]),
             ),
         ]
@@ -2337,30 +2577,77 @@ def test_field_scatter_samples_points_with_true_extents() -> None:
     assert (result["x_min"], result["x_max"]) == (0.0, 1000.0)
     assert (result["y_min"], result["y_max"]) == (-5.0, 99.0)
     assert result["points"] == [[10.0, 1.0], [500.0, 42.0]]
+    # Correlation/regression from the full-data scan; p-values derived from n.
+    stats_block = result["stats"]
+    assert stats_block["basis"] == "full"
+    assert stats_block["n"] == 120000
+    assert stats_block["pearson"]["r"] == 0.8
+    assert stats_block["pearson"]["p"] == 0.0  # n huge, r large → underflows to 0
+    assert stats_block["spearman"]["rho"] == 0.75
+    assert stats_block["regression"] == {"slope": 0.09, "intercept": 0.5, "r_squared": 0.8 * 0.8}
+    # Kendall/Shapiro need n >= 3 sample points — with 2, both are absent.
+    assert stats_block["kendall"] is None
+    assert stats_block["shapiro"]["x"] is None
+    # Spearman without a normality test is a default, not a verdict, and the
+    # response has to distinguish the two.
+    assert stats_block["recommendation"] == "spearman"
+    assert stats_block["recommendation_basis"] == "default"
 
     sample_sql = next(
         sql
         for sql, _ in svc.store.client.queries  # type: ignore[union-attr]
-        if "ORDER BY rand()" in sql
+        if "ORDER BY ord" in sql
     )
     assert "LIMIT 2" in sample_sql
     from vestigo.db._scan import HEAVY_SCAN_SETTINGS
 
     assert HEAVY_SCAN_SETTINGS in sample_sql
     assert "toFloat64OrNull(toString(" in sample_sql
+    # Reproducibility: the sample is drawn in a stable hash order, never rand().
+    assert "cityHash64(event_id)" in sample_sql
+    assert "rand()" not in sample_sql
+
+
+def test_scatter_stats_shapiro_is_capped_and_reports_its_verdict() -> None:
+    """Past Royston's n = 5000 the sample is cut, not silently dropped.
+
+    Handing shapiro_wilk more points than its approximation covers returns
+    nothing, which used to leave `recommendation` at "spearman" with no test
+    behind it while the UI blamed a too-small sample.
+    """
+    from vestigo.db.queries import SHAPIRO_SAMPLE_MAX, _scatter_stats
+
+    # Normal-ish x and y, more points than Shapiro's ceiling.
+    points = [[float(i % 997) / 997.0, float((i * 7) % 991) / 991.0] for i in range(12000)]
+    stats_block = _scatter_stats(12000, 0.01, 0.01, None, points)
+
+    assert stats_block["shapiro"]["n"] == SHAPIRO_SAMPLE_MAX
+    assert stats_block["shapiro"]["x"] is not None
+    assert stats_block["shapiro"]["y"] is not None
+    assert stats_block["recommendation_basis"] == "shapiro"
+    # Kendall is O(n log n), so it still covers every drawn point.
+    assert stats_block["kendall"]["n"] == 12000
 
 
 def test_field_scatter_non_numeric_skips_sample_scan() -> None:
     """total == 0 (no numeric pairs) → no second scan, categorical fallback signal."""
-    svc = _viz_service([("min(vx)", FakeQueryResult(result_rows=[[0, None, None, None, None]]))])
+    svc = _viz_service(
+        [
+            (
+                "min(vx)",
+                FakeQueryResult(result_rows=[[0, None, None, None, None, None, None, None]]),
+            )
+        ]
+    )
     result = svc.field_scatter(
         EventQuery(case_id="c1", source_ids=["s1"]), "attr:user_agent", "attr:bytes"
     )
     assert result["total"] == 0
     assert result["points"] == []
     assert result["x_min"] is None
+    assert result["stats"] is None
     assert not any(
-        "ORDER BY rand()" in sql
+        "ORDER BY ord" in sql
         for sql, _ in svc.store.client.queries  # type: ignore[union-attr]
     )
 

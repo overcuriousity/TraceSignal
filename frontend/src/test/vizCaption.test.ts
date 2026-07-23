@@ -126,7 +126,7 @@ describe("buildCaptionLines", () => {
       facts: { sampledPoints: 5000, totalPoints: 120000 },
     });
     expect(lines).toContain(
-      "showing 5,000 of 120,000 points (uniform random sample; axes span full data)",
+      "showing 5,000 of 120,000 points (uniform sample, stable across reruns; axes span full data)",
     );
   });
 
@@ -144,5 +144,254 @@ describe("buildCaptionLines", () => {
       facts: { sampledPoints: 800, totalPoints: 800 },
     });
     expect(lines.some((l) => l.includes("random sample"))).toBe(false);
+  });
+
+  it("histogram caption states the bin rule and the skewness reading", () => {
+    const config: ChartConfig = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "histogram",
+      field: "attr:bytes",
+      scale: "ratio",
+    };
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Histogram",
+      config,
+      facts: { binCount: 42, valueMin: 0, valueMax: 100, binRule: "fd", skewness: 1.7 },
+    });
+    expect(lines).toContain(
+      "42 fixed-width bins over [0, 100] (Freedman–Diaconis automatic width)",
+    );
+    expect(lines).toContain(
+      "skewness g₁ = 1.70 — right-skewed (long upper tail; mode < median < mean)",
+    );
+  });
+
+  it("symmetric skewness reads as approximately symmetric", () => {
+    const config: ChartConfig = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "histogram",
+      field: "attr:bytes",
+      scale: "ratio",
+    };
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Histogram",
+      config,
+      facts: { binCount: 30, valueMin: 0, valueMax: 10, binRule: "manual", skewness: -0.1 },
+    });
+    expect(lines).toContain("30 fixed-width bins over [0, 10] (manual)");
+    expect(lines).toContain("skewness g₁ = -0.10 — approximately symmetric");
+  });
+});
+
+describe("lecture-driven caption lines", () => {
+  const base = {
+    caseId: "c1",
+    timelineId: "t1",
+    chartLabel: "Chart",
+    filters: {},
+  };
+
+  it("states the grouped-distribution omission without inventing an Other group", () => {
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Box plot",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "box",
+        field: "attr:latency",
+        fieldY: "attr:user",
+        scale: "ratio",
+      },
+      facts: {
+        groupField: "attr:user",
+        groupsShown: 2,
+        groupsOmitted: 3,
+        groupOmittedCount: 41,
+      },
+    });
+    const line = lines.find((l) => l.startsWith("grouped by"))!;
+    expect(line).toContain("2 groups shown");
+    expect(line).toContain("3 smaller groups omitted (41 events)");
+    expect(line).toContain('not merged into an "Other" group');
+  });
+
+  it("does not credit Freedman–Diaconis for a fallback or a clamped count", () => {
+    const config: ChartConfig = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "histogram",
+      field: "attr:bytes",
+      scale: "ratio",
+    };
+    const fallback = buildCaptionLines({
+      ...base,
+      chartLabel: "Histogram",
+      config,
+      facts: { binCount: 30, valueMin: 0, valueMax: 100, binRule: "fd_fallback" },
+    });
+    expect(fallback).toContain(
+      "30 fixed-width bins over [0, 100] (no interquartile spread — the automatic rule is undefined; fixed default)",
+    );
+    expect(fallback.join(" ")).not.toContain("Freedman–Diaconis automatic width");
+
+    const clamped = buildCaptionLines({
+      ...base,
+      chartLabel: "Histogram",
+      config,
+      facts: { binCount: 60, valueMin: 0, valueMax: 100, binRule: "fd", binCountClamped: true },
+    });
+    expect(clamped).toContain(
+      "60 fixed-width bins over [0, 100] (Freedman–Diaconis, clamped to the allowed bin range)",
+    );
+  });
+
+  it("spells out that grouped violin widths compare shape, not group size", () => {
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Violin plot",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "violin",
+        field: "attr:latency",
+        fieldY: "attr:user",
+        scale: "ratio",
+      },
+      facts: {
+        groupField: "attr:user",
+        groupsShown: 3,
+        groupedViolin: true,
+      },
+    });
+    const line = lines.find((l) => l.startsWith("violin widths"))!;
+    expect(line).toContain("relative frequency");
+    expect(line).toContain("not its size");
+  });
+
+  it("cautions when the grouping field looks like an identifier", () => {
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Box plot",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "box",
+        field: "attr:latency",
+        fieldY: "attr:event_id",
+        scale: "ratio",
+      },
+      facts: { groupField: "attr:event_id", groupsShown: 8, groupDistinct: 4210 },
+    });
+    expect(lines.some((l) => l.includes("usually an identifier"))).toBe(true);
+  });
+
+  it("never presents an untested normality default as a recommendation", () => {
+    const stats = {
+      n: 10,
+      basis: "full" as const,
+      pearson: { r: 0.5, p: 0.1 },
+      spearman: { rho: 0.4, p: 0.2 },
+      kendall: null,
+      regression: null,
+      shapiro: { x: null, y: null, basis: "sample" as const, n: 0 },
+      recommendation: "spearman" as const,
+      recommendation_basis: "default" as const,
+    };
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Scatter",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "scatter",
+        field: "attr:bytes",
+        fieldY: "attr:latency",
+        scale: "ratio",
+      },
+      facts: { scatterStats: stats },
+    });
+    expect(lines.some((l) => l.includes("normality could not be tested here"))).toBe(true);
+    expect(lines.join(" ")).not.toContain("recommended coefficient");
+  });
+
+  // The test's power grows with n, so at the API's sample ceiling it rejects
+  // deviations too small to change which coefficient to quote. The caption is
+  // the export text — without this it reads as a finding about the data.
+  it("qualifies a Shapiro–Wilk verdict drawn from a large sample", () => {
+    const stats = (n: number) => ({
+      n: 50_000,
+      basis: "full" as const,
+      pearson: { r: 0.5, p: 1e-9 },
+      spearman: { rho: 0.4, p: 1e-8 },
+      kendall: null,
+      regression: null,
+      shapiro: {
+        x: { w: 0.98, p: 0.001 },
+        y: { w: 0.99, p: 0.2 },
+        basis: "sample" as const,
+        n,
+      },
+      recommendation: "spearman" as const,
+      recommendation_basis: "shapiro" as const,
+    });
+    const captionFor = (n: number) =>
+      buildCaptionLines({
+        ...base,
+        chartLabel: "Scatter",
+        config: {
+          ...DEFAULT_CHART_CONFIG,
+          chartType: "scatter",
+          field: "attr:bytes",
+          fieldY: "attr:latency",
+          scale: "ratio",
+        },
+        facts: { scatterStats: stats(n) },
+      })
+        .find((l) => l.startsWith("recommended coefficient"))!;
+
+    expect(captionFor(5000)).toContain("flags even slight departures from normality");
+    // A small sample carries no such caveat — the verdict stands on its own.
+    expect(captionFor(120)).not.toContain("flags even slight departures");
+  });
+
+  it("states the point-overlay sample honestly", () => {
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Violin plot",
+      config: { ...DEFAULT_CHART_CONFIG, chartType: "violin", field: "attr:latency", scale: "ratio" },
+      facts: { overlayShown: 1000, overlayTotal: 52341 },
+    });
+    expect(lines).toContain(
+      "point overlay: showing 1,000 of 52,341 values (uniform sample, stable across reruns)",
+    );
+  });
+
+  it("records the correlation matrix's pairwise-complete counts and the causation caveat", () => {
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Correlation matrix",
+      config: { ...DEFAULT_CHART_CONFIG, chartType: "corr", scale: "ratio" },
+      facts: {
+        corrFields: ["attr:bytes", "attr:latency"],
+        corrPairs: 1,
+        corrMinPairN: 900,
+        corrMaxPairN: 900,
+        corrDropped: ["attr:retries"],
+      },
+    });
+    expect(lines.some((l) => l.includes("1 field pairs over 2 fields"))).toBe(true);
+    expect(lines.some((l) => l.includes("900 events with both values (pairwise-complete)"))).toBe(
+      true,
+    );
+    expect(lines.some((l) => l.includes("no numeric values under these filters"))).toBe(true);
+    expect(lines.some((l) => l.includes("correlation is not causation"))).toBe(true);
+  });
+
+  it("carries the pie readability caution into the export", () => {
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Pie / Donut",
+      config: { ...DEFAULT_CHART_CONFIG, chartType: "pie", field: "attr:status" },
+      facts: { readabilityWarning: "6 slices — past about 4, judging angles gets unreliable." },
+    });
+    expect(lines.some((l) => l.startsWith("readability: 6 slices"))).toBe(true);
   });
 });

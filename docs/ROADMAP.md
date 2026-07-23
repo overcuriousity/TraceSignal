@@ -52,6 +52,41 @@ round — the data model migrates once, not twice.
   record-boundary chunking, CSV intra-file record-boundary chunking (a logical CSV
   record can span physical lines via quoted embedded newlines, unsafe to newline-chunk).
 
+- [ ] **Choropleth / geographic charts** — the one chart family from the
+  "Datenanalyse und -visualisierung" lecture set left unimplemented in the 2026-07-22 viz
+  round (everything else — correlation matrix, grouped box/violin, waffle,
+  distribution statistics — shipped; facetting was cut in review, see below).
+  Deliberately deferred, not forgotten: `geoip2` is
+  already a dependency, but an offline-by-default deployment also needs vendored basemap
+  geometry (world/country boundary GeoJSON) with a licence that permits redistribution,
+  plus an honest binning story for geo-aggregates (count per country is a choropleth;
+  count per city is a proportional-symbol map, and using the wrong one misleads by area).
+  Needs its own design round covering the offline asset, the projection, and the
+  rate/count normalization rule.
+
+- [ ] **Facetting / small multiples** — built in the 2026-07-22 viz round and **cut in
+  the PR #162 review**, not abandoned. The client-orchestrated version let every panel
+  request its own aggregation, so each got Freedman–Diaconis bin edges from its own
+  subset while the grid pinned a shared count axis: equal bar heights meant different
+  densities, which is the exact misreading small multiples exist to prevent. Reviving it
+  needs a **shared ruler** — optional `range_min`/`range_max` on `field_numeric_stats`
+  (rejecting a range without an explicit `bins`, so the edges are pinned rather than
+  re-derived per panel), the page resolving one global range + bin count from the
+  unfacetted query and passing both to every panel — plus a caption that describes the
+  *grid* rather than the aggregate (grouped mode already nulls its per-distribution facts;
+  facet mode did not), and a shared scale computed only once every panel has settled.
+  Reusing `field_numeric_grouped` is the cheaper alternative — it already bins every group
+  over a global range in one scan — at the cost of capping panels at 8 and selecting
+  groups by numeric-value count rather than event count.
+
+- [ ] **Make the ClickHouse-dependent tests visibly skipped.** All ten `tests/*_clickhouse.py`
+  files `pytest.skip` inside a module fixture when the dev compose stack is absent, so a run
+  without ClickHouse reports them as ordinary passes-worth-of-dots and a CI that never had a
+  server looks green. Register a `clickhouse` marker in `pyproject.toml` and apply
+  `pytestmark` to all ten, so `-m clickhouse` selects them and their absence is assertable.
+  Pre-existing convention, surfaced by the PR #162 review — the statistics work leans on
+  `test_viz_stats_clickhouse.py` to pin ClickHouse's NULL-handling semantics.
+
 ## Milestone 3 — polish
 
 - [ ] Evaluate OpenAPI-generated frontend API types (`openapi-typescript` over `/openapi.json`)

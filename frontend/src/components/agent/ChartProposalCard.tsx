@@ -30,9 +30,11 @@ import { CHART_META } from "@/components/viz/lib/chartMeta";
 import { resolveChartOptions } from "@/components/viz/lib/chartOptions";
 import { BarChart } from "@/components/viz/charts/BarChart";
 import { PieChart } from "@/components/viz/charts/PieChart";
+import { WaffleChart } from "@/components/viz/charts/WaffleChart";
 import { NumericHistogram } from "@/components/viz/charts/NumericHistogram";
 import { BoxPlot } from "@/components/viz/charts/BoxPlot";
 import { ViolinPlot } from "@/components/viz/charts/ViolinPlot";
+import { GroupedDistribution } from "@/components/viz/charts/GroupedDistribution";
 import { EcdfChart } from "@/components/viz/charts/EcdfChart";
 import { LineChart } from "@/components/viz/charts/LineChart";
 import { Heatmap } from "@/components/viz/charts/Heatmap";
@@ -41,6 +43,8 @@ import { PunchCard } from "@/components/viz/charts/PunchCard";
 import { PivotHeatmap } from "@/components/viz/charts/PivotHeatmap";
 import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
 import { ScatterChart } from "@/components/viz/charts/ScatterChart";
+import { CorrMatrix } from "@/components/viz/charts/CorrMatrix";
+import { ScatterStatsPanel } from "@/components/viz/ScatterStatsPanel";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Spinner } from "@/components/ui/Spinner";
@@ -65,6 +69,7 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
   const config = useMemo(() => specToChartConfig(spec), [spec]);
   const filters = useMemo(() => specToEventFilters(spec.filters ?? {}), [spec]);
   const dataKind = CHART_META[config.chartType].dataKind;
+  const groupedOn = !!CHART_META[config.chartType].acceptsSecondField && !!config.fieldY;
   const compareOn = config.compare.mode !== "off";
   const compareApiSpec: CompareMode | null =
     config.compare.mode === "baseline"
@@ -84,9 +89,11 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
   const specComplete =
     dataKind === "time" || dataKind === "punchcard"
       ? true
-      : dataKind === "pivot" || dataKind === "scatter"
-        ? !!(config.field && config.fieldY)
-        : !!config.field;
+      : dataKind === "corr"
+        ? (config.fields?.length ?? 0) >= 2
+        : dataKind === "pivot" || dataKind === "scatter"
+          ? !!(config.field && config.fieldY)
+          : !!config.field;
 
   const chartQuery = useQuery({
     queryKey: ["agent-chart", caseId, timelineId, config, filters],
@@ -112,6 +119,23 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
             data: await vizApi.fieldTerms(caseId, timelineId, config.field!, filters, opts.topN),
           };
         case "numeric":
+          // A grouping field on box/violin switches to the grouped
+          // aggregation — same rule the Visualize page applies.
+          if (groupedOn) {
+            return {
+              kind: "numeric_grouped" as const,
+              data: await vizApi.fieldNumericGrouped(
+                caseId,
+                timelineId,
+                config.field!,
+                config.fieldY!,
+                filters,
+                opts.groups,
+                opts.bins ?? 30,
+                opts.showPoints,
+              ),
+            };
+          }
           if (compareApiSpec) {
             return {
               kind: "numeric" as const,
@@ -121,14 +145,21 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
                 field: config.field!,
                 primary: filters,
                 comparison: compareApiSpec,
-                bins: opts.bins,
+                bins: opts.bins ?? 30,
               })) as CompareNumericResponse,
             };
           }
           return {
             kind: "numeric" as const,
             compare: false as const,
-            data: await vizApi.fieldNumeric(caseId, timelineId, config.field!, filters, opts.bins),
+            data: await vizApi.fieldNumeric(
+              caseId,
+              timelineId,
+              config.field!,
+              filters,
+              opts.bins,
+              opts.showPoints,
+            ),
           };
         case "timeseries":
           return {
@@ -168,6 +199,16 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
               filters,
               opts.limitX,
               opts.limitY,
+            ),
+          };
+        case "corr":
+          return {
+            kind: "corr" as const,
+            data: await vizApi.fieldCorrelation(
+              caseId,
+              timelineId,
+              config.fields ?? [],
+              filters,
             ),
           };
         case "scatter":
@@ -253,19 +294,36 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
         {chartQuery.data?.kind === "terms" &&
           config.chartType === "pie" &&
           !chartQuery.data.compare && <PieChart terms={chartQuery.data.data} />}
+        {chartQuery.data?.kind === "terms" &&
+          config.chartType === "waffle" &&
+          !chartQuery.data.compare && <WaffleChart terms={chartQuery.data.data} />}
         {chartQuery.data?.kind === "numeric" && config.chartType === "histogram" && (
           <NumericHistogram
             stats={chartQuery.data.compare ? undefined : chartQuery.data.data}
             compare={chartQuery.data.compare ? chartQuery.data.data : undefined}
             logScale={opts.logScale}
+            showDensity={opts.showDensity}
+            showMarkers
           />
         )}
+        {chartQuery.data?.kind === "numeric_grouped" &&
+          (config.chartType === "box" || config.chartType === "violin") && (
+            <GroupedDistribution
+              data={chartQuery.data.data}
+              mark={config.chartType}
+              showPoints={opts.showPoints}
+            />
+          )}
         {chartQuery.data?.kind === "numeric" &&
           !chartQuery.data.compare &&
-          config.chartType === "box" && <BoxPlot stats={chartQuery.data.data} />}
+          config.chartType === "box" && (
+            <BoxPlot stats={chartQuery.data.data} showPoints={opts.showPoints} />
+          )}
         {chartQuery.data?.kind === "numeric" &&
           !chartQuery.data.compare &&
-          config.chartType === "violin" && <ViolinPlot stats={chartQuery.data.data} />}
+          config.chartType === "violin" && (
+            <ViolinPlot stats={chartQuery.data.data} showPoints={opts.showPoints} />
+          )}
         {chartQuery.data?.kind === "numeric" &&
           !chartQuery.data.compare &&
           config.chartType === "ecdf" && <EcdfChart stats={chartQuery.data.data} />}
@@ -273,6 +331,7 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
           <LineChart
             data={chartQuery.data.data}
             seriesMode={opts.seriesMode}
+            showPoints={config.options.showPoints ?? true}
             showLegend={opts.legend}
           />
         )}
@@ -293,7 +352,15 @@ export function ChartProposalCard({ caseId, timelineId, title, description, spec
         {chartQuery.data?.kind === "pivot" && config.chartType === "sankey" && (
           <SankeyFlow data={chartQuery.data.data} />
         )}
-        {chartQuery.data?.kind === "scatter" && <ScatterChart data={chartQuery.data.data} />}
+        {chartQuery.data?.kind === "corr" && <CorrMatrix data={chartQuery.data.data} />}
+        {chartQuery.data?.kind === "scatter" && (
+          <>
+            <ScatterChart data={chartQuery.data.data} />
+            {chartQuery.data.data.stats && (
+              <ScatterStatsPanel stats={chartQuery.data.data.stats} />
+            )}
+          </>
+        )}
       </div>
 
       <div className="mt-2 flex items-center justify-between gap-2">

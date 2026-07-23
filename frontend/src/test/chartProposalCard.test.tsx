@@ -51,6 +51,8 @@ vi.mock("@/api/viz", async () => {
       fieldTimeseries: (...args: unknown[]) => fieldTimeseriesMock(...args),
       fieldPivot: (...args: unknown[]) => fieldPivotMock(...args),
       fieldScatter: vi.fn(),
+      fieldCorrelation: vi.fn(),
+      fieldNumericGrouped: vi.fn(),
       compare: vi.fn(),
     },
     savedChartsApi: {
@@ -83,6 +85,11 @@ const NUMERIC: FieldNumericResponse = {
   max: 100,
   mean: 50,
   stddev: 20,
+  skewness: 0,
+  points: null,
+  bin_rule: "manual",
+  bin_count_clamped: false,
+  bin_width: 50,
   quantiles: {},
   bins: [{ x0: 0, x1: 50, count: 60 }],
 };

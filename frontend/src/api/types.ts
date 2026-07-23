@@ -1059,9 +1059,87 @@ export interface FieldNumericResponse {
   max: number | null;
   mean: number | null;
   stddev: number | null;
+  /** Population skewness g₁ — null for degenerate distributions (n < 2,
+   * zero variance). Sign convention: > 0 right-skewed, < 0 left-skewed. */
+  skewness: number | null;
   /** Keyed by quantile, e.g. "0.5" (median), "0.25", "0.95", ... */
   quantiles: Record<string, number>;
   bins: FieldNumericBin[];
+  /** How the bin count was chosen. "fd": the Freedman–Diaconis rule produced
+   * it. "fd_fallback": the rule was undefined (no interquartile spread) and a
+   * fixed default was used instead — the caption must NOT credit FD for these.
+   * "manual": an explicit bins request. */
+  bin_rule: "fd" | "fd_fallback" | "manual";
+  /** True when an "fd" count hit the allowed bin-count range and was clamped,
+   * so the drawn width is not exactly the width the rule asked for. */
+  bin_count_clamped: boolean;
+  bin_width: number | null;
+  /** Uniform sample of raw values for the strip overlay, drawn in a stable
+   * hash order so an identical query redraws identical points — only
+   * present when the request opted in (`points=true`). */
+  points: { total: number; shown: number; values: number[] } | null;
+}
+
+/** One group's distribution inside a grouped box/violin response. */
+export interface FieldNumericGroup {
+  value: string;
+  count: number;
+  min: number | null;
+  max: number | null;
+  mean: number | null;
+  stddev: number | null;
+  skewness: number | null;
+  quantiles: Record<string, number>;
+  /** Binned over the response's GLOBAL [min, max] so groups compare. */
+  bins: FieldNumericBin[];
+}
+
+/**
+ * Per-group numeric distributions from `viz/field-numeric-grouped` — one
+ * numeric field split by a categorical grouping field. Groups outside the
+ * top-N are omitted (never rolled into an "Other" box); `omitted_groups` /
+ * `omitted_count` carry the truth for the caption.
+ */
+export interface FieldNumericGroupedResponse {
+  kind: "numeric_grouped";
+  field: string;
+  group_field: string;
+  total: number;
+  min: number | null;
+  max: number | null;
+  distinct_groups: number;
+  omitted_groups: number;
+  omitted_count: number;
+  groups: FieldNumericGroup[];
+  /** Uniform sample across the kept groups: [group, value] pairs. Stable
+   * across reruns of an identical query. */
+  points: { total: number; shown: number; values: [string, number][] } | null;
+}
+
+/** One field pair inside a correlation matrix. */
+export interface FieldCorrelationPair {
+  x: string;
+  y: string;
+  /** Events where BOTH fields are numeric — each pair has its own n. */
+  n: number;
+  pearson: number | null;
+  p_pearson: number | null;
+  spearman: number | null;
+  p_spearman: number | null;
+}
+
+/**
+ * Pairwise correlations across several numeric fields, from
+ * `viz/field-correlation`. Pairwise-complete: a field with sparse numeric
+ * coverage shrinks only the pairs it takes part in.
+ */
+export interface FieldCorrelationResponse {
+  kind: "corr";
+  fields: string[];
+  total: number;
+  numeric_counts?: Record<string, number>;
+  pairs: FieldCorrelationPair[];
+  dropped_fields: { field: string; reason: string }[];
 }
 
 /** One time-bucketed series (a single field value's counts over time). */
@@ -1130,10 +1208,39 @@ export interface FieldPivotResponse {
 }
 
 /**
- * Uniform random sample of numeric (x, y) pairs from `viz/field-scatter`.
+ * Uniform sample of numeric (x, y) pairs from `viz/field-scatter`, drawn in
+ * a stable hash order so an identical query redraws identical points.
  * Extents describe the FULL data, not the sample; `total === 0` means one or
  * both fields have no numeric values — fall back to a categorical hint.
  */
+/**
+ * Server-computed correlation/regression block for a scatter pair. Pearson,
+ * Spearman and the regression line are computed over the FULL pairwise-
+ * complete data in ClickHouse; Kendall and Shapiro–Wilk over the drawn
+ * sample (their `basis`/`n` say so). Nullable throughout — degenerate data
+ * nulls a coefficient rather than failing the chart.
+ */
+export interface ScatterStats {
+  n: number;
+  basis: "full";
+  pearson: { r: number | null; p: number | null };
+  spearman: { rho: number | null; p: number | null };
+  kendall: { tau: number | null; p: number | null; basis: "sample"; n: number } | null;
+  regression: { slope: number | null; intercept: number | null; r_squared: number | null } | null;
+  shapiro: {
+    x: { w: number | null; p: number | null } | null;
+    y: { w: number | null; p: number | null } | null;
+    basis: "sample";
+    n: number;
+  };
+  recommendation: "pearson" | "spearman";
+  /** Where `recommendation` came from. "shapiro": both axes were tested and
+   * the verdict follows. "default": normality could not be tested at all, so
+   * Spearman is the conservative fallback and nothing measured it — the UI
+   * must not present it as a verdict. */
+  recommendation_basis: "shapiro" | "default";
+}
+
 export interface FieldScatterResponse {
   kind: "scatter";
   field_x: string;
@@ -1145,6 +1252,7 @@ export interface FieldScatterResponse {
   y_min: number | null;
   y_max: number | null;
   points: [number, number][];
+  stats: ScatterStats | null;
 }
 
 /** One shared-grid time bucket carrying both compare layers' raw counts. */

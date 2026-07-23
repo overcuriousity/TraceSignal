@@ -677,6 +677,30 @@ class _FakeVizService:
             "y_bounded": _bounded(field_y),
         }
 
+    def field_correlation(self, query, fields):
+        self.calls.append(("field_correlation", (tuple(fields),), {}))
+        pairs = [
+            {
+                "x": a,
+                "y": b,
+                "n": 100,
+                "pearson": 0.5,
+                "p_pearson": 0.001,
+                "spearman": 0.4,
+                "p_spearman": 0.01,
+            }
+            for i, a in enumerate(fields)
+            for b in fields[i + 1 :]
+        ]
+        return {
+            "kind": "corr",
+            "fields": list(fields),
+            "total": 100,
+            "numeric_counts": dict.fromkeys(fields, 100),
+            "pairs": pairs,
+            "dropped_fields": self.corr_dropped,
+        }
+
     def field_scatter(self, query, field_x, field_y, limit):
         self.calls.append(("field_scatter", (field_x, field_y, limit), {}))
         return {"kind": "scatter", "points": [], "total": 0, "sampled": 0}
@@ -831,29 +855,56 @@ async def test_compare_rejects_unknown_kind(store):
 
 class _FakeChartService(_FakeVizService):
     #: Field vocabulary `propose_chart`/`describe_field` validate against.
-    FIELDS = ["bytes", "latency", "status", "user", "country"]
+    FIELDS = [
+        "bytes",
+        "latency",
+        "status",
+        "user",
+        "country",
+        # Extra numeric-ish tokens so the >8-field correlation rejection can
+        # be exercised with a vocabulary the field check accepts.
+        "duration",
+        "retries",
+        "size",
+        "score",
+        "rank",
+    ]
 
     #: Set to 0 to exercise the "field is not numeric" rejection.
     numeric_count = 100
     #: Set to 0 to exercise the "no numeric pairs" scatter rejection.
     scatter_sampled = 25
+    #: Non-numeric fields the correlation scan reports back.
+    corr_dropped: list[dict[str, str]] = []
+    #: Distinct grouping values a grouped box/violin scan reports back —
+    #: raise it past VIZ_GROUP_CARDINALITY_CAUTION to exercise the caution.
+    grouped_distinct_groups = 5
 
     def list_fields(self, case_id, source_ids, field_mappings=None):
         self.calls.append(("list_fields", (), {}))
         return {"top_level": ["artifact", "message"], "attributes": list(self.FIELDS), "mapped": []}
 
+    #: Overridable so pie-readability cases can shape the value distribution.
+    terms_values: list[dict[str, Any]] | None = None
+    terms_other = 5
+
     def field_terms(self, query, field, limit):
         self.calls.append(("field_terms", (field, limit), {}))
+        values = self.terms_values or [
+            {"value": "a", "count": 60},
+            {"value": "b", "count": 40},
+        ]
         return {
             "field": field,
             "total": 100,
             "distinct": 4,
-            "other_count": 5,
-            "values": [{"value": "a", "count": 60}, {"value": "b", "count": 40}],
+            "other_count": self.terms_other,
+            "values": values,
         }
 
-    def field_numeric_stats(self, query, field, bins=30):
+    def field_numeric_stats(self, query, field, bins=None):
         self.calls.append(("field_numeric_stats", (field, bins), {}))
+        resolved = bins if bins is not None else 30
         return {
             "field": field,
             "count": self.numeric_count,
@@ -861,11 +912,83 @@ class _FakeChartService(_FakeVizService):
             "max": 99,
             "mean": 50,
             "stddev": 10,
+            "skewness": 0.1,
+            "quantiles": {"0.25": 25, "0.5": 50, "0.75": 75},
+            "bins": [{"x0": i, "x1": i + 1, "count": 1} for i in range(resolved)],
+            "bin_rule": "manual" if bins is not None else "fd",
+            "bin_count_clamped": False,
+            "bin_width": 1.0,
+        }
+
+    def field_numeric_grouped(
+        self, query, field, group_field, groups=8, bins=30, points=False, points_limit=1000
+    ):
+        self.calls.append(("field_numeric_grouped", (field, group_field, groups, bins, points), {}))
+        return {
+            "kind": "numeric_grouped",
+            "field": field,
+            "group_field": group_field,
+            "total": self.numeric_count,
+            "min": 0,
+            "max": 99,
+            "distinct_groups": self.grouped_distinct_groups,
+            "omitted_groups": 3,
+            "omitted_count": 7,
+            "groups": [
+                {
+                    "value": "alice",
+                    "count": 40,
+                    "quantiles": {"0.5": 20},
+                    "bins": [],
+                },
+                {"value": "bob", "count": 30, "quantiles": {"0.5": 50}, "bins": []},
+            ],
+            "points": None,
+        }
+
+    def field_correlation(self, query, fields):
+        self.calls.append(("field_correlation", (tuple(fields),), {}))
+        pairs = [
+            {
+                "x": a,
+                "y": b,
+                "n": 100,
+                "pearson": 0.5,
+                "p_pearson": 0.001,
+                "spearman": 0.4,
+                "p_spearman": 0.01,
+            }
+            for i, a in enumerate(fields)
+            for b in fields[i + 1 :]
+        ]
+        return {
+            "kind": "corr",
+            "fields": list(fields),
+            "total": 100,
+            "numeric_counts": dict.fromkeys(fields, 100),
+            "pairs": pairs,
+            "dropped_fields": self.corr_dropped,
         }
 
     def field_scatter(self, query, field_x, field_y, limit):
         self.calls.append(("field_scatter", (field_x, field_y, limit), {}))
-        return {"kind": "scatter", "points": [], "total": 0, "sampled": self.scatter_sampled}
+        return {
+            "kind": "scatter",
+            "points": [],
+            "total": 0,
+            "sampled": self.scatter_sampled,
+            "stats": {
+                "n": 100,
+                "basis": "full",
+                "pearson": {"r": 0.5, "p": 0.001},
+                "spearman": {"rho": 0.4, "p": 0.01},
+                "kendall": None,
+                "regression": {"slope": 1.0, "intercept": 2.0, "r_squared": 0.25},
+                "shapiro": {"x": None, "y": None, "basis": "sample", "n": 0},
+                "recommendation": "spearman",
+                "recommendation_basis": "default",
+            },
+        }
 
     def compare_field_terms(self, primary, comparison, field, limit):
         self.calls.append(("compare_field_terms", (field, limit), {}))
@@ -903,14 +1026,15 @@ def _called(fake: _FakeChartService, name: str) -> tuple:
 
 
 # ── every chart type is reachable ───────────────────────────────────────────
-# The bug this contract replaced: `kind` addressed 7 of 13 marks, so a pie
-# request silently rendered a bar. `pie`/`heatmap`/`box`/`violin`/`ecdf`/
-# `sankey` here are the six that were unreachable.
+# The bug this contract replaced: `kind` addressed 7 marks, so a pie request
+# silently rendered a bar. `pie`/`heatmap`/`box`/`violin`/`ecdf`/`sankey` here
+# are the ones that were unreachable; `waffle` postdates the enum entirely.
 
 _CHART_TYPE_CASES = [
     ("time", {}, "histogram"),
     ("bar", {"field": "attr:status"}, "field_terms"),
     ("pie", {"field": "attr:status"}, "field_terms"),
+    ("waffle", {"field": "attr:status"}, "field_terms"),
     ("heatmap", {"field": "attr:status"}, "field_value_timeseries"),
     ("line", {"field": "attr:bytes", "scale": "ratio"}, "field_value_timeseries"),
     ("histogram", {"field": "attr:bytes"}, "field_numeric_stats"),
@@ -921,6 +1045,7 @@ _CHART_TYPE_CASES = [
     ("pivot", {"field": "attr:user", "field_y": "attr:status"}, "field_pivot"),
     ("sankey", {"field": "attr:user", "field_y": "attr:status"}, "field_pivot"),
     ("scatter", {"field": "attr:bytes", "field_y": "attr:latency"}, "field_scatter"),
+    ("corr", {"fields": ["attr:bytes", "attr:latency"]}, "field_correlation"),
 ]
 
 
@@ -936,7 +1061,7 @@ async def test_propose_chart_reaches_every_chart_type(
     _called(fake, expected_call)
 
 
-async def test_propose_chart_covers_all_thirteen_types():
+async def test_propose_chart_covers_every_chart_type():
     """Guard against the parametrization drifting behind the table."""
     from vestigo.agent.chart_meta import CHART_TYPES
 
@@ -960,6 +1085,7 @@ async def test_propose_chart_echoes_what_will_be_drawn(store, monkeypatch):
         "data_kind": "terms",
         "field": "country",
         "field_y": None,
+        "fields": None,
         "options": {"top_n": 30},
     }
     assert result["warnings"] == []
@@ -1658,3 +1784,236 @@ async def test_disabling_unregistered_tool_is_harmless(store):
     async with FastMCPClient(server) as client:
         names = {t.name for t in await client.list_tools()}
     assert "propose_annotation" not in names
+
+
+# ── grouped distributions, pie readability (lecture-driven additions) ────────
+
+
+async def test_box_with_a_group_field_uses_the_grouped_aggregation(store, monkeypatch):
+    """box/violin accept an OPTIONAL categorical field_y — the grouped
+    aggregation, not the single-distribution one."""
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "box",
+                "field": "attr:bytes",
+                "field_y": "attr:user",
+                "options": {"groups": 3, "show_points": True},
+            }
+        ),
+    )
+    assert result["ok"] is True
+    field, group_field, groups, _bins, points = _called(fake, "field_numeric_grouped")
+    assert (field, group_field, groups, points) == ("attr:bytes", "attr:user", 3, True)
+    # The omission is reported, never silently rolled into an "Other" group.
+    assert result["summary"]["omitted_groups"] == 3
+    assert result["summary"]["omitted_count"] == 7
+    assert [g["value"] for g in result["summary"]["groups"]] == ["alice", "bob"]
+
+
+async def test_grouped_group_count_is_clamped(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "violin",
+                "field": "attr:bytes",
+                "field_y": "attr:user",
+                "options": {"groups": 50},
+            }
+        ),
+    )
+    assert _called(fake, "field_numeric_grouped")[2] == 8
+    assert any("groups=50 clamped to 8" in w for w in result["warnings"])
+
+
+async def test_group_field_is_rejected_for_charts_that_take_no_second_field(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    with pytest.raises(ToolError, match="takes no field_y"):
+        await _call(
+            server,
+            "propose_chart",
+            _chart({"chart_type": "ecdf", "field": "attr:bytes", "field_y": "attr:user"}),
+        )
+
+
+async def test_pie_with_too_many_slices_is_warned_not_rejected(store, monkeypatch):
+    """Lecture rule: past a handful of slices, angle comparison stops working.
+    Advisory — the chart still validates, the model just learns a better mark."""
+    fake = _patch_chart_service(monkeypatch)
+    fake.terms_values = [{"value": f"v{i}", "count": 100 - i * 7} for i in range(6)]
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server, "propose_chart", _chart({"chart_type": "pie", "field": "attr:status"})
+    )
+    assert result["ok"] is True
+    assert any("slices" in w and "waffle" in w for w in result["warnings"])
+
+
+async def test_pie_with_near_equal_slices_is_warned(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    fake.terms_values = [{"value": "a", "count": 100}, {"value": "b", "count": 96}]
+    fake.terms_other = 0
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server, "propose_chart", _chart({"chart_type": "pie", "field": "attr:status"})
+    )
+    assert any("less than 10%" in w for w in result["warnings"])
+
+
+async def test_waffle_and_bar_never_get_a_readability_warning(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    fake.terms_values = [{"value": f"v{i}", "count": 100 - i} for i in range(8)]
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    for chart_type in ("waffle", "bar"):
+        result = await _call(
+            server, "propose_chart", _chart({"chart_type": chart_type, "field": "attr:status"})
+        )
+        assert not [w for w in result["warnings"] if "slices" in w]
+
+
+async def test_corr_requires_a_field_list(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    with pytest.raises(ToolError, match="needs `fields`"):
+        await _call(server, "propose_chart", _chart({"chart_type": "corr", "field": "attr:bytes"}))
+    with pytest.raises(ToolError, match="must not repeat"):
+        await _call(
+            server,
+            "propose_chart",
+            _chart({"chart_type": "corr", "fields": ["attr:bytes", "attr:bytes"]}),
+        )
+
+
+async def test_fields_list_is_rejected_for_single_field_charts(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    with pytest.raises(ToolError, match="takes no `fields` list"):
+        await _call(
+            server,
+            "propose_chart",
+            _chart({"chart_type": "bar", "field": "attr:status", "fields": ["attr:bytes"]}),
+        )
+
+
+async def test_corr_reports_non_numeric_fields_as_a_warning(store, monkeypatch):
+    """An empty row/column is a fact about the data, not a reason to refuse."""
+    fake = _patch_chart_service(monkeypatch)
+    fake.corr_dropped = [{"field": "attr:user", "reason": "non_numeric"}]
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart({"chart_type": "corr", "fields": ["attr:bytes", "attr:user"]}),
+    )
+    fake.corr_dropped = []
+    assert result["ok"] is True
+    assert any("no numeric values for attr:user" in w for w in result["warnings"])
+    assert result["summary"]["pairs"][0]["n"] == 100
+
+
+async def test_field_correlation_tool_refuses_rather_than_truncates(store, monkeypatch):
+    """The data tool must not quietly chart a subset of what was asked for.
+
+    Truncating to the first eight fields (or de-duplicating in silence)
+    answers a different question and labels it as the answer to this one.
+    """
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+
+    with pytest.raises(ToolError) as too_many:
+        await _call(
+            server,
+            "field_correlation",
+            {"fields": [f"attr:f{i}" for i in range(9)]},
+        )
+    assert "between 2 and 8 fields" in str(too_many.value)
+
+    with pytest.raises(ToolError) as duplicated:
+        await _call(
+            server,
+            "field_correlation",
+            {"fields": ["attr:bytes", "attr:bytes"]},
+        )
+    assert "repeat" in str(duplicated.value)
+
+    with pytest.raises(ToolError) as too_few:
+        await _call(server, "field_correlation", {"fields": ["attr:bytes"]})
+    assert "between 2 and 8 fields" in str(too_few.value)
+
+
+async def test_grouped_chart_warns_about_omission_and_identifier_like_groups(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    fake.grouped_distinct_groups = 400
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart({"chart_type": "box", "field": "attr:bytes", "field_y": "attr:user"}),
+    )
+    assert result["ok"] is True
+    # Omission is a warning, not just a number buried in the summary.
+    assert any("omitted" in w for w in result["warnings"])
+    assert any("identifier" in w for w in result["warnings"])
+
+
+async def test_corr_field_list_refuses_rather_than_truncates(store, monkeypatch):
+    """propose_chart rejects >8 correlation fields, matching field_correlation.
+
+    Both agent entry points must apply the identical rule — silently charting
+    the first eight answers a question the model never asked.
+    """
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    with pytest.raises(ToolError) as too_many:
+        await _call(
+            server,
+            "propose_chart",
+            _chart(
+                {
+                    "chart_type": "corr",
+                    "fields": [f"attr:{f}" for f in _FakeChartService.FIELDS],
+                }
+            ),
+        )
+    assert "between 2 and 8 fields" in str(too_many.value)
+    # Rejected before any scan — the service is never called with a subset.
+    assert not any(name == "field_correlation" for name, _, _ in fake.calls)
+
+
+# ── retired facet spec ──────────────────────────────────────────────────────
+
+
+async def test_stale_facet_key_is_ignored_and_absent_from_the_resolved_echo(store, monkeypatch):
+    """A conversation holding the pre-removal tool schema must not hard-fail.
+
+    `ChartSpec` is `extra="ignore"` on purpose (same reason as
+    `_accept_legacy_kind`): a model whose context still carries the old schema
+    keeps working. What it must NOT do is quietly promise panels — `resolved`
+    is the contract, and it no longer mentions facetting at all, so the model
+    reading it learns the chart is unfacetted.
+    """
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "bar",
+                "field": "attr:status",
+                "facet": {"field": "attr:user", "limit": 4},
+            }
+        ),
+    )
+    assert result["ok"] is True
+    assert "facet" not in result["resolved"]
+    assert "facet" not in result["summary"]

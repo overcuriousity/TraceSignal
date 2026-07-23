@@ -13,6 +13,7 @@ const fullConfig: ChartConfig = {
   v: 1,
   field: "attr:src_ip",
   fieldY: null,
+  fields: null,
   scale: "nominal",
   chartType: "time",
   metric: "ratio",
@@ -156,5 +157,50 @@ describe("stored (saved chart) round-trip", () => {
     const parsed = parseStoredChartConfig(stored);
     expect(parsed).not.toBeNull();
     expect(parsed?.chartType).toBe(DEFAULT_CHART_CONFIG.chartType);
+  });
+});
+
+describe("multi-field serialization", () => {
+  // The facet grid was retired; a bookmark or saved chart from before that
+  // must still open — as the unfacetted chart, not as an error.
+  it("ignores the retired facet params instead of failing to parse the URL", () => {
+    const params = new URLSearchParams({
+      c_type: "bar",
+      c_field: "attr:status",
+      c_facet: "attr:user",
+      c_facet_n: "99",
+    });
+    const parsed = paramsToChartConfig(params);
+    expect(parsed.chartType).toBe("bar");
+    expect(parsed.field).toBe("attr:status");
+    expect("facet" in parsed).toBe(false);
+  });
+
+  it("ignores a retired facet key on a stored chart config", () => {
+    const parsed = parseStoredChartConfig({
+      v: 1,
+      chartType: "histogram",
+      field: "attr:bytes",
+      scale: "ratio",
+      facet: { field: "attr:user", limit: 6 },
+    });
+    expect(parsed?.chartType).toBe("histogram");
+    expect(parsed && "facet" in parsed).toBe(false);
+  });
+
+  it("round-trips a correlation field list, commas and all", () => {
+    const fields = ["attr:bytes", "attr:weird,name", "attr:latency"];
+    const params = chartConfigToParams({
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "corr",
+      scale: "ratio",
+      fields,
+    });
+    expect(paramsToChartConfig(params).fields).toEqual(fields);
+  });
+
+  it("ignores a malformed field list instead of throwing", () => {
+    const params = new URLSearchParams({ c_type: "corr", c_fields: "{not json" });
+    expect(paramsToChartConfig(params).fields).toBeNull();
   });
 });

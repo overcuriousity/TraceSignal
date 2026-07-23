@@ -5,7 +5,7 @@
  * exactly what a report reader sees. Includes the truthfulness warnings
  * (top-N capping, undefined metric bins) forensic rigor demands.
  */
-import type { EventFilters } from "@/api/types";
+import type { EventFilters, ScatterStats } from "@/api/types";
 import type { ChartConfig } from "./chartConfig";
 import { METRIC_INFO } from "./transforms";
 
@@ -23,6 +23,13 @@ export interface CaptionFacts {
   binCount?: number;
   valueMin?: number | null;
   valueMax?: number | null;
+  /** kind=numeric: how the bin count was chosen ("fd" = Freedman–Diaconis,
+   * "fd_fallback" = the rule was undefined and a fixed default was used). */
+  binRule?: "fd" | "fd_fallback" | "manual";
+  /** kind=numeric: an "fd" count that hit the allowed bin-count clamp. */
+  binCountClamped?: boolean;
+  /** kind=numeric: population skewness g₁ (null when degenerate). */
+  skewness?: number | null;
   /** Single focused value (e.g. the field-histogram modal's `field = value`
    * drill-down) — takes over the kind=time field line instead of the
    * generic "event count over time" phrasing. */
@@ -35,7 +42,41 @@ export interface CaptionFacts {
   /** kind=scatter: sample-size truthfulness. */
   sampledPoints?: number;
   totalPoints?: number;
+  /** kind=scatter: server-computed correlation/regression block. */
+  scatterStats?: ScatterStats | null;
+  /** Grouped box/violin: grouping field and top-N truthfulness. */
+  groupField?: string;
+  /** Grouped box/violin: distinct values of the grouping field, for the
+   * "this looks like an identifier" caution. */
+  groupDistinct?: number;
+  /** Grouped box/violin drawn as violins — widths need their reading spelled
+   * out, since they are normalized per group. */
+  groupedViolin?: boolean;
+  groupsShown?: number;
+  groupsOmitted?: number;
+  groupOmittedCount?: number;
+  /** box/violin raw-value strip overlay: sample truthfulness. */
+  overlayShown?: number;
+  overlayTotal?: number;
+  /** Mark-choice caution (e.g. a pie with too many/near-equal slices). */
+  readabilityWarning?: string;
+  /** kind=corr: which fields were correlated, and over how many events. */
+  corrFields?: string[];
+  corrPairs?: number;
+  corrDropped?: string[];
+  corrMinPairN?: number;
+  corrMaxPairN?: number;
 }
+
+/** Distinct grouping values past which the grouping field reads as an
+ * identifier. Mirrors the agent's VIZ_GROUP_CARDINALITY_CAUTION. */
+const IDENTIFIER_LIKE_GROUP_COUNT = 50;
+
+/** Shapiro–Wilk sample size past which "normality rejected" says more about
+ * the sample size than about the data — the test's power grows with n, so it
+ * starts flagging departures too small to change which coefficient to quote.
+ * Matches the `shapiroWilk` explainer's "distrust" section. */
+const SHAPIRO_LARGE_SAMPLE = 1000;
 
 const fmtInt = (n: number) => n.toLocaleString("en-US");
 
@@ -131,9 +172,32 @@ export function buildCaptionLines(args: {
     lines.push(`${describeInterval(facts.intervalSeconds)} buckets, UTC`);
   }
   if (facts.binCount != null && facts.valueMin != null && facts.valueMax != null) {
+    // Each rule names itself exactly. Crediting Freedman–Diaconis for a fixed
+    // fallback, or for a count the clamp overrode, would put a decision in the
+    // caption that the data never made.
+    const rule =
+      facts.binRule === "fd"
+        ? facts.binCountClamped
+          ? " (Freedman–Diaconis, clamped to the allowed bin range)"
+          : " (Freedman–Diaconis automatic width)"
+        : facts.binRule === "fd_fallback"
+          ? " (no interquartile spread — the automatic rule is undefined; fixed default)"
+          : facts.binRule === "manual"
+            ? " (manual)"
+            : "";
     lines.push(
-      `${facts.binCount} fixed-width bins over [${facts.valueMin.toLocaleString()}, ${facts.valueMax.toLocaleString()}]`,
+      `${facts.binCount} fixed-width bins over [${facts.valueMin.toLocaleString()}, ${facts.valueMax.toLocaleString()}]${rule}`,
     );
+  }
+  if (facts.skewness != null) {
+    const g1 = facts.skewness;
+    const reading =
+      Math.abs(g1) < 0.5
+        ? "approximately symmetric"
+        : g1 > 0
+          ? "right-skewed (long upper tail; mode < median < mean)"
+          : "left-skewed (long lower tail; mean < median < mode)";
+    lines.push(`skewness g₁ = ${g1.toFixed(2)} — ${reading}`);
   }
 
   // Truthfulness warnings.
@@ -165,9 +229,81 @@ export function buildCaptionLines(args: {
     facts.totalPoints > facts.sampledPoints
   ) {
     lines.push(
-      `showing ${fmtInt(facts.sampledPoints)} of ${fmtInt(facts.totalPoints)} points (uniform random sample; axes span full data)`,
+      `showing ${fmtInt(facts.sampledPoints)} of ${fmtInt(facts.totalPoints)} points (uniform sample, stable across reruns; axes span full data)`,
     );
   }
+  if (facts.groupField != null && facts.groupsShown != null) {
+    lines.push(
+      `grouped by ${facts.groupField}: ${fmtInt(facts.groupsShown)} group${facts.groupsShown === 1 ? "" : "s"} shown` +
+        (facts.groupsOmitted
+          ? `; ${fmtInt(facts.groupsOmitted)} smaller group${facts.groupsOmitted === 1 ? "" : "s"} omitted (${fmtInt(facts.groupOmittedCount ?? 0)} events), not merged into an "Other" group`
+          : "") +
+        " — all groups binned over the same value range",
+    );
+    if (facts.groupDistinct != null && facts.groupDistinct > IDENTIFIER_LIKE_GROUP_COUNT) {
+      lines.push(
+        `${facts.groupField} has ${fmtInt(facts.groupDistinct)} distinct values — that is usually an identifier rather than a grouping variable, and only the largest groups are drawn`,
+      );
+    }
+    if (facts.groupedViolin) {
+      // Widths are normalized per group, so they compare shapes, not sizes.
+      // Without this line a narrow violin reads as "fewer events", which is
+      // not what the mark encodes.
+      lines.push(
+        "violin widths show each group's own distribution shape (relative frequency), not its size — group sizes differ and are stated per group",
+      );
+    }
+  }
+  if (facts.overlayShown != null && facts.overlayTotal != null) {
+    lines.push(
+      facts.overlayShown < facts.overlayTotal
+        ? `point overlay: showing ${fmtInt(facts.overlayShown)} of ${fmtInt(facts.overlayTotal)} values (uniform sample, stable across reruns)`
+        : `point overlay: all ${fmtInt(facts.overlayShown)} values shown`,
+    );
+  }
+  if (facts.scatterStats) {
+    const s = facts.scatterStats;
+    const fmtC = (v: number | null) => (v == null ? "n/a" : v.toFixed(3));
+    lines.push(
+      `Pearson r = ${fmtC(s.pearson.r)}, Spearman ρ = ${fmtC(s.spearman.rho)} over all ${s.n.toLocaleString("en-US")} pairs (ClickHouse)` +
+        (s.regression?.slope != null && s.regression.intercept != null
+          ? `; regression y ≈ ${s.regression.slope.toPrecision(4)}·x + ${s.regression.intercept.toPrecision(4)}, R² = ${fmtC(s.regression.r_squared)}`
+          : ""),
+    );
+    lines.push(
+      s.recommendation_basis === "shapiro"
+        ? `recommended coefficient: ${s.recommendation === "pearson" ? "Pearson r" : "Spearman ρ"} (Shapiro–Wilk normality check on the ${s.shapiro.n.toLocaleString("en-US")}-point sample)` +
+            // The test's power grows with n, so at these sample sizes it
+            // rejects deviations too small to affect which coefficient to
+            // quote. The explainer says so on screen; the export has to say
+            // it too, or the caption reads as a finding about the data.
+            (s.shapiro.n >= SHAPIRO_LARGE_SAMPLE
+              ? ` — at this sample size Shapiro–Wilk flags even slight departures from normality, so read the verdict alongside the scatter's shape`
+              : "")
+        : // No normality verdict exists — say the coefficient is a fallback
+          // rather than dressing an untested default as a recommendation.
+          `normality could not be tested here; Spearman ρ shown as the conservative default`,
+    );
+  }
+  if (facts.corrFields?.length) {
+    lines.push(
+      `${facts.corrPairs ?? 0} field pairs over ${facts.corrFields.length} fields: ${facts.corrFields.join(", ")}`,
+    );
+    if (facts.corrMinPairN != null && facts.corrMaxPairN != null) {
+      lines.push(
+        facts.corrMinPairN === facts.corrMaxPairN
+          ? `each pair computed over ${fmtInt(facts.corrMinPairN)} events with both values (pairwise-complete)`
+          : `pairs computed over ${fmtInt(facts.corrMinPairN)}–${fmtInt(facts.corrMaxPairN)} events with both values (pairwise-complete)`,
+      );
+    }
+    if (facts.corrDropped?.length) {
+      lines.push(
+        `no numeric values under these filters: ${facts.corrDropped.join(", ")} — their cells are empty`,
+      );
+    }
+    lines.push("correlation is not causation; a coefficient near 0 rules out only the relationship it measures");
+  }
+  if (facts.readabilityWarning) lines.push(`readability: ${facts.readabilityWarning}`);
   if (metric === "delta") lines.push("first bin omitted (Δ undefined)");
   if (metric === "ratio") lines.push("bins with a zero-count comparison layer omitted (ratio undefined)");
 

@@ -144,12 +144,14 @@ small-context local models.
 | `describe_field` | core | Probe one field: coverage, numeric-ness, suggested scale/charts. |
 | `list_artifacts` | core | Distinct artifact types in the timeline. |
 | `field_terms` | core | Top-N value distribution for a field. |
-| `field_numeric_stats` | | Summary stats + histogram for a numeric field. |
+| `field_numeric_stats` | | Summary stats (incl. skewness) + histogram for a numeric field. |
+| `field_numeric_grouped` | | Per-group numeric distributions — one numeric field split by a categorical one. |
+| `field_correlation` | | Pairwise Pearson/Spearman across 2–8 numeric fields. |
 | `histogram` | core | Time-bucketed event counts. |
 | `field_timeseries` | core | Per-value counts bucketed over time. |
 | `time_punchcard` | | Counts by day-of-week × hour-of-day (UTC). |
 | `field_pivot` | | Top-X × top-Y co-occurrence matrix for two fields. |
-| `field_scatter` | | Sampled (x, y) numeric pairs for two fields. |
+| `field_scatter` | | Sampled (x, y) numeric pairs for two fields, plus full-data correlation/regression. Samples are drawn in a stable hash order, so an identical query redraws identical points. |
 | `compare` | | Two filtered layers of the same timeline (time/terms/numeric). |
 | `run_anomaly_detector` | core | Run a statistical detector; persists a `DetectorRun`. Exposes the same tuning surface and bounds as the HTTP endpoint. |
 | `propose_finding` | core | Finding card with applicable Explorer filters. |
@@ -185,10 +187,16 @@ frontend renders an "Apply to Explorer" card (`run_id` maps onto
 
 `propose_chart(title, description, spec)` mirrors the Visualize page's
 `ChartConfig` field for field (`chart_type`, `scale`, `field`, `field_y`,
-`metric`, `filters`, `compare{mode, filters}`, `options{…}`) — anything an
-analyst can build by hand the agent can propose. It replaced a flattened
-`kind` enum that could address only 7 of 13 chart types and silently rendered
-a requested pie as a bar.
+`fields`, `metric`, `filters`, `compare{mode, filters}`, `options{…}`) — anything an analyst can build by hand the agent can propose.
+It replaced a flattened `kind` enum that could address only 7 chart types and
+silently rendered a requested pie as a bar.
+
+The field slots are not interchangeable, and the table says which a mark
+takes: `field_y` is **required** by pivot/sankey/scatter (`requires_second
+_field`) and **optional** on box/violin (`accepts_second_field`), where it is
+a categorical grouping variable producing one distribution per group;
+`fields` is a 2–8 token list used only by the correlation matrix
+(`multi_field`).
 
 - **Legality is enforced from one table.** `agent/chart_meta.py` is the
   source of truth (which scales each mark admits, comparison support, second
@@ -204,6 +212,30 @@ a requested pie as a bar.
   no numeric pairs). Errors the model must recover from say what to do, not
   only what is wrong — e.g. the field × field grid is `pivot`, not
   `heatmap` (one field × time), and the rejection names that fix.
+- **Statistics are server-computed, never eyeballed.** ClickHouse natives
+  supply the descriptive side (`corr`, `rankCorr`, `simpleLinearRegression`,
+  `skewPop`, quantiles) over the **full** filtered data; `vestigo/stats.py`
+  (pure Python, no scipy) adds only what ClickHouse has no aggregate for —
+  p-values, Kendall's tau-b (Knight's O(n log n) method), Shapiro–Wilk — and
+  the response labels which numbers came from a sample. Correlations are
+  **pairwise-complete**: each pair reports the `n` it was computed over, so a
+  sparse field cannot silently shrink the other pairs. Where a statistic could
+  not be computed at all, the response says so rather than falling back
+  silently: `recommendation_basis` distinguishes a Shapiro–Wilk verdict from
+  the conservative default, and `bin_rule` distinguishes a Freedman–Diaconis
+  count from the fixed fallback used when the rule is undefined.
+- **Mark-choice cautions are warnings, not rejections.** A pie past
+  `PIE_COMFORTABLE_MAX` slices, or with two slices within 10% of each other,
+  still validates — with a warning naming bar/waffle. A grouped box/violin
+  whose grouping field has more than `VIZ_GROUP_CARDINALITY_CAUTION` distinct
+  values gets the same treatment (that is usually an identifier, not a
+  grouping variable), as does any grouped chart that omitted groups. Refusing
+  would be paternalistic; staying silent would let the model ship an
+  unreadable chart.
+- **Bad input is refused, not quietly narrowed.** `field_correlation` rejects
+  a field list that is too long or repeats a token rather than truncating it
+  to the cap — a silently truncated matrix answers a question the model never
+  asked and returns it as the answer to the one it did.
 - **The result echoes what will be drawn**: `{ok, resolved{…}, warnings,
   summary}`. `AgentPanel.tsx` gates card creation on `ok`; the system prompt
   requires the model to check `resolved`. Warnings carry ignored options and
