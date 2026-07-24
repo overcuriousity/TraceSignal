@@ -16,7 +16,7 @@ from fastmcp.client import Client as FastMCPClient
 from fastmcp.exceptions import ToolError
 
 from vestigo.agent.fidelity import Fidelity
-from vestigo.agent.tools import AgentScope, build_tool_server
+from vestigo.agent.tools import AgentScope, build_tool_server, schema_chars_for_scope
 from vestigo.db._time_fields import resolve_time_field
 from vestigo.db.postgres import User
 
@@ -1786,6 +1786,24 @@ async def test_disabling_unregistered_tool_is_harmless(store):
     assert "propose_annotation" not in names
 
 
+def test_schema_chars_for_scope_measures_the_advertised_tool_list():
+    """The number budget_for reserves for the tool list — measured from the
+    scope's actual advertised set: a conversation adds propose_annotation,
+    disabled_tools takes tools back out. For the default shape it stays in the
+    tens of kilobytes (the ~38.8k whose omission sank the budget on 2026-07-23).
+    """
+    full = schema_chars_for_scope(_scope_with_conversation("c1", "t1", "conv1"))
+    assert 30_000 < full < 60_000
+
+    # propose_annotation is only registered for a conversation scope.
+    assert schema_chars_for_scope(_scope("c1", "t1")) < full
+
+    # Every disabled tool takes its schema with it.
+    trimmed = _scope_with_conversation("c1", "t1", "conv1")
+    trimmed.disabled_tools = frozenset({"search_events", "list_fields"})
+    assert schema_chars_for_scope(trimmed) < full
+
+
 # ── grouped distributions, pie readability (lecture-driven additions) ────────
 
 
@@ -2017,3 +2035,45 @@ async def test_stale_facet_key_is_ignored_and_absent_from_the_resolved_echo(stor
     assert result["ok"] is True
     assert "facet" not in result["resolved"]
     assert "facet" not in result["summary"]
+
+
+# ---------------------------------------------------------------------------
+# No-op filter rejection (2026-07-23 context overflow)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"filters": {"src_ip": []}},
+        {"exclusions": {"status_code": []}},
+        {"artifacts": []},
+        {"tags_include": []},
+        {"event_ids": []},
+    ],
+)
+def test_empty_selections_are_rejected(payload):
+    """An empty value list is an absent filter, so the tool would answer with
+    the whole unfiltered timeline — a full-size result for a question the model
+    did not mean to ask. Three such calls in one turn (`{"src_ip": []}`,
+    `{"user_agent": []}`, `{"remote_user": []}`) returned byte-identical 34 KB
+    payloads and consumed two thirds of a 65k context window.
+    """
+    from pydantic import ValidationError
+
+    from vestigo.agent.tools import FilterSpec
+
+    with pytest.raises(ValidationError) as exc:
+        FilterSpec(**payload)
+    message = str(exc.value)
+    # The error has to name a way forward, not just refuse.
+    assert "Omit" in message
+    assert "field_terms" in message or "unconstrained" in message
+
+
+def test_populated_and_absent_filters_still_validate():
+    """The rejection must not catch either legitimate shape."""
+    from vestigo.agent.tools import FilterSpec
+
+    assert FilterSpec().filters == {}
+    assert FilterSpec(filters={"src_ip": ["203.0.113.1"]}).filters == {"src_ip": ["203.0.113.1"]}

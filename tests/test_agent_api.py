@@ -376,6 +376,27 @@ def test_conversations_are_private_to_their_creator(client, admin_bootstrap, age
         assert resp.status_code == 404
 
 
+def test_add_agent_message_bumps_conversation_updated_at(client, admin_bootstrap, agent_on, store):
+    """A message landing is activity on its conversation. Without this bump a
+    conversation whose turns all failed (history is rewritten only on success)
+    freezes at the last successful turn and sorts wrong in the listing."""
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    async def _exercise():
+        conv = await store.create_agent_conversation(
+            case_id, timeline_id, owner["id"], model_id="m"
+        )
+        before = (await store.get_agent_conversation(case_id, conv.id)).updated_at
+        await store.add_agent_message(conv.id, "user", "a failed question")
+        after = (await store.get_agent_conversation(case_id, conv.id)).updated_at
+        return before, after
+
+    before, after = asyncio.run(_exercise())
+    assert after >= before
+    assert after != before
+
+
 # ---------------------------------------------------------------------------
 # Proposals: confirm/reject (A1)
 # ---------------------------------------------------------------------------
@@ -1727,9 +1748,13 @@ def test_configured_window_elides_mid_turn(client, admin_bootstrap, agent_on, st
     the second bulky tool result lands, the first one is elided from what the
     model sees — mid-turn, before any provider 400. The reduction is persisted
     as a role="window" row plus an audit row, and streamed as a window event."""
-    monkeypatch.setenv("VESTIGO_AGENT_CONTEXT_WINDOW", "8000")
+    # The window must be large enough to hold the tool schemas (~13k tokens for
+    # the full tool set) *and* leave a few thousand for messages — otherwise
+    # `budget_for` clamps to its floor of 1 and this asserts the clamp rather
+    # than mid-turn elision. ~5k budget against ~2.7k estimated tokens per
+    # result: the second result's arrival is what pushes the first one out.
+    monkeypatch.setenv("VESTIGO_AGENT_CONTEXT_WINDOW", "28000")
     get_settings.cache_clear()
-    # ~2000 estimated tokens per result against a ~3400-token budget.
     seen = _big_tool_model(monkeypatch, result_chars=8000, tool_calls=2)
 
     as_admin(client, admin_bootstrap)
@@ -1748,6 +1773,10 @@ def test_configured_window_elides_mid_turn(client, admin_bootstrap, agent_on, st
     window = next(e for e in events if e["type"] == "window")
     assert window["reason"] == "fit"
     assert window["stats"]["results_elided"] >= 1
+    # Guard the premise: a clamped budget would elide everything and make the
+    # assertion above pass without exercising the mid-turn path at all.
+    assert window["stats"]["budget"] > 1000
+    assert window["stats"]["tool_schema_chars"] > 0
 
     # Transparency: the model's last request carried the elision stub.
     from pydantic_ai.messages import ToolReturnPart
@@ -2092,6 +2121,53 @@ def test_overflow_window_hint_parses_provider_phrasings():
     assert _overflow_window_hint(_exc("This model's maximum context length is 12 tokens")) is None
 
 
+def test_overflow_request_tokens_parses_provider_phrasings():
+    """The calibration's other half: how many tokens the provider charged for
+    the request that just failed — per-provider phrasings, garbage ignored."""
+    from pydantic_ai.exceptions import ModelHTTPError
+
+    from vestigo.api.routers.agent import _overflow_request_tokens
+
+    def _exc(body: str) -> ModelHTTPError:
+        return ModelHTTPError(status_code=400, model_name="m", body=body)
+
+    # llama.cpp behind LiteLLM (the 2026-07-23 phrasing).
+    assert (
+        _overflow_request_tokens(
+            _exc(
+                "litellm.BadRequestError: Custom_openaiException - request (75967 tokens) "
+                "exceeds the available context size (65536 tokens), try increasing it."
+            )
+        )
+        == 75967
+    )
+    # OpenAI.
+    assert (
+        _overflow_request_tokens(
+            _exc(
+                "This model's maximum context length is 65536 tokens. However, your "
+                "messages resulted in 75967 tokens."
+            )
+        )
+        == 75967
+    )
+    # Anthropic — and the window hint in the same sentence is not picked up as
+    # the request's cost.
+    assert (
+        _overflow_request_tokens(_exc("prompt is too long: 210000 tokens > 200000 maximum"))
+        == 210000
+    )
+    # A window hint alone is not a measurement of the request.
+    assert _overflow_request_tokens(_exc("maximum context length exceeded")) is None
+    # Zero is garbage, not a reading.
+    assert (
+        _overflow_request_tokens(
+            _exc("request (0 tokens) exceeds the available context size (65536 tokens)")
+        )
+        is None
+    )
+
+
 def test_overflow_with_provider_hint_derives_budget_from_reported_window(
     client, admin_bootstrap, agent_on, store, monkeypatch
 ):
@@ -2118,11 +2194,10 @@ def test_overflow_with_provider_hint_derives_budget_from_reported_window(
     assert resp.status_code == 200
     events = _sse_events(resp)
     from vestigo.agent.runtime import SYSTEM_PROMPT
-    from vestigo.agent.window import budget_for
+    from vestigo.agent.window import CHARS_PER_TOKEN_DEFAULT, budget_for
 
     window = next(e for e in events if e["type"] == "window")
     assert window["reason"] == "overflow"
-    assert window["budget"] == budget_for(65536, SYSTEM_PROMPT)
     assert any(e["type"] == "done" for e in events)
     assert calls["stream"] == 2
 
@@ -2131,8 +2206,99 @@ def test_overflow_with_provider_hint_derives_budget_from_reported_window(
 
     rows = [m for m in asyncio.run(_record()) if m.role == "window"]
     assert len(rows) == 1
-    assert rows[0].tool_result["window_hint"] == 65536
-    assert rows[0].tool_result["budget"] == budget_for(65536, SYSTEM_PROMPT)
+    detail = rows[0].tool_result
+    assert detail["window_hint"] == 65536
+
+    # The budget reserves the tool schemas too — they ship with every request
+    # but ride outside `messages`, so the window processor cannot see them.
+    # The row records what was reserved, which is what makes it reproducible.
+    tool_chars = detail["tool_schema_chars"]
+    assert tool_chars > 0
+    expected = budget_for(65536, SYSTEM_PROMPT, tool_chars, CHARS_PER_TOKEN_DEFAULT)
+    assert detail["budget"] == expected
+    assert window["budget"] == expected
+    assert expected < budget_for(65536, SYSTEM_PROMPT)  # strictly tighter than the old 2-term form
+
+    # No tool ran and no window was active, so nothing recorded a request size
+    # to divide the reported token count into — calibration must stay silent
+    # rather than invent a ratio from a number it cannot pair.
+    assert "measured_chars_per_token" not in detail
+
+
+def test_overflow_with_recorded_request_size_calibrates_the_estimator(
+    client, admin_bootstrap, agent_on, store, monkeypatch
+):
+    """The release's centerpiece, end to end: an overflow whose error body
+    names the request's token count, paired with the size the window recorded
+    sending, is a real chars-per-token measurement — persisted on the overflow
+    row, used for the retry budget, and reused by later turns."""
+    from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+
+    from vestigo.agent.runtime import SYSTEM_PROMPT, dump_history
+    from vestigo.agent.window import budget_for
+
+    # A configured window is what attaches the processor that records how much
+    # was actually sent — without it there is no numerator (the negative case
+    # above). The seeded history is bulky so the implied ratio lands inside
+    # the plausible band, like the real 2.35 it reproduces.
+    monkeypatch.setenv("VESTIGO_AGENT_CONTEXT_WINDOW", "65536")
+    get_settings.cache_clear()
+    _tool_free_model(
+        monkeypatch,
+        fail_first_stream=(
+            "request (75967 tokens) exceeds the available context size (65536 tokens)"
+        ),
+    )
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+
+    history = []
+    for i in range(12):
+        history.append(ModelRequest(parts=[UserPromptPart(content=f"question {i} " + "q" * 5000)]))
+        history.append(ModelResponse(parts=[TextPart(content="a" * 7000)]))
+
+    async def _seed():
+        await store.update_agent_conversation(conversation["id"], history=dump_history(history))
+
+    asyncio.run(_seed())
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
+        json={"content": "keep going"},
+    )
+    assert resp.status_code == 200
+    events = _sse_events(resp)
+    assert any(e["type"] == "done" for e in events)
+
+    async def _messages():
+        return await store.list_agent_messages(conversation["id"])
+
+    rows = [m for m in asyncio.run(_messages()) if m.role == "window"]
+    detail = next(r.tool_result for r in rows if r.tool_result["reason"] == "overflow")
+    assert detail["reported_request_tokens"] == 75967
+
+    # The numerator is exactly what the row carries: the recorded send size
+    # plus what rides outside `messages` — so the ratio stays auditable.
+    assert detail["max_request_chars"] > 0
+    request_chars = detail["max_request_chars"] + len(SYSTEM_PROMPT) + detail["tool_schema_chars"]
+    expected = request_chars / 75967
+    assert detail["measured_chars_per_token"] == round(expected, 4)
+
+    # The retry budget was computed with the measured divisor, not the default.
+    assert detail["budget"] == budget_for(
+        65536, SYSTEM_PROMPT, detail["tool_schema_chars"], expected
+    )
+    overflow_event = next(e for e in events if e["type"] == "window" and e["reason"] == "overflow")
+    assert overflow_event["budget"] == detail["budget"]
+
+    # And the next turn inherits the ratio: get_last_chars_per_token is what
+    # the router consults before computing the budget.
+    learned = asyncio.run(store.get_last_chars_per_token(conversation["id"]))
+    assert learned == pytest.approx(expected, abs=1e-3)
 
 
 def test_interrupted_turn_still_persists_window_row(
@@ -2147,14 +2313,18 @@ def test_interrupted_turn_still_persists_window_row(
 
     from vestigo.agent import runtime
 
-    monkeypatch.setenv("VESTIGO_AGENT_CONTEXT_WINDOW", "8000")
+    # Window sized so budget_for clears the floor (the real tool-schema share,
+    # ~13k tokens, is reserved regardless of this stub server), while two bulky
+    # results still overflow it and force an elision — same reason
+    # test_configured_window_elides_mid_turn uses 28000 not 8000.
+    monkeypatch.setenv("VESTIGO_AGENT_CONTEXT_WINDOW", "28000")
     get_settings.cache_clear()
 
     server = FastMCP("stub")
 
     @server.tool()
     def run_anomaly_detector(detector: str = "value_novelty") -> dict:
-        return {"status": "ok", "blob": "x" * 8000}
+        return {"status": "ok", "blob": "x" * 12000}
 
     monkeypatch.setattr(runtime, "build_tool_server", lambda scope: server)
 
@@ -2191,6 +2361,10 @@ def test_interrupted_turn_still_persists_window_row(
     window = next(e for e in events if e["type"] == "window")
     assert window["reason"] == "fit"
     assert window["stats"]["results_elided"] >= 1
+    # Guard the premise: a clamped budget would elide everything and make the
+    # assertion above pass without exercising the mid-turn path at all.
+    assert window["stats"]["budget"] > 1000
+    assert window["stats"]["tool_schema_chars"] > 0
 
     async def _record():
         return await store.list_agent_messages(conversation["id"])

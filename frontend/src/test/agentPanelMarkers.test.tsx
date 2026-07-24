@@ -168,4 +168,47 @@ describe("AgentPanel window marker rows", () => {
       await screen.findByText(/exceeded the model's context window — retrying/),
     ).toBeTruthy();
   });
+
+  it("names the request-guard defenses when they acted", async () => {
+    getConversationMock.mockResolvedValue({
+      ...conversation(),
+      messages: [
+        markerRow("window", {
+          reason: "fit",
+          attempt: 0,
+          budget: 3000,
+          results_elided: 1,
+          turns_dropped: 0,
+          estimated_before: 5000,
+          estimated_after: 2800,
+          duplicate_calls: 2,
+          results_capped: 1,
+        }),
+      ],
+    });
+    renderPanel();
+    expect(
+      await screen.findByText(/1 elided, 2 duplicate calls collapsed, 1 returns capped/),
+    ).toBeTruthy();
+  });
+
+  it("omits the guard counts on rows written before the request guard existed", async () => {
+    getConversationMock.mockResolvedValue({
+      ...conversation(),
+      messages: [
+        markerRow("window", {
+          reason: "fit",
+          attempt: 0,
+          budget: 3000,
+          results_elided: 3,
+          turns_dropped: 0,
+          estimated_before: 5000,
+          estimated_after: 2800,
+        }),
+      ],
+    });
+    renderPanel();
+    expect(await screen.findByText(/\(3 elided\)/)).toBeTruthy();
+    expect(screen.queryByText(/duplicate calls collapsed/)).toBeNull();
+  });
 });

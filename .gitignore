@@ -19,6 +19,8 @@ htmlcov/
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
+# Root-level vitest cache, created when frontend tests run from the repo root
+/node_modules/
 
 # Claude Code local config + temp files
 .claude/settings.local.json
