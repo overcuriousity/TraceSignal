@@ -21,6 +21,7 @@ that function's docstring for the wire-field verification).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -353,10 +354,13 @@ class _RequestGuardToolset(WrapperToolset):
     (it only rewrites *older* messages; the newest tool returns are exactly the
     ones it protects):
 
-    * **Duplicate calls.** Three ``search_events`` calls with byte-identical
-      arguments returned three byte-identical ~34 KB payloads on 2026-07-23 —
-      ~100 KB of pure duplicate in one request. An identical ``(name, args)``
-      already answered this request comes back as a back-reference instead.
+    * **Duplicate calls.** An identical ``(name, args)`` already answered this
+      request comes back as a back-reference — a model stuck in a loop must not
+      pay full payload size for every lap. (On 2026-07-23 the three
+      ``search_events`` calls had *different* empty-filter keys collapsing to
+      the same query and returning byte-identical ~34 KB results; the
+      FilterSpec empty-list rejection defends that shape, this guard defends
+      the literal-repeat one.)
     * **Runaway total.** Once this request's returns pass a byte ceiling
       derived from the budget, further returns come back reduced with a pointer
       to ``get_event`` and narrower filters.
@@ -373,7 +377,12 @@ class _RequestGuardToolset(WrapperToolset):
         self._byte_ceiling = byte_ceiling
         self._stats = stats
         self._step: int | None = None
-        self._seen: dict[tuple[str, str], str] = {}
+        # key -> (first call's tool_call_id, future resolving False once the
+        # call produced a result, True if it raised). The future is planted
+        # *before* the first await so a concurrent identical call — pydantic-ai
+        # runs one response's tool calls in parallel — waits for the original's
+        # outcome instead of executing a second time.
+        self._seen: dict[tuple[str, str], tuple[str, asyncio.Future[bool]]] = {}
         self._bytes = 0
 
     def _reset_for_step(self, step: int) -> None:
@@ -385,27 +394,48 @@ class _RequestGuardToolset(WrapperToolset):
     async def call_tool(self, name, tool_args, ctx, tool):  # noqa: ANN001 - match base
         self._reset_for_step(ctx.run_step)
         key = (name, json.dumps(tool_args, sort_keys=True, default=str))
-        if (first_id := self._seen.get(key)) is not None:
-            self._stats.duplicate_calls += 1
-            logger.info("Deduped identical %s call within one request", name)
-            return {
-                "duplicate_of": first_id,
-                "note": (
-                    f"An identical {name} call was already made this turn — its result "
-                    "stands. Change the arguments, or read a specific record with get_event, "
-                    "rather than repeating the call."
-                ),
-            }
-        # Only a successful call is cached: a rejected one raises before this
-        # line, so the model's corrected retry re-runs rather than being deduped
-        # against a call that never produced a result.
-        result = await self.wrapped.call_tool(name, tool_args, ctx, tool)
-        self._seen[key] = ctx.tool_call_id or key[1]
+        call_id = ctx.tool_call_id or "an earlier identical call"
+        while True:
+            existing = self._seen.get(key)
+            if existing is None:
+                # No await between the check and the marker — on a single event
+                # loop that pair is atomic, so exactly one caller wins the slot.
+                done: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+                self._seen[key] = (call_id, done)
+                break
+            first_id, first_done = existing
+            if not await first_done:
+                self._stats.duplicate_calls += 1
+                logger.info("Deduped identical %s call within one request", name)
+                return {
+                    "duplicate_of": first_id,
+                    "note": (
+                        f"An identical {name} call was already made this turn — its result "
+                        "stands. Change the arguments, or read a specific record with get_event, "
+                        "rather than repeating the call."
+                    ),
+                }
+            # The original raised before producing a result — there is nothing
+            # to reference, so fall through and try to become the executor.
+        try:
+            result = await self.wrapped.call_tool(name, tool_args, ctx, tool)
+        except BaseException:
+            # Only a successful call stays cached: a rejected one raises here,
+            # so the model's corrected retry re-runs rather than being deduped
+            # against a call that never produced a result. Waiters are told it
+            # failed, so they re-claim the slot instead of referencing a phantom.
+            if self._seen.get(key, (None, None))[1] is done:
+                del self._seen[key]
+            done.set_result(True)
+            raise
+        done.set_result(False)
 
         size = len(json.dumps(result, default=str))
         # Never reduce the first return of a request — a lone oversized payload
         # is the sliding window's job (truncate), not this guard's; the ceiling
-        # is about the *sum* running away across many calls.
+        # is about the *sum* running away across many calls. The check and the
+        # add stay in one synchronous stretch, so parallel callers cannot split
+        # them; which return counts as "first" is then completion order.
         if self._byte_ceiling and self._bytes > 0 and self._bytes + size > self._byte_ceiling:
             self._stats.results_capped += 1
             logger.info(

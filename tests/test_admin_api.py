@@ -474,6 +474,26 @@ def test_agent_settings_tool_fidelity_round_trips(client, admin_bootstrap, store
     assert cleared.json()["effective"]["tool_fidelity"] == "full"
 
 
+def test_agent_settings_warnings_flag_full_fidelity_on_a_small_window(
+    client, admin_bootstrap, store
+):
+    """The guard-rail must surface where the operator looks: full fidelity
+    against a window below AUTO_FULL_MIN_WINDOW is the shape that overflowed
+    on 2026-07-23. Advisory only — the config itself is left alone."""
+    as_admin(client, admin_bootstrap)
+    client.put("/api/admin/agent-settings", json={"tool_fidelity": "full"})
+    resp = client.put("/api/admin/agent-settings", json={"context_window": 65_536})
+    assert resp.status_code == 200
+    warnings = resp.json()["warnings"]
+    assert any("tool_fidelity" in w and "65536" in w for w in warnings)
+    # And on the read path, not only on writes.
+    assert client.get("/api/admin/agent-settings").json()["warnings"] == warnings
+
+    # auto steps the tier down instead, so it is not flagged.
+    resp = client.put("/api/admin/agent-settings", json={"tool_fidelity": "auto"})
+    assert resp.json()["warnings"] == []
+
+
 def test_agent_settings_put_triggers_reprobe(client, admin_bootstrap, store, monkeypatch):
     """A PUT resets the probe cache so the next health check re-probes immediately,
     reusing the counting-monkeypatch pattern from

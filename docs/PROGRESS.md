@@ -1,9 +1,45 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-24 (session 92 — agent context-window budget fix, 1.6.1).
+Last updated: 2026-07-24 (session 93 — 1.6.1 review hardening).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 93 — 2026-07-24: 1.6.1 code-review hardening
+
+**Why.** A pre-merge review of the 1.6.1 range (9f194d8..0b1f7cb) reproduced two
+bugs in the brand-new request guard and found the release's centerpiece —
+calibration — had no positive test. All fixed on this branch before tagging.
+
+- **Guard counters survived no reduction race.** `make_window_processor` copies a
+  fresh `WindowStats` wholesale whenever a later request reduces more — wiping
+  `duplicate_calls`/`results_capped`, which the guard accumulates on the shared
+  object *between* requests. Turns whose requests grow (the incident shape) lost
+  exactly the forensic record the release promised. The counters now survive the
+  copy the way `max_request_chars` already did.
+- **Dedupe was defeated by parallel tool execution.** pydantic-ai runs one model
+  response's tool calls concurrently, and the check-then-act spanned the wrapped
+  call's `await`, so two identical parallel calls both executed. The first caller
+  now plants an in-flight marker before its first await; concurrent duplicates
+  await the original's outcome and get the back-reference, and a waiter whose
+  original raised re-executes instead of referencing a phantom.
+- **Tests for what the release is about.** Positive calibration round-trip
+  (overflow + recorded send size → `measured_chars_per_token` persisted → retry
+  budget uses it → next turn inherits it), the `_REQUEST_TOKENS_RES` phrasings,
+  band-edge rejection in `calibrate_chars_per_token`, `schema_chars_for_scope`
+  (magnitude, conversation and `disabled_tools` effects), the admin `warnings`
+  array, and both guard races above.
+- **The guard-rail now reaches the operator.** The admin agent page renders the
+  settings `warnings` array (previously: server log and raw JSON only), and the
+  chat's window marker names collapsed duplicates / capped returns alongside the
+  elision counts.
+- Housekeeping from the same review: `max_request_chars` persisted on fit and
+  overflow rows (calibration stays auditable), "28 tools" corrected to 30 in the
+  docs that count honestly, the guard docstring now describes the incident
+  accurately (different empty-filter keys, identical *results*), the stray
+  vitest cache under the root `node_modules/` untracked and ignored, unrelated
+  `uv.lock` platform-marker churn reverted, and the missing 1.6.1 CHANGELOG
+  entry written.
 
 ## Session 92 — 2026-07-24: agent context-window overflow fixed (1.6.1)
 

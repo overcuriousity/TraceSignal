@@ -2121,6 +2121,53 @@ def test_overflow_window_hint_parses_provider_phrasings():
     assert _overflow_window_hint(_exc("This model's maximum context length is 12 tokens")) is None
 
 
+def test_overflow_request_tokens_parses_provider_phrasings():
+    """The calibration's other half: how many tokens the provider charged for
+    the request that just failed — per-provider phrasings, garbage ignored."""
+    from pydantic_ai.exceptions import ModelHTTPError
+
+    from vestigo.api.routers.agent import _overflow_request_tokens
+
+    def _exc(body: str) -> ModelHTTPError:
+        return ModelHTTPError(status_code=400, model_name="m", body=body)
+
+    # llama.cpp behind LiteLLM (the 2026-07-23 phrasing).
+    assert (
+        _overflow_request_tokens(
+            _exc(
+                "litellm.BadRequestError: Custom_openaiException - request (75967 tokens) "
+                "exceeds the available context size (65536 tokens), try increasing it."
+            )
+        )
+        == 75967
+    )
+    # OpenAI.
+    assert (
+        _overflow_request_tokens(
+            _exc(
+                "This model's maximum context length is 65536 tokens. However, your "
+                "messages resulted in 75967 tokens."
+            )
+        )
+        == 75967
+    )
+    # Anthropic — and the window hint in the same sentence is not picked up as
+    # the request's cost.
+    assert (
+        _overflow_request_tokens(_exc("prompt is too long: 210000 tokens > 200000 maximum"))
+        == 210000
+    )
+    # A window hint alone is not a measurement of the request.
+    assert _overflow_request_tokens(_exc("maximum context length exceeded")) is None
+    # Zero is garbage, not a reading.
+    assert (
+        _overflow_request_tokens(
+            _exc("request (0 tokens) exceeds the available context size (65536 tokens)")
+        )
+        is None
+    )
+
+
 def test_overflow_with_provider_hint_derives_budget_from_reported_window(
     client, admin_bootstrap, agent_on, store, monkeypatch
 ):
@@ -2176,6 +2223,82 @@ def test_overflow_with_provider_hint_derives_budget_from_reported_window(
     # to divide the reported token count into — calibration must stay silent
     # rather than invent a ratio from a number it cannot pair.
     assert "measured_chars_per_token" not in detail
+
+
+def test_overflow_with_recorded_request_size_calibrates_the_estimator(
+    client, admin_bootstrap, agent_on, store, monkeypatch
+):
+    """The release's centerpiece, end to end: an overflow whose error body
+    names the request's token count, paired with the size the window recorded
+    sending, is a real chars-per-token measurement — persisted on the overflow
+    row, used for the retry budget, and reused by later turns."""
+    from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+
+    from vestigo.agent.runtime import SYSTEM_PROMPT, dump_history
+    from vestigo.agent.window import budget_for
+
+    # A configured window is what attaches the processor that records how much
+    # was actually sent — without it there is no numerator (the negative case
+    # above). The seeded history is bulky so the implied ratio lands inside
+    # the plausible band, like the real 2.35 it reproduces.
+    monkeypatch.setenv("VESTIGO_AGENT_CONTEXT_WINDOW", "65536")
+    get_settings.cache_clear()
+    _tool_free_model(
+        monkeypatch,
+        fail_first_stream=(
+            "request (75967 tokens) exceeds the available context size (65536 tokens)"
+        ),
+    )
+
+    as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+    conversation = client.post(
+        f"/api/cases/{case_id}/agent/conversations", json={"timeline_id": timeline_id}
+    ).json()
+
+    history = []
+    for i in range(12):
+        history.append(ModelRequest(parts=[UserPromptPart(content=f"question {i} " + "q" * 5000)]))
+        history.append(ModelResponse(parts=[TextPart(content="a" * 7000)]))
+
+    async def _seed():
+        await store.update_agent_conversation(conversation["id"], history=dump_history(history))
+
+    asyncio.run(_seed())
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conversation['id']}/messages",
+        json={"content": "keep going"},
+    )
+    assert resp.status_code == 200
+    events = _sse_events(resp)
+    assert any(e["type"] == "done" for e in events)
+
+    async def _messages():
+        return await store.list_agent_messages(conversation["id"])
+
+    rows = [m for m in asyncio.run(_messages()) if m.role == "window"]
+    detail = next(r.tool_result for r in rows if r.tool_result["reason"] == "overflow")
+    assert detail["reported_request_tokens"] == 75967
+
+    # The numerator is exactly what the row carries: the recorded send size
+    # plus what rides outside `messages` — so the ratio stays auditable.
+    assert detail["max_request_chars"] > 0
+    request_chars = detail["max_request_chars"] + len(SYSTEM_PROMPT) + detail["tool_schema_chars"]
+    expected = request_chars / 75967
+    assert detail["measured_chars_per_token"] == round(expected, 4)
+
+    # The retry budget was computed with the measured divisor, not the default.
+    assert detail["budget"] == budget_for(
+        65536, SYSTEM_PROMPT, detail["tool_schema_chars"], expected
+    )
+    overflow_event = next(e for e in events if e["type"] == "window" and e["reason"] == "overflow")
+    assert overflow_event["budget"] == detail["budget"]
+
+    # And the next turn inherits the ratio: get_last_chars_per_token is what
+    # the router consults before computing the budget.
+    learned = asyncio.run(store.get_last_chars_per_token(conversation["id"]))
+    assert learned == pytest.approx(expected, abs=1e-3)
 
 
 def test_interrupted_turn_still_persists_window_row(

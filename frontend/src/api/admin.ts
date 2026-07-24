@@ -18,6 +18,9 @@ export interface AgentSettingsResponse {
   env_vars: Record<string, string>;
   /** A10: "env-only" means the backend refuses to store the API key in the DB. */
   secret_mode: "db" | "env-only";
+  /** Advisory guard-rails on the resolved config (e.g. full fidelity against an
+   * underpowered context window) — surface them, they change no behaviour. */
+  warnings: string[];
   /** Full tool catalog — checkbox source for the disabled_tools toggle list. */
   tools: AdminAgentTool[];
 }

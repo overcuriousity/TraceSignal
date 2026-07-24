@@ -16,7 +16,7 @@ from fastmcp.client import Client as FastMCPClient
 from fastmcp.exceptions import ToolError
 
 from vestigo.agent.fidelity import Fidelity
-from vestigo.agent.tools import AgentScope, build_tool_server
+from vestigo.agent.tools import AgentScope, build_tool_server, schema_chars_for_scope
 from vestigo.db._time_fields import resolve_time_field
 from vestigo.db.postgres import User
 
@@ -1784,6 +1784,24 @@ async def test_disabling_unregistered_tool_is_harmless(store):
     async with FastMCPClient(server) as client:
         names = {t.name for t in await client.list_tools()}
     assert "propose_annotation" not in names
+
+
+def test_schema_chars_for_scope_measures_the_advertised_tool_list():
+    """The number budget_for reserves for the tool list — measured from the
+    scope's actual advertised set: a conversation adds propose_annotation,
+    disabled_tools takes tools back out. For the default shape it stays in the
+    tens of kilobytes (the ~38.8k whose omission sank the budget on 2026-07-23).
+    """
+    full = schema_chars_for_scope(_scope_with_conversation("c1", "t1", "conv1"))
+    assert 30_000 < full < 60_000
+
+    # propose_annotation is only registered for a conversation scope.
+    assert schema_chars_for_scope(_scope("c1", "t1")) < full
+
+    # Every disabled tool takes its schema with it.
+    trimmed = _scope_with_conversation("c1", "t1", "conv1")
+    trimmed.disabled_tools = frozenset({"search_events", "list_fields"})
+    assert schema_chars_for_scope(trimmed) < full
 
 
 # ── grouped distributions, pie readability (lecture-driven additions) ────────

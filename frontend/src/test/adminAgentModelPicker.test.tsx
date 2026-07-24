@@ -133,3 +133,26 @@ describe("admin agent model picker", () => {
     expect(listAgentModelsMock).not.toHaveBeenCalled();
   });
 });
+
+describe("admin agent settings warnings", () => {
+  it("renders the backend's guard-rail warnings", async () => {
+    getAgentSettingsMock.mockResolvedValue({
+      ...settings({ tool_fidelity: "full", context_window: 65536 }),
+      warnings: [
+        "tool_fidelity is 'full' but context_window is 65536 tokens (< 100000); " +
+          "a single tool sweep can fill the window before history and an answer fit.",
+      ],
+    });
+    renderPage();
+
+    expect(await screen.findByText(/tool_fidelity is 'full'/)).toBeTruthy();
+  });
+
+  it("renders nothing extra when there are no warnings — or an older server omits the field", async () => {
+    getAgentSettingsMock.mockResolvedValue(settings());
+    renderPage();
+
+    await screen.findByText("AI agent");
+    expect(screen.queryByText(/tool_fidelity is 'full'/)).toBeNull();
+  });
+});

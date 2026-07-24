@@ -450,7 +450,7 @@ summarizer ran on the same possibly-small model and was nondeterministic).
   est(system prompt) − est(tool schemas)` (`budget_for`). **All three things
   that ship in a request are reserved** — history, the system prompt, *and*
   the advertised tool schemas. Omitting the tool schemas is what let a 76k-token
-  request through a 49k budget on 2026-07-23: 14 of the 28 tools each carry
+  request through a 49k budget on 2026-07-23: 14 of the 30 tools each carry
   their own copy of the `FilterSpec` definition (~13k tokens total), invisible
   to a window processor that only sees `messages`. `schema_chars_for_scope`
   measures the actual advertised schemas for the conversation's tool set (it
@@ -489,13 +489,21 @@ summarizer ran on the same possibly-small model and was nondeterministic).
 - **Per-request tool guard** (`agent/runtime.py` `_RequestGuardToolset`).
   Wraps the MCP toolset and, scoped to one model request (`RunContext.run_step`),
   (a) collapses an identical `(tool, canonical-args)` call to a
-  `{"duplicate_of": …}` back-reference — three byte-identical `search_events`
-  calls returned ~100k chars of pure duplicate in one turn on 2026-07-23, which
-  the window protects because they are the *newest* returns — and (b) caps one
+  `{"duplicate_of": …}` back-reference — on 2026-07-23 one turn returned ~100k
+  chars of pure duplicate in three calls, which the window protects because
+  they are the *newest* returns (those three had *different* empty-filter keys
+  collapsing to the same query, the shape the FilterSpec empty-list rejection
+  defends; this guard defends the literal-repeat one) — and (b) caps one
   request's total tool-return bytes at `budget × 0.5 × chars_per_token`,
   returning later results reduced with a pointer to `get_event`/narrower
-  filters. Deterministic (keyed on canonical args, reset when `run_step`
-  advances); both actions are counted on the turn's `WindowStats`
+  filters. The dedupe holds under pydantic-ai's parallel tool execution: the
+  first caller plants an in-flight marker before its first await, so a
+  concurrent identical call awaits the original's outcome instead of running a
+  second time. A `budget_for` floor clamp (budget 1, loudly warned about) also
+  collapses the byte ceiling to ~1 byte, so every non-first return is capped —
+  the misconfiguration shows in the transcript rather than passing silently.
+  Deterministic (keyed on canonical args, reset when `run_step` advances);
+  both actions are counted on the turn's `WindowStats`
   (`duplicate_calls`, `results_capped`) and land on the same `role="window"`
   row. This is reduction-for-fit, recorded in the export — distinct from
   `fidelity.py`'s static per-conversation tier (which must never depend on call
@@ -503,8 +511,9 @@ summarizer ran on the same possibly-small model and was nondeterministic).
 - **Config guard-rail.** `fidelity_config_warning` flags an explicit
   `tool_fidelity=full` against a `context_window` below `AUTO_FULL_MIN_WINDOW`
   (100k) — the exact `full` + 65536 shape that overflowed. Advisory only (the
-  operator keeps the override): logged at turn start and surfaced in the admin
-  agent-settings response `warnings` array.
+  operator keeps the override): logged at turn start, surfaced in the admin
+  agent-settings response `warnings` array, and rendered as a warning box on
+  the admin agent page.
 - **Forensic trail.** A reduced turn persists one append-only `role="window"`
   message row (reason, attempt, budget, counts, before/after estimates — the
   turn's single largest reduction) plus an `agent.window` audit row, written

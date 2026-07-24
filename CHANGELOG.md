@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.1] — 2026-07-24
+
+### Fixed
+
+- **Agent context-window overflow** — an analyst investigation died silently
+  when a 76k-token request passed a 49k budget against a 65k-context local
+  model (the provider 400 surfaced as a dead turn), and the retry then re-ran
+  the full orientation sweep three times. Root causes and fixes:
+  - **The budget never counted the advertised tool schemas.** 30 tools with
+    `FilterSpec` inlined ~14 times cost ~38.8k chars (~12.9k tokens) per
+    request and ride outside `messages`, invisible to the window processor.
+    `budget_for` now reserves them, measured per-scope by
+    `schema_chars_for_scope` (`disabled_tools` changes the advertised set).
+  - **The estimator assumed chars/4.** Real tool payloads (escaped JSON,
+    base64 params, dotted-quad IPs, UUIDs) measured 2.35 chars/token on the
+    overflow. The default is now 3.0, and `calibrate_chars_per_token` learns
+    the true ratio from the provider's own error body (clamped to 1.5–5.0),
+    persisted per conversation and reused by later turns — no tokenizer,
+    airgapped-safe. The retry budget and the persisted `role="window"` row
+    carry the ratio actually used, so a reduced request stays reproducible.
+  - **Overflow retry trusted a budget already known to be wrong.** The
+    provider-reported window now wins over a blind 0.6 shrink; the shrink
+    remains only as the no-hint fallback.
+  - **Empty-list filters answered full-size.** `{"src_ip": []}` behaved like
+    an absent filter, so a model that kept "narrowing" kept getting the whole
+    unfiltered timeline. `FilterSpec` now rejects empty value lists with an
+    actionable message naming `field_terms`.
+  - **Duplicate calls and runaway totals inside one request.** A per-request
+    guard (`_RequestGuardToolset`) collapses identical
+    `(tool, canonical-args)` calls to a `{"duplicate_of": …}` back-reference —
+    safe under pydantic-ai's parallel tool execution — and caps one request's
+    total tool-return bytes at half the budget. Both actions are counted on
+    the persisted window row and named in the chat's window marker.
+  - **Failed turns froze the conversation list.** Every appended message now
+    bumps the conversation's `updated_at`, so a conversation whose turns all
+    failed no longer sorts as if abandoned.
+- **Config guard-rail for the overflow shape**: explicit `tool_fidelity=full`
+  against a `context_window` below 100k is flagged in the server log, in the
+  admin agent-settings `warnings` array, and as a warning box on the admin
+  agent page. Advisory only — the operator keeps every override.
+
 ## [1.6.0] — 2026-07-23
 
 ### Added

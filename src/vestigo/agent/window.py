@@ -27,9 +27,10 @@ prose (the findings narrative — small, high value).
 **What the budget must cover.** Three things ship in a request and only one is
 in ``messages``: the history, the system prompt, and the advertised tool
 schemas. :func:`budget_for` reserves all three. Omitting the tool schemas is
-what let a 76k-token request through a 49k budget on 2026-07-23 — 28 tools with
-``FilterSpec`` inlined ~14 times are invisible to a processor that only sees
-the message list. See ``agent/schema_slim.py``, which measures and shrinks them.
+what let a 76k-token request through a 49k budget on 2026-07-23 — 30 tools
+with ``FilterSpec`` inlined ~14 times are invisible to a processor that only
+sees the message list. See ``agent/schema_slim.py``, which measures and
+shrinks them.
 
 **Estimating is calibrated, not assumed.** ``chars/N`` is a heuristic, not a
 tokenizer, and no constant N is right for every payload: prose runs near 4,
@@ -254,10 +255,10 @@ def budget_for(
 
     ``tool_schema_chars`` is not optional in spirit — a caller that passes 0
     when tools are advertised will overrun by exactly the size of the tool
-    list, which is what happened on 2026-07-23 (28 tools, ~14 inlined copies of
+    list, which is what happened on 2026-07-23 (30 tools, ~14 inlined copies of
     ``FilterSpec``). It defaults to 0 only so that callers with genuinely no
     tools need not say so. Measure it from the schemas actually advertised for
-    the scope (``tools.advertised_schema_chars``); do not estimate it.
+    the scope (``tools.schema_chars_for_scope``); do not estimate it.
 
     Clamped to a floor of 1: a non-positive budget would silently maximally
     elide every request, which is a misconfiguration worth a warning, not a
@@ -543,6 +544,13 @@ def make_window_processor(
         # error body can honestly be divided into.
         sent_chars = len(ModelMessagesTypeAdapter.dump_json(out))
         high_water = max(stats.max_request_chars, sent_chars)
+        # Turn-level accumulations the request guard (agent/runtime.py) owns,
+        # written between processor calls. Like max_request_chars they are not
+        # a property of whichever request reduced the most, so they survive
+        # the wholesale copy — otherwise a turn whose requests grow (the
+        # common shape: later requests reduce more) wipes the record of the
+        # guard's actions on the very next request.
+        guard_counts = (stats.duplicate_calls, stats.results_capped)
         if not stats.reduced or request_stats.saved > stats.saved:
             for f in fields(WindowStats):
                 setattr(stats, f.name, getattr(request_stats, f.name))
@@ -551,6 +559,7 @@ def make_window_processor(
         # Survives the wholesale overwrite above: it is a turn-level maximum,
         # not a property of whichever request reduced the most.
         stats.max_request_chars = high_water
+        stats.duplicate_calls, stats.results_capped = guard_counts
         return out
 
     return process

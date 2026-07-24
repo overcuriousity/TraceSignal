@@ -4,7 +4,7 @@ The guard sits between the agent and the MCP toolset and enforces two things
 inside a single model request: identical calls are collapsed to a
 back-reference, and one request's total tool-return bytes cannot run away past
 a ceiling. Both were provoked by the 2026-07-23 overflow, where one assistant
-turn issued three byte-identical ``search_events`` calls.
+turn kept re-asking the same full-size question.
 """
 
 from __future__ import annotations
@@ -27,6 +27,10 @@ class _FakeWrapped:
         self.payload_bytes = payload_bytes
 
     async def call_tool(self, name, tool_args, ctx, tool):
+        # Yield so concurrently gathered callers genuinely interleave, the way
+        # pydantic-ai's parallel tool execution runs them — without this the
+        # first call completes synchronously and a race becomes untestable.
+        await asyncio.sleep(0)
         self.calls.append((name, dict(tool_args)))
         return {"blob": "x" * self.payload_bytes}
 
@@ -155,3 +159,66 @@ def test_a_rejected_call_is_not_cached():
 
     assert retry == {"ok": True}
     assert wrapped.n == 2
+
+
+def test_concurrent_identical_calls_are_deduped():
+    """pydantic-ai runs one model response's tool calls concurrently
+    (parallel_execution_mode). A check-then-act that spans the wrapped call's
+    await lets two identical parallel calls both execute — the dedupe must
+    plant its marker before the first await. Which call wins the race is
+    nondeterministic, so the assertions are order-agnostic."""
+    wrapped = _FakeWrapped()
+    stats = WindowStats()
+    guard = _RequestGuardToolset(wrapped, byte_ceiling=0, stats=stats)
+
+    async def run():
+        return await asyncio.gather(
+            guard.call_tool("search_events", {"filters": {}}, _ctx(1, "tc1"), tool=None),
+            guard.call_tool("search_events", {"filters": {}}, _ctx(1, "tc2"), tool=None),
+        )
+
+    results = asyncio.run(run())
+
+    assert len(wrapped.calls) == 1
+    real = [r for r in results if "blob" in r]
+    back_refs = [r for r in results if "duplicate_of" in r]
+    assert len(real) == 1
+    assert len(back_refs) == 1
+    # The back-reference names the call that actually ran.
+    winner = "tc1" if results[0] is real[0] else "tc2"
+    assert back_refs[0]["duplicate_of"] == winner
+    assert stats.duplicate_calls == 1
+
+
+def test_a_concurrent_duplicate_of_a_failed_call_reruns():
+    """The waiter must not reference a result that never happened: when the
+    original raises, a concurrent identical call re-executes instead of
+    deduping against a phantom."""
+
+    class _Flaky:
+        def __init__(self):
+            self.n = 0
+
+        async def call_tool(self, name, tool_args, ctx, tool):
+            await asyncio.sleep(0)
+            self.n += 1
+            if self.n == 1:
+                raise ValueError("bad args")
+            return {"ok": True}
+
+    wrapped = _Flaky()
+    guard = _RequestGuardToolset(wrapped, byte_ceiling=0, stats=WindowStats())
+
+    async def run():
+        return await asyncio.gather(
+            guard.call_tool("search_events", {"filters": {}}, _ctx(1, "tc1"), tool=None),
+            guard.call_tool("search_events", {"filters": {}}, _ctx(1, "tc2"), tool=None),
+            return_exceptions=True,
+        )
+
+    results = asyncio.run(run())
+
+    assert wrapped.n == 2
+    assert any(isinstance(r, ValueError) for r in results)
+    assert any(r == {"ok": True} for r in results)
+    assert guard._stats.duplicate_calls == 0

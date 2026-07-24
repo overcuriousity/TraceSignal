@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import json
 
+import pytest
 from pydantic_ai.messages import (
     ModelMessagesTypeAdapter,
     ModelRequest,
@@ -22,16 +23,20 @@ from pydantic_ai.messages import (
 from tests.data.agent_payload_shape import (
     OVERFLOW_CHARS_PER_TOKEN,
     OVERFLOW_REQUEST_CHARS,
+    OVERFLOW_REQUEST_TOKENS,
     payload_of_size,
 )
 from vestigo.agent.window import (
     CHARS_PER_TOKEN_DEFAULT,
+    CHARS_PER_TOKEN_MAX,
+    CHARS_PER_TOKEN_MIN,
     ELISION_NOTE,
     MIN_KEEP_CHARS,
     TURN_DROP_MARKER,
     WindowStats,
     apply_window,
     budget_for,
+    calibrate_chars_per_token,
     estimate_tokens,
     make_window_processor,
 )
@@ -177,6 +182,37 @@ def test_budget_for_clamps_to_floor_and_warns(caplog):
     with caplog.at_level(logging.WARNING, logger="vestigo.agent.window"):
         assert budget_for(1024, "s" * 100_000) == 1
     assert "context_window" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# calibrate_chars_per_token
+# ---------------------------------------------------------------------------
+
+
+def test_calibrate_pairs_the_request_size_with_the_reported_token_count():
+    """The 2026-07-23 overflow's own numbers, the case this exists for."""
+    assert calibrate_chars_per_token(
+        OVERFLOW_REQUEST_CHARS, OVERFLOW_REQUEST_TOKENS
+    ) == pytest.approx(OVERFLOW_CHARS_PER_TOKEN)
+
+
+def test_calibrate_rejects_unusable_pairs():
+    assert calibrate_chars_per_token(0, OVERFLOW_REQUEST_TOKENS) is None
+    assert calibrate_chars_per_token(OVERFLOW_REQUEST_CHARS, 0) is None
+    assert calibrate_chars_per_token(-1, OVERFLOW_REQUEST_TOKENS) is None
+
+
+def test_calibrate_accepts_only_the_plausible_band(caplog):
+    """Outside the band the parse is more likely wrong than the model exotic —
+    the caller keeps the default, and the rejection is loud, not silent."""
+    import logging
+
+    assert calibrate_chars_per_token(int(CHARS_PER_TOKEN_MIN * 100), 100) == CHARS_PER_TOKEN_MIN
+    assert calibrate_chars_per_token(int(CHARS_PER_TOKEN_MAX * 100), 100) == CHARS_PER_TOKEN_MAX
+    with caplog.at_level(logging.WARNING, logger="vestigo.agent.window"):
+        assert calibrate_chars_per_token(int(CHARS_PER_TOKEN_MIN * 100) - 1, 100) is None
+        assert calibrate_chars_per_token(int(CHARS_PER_TOKEN_MAX * 100) + 100, 100) is None
+    assert "implausible" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -415,3 +451,27 @@ def test_processor_stats_describe_one_real_request():
     assert stats.estimated_after == large_stats.estimated_after
     assert stats.results_elided == large_stats.results_elided
     assert stats.budget == 3_600
+
+
+def test_processor_preserves_guard_counters_across_the_wholesale_copy():
+    """duplicate_calls / results_capped are accumulated on the shared stats by
+    the request guard (agent/runtime.py) *between* processor calls. A later
+    request that reduces more copies a fresh WindowStats — whose guard
+    counters are zero — over the shared one. Like max_request_chars, these
+    turn-level counts must survive the copy, or precisely the incident-shaped
+    turns (requests grow, so later requests reduce more) lose the record of
+    the guard's actions."""
+    history = _big_turn("q1", cycles=4, prefix="a")
+    budget = _budget_forcing_elisions(history, 2)
+    stats = WindowStats(budget=budget)
+    processor = make_window_processor(budget, stats)
+    processor(history)
+    assert stats.results_elided == 2
+    # The guard acts after the request it scored, before the next one.
+    stats.duplicate_calls = 3
+    stats.results_capped = 1
+    # A later, larger request reduces more and triggers the wholesale copy.
+    processor(_big_turn("q1", cycles=8, prefix="b"))
+    assert stats.results_elided > 2  # the copy really happened
+    assert stats.duplicate_calls == 3
+    assert stats.results_capped == 1

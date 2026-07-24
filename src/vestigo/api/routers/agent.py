@@ -636,6 +636,11 @@ async def _message_stream_inner(
             # and reproducing them is what makes this row evidence.
             "chars_per_token": round(window_stats.chars_per_token, 4),
             "tool_schema_chars": tool_schema_chars,
+            # Turn-level high-water mark of what was actually sent (chars,
+            # messages only). On an overflow row it is the numerator the
+            # measured divisor came from; recording it here too keeps the
+            # calibration auditable when no overflow ever happened.
+            "max_request_chars": window_stats.max_request_chars,
             # Per-request tool-side defenses (agent/runtime.py's request guard),
             # not message reductions — recorded on the same row so a replay
             # shows the turn collapsed duplicate calls or capped its output.
@@ -854,6 +859,10 @@ async def _message_stream_inner(
                     "budget": window_budget,
                     "chars_per_token": round(chars_per_token, 4),
                     "tool_schema_chars": tool_schema_chars,
+                    # What the window recorded sending (chars, messages only) —
+                    # the numerator `measured_chars_per_token` was calibrated
+                    # from, kept on the row so the ratio stays auditable.
+                    "max_request_chars": window_stats.max_request_chars,
                 }
                 if hint is not None:
                     detail["window_hint"] = hint

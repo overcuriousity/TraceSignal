@@ -80,6 +80,8 @@ type ChatItem =
       resultsElided: number;
       resultsTruncated: number;
       turnsDropped: number;
+      duplicateCalls: number;
+      resultsCapped: number;
     }
   | {
       kind: "finding";
@@ -135,6 +137,8 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
         results_elided?: number;
         results_truncated?: number;
         turns_dropped?: number;
+        duplicate_calls?: number;
+        results_capped?: number;
       } | null;
       items.push({
         kind: "window",
@@ -143,6 +147,9 @@ function itemsFromMessages(messages: AgentMessage[]): ChatItem[] {
         // Absent on rows written before the truncation pass existed.
         resultsTruncated: stats?.results_truncated ?? 0,
         turnsDropped: stats?.turns_dropped ?? 0,
+        // Absent on rows written before the request guard existed.
+        duplicateCalls: stats?.duplicate_calls ?? 0,
+        resultsCapped: stats?.results_capped ?? 0,
       });
     } else if (m.role === "assistant") {
       if (m.content) {
@@ -272,6 +279,8 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
             resultsElided: 0,
             resultsTruncated: 0,
             turnsDropped: 0,
+            duplicateCalls: 0,
+            resultsCapped: 0,
           },
         ],
         liveText: "",
@@ -290,6 +299,8 @@ function foldStreamEvent(s: StreamState, e: AgentStreamEvent): StreamState {
           resultsElided: e.stats.results_elided,
           resultsTruncated: e.stats.results_truncated ?? 0,
           turnsDropped: e.stats.turns_dropped,
+          duplicateCalls: e.stats.duplicate_calls ?? 0,
+          resultsCapped: e.stats.results_capped ?? 0,
         },
       ],
       liveText: "",
@@ -891,7 +902,7 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
                 <span>
                   {item.reason === "overflow"
                     ? "The request exceeded the model's context window — retrying with older tool results elided."
-                    : `Older tool results were elided to fit the model's context window (${item.resultsElided} elided${item.resultsTruncated ? `, ${item.resultsTruncated} truncated` : ""}${item.turnsDropped ? `, ${item.turnsDropped} turns dropped` : ""}). The full record is preserved in the transcript.`}
+                    : `Older tool results were elided to fit the model's context window (${item.resultsElided} elided${item.resultsTruncated ? `, ${item.resultsTruncated} truncated` : ""}${item.turnsDropped ? `, ${item.turnsDropped} turns dropped` : ""}${item.duplicateCalls ? `, ${item.duplicateCalls} duplicate calls collapsed` : ""}${item.resultsCapped ? `, ${item.resultsCapped} returns capped` : ""}). The full record is preserved in the transcript.`}
                 </span>
               </div>
             );

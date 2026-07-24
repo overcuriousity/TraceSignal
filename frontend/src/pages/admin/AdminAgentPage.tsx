@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CheckCircle2, XCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle2, XCircle } from "lucide-react";
 import { adminApi } from "@/api/admin";
 import { ApiError } from "@/api/client";
 import { healthApi } from "@/api/health";
@@ -306,6 +306,25 @@ export function AdminAgentPage() {
           variable cannot be edited here — unset the variable to allow a DB override.
         </p>
       </div>
+
+      {/* Advisory guard-rails on the resolved config (e.g. full fidelity against
+          an underpowered context window) — the backend computes them, they
+          change no behaviour, but the operator should see them before an
+          investigation dies of the combination. Older mocks/servers may omit
+          the field, hence the fallback. */}
+      {(data.warnings ?? []).length > 0 && (
+        <div className="space-y-1.5">
+          {(data.warnings ?? []).map((w) => (
+            <div
+              key={w}
+              className="flex items-start gap-2 rounded border border-[var(--color-border)] bg-[var(--color-warning-dim)] p-3 text-xs text-[var(--color-fg-primary)]"
+            >
+              <AlertTriangle size={13} className="mt-0.5 shrink-0 text-[var(--color-warning)]" />
+              <span>{w}</span>
+            </div>
+          ))}
+        </div>
+      )}
 
       <div className="space-y-3">
         <Field label="Model" pinnedBadge={pinnedBadge("model")}>

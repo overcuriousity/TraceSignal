@@ -319,6 +319,10 @@ export interface AgentWindowStats {
   turns_dropped: number;
   estimated_before: number;
   estimated_after: number;
+  /** Request-guard defenses (agent/runtime.py): identical calls collapsed to a
+   * back-reference, returns withheld past the per-request byte ceiling. */
+  duplicate_calls?: number;
+  results_capped?: number;
 }
 
 export type AgentStreamEvent =
