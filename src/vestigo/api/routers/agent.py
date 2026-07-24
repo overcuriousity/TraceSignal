@@ -31,7 +31,7 @@ from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior, Usag
 from vestigo import __version__
 from vestigo.agent.availability import agent_available
 from vestigo.agent.config import DEFAULT_MAX_TURNS, resolve_agent_config
-from vestigo.agent.fidelity import resolve_fidelity
+from vestigo.agent.fidelity import fidelity_config_warning, resolve_fidelity
 from vestigo.agent.runtime import (
     LLM_TIMEOUT,
     SYSTEM_PROMPT,
@@ -538,6 +538,13 @@ async def _message_stream_inner(
     )
     history = load_history(conversation.history)
 
+    if (
+        warning := fidelity_config_warning(config.tool_fidelity, config.context_window)
+    ) is not None:
+        # Advisory only — the operator keeps the override; the log is so a turn
+        # that later overflows has the reason on record beside it.
+        logger.warning("Agent config (conversation %s): %s", conversation_id, warning)
+
     # Sliding context window (agent/window.py): the one context-management
     # mechanism. Proactive when the operator configured context_window;
     # reactive otherwise — a provider overflow derives a budget from the
@@ -629,12 +636,19 @@ async def _message_stream_inner(
             # and reproducing them is what makes this row evidence.
             "chars_per_token": round(window_stats.chars_per_token, 4),
             "tool_schema_chars": tool_schema_chars,
+            # Per-request tool-side defenses (agent/runtime.py's request guard),
+            # not message reductions — recorded on the same row so a replay
+            # shows the turn collapsed duplicate calls or capped its output.
+            "duplicate_calls": window_stats.duplicate_calls,
+            "results_capped": window_stats.results_capped,
         }
         await _persist_window(
             detail,
             f"Older tool results ({window_stats.results_elided} elided, "
             f"{window_stats.results_truncated} truncated, "
-            f"{window_stats.turns_dropped} turns dropped) were reduced to fit "
+            f"{window_stats.turns_dropped} turns dropped; "
+            f"{window_stats.duplicate_calls} duplicate calls collapsed, "
+            f"{window_stats.results_capped} returns capped) were reduced to fit "
             "the model's context window — the full record is preserved here.",
         )
         return detail

@@ -376,6 +376,27 @@ def test_conversations_are_private_to_their_creator(client, admin_bootstrap, age
         assert resp.status_code == 404
 
 
+def test_add_agent_message_bumps_conversation_updated_at(client, admin_bootstrap, agent_on, store):
+    """A message landing is activity on its conversation. Without this bump a
+    conversation whose turns all failed (history is rewritten only on success)
+    freezes at the last successful turn and sorts wrong in the listing."""
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    async def _exercise():
+        conv = await store.create_agent_conversation(
+            case_id, timeline_id, owner["id"], model_id="m"
+        )
+        before = (await store.get_agent_conversation(case_id, conv.id)).updated_at
+        await store.add_agent_message(conv.id, "user", "a failed question")
+        after = (await store.get_agent_conversation(case_id, conv.id)).updated_at
+        return before, after
+
+    before, after = asyncio.run(_exercise())
+    assert after >= before
+    assert after != before
+
+
 # ---------------------------------------------------------------------------
 # Proposals: confirm/reject (A1)
 # ---------------------------------------------------------------------------
@@ -2169,14 +2190,18 @@ def test_interrupted_turn_still_persists_window_row(
 
     from vestigo.agent import runtime
 
-    monkeypatch.setenv("VESTIGO_AGENT_CONTEXT_WINDOW", "8000")
+    # Window sized so budget_for clears the floor (the real tool-schema share,
+    # ~13k tokens, is reserved regardless of this stub server), while two bulky
+    # results still overflow it and force an elision — same reason
+    # test_configured_window_elides_mid_turn uses 28000 not 8000.
+    monkeypatch.setenv("VESTIGO_AGENT_CONTEXT_WINDOW", "28000")
     get_settings.cache_clear()
 
     server = FastMCP("stub")
 
     @server.tool()
     def run_anomaly_detector(detector: str = "value_novelty") -> dict:
-        return {"status": "ok", "blob": "x" * 8000}
+        return {"status": "ok", "blob": "x" * 12000}
 
     monkeypatch.setattr(runtime, "build_tool_server", lambda scope: server)
 

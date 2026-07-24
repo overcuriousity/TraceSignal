@@ -3279,6 +3279,16 @@ class PostgresStore:
         )
         async with self.session_factory() as session:
             session.add(message)
+            # Bump the parent's updated_at in the same transaction: a message
+            # landing *is* activity on the conversation. Without this, a
+            # conversation whose turns all failed (history is only rewritten on
+            # the success path) freezes at the last successful turn's time and
+            # sorts wrong in the conversation list, even as rows keep arriving.
+            await session.execute(
+                update(AgentConversation)
+                .where(AgentConversation.id == conversation_id)
+                .values(updated_at=datetime.now(UTC))
+            )
             await session.commit()
             await session.refresh(message)
             return message

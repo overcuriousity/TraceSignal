@@ -167,10 +167,23 @@ class WindowStats:
     #: the one that overflowed, and the router never sees mid-turn messages
     #: itself (they live inside ``agent.run``).
     max_request_chars: int = 0
+    #: Tool-side defenses applied inside one model request (see the request
+    #: guard in ``agent/runtime.py``), not message reductions the window made:
+    #: identical calls collapsed to a back-reference, and returns dropped once
+    #: one request's tool output passed its byte ceiling. Recorded on the same
+    #: window row so replaying the conversation shows they happened.
+    duplicate_calls: int = 0
+    results_capped: int = 0
 
     @property
     def reduced(self) -> bool:
-        return self.results_elided > 0 or self.results_truncated > 0 or self.turns_dropped > 0
+        return (
+            self.results_elided > 0
+            or self.results_truncated > 0
+            or self.turns_dropped > 0
+            or self.duplicate_calls > 0
+            or self.results_capped > 0
+        )
 
     @property
     def saved(self) -> int:
