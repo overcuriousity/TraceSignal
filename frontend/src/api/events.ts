@@ -41,6 +41,27 @@ export const eventsApi = {
     return page.events[0] ?? null;
   },
 
+  /** Total events matching `filters`, run server-side regardless of pagination
+   * mode. Unlike `list`, whose `total` is only populated on the first
+   * offset-mode page, this always resolves — so cursor/jump-to-time sessions
+   * still know how many events the current filter matches (for the grid footer
+   * and "select all matching" bulk actions). */
+  count: (
+    caseId: string,
+    timelineId: string,
+    filters: EventFilters = {},
+    signal?: AbortSignal,
+  ): Promise<{ total: number }> => {
+    const params: Record<string, string | number | boolean | undefined | null> = {
+      ...serializeEventFilterParams(filters),
+    };
+    return get<{ total: number }>(
+      `/cases/${caseId}/timelines/${timelineId}/events/count`,
+      params,
+      signal,
+    );
+  },
+
   fields: (caseId: string, timelineId: string): Promise<FieldsResponse> =>
     get<FieldsResponse>(`/cases/${caseId}/timelines/${timelineId}/fields`),
 

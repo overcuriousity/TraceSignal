@@ -781,7 +781,20 @@ export function ExplorerPage() {
   // `null` rather than defaulting to 0 — a jump-to-time session may never load
   // an offset-mode page, and 0 would read as "no matching events" when the
   // true count is simply unknown.
-  const total = eventsData?.pages.find((p) => p.total != null)?.total ?? null;
+  const pageTotal = eventsData?.pages.find((p) => p.total != null)?.total ?? null;
+
+  // A cursor-only session (jump-to-time seek, or paging past the first page
+  // before an offset page ever loaded) has no `pageTotal`. Fetch the true match
+  // count independently so the grid footer, the "select all matching" banner,
+  // and the bulk-annotate confirm dialog all report the real number — otherwise
+  // they fall back to the loaded-row count and mislead the analyst into
+  // thinking only the visible page matches the filter (regression #163-followup).
+  const { data: countData } = useQuery({
+    queryKey: ["events-count", caseId, timelineId, effectiveFilters],
+    queryFn: ({ signal }) => eventsApi.count(caseId!, timelineId!, effectiveFilters, signal),
+    enabled: !!(caseId && timelineId) && pageTotal === null && !eventsLoading,
+  });
+  const total = pageTotal ?? countData?.total ?? null;
 
   // Derive a plain Set<string> of selected IDs for components that don't know
   // about the "all" mode (EventGrid checkboxes). In "all" mode we show all

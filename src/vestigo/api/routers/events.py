@@ -6,6 +6,7 @@ import asyncio
 import csv
 import io
 import json
+import logging
 import re
 from collections.abc import Generator
 from dataclasses import asdict, dataclass, replace
@@ -17,6 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
+from starlette.background import BackgroundTask
 
 from vestigo.api.deps import (
     get_current_user,
@@ -119,6 +121,19 @@ def _get_field_encoder() -> Any:
 
 
 router = APIRouter(prefix="/api/cases", tags=["events"])
+
+_logger = logging.getLogger(__name__)
+
+
+class ExportIncompleteError(RuntimeError):
+    """Raised mid-stream when an export wrote fewer rows than the filter matched.
+
+    A forensic export is a custody artifact — a silently short file is worse
+    than a failed one. Raising inside the streaming generator breaks the HTTP
+    response so the client cannot mistake a truncated download for a complete
+    one; the emitted completeness trailer records the shortfall in the bytes
+    already written.
+    """
 
 
 def _validate_regex(q: str | None, q_regex: bool) -> None:
@@ -1039,6 +1054,99 @@ async def list_source_embedding_fields(
     )
 
 
+@router.get("/{case_id}/timelines/{timeline_id}/events/count")
+async def count_events(
+    case_id: str,
+    timeline_id: str,
+    q: str | None = Query(default=None),
+    q_regex: bool = Query(default=False, description="Treat q as an RE2 regular expression."),
+    artifact: str | None = Query(default=None),
+    artifacts: str | None = Query(default=None),
+    source_id: str | None = Query(default=None),
+    tag: str | None = Query(default=None),
+    exclude_tag: str | None = Query(default=None),
+    tags_include: str | None = Query(default=None),
+    tags_exclude: str | None = Query(default=None),
+    ids: str | None = Query(default=None),
+    start: datetime | None = Query(default=None),  # noqa: B008
+    end: datetime | None = Query(default=None),  # noqa: B008
+    filters: str | None = Query(default=None),
+    exclusions: str | None = Query(default=None),
+    filter_modes: str | None = Query(default=None),
+    exclusion_modes: str | None = Query(default=None),
+    annotated: str | None = Query(default=None),
+    annotation_tag_value: str | None = Query(default=None),
+    run_id: str | None = Query(default=None),
+    collapse_routine: bool = Query(
+        default=False,
+        description="Exclude routine-motif occurrence events — same semantics as the events list.",
+    ),
+    case: Case = Depends(require_case_read),
+) -> dict[str, Any]:
+    """Return the total number of events matching the current filter.
+
+    Honors the exact same filter params as the events list endpoint, but always
+    runs a ``count()`` regardless of pagination mode. The events list only
+    carries a real ``total`` on its first offset-mode page, so a cursor-only
+    session (e.g. a jump-to-time seek) has no match count to show or to drive a
+    "select all matching" bulk annotation; this endpoint fills that gap. With
+    ``collapse_routine`` the count matches the collapsed grid and the set that a
+    filter-scoped bulk annotation would write.
+    """
+    _validate_regex(q, q_regex)
+    parsed_filters = _parse_multivalue_object(filters)
+    parsed_exclusions = _parse_multivalue_object(exclusions)
+    parsed_filter_modes = _parse_modes_object(filter_modes)
+    parsed_exclusion_modes = _parse_modes_object(exclusion_modes)
+    _validate_field_regexes(parsed_filters, parsed_filter_modes)
+    _validate_field_regexes(parsed_exclusions, parsed_exclusion_modes)
+    source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
+    event_ids, tags_include_filter, tags_exclude_filter = await _resolve_event_id_filters(
+        case_id,
+        source_ids,
+        annotated=annotated,
+        annotation_tag_value=annotation_tag_value,
+        run_id=run_id,
+        tags_include=tags_include,
+        tags_exclude=tags_exclude,
+        ids=ids,
+    )
+    routine_scope = await _resolve_routine_collapse(
+        case_id, timeline_id, source_ids, collapse_routine
+    )
+    service = _get_query_service()
+    # Blocking ClickHouse scan — threadpool, same as list_events.
+    total = await _run_regex_guarded(
+        _uses_regex(q_regex, parsed_filter_modes, parsed_exclusion_modes),
+        service.count,
+        EventQuery(
+            case_id=case_id,
+            source_ids=source_ids,
+            q=q,
+            q_regex=q_regex,
+            artifact=artifact,
+            artifacts=_parse_str_list(artifacts),
+            source_id=source_id,
+            tag=tag,
+            exclude_tag=exclude_tag,
+            start=start,
+            end=end,
+            field_filters=parsed_filters,
+            field_exclusions=parsed_exclusions,
+            filter_modes=parsed_filter_modes,
+            exclusion_modes=parsed_exclusion_modes,
+            event_ids=event_ids,
+            tags_include=tags_include_filter,
+            tags_exclude=tags_exclude_filter,
+            field_mappings=field_mappings,
+            source_offsets=source_offsets,
+            exclude_routine_disposition_ids=routine_scope.motif_disposition_ids,
+            exclude_template_hashes=routine_scope.template_hashes,
+        ),
+    )
+    return {"total": total}
+
+
 @router.get("/{case_id}/timelines/{timeline_id}/histogram")
 async def get_histogram(
     case_id: str,
@@ -1219,32 +1327,65 @@ def _stream_jsonl(
     query: EventQuery,
     annotations_by_event: dict[str, list[Any]],
     applied_offsets: dict[str, int] | None = None,
+    *,
+    expected: int,
+    tally: dict[str, Any],
 ) -> Generator[str]:
     """Yield one JSONL line per matching event, with its annotations attached.
 
     When any per-source clock-skew offset is active, a leading ``_meta`` record
     documents it so the corrected timestamps in the export are self-describing;
     an untouched (offset-free) export stays byte-identical to pre-W2.
+
+    A trailing ``_meta`` completeness record proves the export holds every
+    matching row (``expected`` from a pre-flight ``count()`` over the same
+    filter). On a shortfall the trailer is marked ``complete: false`` and the
+    generator raises :class:`ExportIncompleteError` — see its docstring.
     """
     if applied_offsets:
         yield json.dumps({"_meta": {"applied_time_offsets": applied_offsets}}) + "\n"
     service = EventQueryService()
+    written = 0
     for event in service.iter_events(query):
         row = dict(event)
         row["annotations"] = [a.to_dict() for a in annotations_by_event.get(row["event_id"], [])]
         yield json.dumps(row, default=str) + "\n"
+        written += 1
+    complete = written == expected
+    tally["written"] = written
+    tally["complete"] = complete
+    yield (
+        json.dumps({"_meta": {"expected": expected, "written": written, "complete": complete}})
+        + "\n"
+    )
+    if not complete:
+        _logger.error(
+            "export incomplete (jsonl): expected=%s written=%s case=%s timeline sources=%s",
+            expected,
+            written,
+            query.case_id,
+            query.source_ids,
+        )
+        raise ExportIncompleteError(f"export wrote {written} of {expected} matching events")
 
 
 def _stream_csv(
     query: EventQuery,
     annotations_by_event: dict[str, list[Any]],
     applied_offsets: dict[str, int] | None = None,
+    *,
+    expected: int,
+    tally: dict[str, Any],
 ) -> Generator[str]:
     """Yield CSV rows for all matching events (header first), annotations flattened.
 
     A leading ``# applied_time_offsets=…`` comment documents any active
     per-source clock-skew offset; without one the output is byte-identical to
     the pre-W2 export.
+
+    A trailing ``# vestigo_export …`` comment proves completeness against a
+    pre-flight ``count()``; a shortfall marks it ``complete=false`` and raises
+    :class:`ExportIncompleteError` (see its docstring).
     """
     buf = io.StringIO()
     if applied_offsets:
@@ -1260,6 +1401,7 @@ def _stream_csv(
     yield buf.getvalue()
 
     service = EventQueryService()
+    written = 0
     for event in service.iter_events(query):
         # Normalise list/dict fields that don't serialize well in CSV.
         row = dict(event)
@@ -1285,6 +1427,21 @@ def _stream_csv(
         buf.truncate()
         writer.writerow(row)
         yield buf.getvalue()
+        written += 1
+
+    complete = written == expected
+    tally["written"] = written
+    tally["complete"] = complete
+    yield f"# vestigo_export complete={str(complete).lower()} rows={written} expected={expected}\n"
+    if not complete:
+        _logger.error(
+            "export incomplete (csv): expected=%s written=%s case=%s sources=%s",
+            expected,
+            written,
+            query.case_id,
+            query.source_ids,
+        )
+        raise ExportIncompleteError(f"export wrote {written} of {expected} matching events")
 
 
 # ── Export endpoint ───────────────────────────────────────────────────────────
@@ -1366,18 +1523,36 @@ async def export_events(
         # instead of breaking the response mid-stream.
         await _run_regex_guarded(True, _get_query_service().query, replace(eq, limit=1, offset=0))
 
+    # Pre-flight the expected row count over the *same* EventQuery, so the stream
+    # can prove it emitted every matching row (and hard-fail if it didn't). Same
+    # WHERE as the stream's keyset scan → identical scope.
+    expected = await _run_regex_guarded(
+        _uses_regex(bool(eq.q_regex and eq.q), eq.filter_modes, eq.exclusion_modes),
+        _get_query_service().count,
+        eq,
+    )
+    # Shared holder the streaming generator fills once it drains; read by the
+    # completeness audit that runs after the response is sent.
+    tally: dict[str, Any] = {"written": None, "complete": None}
+
     if body.format == "jsonl":
         media_type = "application/x-ndjson"
         ext = "jsonl"
-        content = _stream_jsonl(eq, annotations_by_event, source_offsets)
+        content = _stream_jsonl(
+            eq, annotations_by_event, source_offsets, expected=expected, tally=tally
+        )
     else:
         media_type = "text/csv"
         ext = "csv"
-        content = _stream_csv(eq, annotations_by_event, source_offsets)
+        content = _stream_csv(
+            eq, annotations_by_event, source_offsets, expected=expected, tally=tally
+        )
 
     # Audited before streaming starts: an export that fails mid-stream still
     # extracted data up to the failure point, so the attempt itself is the
-    # custody-relevant fact.
+    # custody-relevant fact. `expected` is known now; the completeness *result*
+    # (written/complete) is only known once the stream drains, so it is recorded
+    # by a background task below.
     await store.record_audit(
         action="events.export",
         actor=user,
@@ -1386,16 +1561,38 @@ async def export_events(
         target_id=timeline_id,
         detail={
             "format": body.format,
+            "expected": expected,
             "filter": body.filter.model_dump(exclude_none=True, exclude_defaults=True),
             **({"applied_time_offsets": source_offsets} if source_offsets else {}),
         },
     )
+
+    async def _audit_completeness() -> None:
+        # Runs after the response body is fully sent. On a mid-stream
+        # ExportIncompleteError the error path already logged the shortfall and
+        # broke the download; this records the completeness result of a stream
+        # that drained (complete, or — if a future bug lets it finish short —
+        # incomplete).
+        await store.record_audit(
+            action="events.export.result",
+            actor=user,
+            case_id=case_id,
+            target_type="timeline",
+            target_id=timeline_id,
+            detail={
+                "format": body.format,
+                "expected": expected,
+                "written": tally["written"],
+                "complete": tally["complete"],
+            },
+        )
 
     filename = f"{case_id}-{timeline_id}-events.{ext}"
     return StreamingResponse(
         content,
         media_type=media_type,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        background=BackgroundTask(_audit_completeness),
     )
 
 

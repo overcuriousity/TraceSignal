@@ -1,9 +1,63 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-07-23 (session 91 — converter time-window filtering + forensic footer metadata).
+Last updated: 2026-07-24 (session 93 — grid completeness surfacing + export hard-fail).
 
 Append-only session log, newest entry on top. Sessions 1–70 are archived in
 [`docs/archive/PROGRESS_SESSIONS_01-70.md`](./archive/PROGRESS_SESSIONS_01-70.md).
+
+## Session 93 — 2026-07-24: surface incomplete result loads + prove export completeness
+
+**Why.** Follow-up to session 92. An analyst's Explorer showed "20,522 events loaded · all
+loaded" while the AI agent's `search_events` reported 21,175 for the *same* filter; the agent
+spent four turns guessing at the gap. Live investigation against a replicated localhost
+instance (case `CloudTrail_2b558274`, 11-IP `src_ip` filter) **disproved every structural
+theory**: not routine-collapse (none active), not duplicate `event_id` (`count()` =
+`uniqExact(event_id)` = `uniqExact((timestamp,event_id))` = 21,175; table-wide dup gap is 56 in
+an unrelated case), and **not a keyset-pagination skip** — a faithful ms-truncated keyset walk
+yields all 21,175 rows over 212 pages. So keyset pagination is provably complete; the 20,522 was
+session-92's null-`total` bug (no count shown) over a partial/point-in-time load, and the grid
+compounded it by asserting "all loaded" from cursor state alone.
+
+**What.**
+- *Grid (`components/explorer/EventGrid.tsx`).* "all loaded" is now derived from
+  `events.length >= total` (a completeness claim), not `!hasNextPage`. When both directions are
+  exhausted yet short of the known total, the footer shows a red `⚠ N not loaded — reload`
+  instead of falsely reading complete.
+- *Export hard-fail (`api/routers/events.py`).* `export_events` pre-flights `count()` over the
+  same `EventQuery`; `_stream_jsonl`/`_stream_csv` tally rows and emit a self-proving completeness
+  trailer (JSONL trailing `_meta`, CSV trailing `# vestigo_export …` comment). On a shortfall
+  they mark it incomplete and raise `ExportIncompleteError`, breaking the download so a
+  silently-short custody artifact can't be mistaken for complete. `expected` is added to the
+  `events.export` audit; a background task records the `events.export.result` (written/complete).
+- *Tests.* New `tests/test_pagination_completeness_clickhouse.py` walks a real keyset over 200
+  tied-millisecond rows + adjacent + null-timestamp sentinels via both `query` (grid) and
+  `iter_events` (export), asc+desc, asserting loaded == `count()` — the invariant no mocked
+  `test_queries.py` test covered. `tests/test_events_router.py` gains export hard-fail + success
+  trailer cases. Builds on session 92's `EventQueryService.count()` / `GET .../events/count`.
+
+**No** storage/sort-key change: the keyset was verified correct, so the fix is surfacing +
+proof, not a pagination rewrite.
+
+## Session 92 — 2026-07-24: true match count in cursor/jump-to-time sessions (bulk-tag regression)
+
+**Why.** Bulk-tagging "all events matching the filter" showed and offered only the loaded-row
+count (e.g. "Apply to 600") when the real match set was much larger (21k). Root cause: the
+events list only carries a real `COUNT(*)` on its first *offset*-mode page (`db/queries.py::query`).
+A cursor-only session — a jump-to-time seek, or paging before an offset page ever loaded —
+leaves `page.total = null`, so the Explorer fell back to `events.length` for the grid footer,
+the "select all matching" banner, and the bulk-annotate confirm dialog. The server-side write
+itself already covered the full filter set correctly; only the count the analyst *saw* was wrong,
+which both hid the true scope and undercut the "select all matching" bulk action.
+
+**What.** Added a dedicated count path that always runs, independent of pagination mode:
+`EventQueryService.count()` (`db/queries.py`, same `_build_where` as `query`/`query_event_refs`)
++ `GET .../events/count` (`api/routers/events.py`, mirrors `get_histogram`'s filter surface,
+incl. `collapse_routine` so the count matches the collapsed grid and what a filter-scoped bulk
+write touches). Frontend: `eventsApi.count` (`api/events.ts`), and ExplorerPage now fetches it
+whenever `pageTotal === null`, using `pageTotal ?? countData.total` as the authoritative `total`
+that already feeds the footer, banner, `selectionCount`, and confirm dialog. Tests: two new
+`count_events` router tests (returns total; resolves the same routine-collapse scope as the bulk
+write). No extra count scan on the common offset path (gated on `pageTotal === null`).
 
 ## Session 91 — 2026-07-23: `--since`/`--until` for native converters + forensic footer metadata
 

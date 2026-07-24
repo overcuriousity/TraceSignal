@@ -960,7 +960,17 @@ export const EventGrid = forwardRef<EventGridHandle, Props>(function EventGrid({
           {total != null
             ? `${events.length.toLocaleString()} of ${total.toLocaleString()} events loaded`
             : `${events.length.toLocaleString()} events loaded`}
-          {!hasNextPage && " · all loaded"}
+          {/* "all loaded" is a claim about *completeness*, not cursor state: with
+              a known total it means we actually hold every matching row. Deriving
+              it from `!hasNextPage` alone let a partial/point-in-time load read as
+              complete (a filter matching N showing far fewer, silently). */}
+          {(total == null ? !hasNextPage && !hasPreviousPage : events.length >= total) &&
+            " · all loaded"}
+          {total != null && !hasNextPage && !hasPreviousPage && events.length < total && (
+            <span className="ml-1 text-[var(--color-danger)]">
+              {`· ⚠ ${(total - events.length).toLocaleString()} not loaded — reload to see all`}
+            </span>
+          )}
         </span>
         {hasNextPage && (
           <button

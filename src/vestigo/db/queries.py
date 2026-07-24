@@ -1273,6 +1273,26 @@ class EventQueryService:
         )
         return [(row[0], row[1]) for row in result.result_rows]
 
+    def count(self, query: EventQuery) -> int:
+        """Return the total number of events matching *query*'s filters.
+
+        Shares the exact ``WHERE`` clause with :py:meth:`query` and
+        :py:meth:`query_event_refs`, so the number reported here matches both
+        the paginated view's ``total`` and what a filter-scoped bulk annotation
+        would write. ``limit``/``offset``/``order`` on *query* are ignored.
+        Unlike :py:meth:`query`, this runs regardless of pagination mode — the
+        Explorer uses it to surface the match count for cursor/jump-to-time
+        sessions where the first offset-mode COUNT never ran.
+        """
+        self.store.init_schema()
+        where, parameters = self._build_where(query)
+        database = self.store.database
+        result = self.store.client.query(
+            f"SELECT count() FROM {database}.events WHERE {where}",
+            parameters=parameters,
+        )
+        return result.result_rows[0][0] if result.result_rows else 0
+
     def list_fields(
         self,
         case_id: str,

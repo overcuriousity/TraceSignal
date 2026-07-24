@@ -285,13 +285,18 @@ async def test_resolve_tags_filter_resolves_only_postgres_side(patched_store):
 class _FakeQueryService:
     """Captures the EventQuery passed by bulk_annotate_by_filter."""
 
-    def __init__(self, refs: list[tuple[str, str]]) -> None:
+    def __init__(self, refs: list[tuple[str, str]], count: int = 0) -> None:
         self.refs = refs
+        self._count = count
         self.last_query = None
 
     def query_event_refs(self, query, cap: int = 100_000):
         self.last_query = query
         return self.refs
+
+    def count(self, query):
+        self.last_query = query
+        return self._count
 
 
 @pytest.mark.asyncio
@@ -384,6 +389,192 @@ async def test_bulk_annotate_by_filter_honors_routine_collapse(patched_store, mo
 
     assert fake_service.last_query.exclude_template_hashes is None
     assert fake_service.last_query.exclude_routine_disposition_ids is None
+
+
+# ---------------------------------------------------------------------------
+# count_events
+# ---------------------------------------------------------------------------
+
+
+# The endpoint's filter params carry FastAPI `Query(...)` defaults, which are
+# only resolved to real values by the framework. When calling the function
+# directly (as these tests do, to avoid a live ClickHouse), spell out the
+# defaults so parsing/validation sees plain values, not Query sentinels.
+_COUNT_DEFAULTS = {
+    "q": None,
+    "q_regex": False,
+    "artifact": None,
+    "artifacts": None,
+    "source_id": None,
+    "tag": None,
+    "exclude_tag": None,
+    "tags_include": None,
+    "tags_exclude": None,
+    "ids": None,
+    "start": None,
+    "end": None,
+    "filters": None,
+    "exclusions": None,
+    "filter_modes": None,
+    "exclusion_modes": None,
+    "annotated": None,
+    "annotation_tag_value": None,
+    "run_id": None,
+    "collapse_routine": False,
+}
+
+
+@pytest.mark.asyncio
+async def test_count_events_returns_total_matching_filter(patched_store, monkeypatch):
+    """The count endpoint always runs a server-side count(), independent of
+    pagination mode — a cursor-only/jump-to-time session has no page `total`,
+    so this is what lets the grid footer and "select all matching" bulk action
+    report the true match count instead of the loaded-row count."""
+    await patched_store.create_case("c1", "Case One")
+    await patched_store.create_source("c1", "s1", "source one", file_hash="h1", size_bytes=10)
+    await patched_store.create_timeline("c1", "t1", "Timeline One", source_ids=["s1"])
+
+    fake_service = _FakeQueryService(refs=[], count=21000)
+    monkeypatch.setattr(events, "_get_query_service", lambda: fake_service)
+
+    result = await events.count_events("c1", "t1", case=Case(id="c1"), **_COUNT_DEFAULTS)
+
+    assert result == {"total": 21000}
+
+
+@pytest.mark.asyncio
+async def test_count_events_matches_bulk_write_scope(patched_store, monkeypatch):
+    """The count must resolve the same routine-collapse and `annotated` scope as
+    `bulk_annotate_by_filter`, so the confirm-dialog count equals what the write
+    touches — a count over a wider set than the write would mislead the analyst
+    into approving a smaller change than the number implies (and vice-versa)."""
+    await patched_store.create_case("c1", "Case One")
+    await patched_store.create_source("c1", "s1", "source one", file_hash="h1", size_bytes=10)
+    await patched_store.create_timeline("c1", "t1", "Timeline One", source_ids=["s1"])
+    await patched_store.create_disposition(
+        case_id="c1",
+        timeline_id="t1",
+        kind="routine",
+        detector="log_template",
+        field="template_id",
+        value="4736",
+    )
+    motif = await patched_store.create_disposition(
+        case_id="c1",
+        timeline_id="t1",
+        kind="routine",
+        detector="sequence_motif",
+        field="motif_id",
+        value="m-1",
+    )
+
+    fake_service = _FakeQueryService(refs=[], count=5)
+    monkeypatch.setattr(events, "_get_query_service", lambda: fake_service)
+
+    await events.count_events(
+        "c1", "t1", case=Case(id="c1"), **{**_COUNT_DEFAULTS, "collapse_routine": True}
+    )
+    assert fake_service.last_query.exclude_template_hashes == [4736]
+    assert fake_service.last_query.exclude_routine_disposition_ids == [motif.id]
+
+    await events.count_events("c1", "t1", case=Case(id="c1"), **_COUNT_DEFAULTS)
+    assert fake_service.last_query.exclude_template_hashes is None
+    assert fake_service.last_query.exclude_routine_disposition_ids is None
+
+
+# ---------------------------------------------------------------------------
+# export_events completeness (hard-fail on shortfall)
+# ---------------------------------------------------------------------------
+
+
+class _FakeExportService:
+    """Decouples the pre-flight ``count()`` from what ``iter_events`` streams,
+    so a shortfall (the integrity failure the hard-fail guards) can be forced."""
+
+    def __init__(self, count_val: int, rows: list[dict]) -> None:
+        self._count = count_val
+        self._rows = rows
+
+    def count(self, query):
+        return self._count
+
+    def iter_events(self, query, batch_size: int = 1000):
+        yield from self._rows
+
+    def query(self, query):  # only reached on a regex pre-check, not used here
+        raise AssertionError("query() should not be called")
+
+
+async def _seed_export_timeline(store) -> None:
+    await store.create_case("c1", "Case One")
+    await store.create_source("c1", "s1", "source one", file_hash="h1", size_bytes=10)
+    await store.create_timeline("c1", "t1", "Timeline One", source_ids=["s1"])
+
+
+def _rows(n: int) -> list[dict]:
+    return [
+        {
+            "event_id": f"e{i}",
+            "source_id": "s1",
+            "message": f"m{i}",
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "tags": [],
+            "attributes": {},
+        }
+        for i in range(n)
+    ]
+
+
+async def _collect(resp, chunks: list[str]) -> None:
+    # Starlette wraps a sync streaming generator into an async iterator, so a
+    # mid-stream raise surfaces through `async for`. Chunks are appended to the
+    # caller's list so the partial output (incl. the trailer emitted just before
+    # a raise) is inspectable afterwards.
+    async for chunk in resp.body_iterator:
+        chunks.append(chunk)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fmt", ["jsonl", "csv"])
+async def test_export_hard_fails_on_shortfall(patched_store, monkeypatch, fmt):
+    """A forensic export that streams fewer rows than the filter matches must
+    NOT produce a silently-short file: the generator marks the trailer
+    incomplete and raises, breaking the download."""
+    await _seed_export_timeline(patched_store)
+    fake = _FakeExportService(count_val=5, rows=_rows(3))
+    monkeypatch.setattr(events, "_get_query_service", lambda: fake)
+    monkeypatch.setattr(events, "EventQueryService", lambda *a, **k: fake)
+
+    body = events.ExportRequest(format=fmt, filter=events.ExportFilter())
+    resp = await events.export_events("c1", "t1", body, case=Case(id="c1"), user=_fake_user())
+
+    chunks: list[str] = []
+    with pytest.raises(events.ExportIncompleteError):
+        await _collect(resp, chunks)
+    # The completeness trailer is emitted before the raise, so the bytes already
+    # written self-declare the shortfall.
+    joined = "".join(chunks)
+    assert ("expected=5" in joined) or ('"expected": 5' in joined)
+    assert ("complete=false" in joined) or ('"complete": false' in joined)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fmt", ["jsonl", "csv"])
+async def test_export_complete_marks_trailer_and_does_not_raise(patched_store, monkeypatch, fmt):
+    """When every matching row is streamed, the trailer proves completeness and
+    no error is raised."""
+    await _seed_export_timeline(patched_store)
+    fake = _FakeExportService(count_val=3, rows=_rows(3))
+    monkeypatch.setattr(events, "_get_query_service", lambda: fake)
+    monkeypatch.setattr(events, "EventQueryService", lambda *a, **k: fake)
+
+    body = events.ExportRequest(format=fmt, filter=events.ExportFilter())
+    resp = await events.export_events("c1", "t1", body, case=Case(id="c1"), user=_fake_user())
+    chunks: list[str] = []
+    await _collect(resp, chunks)
+    joined = "".join(chunks)
+    assert ("complete=true" in joined) or ('"complete": true' in joined)
+    assert ("rows=3" in joined) or ('"written": 3' in joined)
 
 
 # ---------------------------------------------------------------------------
@@ -1973,13 +2164,16 @@ def test_stream_jsonl_prepends_meta_line_only_when_offsets_active(monkeypatch):
     from vestigo.db.queries import EventQuery
 
     eq = EventQuery(case_id="c1", source_ids=["s1"])
-    with_off = list(events._stream_jsonl(eq, {}, {"s1": 3600}))
+    # expected=2 matches the stub's two rows → complete, no raise. The trailing
+    # completeness `_meta` line adds one chunk beyond the data rows.
+    with_off = list(events._stream_jsonl(eq, {}, {"s1": 3600}, expected=2, tally={}))
     assert json.loads(with_off[0]) == {"_meta": {"applied_time_offsets": {"s1": 3600}}}
-    assert len(with_off) == 3  # meta + 2 rows
+    assert len(with_off) == 4  # offset meta + 2 rows + completeness trailer
+    assert json.loads(with_off[-1]) == {"_meta": {"expected": 2, "written": 2, "complete": True}}
 
-    without = list(events._stream_jsonl(eq, {}, None))
+    without = list(events._stream_jsonl(eq, {}, None, expected=2, tally={}))
     assert "_meta" not in without[0]
-    assert len(without) == 2
+    assert len(without) == 3  # 2 rows + completeness trailer
 
 
 def test_stream_csv_prepends_offset_comment_only_when_active(monkeypatch):
@@ -1987,8 +2181,9 @@ def test_stream_csv_prepends_offset_comment_only_when_active(monkeypatch):
     from vestigo.db.queries import EventQuery
 
     eq = EventQuery(case_id="c1", source_ids=["s1"])
-    with_off = list(events._stream_csv(eq, {}, {"s1": -120}))
+    with_off = list(events._stream_csv(eq, {}, {"s1": -120}, expected=2, tally={}))
     assert with_off[0] == '# applied_time_offsets={"s1": -120}\n'
+    assert with_off[-1] == "# vestigo_export complete=true rows=2 expected=2\n"
 
-    without = list(events._stream_csv(eq, {}, None))
+    without = list(events._stream_csv(eq, {}, None, expected=2, tally={}))
     assert not without[0].startswith("#")
